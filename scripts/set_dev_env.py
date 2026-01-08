@@ -1,5 +1,6 @@
 import site
 import os
+import sys
 from pathlib import Path
 
 
@@ -14,6 +15,43 @@ def find_installed_max():
             return max_path
 
     return None
+
+
+def link_nvidia_libraries(site_packages_path: Path):
+    nvidia_dir = site_packages_path / "nvidia"
+    if not nvidia_dir.exists():
+        print("Installing nvidia-cudnn-cu12...")
+        try:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "nvidia-cudnn-cu12"])
+        except Exception as e:
+            print(f"Error installing nvidia-cudnn-cu12: {e}")
+            return
+
+    env_lib_dir = Path(sys.prefix) / "lib"
+    if not env_lib_dir.exists():
+        return
+
+    target_subdirs = ["cudnn", "cublas"]
+    
+    for subdir in target_subdirs:
+        src_dir = nvidia_dir / subdir
+        if not src_dir.exists():
+            continue
+            
+        for src_file in src_dir.rglob("*.so*"):
+            dst_file = env_lib_dir / src_file.name
+        
+            if dst_file.exists() or dst_file.is_symlink():
+                if dst_file.is_symlink() and os.readlink(dst_file) == str(src_file):
+                    continue
+                dst_file.unlink()
+                
+            try:
+                os.symlink(src_file, dst_file)
+                print(f"  Linked {src_file.name}")
+            except OSError as e:
+                print(f"  Failed to link {src_file.name}: {e}")
 
 
 def setup_sitecustomize(site_packages_path: Path, local_max_path: Path):
@@ -110,8 +148,11 @@ def main():
             except OSError as e:
                 print(f"Failed to link modular lib: {e}")
 
-    # Create sitecustomize.py to prioritize local source
+    # Link NVIDIA libraries
     site_packages = installed_max.parent
+    link_nvidia_libraries(site_packages)
+
+    # Create sitecustomize.py to prioritize local source
     local_max_path = repo_root / "max" / "python"
     setup_sitecustomize(site_packages, local_max_path)
 
