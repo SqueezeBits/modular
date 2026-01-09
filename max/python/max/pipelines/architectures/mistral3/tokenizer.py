@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 import huggingface_hub
 from max.pipelines.lib import TextTokenizer, try_to_load_from_cache
@@ -60,57 +61,80 @@ class Mistral3Tokenizer(TextTokenizer):
         revision: str | None = None,
         pipeline_config: PipelineConfig | None = None,
     ) -> None:
-        """Load chat template from chat_template.json file and set it on the tokenizer."""
+        """Load chat template from chat_template.json or chat_template.jinja file and set it on the tokenizer."""
 
         if pipeline_config and hasattr(pipeline_config, "model_config"):
-            revision = (
-                revision
-                or pipeline_config.model_config.huggingface_model_revision
-            )
+            revision = revision or pipeline_config.model_config.huggingface_model_revision
         revision = revision or "main"
 
-        # Try to load from cache first
-        template_file_path = try_to_load_from_cache(
-            repo_id=self.model_path,
-            filename="chat_template.json",
-            revision=revision,
-        )
+        # Try both chat_template.json and chat_template.jinja
+        template_files = [
+            ("chat_template.json", False),
+            ("chat_template.jinja", True),
+        ]
+
+        template_file_path = None
+        is_jinja_file = False
+
+        for filename, is_jinja in template_files:
+            # Try to load from cache first
+            cached_path = try_to_load_from_cache(
+                repo_id=self.model_path,
+                filename=filename,
+                revision=revision,
+            )
+
+            # Check if the result is a valid path
+            if cached_path and isinstance(cached_path, (str, os.PathLike)):
+                template_file_path = cached_path
+                is_jinja_file = is_jinja
+                break
 
         # If not in cache, try to download
         if not template_file_path:
-            logger.info(
-                "chat_template.json not in cache, attempting to download..."
-            )
-            try:
-                template_file_path = huggingface_hub.hf_hub_download(
-                    repo_id=self.model_path,
-                    filename="chat_template.json",
-                    revision=revision,
+            for filename, is_jinja in template_files:
+                try:
+                    template_file_path = huggingface_hub.hf_hub_download(
+                        repo_id=self.model_path,
+                        filename=filename,
+                        revision=revision,
+                    )
+                    is_jinja_file = is_jinja
+                    logger.info(f"Successfully downloaded {filename}")
+                    break
+                except Exception:
+                    continue
+
+        # If neither file was found, use tokenizer's default if available
+        if not template_file_path:
+            if hasattr(self.delegate, "chat_template") and self.delegate.chat_template:
+                logger.info(
+                    f"Neither chat_template.json nor chat_template.jinja found, "
+                    f"using tokenizer's default chat template for {self.model_path}"
                 )
-                logger.info("Successfully downloaded chat_template.json")
-            except Exception as e:
+                return
+            else:
                 raise RuntimeError(
-                    f"Failed to download 'chat_template.json' from model repo '{self.model_path}' "
-                    f"at revision '{revision}': {e}"
-                ) from e
+                    f"Failed to find 'chat_template.json' or 'chat_template.jinja' "
+                    f"from model repo '{self.model_path}' at revision '{revision}'"
+                )
 
         # Load and set the chat template
         try:
-            with open(template_file_path) as f:
-                template_data = json.load(f)
-                chat_template = template_data.get("chat_template")
-
-            if not chat_template:
-                raise KeyError(
-                    f"No 'chat_template' key found in {template_file_path} for model {self.model_path}"
-                )
+            with open(template_file_path, encoding="utf-8") as f:
+                if is_jinja_file:
+                    chat_template = f.read().strip()
+                    logger.info(f"Loaded chat template from {template_file_path} (Jinja format)")
+                else:
+                    template_data = json.load(f)
+                    chat_template = template_data.get("chat_template")
+                    if not chat_template:
+                        raise KeyError(
+                            f"No 'chat_template' key found in {template_file_path} for model {self.model_path}"
+                        )
 
             self.delegate.chat_template = chat_template
-            logger.info(
-                f"Loaded custom chat template from {template_file_path}"
-            )
+            logger.info(f"Loaded custom chat template from {template_file_path}")
 
         except (OSError, json.JSONDecodeError) as e:
-            raise ValueError(
-                f"Failed to load chat template from {template_file_path}: {e}"
-            ) from e
+            raise ValueError(f"Failed to load chat template from {template_file_path}: {e}") from e
