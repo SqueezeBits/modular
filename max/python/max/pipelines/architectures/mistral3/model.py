@@ -18,7 +18,7 @@ from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef
 from max.graph.weights import Weights, WeightsAdapter
-from max.nn import ReturnLogits
+from max.nn import ReturnHiddenStates, ReturnLogits
 from max.nn.kv_cache import KVCacheParams
 from max.pipelines.lib import KVCacheConfig, PipelineConfig, SupportedEncoding
 from transformers import AutoConfig
@@ -40,6 +40,7 @@ class Mistral3Model(MistralModel):
         weights: Weights,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
+        return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
     ) -> None:
         super().__init__(
             pipeline_config,
@@ -51,6 +52,7 @@ class Mistral3Model(MistralModel):
             weights,
             adapter,
             return_logits,
+            return_hidden_states,
             text_huggingface_config=huggingface_config.text_config,
         )
 

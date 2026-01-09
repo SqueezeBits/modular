@@ -121,4 +121,5 @@ class DistributedMistral(DistributedTransformer):
             devices=config.devices,
             rope=rope,
             return_logits=config.return_logits,
+            return_hidden_states=config.return_hidden_states,
         )
