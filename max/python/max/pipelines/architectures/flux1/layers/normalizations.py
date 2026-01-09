@@ -1,0 +1,437 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2025, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+
+import max.nn as nn
+from max.dtype import DType
+from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
+from max.nn import (
+    Module,
+    RMSNorm,
+)
+
+
+class AdaLayerNormZeroSingle(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        norm_type: str = "layer_norm",
+        bias: bool = True,
+        device: DeviceRef = DeviceRef.CPU(),
+        dtype: DType = DType.bfloat16,
+    ):
+        """Initialize adaptive layer normalization zero single module.
+
+        Args:
+            embedding_dim: Size of each embedding vector.
+            norm_type: Type of normalization to use ("layer_norm").
+            bias: Whether to use bias in linear projection.
+            device: Device to place the module on.
+            dtype: Data type for the module.
+        """
+        super().__init__()
+        self.linear = nn.Linear(
+            embedding_dim,
+            3 * embedding_dim,
+            has_bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+        if norm_type == "layer_norm":
+            self.norm = WeightedLayerNorm(
+                embedding_dim,
+                elementwise_affine=False,
+                use_bias=False,
+                eps=1e-6,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+    def __call__(
+        self, x: TensorValue, emb: TensorValue | None = None
+    ) -> TensorValue:
+        """Apply adaptive layer normalization.
+
+        Args:
+            x: Input tensor.
+            emb: Optional embedding tensor for conditioning.
+
+        Returns:
+            Tuple of normalized tensor and gate values.
+        """
+        emb = self.linear(ops.silu(emb))
+        shift_msa, scale_msa, gate_msa = ops.chunk(emb, 3, axis=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa
+
+
+class AdaLayerNormZero(nn.Module):
+    r"""Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_embeddings: int | None = None,
+        norm_type: str = "layer_norm",
+        bias: bool = True,
+        device: DeviceRef = DeviceRef.CPU(),
+        dtype: DType = DType.bfloat16,
+    ):
+        """Initialize adaptive layer normalization zero module.
+
+        Args:
+            embedding_dim: Size of each embedding vector.
+            num_embeddings: Optional size of the embeddings dictionary.
+            norm_type: Type of normalization to use ("layer_norm" or "fp32_layer_norm").
+            bias: Whether to use bias in linear projection.
+            device: Device to place the module on.
+            dtype: Data type for the module.
+        """
+        super().__init__()
+        if num_embeddings is not None:
+            # self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
+            raise NotImplementedError(
+                "CombinedTimestepLabelEmbeddings is not implemented"
+            )
+        else:
+            self.emb = None
+
+        self.linear = nn.Linear(
+            embedding_dim,
+            6 * embedding_dim,
+            has_bias=bias,
+            dtype=dtype,
+            device=device,
+        )
+        if norm_type == "layer_norm":
+            self.norm = WeightedLayerNorm(
+                embedding_dim,
+                elementwise_affine=False,
+                use_bias=False,
+                eps=1e-6,
+                device=device,
+                dtype=dtype,
+            )
+        elif norm_type == "fp32_layer_norm":
+            # self.norm = FP32LayerNorm(embedding_dim, elementwise_affine=False, bias=False)
+            raise NotImplementedError("FP32LayerNorm is not implemented")
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+    def __call__(
+        self,
+        x: TensorValue,
+        timestep: TensorValue | None = None,
+        class_labels: TensorValue | None = None,
+        hidden_dtype: DType | None = None,
+        emb: TensorValue | None = None,
+    ) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue, TensorValue]:
+        """Apply adaptive layer normalization with gate values for attention and MLP.
+
+        Args:
+            x: Input tensor.
+            timestep: Optional timestep tensor.
+            class_labels: Optional class label tensor.
+            hidden_dtype: Optional hidden data type.
+            emb: Optional embedding tensor for conditioning.
+
+        Returns:
+            Tuple of (normalized tensor, gate_msa, shift_mlp, scale_mlp, gate_mlp).
+        """
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(ops.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            ops.chunk(emb, 6, axis=1)
+        )
+        x = self.norm(x)
+        x = x * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class AdaLayerNormContinuous(nn.Module):
+    r"""Adaptive normalization layer with a norm layer (layer_norm or rms_norm).
+
+    Args:
+        embedding_dim (`int`): Embedding dimension to use during projection.
+        conditioning_embedding_dim (`int`): Dimension of the input condition.
+        elementwise_affine (`bool`, defaults to `True`):
+            Boolean flag to denote if affine transformation should be applied.
+        eps (`float`, defaults to 1e-5): Epsilon factor.
+        bias (`bias`, defaults to `True`): Boolean flag to denote if bias should be use.
+        norm_type (`str`, defaults to `"layer_norm"`):
+            Normalization layer to use. Values supported: "layer_norm", "rms_norm".
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        conditioning_embedding_dim: int,
+        # NOTE: It is a bit weird that the norm layer can be configured to have scale and shift parameters
+        # because the output is immediately scaled and shifted by the projected conditioning embeddings.
+        # Note that AdaLayerNorm does not let the norm layer have scale and shift parameters.
+        # However, this is how it was implemented in the original code, and it's rather likely you should
+        # set `elementwise_affine` to False.
+        # elementwise_affine=True,
+        eps: float = 1e-5,
+        bias: bool = True,
+        norm_type: str = "layer_norm",
+        device: DeviceRef = DeviceRef.CPU(),
+        dtype: DType = DType.bfloat16,
+    ):
+        """Initialize adaptive layer normalization continuous module.
+
+        Args:
+            embedding_dim: Embedding dimension to use during projection.
+            conditioning_embedding_dim: Dimension of the input condition.
+            eps: Epsilon factor for normalization.
+            bias: Whether to use bias in linear projection.
+            norm_type: Type of normalization to use ("layer_norm" or "rms_norm").
+            device: Device to place the module on.
+            dtype: Data type for the module.
+        """
+        super().__init__()
+        self.silu = ops.silu
+        self.linear = nn.Linear(
+            conditioning_embedding_dim,
+            embedding_dim * 2,
+            has_bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+        if norm_type == "layer_norm":
+            self.norm = WeightedLayerNorm(
+                embedding_dim,
+                elementwise_affine=False,
+                eps=eps,
+                device=device,
+                dtype=dtype,
+            )
+        elif norm_type == "rms_norm":
+            self.norm = RMSNorm(
+                embedding_dim, eps=eps, device=device, dtype=dtype
+            )
+        else:
+            raise ValueError(f"unknown norm_type {norm_type}")
+
+    def __call__(
+        self, x: TensorValue, conditioning_embedding: TensorValue
+    ) -> TensorValue:
+        """Apply adaptive layer normalization with conditioning.
+
+        Args:
+            x: Input tensor.
+            conditioning_embedding: Conditioning embedding tensor.
+
+        Returns:
+            Normalized and conditioned tensor.
+        """
+        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
+        emb = self.linear(self.silu(conditioning_embedding).cast(x.dtype))
+        scale, shift = ops.chunk(emb, 2, axis=1)
+        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+        return x
+
+
+class WeightedLayerNorm(Module):
+    """Layer normalization block.
+
+    Max.nn.LayerNorm is FP32 only and forcely use weight.
+    This layer is a workaround to use layer norm in bfloat16 and no weight.
+    """
+
+    def __init__(
+        self,
+        dims: int,
+        device: DeviceRef,
+        dtype: DType,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        use_bias: bool = True,
+    ) -> None:
+        """Initialize weighted layer normalization module.
+
+        Args:
+            dims: Number of dimensions for normalization.
+            device: Device to place the module on.
+            dtype: Data type for the module.
+            eps: Epsilon for numerical stability.
+            elementwise_affine: Whether to use learnable affine parameters.
+            use_bias: Whether to use bias in affine transformation.
+        """
+        super().__init__()
+        self.eps = eps
+        self.device = device
+        self.dtype = dtype
+        if elementwise_affine:
+            self.weight = Weight("weight", dtype, (dims,), device=device)
+            if use_bias:
+                self.bias = Weight("bias", dtype, (dims,), device=device)
+            else:
+                self.bias = None
+        else:
+            self.weight = None
+            self.bias = None
+
+    def __call__(self, input: TensorValue):
+        """Apply layer normalization to input tensor.
+
+        Args:
+            input: Input tensor to normalize.
+
+        Returns:
+            Normalized tensor.
+        """
+        gamma = (
+            self.weight
+            if self.weight
+            else ops.broadcast_to(
+                ops.constant(1.0, self.dtype, self.device),
+                shape=(input.shape[-1],),
+            )
+        )
+        bias = (
+            self.bias
+            if self.bias
+            # If bias wasn't passed then use bias-less layer norm (beta = 0).
+            else ops.broadcast_to(
+                ops.constant(0.0, self.dtype, self.device),
+                shape=(input.shape[-1],),
+            )
+        )
+        return ops.layer_norm(
+            input,
+            gamma=gamma,
+            beta=bias,
+            epsilon=self.eps,
+        )
+
+
+class WeightedGroupNorm(Module):
+    """Group normalization block with configurable dtype.
+
+    This is a custom implementation that replaces max.nn.GroupNorm to support
+    configurable dtype for weight and bias parameters. MAX's native GroupNorm
+    hardcodes weight/bias to float32 (see max.nn.norm.group_norm.GroupNorm),
+    which causes dtype mismatch errors when loading bfloat16 checkpoints.
+
+    This implementation allows weight/bias to use the same dtype as the input
+    (e.g., bfloat16), matching PyTorch's behavior where weight/bias dtype
+    matches input dtype.
+    """
+
+    def __init__(
+        self,
+        num_groups: int,
+        num_channels: int,
+        device: DeviceRef,
+        dtype: DType,
+        eps: float = 1e-5,
+        affine: bool = True,
+    ) -> None:
+        """Initialize WeightedGroupNorm module.
+
+        Args:
+            num_groups: Number of groups to separate the channels into
+            num_channels: Number of input channels
+            device: Device to place the module on
+            dtype: Data type for weight and bias parameters (e.g., DType.bfloat16)
+            eps: Small constant added to denominator for numerical stability
+            affine: If True, apply learnable affine transform parameters
+        """
+        super().__init__()
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.eps = eps
+        self.affine = affine
+        self.device = device
+        self.dtype = dtype
+
+        if self.num_channels % self.num_groups != 0:
+            raise ValueError(
+                f"num_channels({self.num_channels}) should be divisible by "
+                f"num_groups({self.num_groups})"
+            )
+
+        self.weight: Weight | None = None
+        self.bias: Weight | None = None
+        if self.affine:
+            self.weight = Weight(
+                "weight", dtype, (self.num_channels,), device=device
+            )
+            self.bias = Weight(
+                "bias", dtype, (self.num_channels,), device=device
+            )
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        """Apply group normalization to input tensor.
+
+        Args:
+            x: Input tensor of shape [N, C, *] where C is number of channels
+
+        Returns:
+            Normalized tensor of same shape as input
+        """
+        # Input shape validation
+        if len(x.shape) < 2:
+            raise ValueError(
+                f"Expected input tensor with >=2 dimensions, got shape {x.shape}"
+            )
+        if x.shape[1] != self.num_channels:
+            raise ValueError(
+                f"Expected {self.num_channels} channels, got shape {x.shape}"
+            )
+
+        gamma = (
+            self.weight
+            if self.affine and self.weight
+            else ops.broadcast_to(
+                ops.constant(1.0, self.dtype, self.device),
+                shape=(self.num_channels,),
+            )
+        )
+
+        beta = (
+            self.bias
+            if self.affine and self.bias
+            else ops.broadcast_to(
+                ops.constant(0.0, self.dtype, self.device),
+                shape=(self.num_channels,),
+            )
+        )
+
+        return ops.custom(
+            "group_norm",
+            x.device,
+            [
+                x,
+                gamma,
+                beta,
+                ops.constant(self.eps, dtype=x.dtype, device=DeviceRef.CPU()),
+                ops.constant(
+                    self.num_groups, dtype=DType.int32, device=DeviceRef.CPU()
+                ),
+            ],
+            [TensorType(dtype=x.dtype, shape=x.shape, device=x.device)],
+        )[0].tensor

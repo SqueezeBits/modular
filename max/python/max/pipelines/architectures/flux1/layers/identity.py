@@ -11,5 +11,13 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .image_generation import DiffusionPipeline
-from .text_generation import TextGenerationPipeline
+from max.graph import TensorValue
+from max.nn import Module
+
+
+class Identity(Module):
+    """A module that returns the input tensor as is."""
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        """Return the input as is."""
+        return x
