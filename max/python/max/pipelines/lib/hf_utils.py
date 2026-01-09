@@ -100,6 +100,15 @@ def try_to_load_from_cache(
     validate_hf_repo_access is called before this function to ensure the repo
     exists.
     """
+    # Check if repo_id is a local path
+    if os.path.exists(repo_id):
+        # For local paths, try to load the file directly
+        local_file_path = os.path.join(repo_id, filename)
+        if os.path.exists(local_file_path):
+            return local_file_path
+        return None
+
+    # For HuggingFace repositories, validate access first
     validate_hf_repo_access(repo_id=repo_id, revision=revision)
     return huggingface_hub.try_to_load_from_cache(
         repo_id=repo_id,
