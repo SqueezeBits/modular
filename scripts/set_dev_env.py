@@ -133,20 +133,15 @@ def main():
              local_modular_dir.mkdir(parents=True, exist_ok=True)
              
         local_lib_link = local_modular_dir / "lib"
-        
-        should_link_lib = False
-        if not local_lib_link.exists():
-             should_link_lib = True
-        elif local_lib_link.is_symlink() and os.readlink(local_lib_link) != str(installed_modular_lib):
-             local_lib_link.unlink()
-             should_link_lib = True
-             
-        if should_link_lib:
-            print(f"Linking dependency: {installed_modular_lib} -> {local_lib_link}")
-            try:
-                os.symlink(installed_modular_lib, local_lib_link)
-            except OSError as e:
-                print(f"Failed to link modular lib: {e}")
+
+        if local_lib_link.is_symlink():
+            local_lib_link.unlink()
+
+        print(f"Linking dependency: {installed_modular_lib} -> {local_lib_link}")
+        try:
+            os.symlink(installed_modular_lib, local_lib_link)
+        except OSError as e:
+            print(f"Failed to link modular lib: {e}")
 
     # Link NVIDIA libraries
     site_packages = installed_max.parent
