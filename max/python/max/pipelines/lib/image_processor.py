@@ -23,7 +23,7 @@ from max.experimental.compile_utils import max_compile
 from max.graph import DeviceRef, TensorType, TensorValue, ops
 from PIL import Image
 
-from .pipeline_variants.configuration_utils import (
+from .interfaces.configuration_utils import (
     ConfigMixin,
     register_to_config,
 )
@@ -104,7 +104,7 @@ class VaeImageProcessor(ConfigMixin):
             `np.ndarray` or `Tensor`:
                 The denormalized image array.
         """
-        if isinstance(images, Tensor) or isinstance(images, TensorValue):
+        if isinstance(images, (Tensor, TensorValue)):
             images = images * 0.5 + 0.5
             images = F.min(
                 images,

@@ -19,6 +19,5 @@ repos:
         entry: ./bazelw run format
         language: system
         files: '\.(mojo|🔥|py|md)$'
-        exclude: ^scripts/
         stages: [pre-commit]
         pass_filenames: false

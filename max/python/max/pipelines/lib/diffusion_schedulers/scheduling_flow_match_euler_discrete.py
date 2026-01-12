@@ -22,7 +22,7 @@ from max.engine import InferenceSession
 from max.experimental import Tensor, random
 from max.graph import DeviceRef, Graph, TensorType
 
-from ..pipeline_variants.configuration_utils import (
+from ..interfaces.configuration_utils import (
     ConfigMixin,
     register_to_config,
 )

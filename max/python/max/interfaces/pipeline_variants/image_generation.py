@@ -11,4 +11,26 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .arch import flux1_arch
+from dataclasses import dataclass
+
+from max.interfaces.pipeline import PipelineInputs
+from PIL.Image import Image
+
+
+@dataclass(eq=True)
+class ImageGenerationInputs(PipelineInputs):
+    # NOTE: current implementation only considers offline generation,
+    # without request scheduling.
+    # `ImageGenerationContext` should be used after request scheduling is implemented.
+    prompt: str
+    height: int
+    width: int
+    num_inference_steps: int
+    guidance_scale: float
+    num_images_per_prompt: int
+
+
+@dataclass(kw_only=True)
+class ImageGenerationOutput:
+    images: list[Image]
+    """List of generated images."""

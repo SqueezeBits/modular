@@ -13,7 +13,6 @@
 
 """Upsampling utilities for MAX framework."""
 
-
 import max.nn as nn
 from max.dtype import DType
 from max.experimental import tensor

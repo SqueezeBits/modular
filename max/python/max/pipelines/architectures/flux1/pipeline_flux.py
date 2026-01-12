@@ -32,10 +32,10 @@ from max.pipelines.lib.image_processor import (
     PipelineImageInput,
     VaeImageProcessor,
 )
-from max.pipelines.lib.pipeline_variants.configuration_utils import (
+from max.pipelines.lib.interfaces.configuration_utils import (
     register_to_config,
 )
-from max.pipelines.lib.pipeline_variants.image_generation import (
+from max.pipelines.lib.interfaces.diffusion_pipeline import (
     DiffusionPipeline,
 )
 from tqdm import tqdm
@@ -373,7 +373,7 @@ class FluxPipeline(DiffusionPipeline):
         vae_scale_factor: int,
     ) -> Tensor_v3:
         # TODO: should compile this function for speed up.
-        batch_size, num_patches, channels = latents.shape
+        batch_size, _, channels = latents.shape
 
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.

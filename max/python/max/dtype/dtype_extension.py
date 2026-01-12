@@ -13,8 +13,9 @@
 
 """Extension for max.dtype to support additional attributes."""
 
-from .dtype import DType
 from numpy import finfo as np_finfo
+
+from .dtype import DType
 
 
 class finfo:

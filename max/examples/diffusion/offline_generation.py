@@ -1,14 +1,28 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2025, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
 import argparse
 import os
 import time
 from pathlib import Path
 
 from max.dtype import DType
+from max.entrypoints.diffusion import DiffusionPipeline
 from max.graph import DeviceRef
-from max.pipelines import FluxPipeline as MaxFluxPipeline
+from max.pipelines import PipelineConfig
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Run Flux inference")
     parser.add_argument(
         "--model_id",
@@ -113,22 +127,23 @@ def main():
         if args.device == "cuda":
             # pipe.enable_model_cpu_offload()  # Use this if you have limited VRAM
             pipe.enable_attention_slicing()
-        if args.use_torch_randn:
-            os.environ["USE_TORCH_RANDN"] = "1"
-            os.environ["SEED"] = str(args.seed)
-            generator = torch.Generator(device="cuda").manual_seed(args.seed)
+        generator = torch.Generator(device="cuda").manual_seed(args.seed)
     else:
-        max_device = DeviceRef.GPU() if args.device == "cuda" else DeviceRef.CPU()
+        max_device = (
+            DeviceRef.GPU() if args.device == "cuda" else DeviceRef.CPU()
+        )
         max_dtype = (
             DType.bfloat16
             if args.dtype == "bfloat16"
-            else DType.float16 if args.dtype == "float16" else DType.float32
+            else DType.float16
+            if args.dtype == "float16"
+            else DType.float32
         )
-        pipe = MaxFluxPipeline.from_pretrained(
-            args.model_id,
-            device=max_device,
-            dtype=max_dtype,
-        )
+        pipeline_config = PipelineConfig(model_path=args.model_id)
+        pipe = DiffusionPipeline(pipeline_config)
+        if args.use_torch_randn:
+            os.environ["USE_TORCH_RANDN"] = "1"
+            os.environ["SEED"] = str(args.seed)
 
     print(f"\nPrompt: {args.prompt}")
     print(f"Image size: {args.width}x{args.height}")
@@ -136,7 +151,7 @@ def main():
     print(f"Inference steps: {args.num_inference_steps}")
     print(f"Guidance scale: {args.guidance_scale}")
 
-    print(f"\nRunning warmup...")
+    print("\nRunning warmup...")
     result = pipe(
         prompt=args.prompt,
         height=args.height,
@@ -186,7 +201,7 @@ def main():
         stem = output_path.stem
         suffix = output_path.suffix
         for i, image in enumerate(images):
-            numbered_path = output_path.parent / f"{stem}_{i+1}{suffix}"
+            numbered_path = output_path.parent / f"{stem}_{i + 1}{suffix}"
             image.save(numbered_path)
         print(f"\n✓ {len(images)} images saved to: {output_path.parent}")
         print(f"  Filenames: {stem}_1{suffix} to {stem}_{len(images)}{suffix}")

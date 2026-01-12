@@ -36,7 +36,7 @@ from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops
 from max.graph.weights import SafetensorWeights
 from max.nn.layer.layer_list import LayerList
-from max.pipelines.lib.pipeline_variants.configuration_utils import (
+from max.pipelines.lib.interfaces.configuration_utils import (
     ConfigMixin,
     register_to_config,
 )
