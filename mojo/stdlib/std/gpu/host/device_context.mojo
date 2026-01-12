@@ -1866,7 +1866,7 @@ struct DeviceFunction[
         pass
 
     var ctx = DeviceContext()
-    var kernel = ctx.compile_function[my_kernel, my_kernel]()
+    var kernel = ctx.compile_function_experimental[my_kernel]()
     ctx.enqueue_function(kernel, grid_dim=(1,1,1), block_dim=(32,1,1))
     ```
     """
@@ -1991,7 +1991,9 @@ struct DeviceFunction[
         )
         self._handle = result
 
-    fn _copy_to_constant_memory(self, mapping: ConstantMemoryMapping) raises:
+    fn _copy_to_constant_memory(
+        read self, mapping: ConstantMemoryMapping
+    ) raises:
         # const char *AsyncRT_DeviceFunction_copyToConstantMemory(
         #     const DeviceFunction *func,
         #     const void *name, size_t nameSize,
@@ -2064,14 +2066,14 @@ struct DeviceFunction[
             .replace("\t;;#ASMEND\n", "")
         )
 
-    fn _expand_path(self, path: Path) -> Path:
+    fn _expand_path(read self, path: Path) -> Path:
         """If the path contains a `%` character, it is replaced with the module
         name. This allows one to dump multiple kernels which are disambiguated
         by the module name.
         """
         return String(path).replace("%", self._func_impl.module_name)
 
-    fn _expand_path(self, path: StaticString) -> Path:
+    fn _expand_path(read self, path: StaticString) -> Path:
         """If the path contains a `%` character, it is replaced with the module
         name. This allows one to dump multiple kernels which are disambiguated
         by the module name.
@@ -2083,7 +2085,7 @@ struct DeviceFunction[
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
         _dump_sass: _DumpPath = False,
-    ](self) raises:
+    ](read self) raises:
         """Dumps various representations of the compiled device function.
 
         This method dumps the assembly, LLVM IR, and/or SASS code for the compiled
@@ -2107,6 +2109,8 @@ struct DeviceFunction[
         help disambiguate multiple kernel dumps.
         """
 
+        # Get ASM - either from the pre-compiled func_impl or by compiling now
+        @parameter
         fn get_asm() -> StaticString:
             @parameter
             if Self._emission_kind == "asm":
@@ -2208,7 +2212,7 @@ struct DeviceFunction[
     fn _call_with_pack[
         *Ts: AnyType
     ](
-        self,
+        read self,
         ctx: DeviceContext,
         args: VariadicPack[_, AnyType, *Ts],
         grid_dim: Dim,
@@ -2380,7 +2384,7 @@ struct DeviceFunction[
     fn _call_with_pack[
         *Ts: AnyType
     ](
-        self,
+        read self,
         stream: DeviceStream,
         args: VariadicPack[_, AnyType, *Ts],
         grid_dim: Dim,
@@ -2581,7 +2585,7 @@ struct DeviceFunction[
     fn _call_with_pack_checked[
         *Ts: DevicePassable
     ](
-        self,
+        read self,
         stream: DeviceStream,
         args: VariadicPack[_, DevicePassable, *Ts],
         grid_dim: Dim,
@@ -2703,7 +2707,7 @@ struct DeviceFunction[
     fn _call_with_pack_checked[
         *Ts: DevicePassable
     ](
-        self,
+        read self,
         ctx: DeviceContext,
         args: VariadicPack[_, DevicePassable, *Ts],
         grid_dim: Dim,
@@ -3102,7 +3106,9 @@ struct DeviceExternalFunction:
         self._handle = result
 
     @always_inline
-    fn _copy_to_constant_memory(self, mapping: ConstantMemoryMapping) raises:
+    fn _copy_to_constant_memory(
+        read self, mapping: ConstantMemoryMapping
+    ) raises:
         """Copies data to constant memory for use by the device function.
 
         Args:
@@ -3138,7 +3144,7 @@ struct DeviceExternalFunction:
     fn _call_with_pack[
         *Ts: AnyType
     ](
-        self,
+        read self,
         ctx: DeviceContext,
         args: VariadicPack[_, AnyType, *Ts],
         grid_dim: Dim,
@@ -3282,7 +3288,7 @@ struct DeviceContext(ImplicitlyCopyable):
         print("hello from thread:", thread_idx.x, thread_idx.y, thread_idx.z)
 
     with DeviceContext() as ctx:
-        ctx.enqueue_function[kernel, kernel](grid_dim=1, block_dim=(2, 2, 2))
+        ctx.enqueue_function_experimental[kernel](grid_dim=1, block_dim=(2, 2, 2))
         ctx.synchronize()
     ```
 
@@ -3297,7 +3303,7 @@ struct DeviceContext(ImplicitlyCopyable):
         @staticmethod
         fn execute(ctx_ptr: DeviceContextPtr) raises:
             var ctx = ctx_ptr.get_device_context()
-            ctx.enqueue_function[kernel, kernel](grid_dim=1, block_dim=(2, 2, 2))
+            ctx.enqueue_function_experimental[kernel](grid_dim=1, block_dim=(2, 2, 2))
             ctx.synchronize()
     ```
     """
@@ -4336,7 +4342,7 @@ struct DeviceContext(ImplicitlyCopyable):
             print("Value:", x)
 
         with DeviceContext() as ctx:
-            ctx.enqueue_function[kernel, kernel](compiled_func, 42, grid_dim=1, block_dim=1)
+            ctx.enqueue_function_experimental[kernel](compiled_func, 42, grid_dim=1, block_dim=1)
             ctx.synchronize()
         ```
 
@@ -4533,7 +4539,7 @@ struct DeviceContext(ImplicitlyCopyable):
         with DeviceContext() as ctx:
             # Create tensors a, b, c...
             # Most parameters are inferred automatically:
-            ctx.enqueue_function[vector_add, vector_add](
+            ctx.enqueue_function_experimental[vector_add](
                 a, b, c,
                 grid_dim=4,
                 block_dim=256
@@ -4783,7 +4789,7 @@ struct DeviceContext(ImplicitlyCopyable):
 
                 # Create tensor 'data'...
                 # Most parameters are inferred:
-                ctx.enqueue_function[scale_kernel, scale_kernel](
+                ctx.enqueue_function_experimental[scale_kernel](
                     data,
                     grid_dim=1,
                     block_dim=256
@@ -5005,7 +5011,7 @@ struct DeviceContext(ImplicitlyCopyable):
             print("hello from the GPU")
 
         with DeviceContext() as ctx:
-            ctx.enqueue_function[kernel, kernel](grid_dim=1, block_dim=1)
+            ctx.enqueue_function_experimental[kernel](grid_dim=1, block_dim=1)
             ctx.synchronize()
         ```
 
@@ -5017,7 +5023,7 @@ struct DeviceContext(ImplicitlyCopyable):
         from gpu.host import DeviceContext
 
         with DeviceContext() as ctx:
-            var compiled_func = ctx.compile_function[kernel, kernel]()
+            var compiled_func = ctx.compile_function_experimental[kernel]()
             ctx.enqueue_function(compiled_func, grid_dim=1, block_dim=1)
             ctx.enqueue_function(compiled_func, grid_dim=1, block_dim=1)
             ctx.synchronize()

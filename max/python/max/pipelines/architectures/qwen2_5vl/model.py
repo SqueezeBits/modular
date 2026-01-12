@@ -172,9 +172,12 @@ class Qwen2_5VLModel(
         self.model_config = None
         self._session = session  # reuse for on-device casts
 
-        self.vision_model, self.language_model = self.load_model(session)
+        gpu0 = devices[0]
+        if gpu0.is_host:
+            raise ValueError("Qwen2.5VL currently only supports GPU devices")
+        self._parallel_ops = ParallelArrayOps(accelerator=gpu0, max_workers=24)
 
-        self._parallel_ops = ParallelArrayOps(max_workers=24)
+        self.vision_model, self.language_model = self.load_model(session)
 
     @staticmethod
     def calculate_max_seq_len(
@@ -805,7 +808,7 @@ class Qwen2_5VLModel(
         """
         # Optimize concatenation: pre-allocate output array and write directly
         # Calculate total output size first
-        total_seq_len = sum(ctx.active_length for ctx in context_batch)
+        total_seq_len = sum(ctx.tokens.active_length for ctx in context_batch)
         n_rope_sections = 3  # Fixed for Qwen2.5VL
 
         # Fast path for single context: avoid concatenation overhead
@@ -823,12 +826,11 @@ class Qwen2_5VLModel(
             #               token_ids = [10, 11, 12, 13, IMG, IMG, IMG, IMG, IMG, 14, 15]
             # temp_position_ids[0, :] = [0, 1, 2, 3, 4, 4, 4, 4, 4, 7, 8]
             #                                                 jump ^
-            if (
-                ctx.needs_vision_encoding
-                and ctx_decoder_position_ids.shape[1] == ctx.current_length
-            ):
+            if ctx.needs_vision_encoding and ctx_decoder_position_ids.shape[
+                1
+            ] == len(ctx.tokens):
                 result_array = ctx_decoder_position_ids[
-                    :, ctx.processed_length : ctx.current_position
+                    :, ctx.tokens.processed_length : ctx.tokens.current_position
                 ].astype(np.uint32, copy=False)
             elif ctx.needs_vision_encoding:
                 # Recompute decoder_position_ids using get_rope_index
@@ -849,9 +851,7 @@ class Qwen2_5VLModel(
                 # Always create a fresh attention mask based on current context length
                 # The stored attention_mask in extra_model_args may be outdated if tokens
                 # were added after context creation (e.g., during generation before reset)
-                attention_mask = np.ones(
-                    (1, ctx.current_length), dtype=np.float32
-                )
+                attention_mask = np.ones((1, len(ctx.tokens)), dtype=np.float32)
 
                 # Recompute position_ids using get_rope_index (same logic as tokenizer)
                 temp_position_ids, rope_delta_array = get_rope_index(
@@ -860,7 +860,7 @@ class Qwen2_5VLModel(
                     video_token_id=video_token_id,
                     vision_start_token_id=vision_start_token_id,
                     tokens_per_second=tokens_per_second,
-                    input_ids=ctx.tokens[: ctx.current_length].reshape(1, -1),
+                    input_ids=ctx.tokens[: len(ctx.tokens)].reshape(1, -1),
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=None,
                     second_per_grid_ts=None,
@@ -873,7 +873,7 @@ class Qwen2_5VLModel(
 
                 # Slice to get only the active portion and convert type
                 result_array = temp_position_ids[
-                    :, ctx.processed_length : ctx.current_position
+                    :, ctx.tokens.processed_length : ctx.tokens.current_position
                 ].astype(np.uint32, copy=False)
             else:
                 # This case should only happen during Token Generation
@@ -881,12 +881,12 @@ class Qwen2_5VLModel(
                 # Recompute this value on the fly.
                 # This assumes that there are no image placeholder tokens in
                 # next_tokens so it is a simple arange operation.
-                context_seq_length = ctx.active_length
+                context_seq_length = ctx.tokens.active_length
                 temp_position_ids = np.arange(context_seq_length)
                 temp_position_ids = temp_position_ids.reshape(1, 1, -1)
                 temp_position_ids = np.tile(temp_position_ids, (3, 1, 1))
                 # Offset by the number of previous tokens (start_idx).
-                delta = ctx.processed_length + ctx.rope_delta
+                delta = ctx.tokens.processed_length + ctx.rope_delta
                 temp_position_ids = temp_position_ids + delta
                 result_array = temp_position_ids.squeeze(1).astype(
                     np.uint32, copy=False
@@ -908,7 +908,7 @@ class Qwen2_5VLModel(
 
         for ctx in context_batch:
             ctx_decoder_position_ids = ctx.decoder_position_ids
-            active_len = ctx.active_length
+            active_len = ctx.tokens.active_length
 
             # - For each text token, the position id increases by one each time.
             # - Each image token of same image has the same position id as they
@@ -920,13 +920,12 @@ class Qwen2_5VLModel(
             #               token_ids = [10, 11, 12, 13, IMG, IMG, IMG, IMG, IMG, 14, 15]
             # temp_position_ids[0, :] = [0, 1, 2, 3, 4, 4, 4, 4, 4, 7, 8]
             #                                                 jump ^
-            if (
-                ctx.needs_vision_encoding
-                and ctx_decoder_position_ids.shape[1] == ctx.current_length
-            ):
+            if ctx.needs_vision_encoding and ctx_decoder_position_ids.shape[
+                1
+            ] == len(ctx.tokens):
                 # Direct slice and write to output
                 src_slice = ctx_decoder_position_ids[
-                    :, ctx.processed_length : ctx.current_position
+                    :, ctx.tokens.processed_length : ctx.tokens.current_position
                 ]
                 out_array[:, write_offset : write_offset + active_len] = (
                     src_slice.astype(np.uint32, copy=False)
@@ -950,9 +949,7 @@ class Qwen2_5VLModel(
                 # Always create a fresh attention mask based on current context length
                 # The stored attention_mask in extra_model_args may be outdated if tokens
                 # were added after context creation (e.g., during generation before reset)
-                attention_mask = np.ones(
-                    (1, ctx.current_length), dtype=np.float32
-                )
+                attention_mask = np.ones((1, len(ctx.tokens)), dtype=np.float32)
 
                 # Recompute position_ids using get_rope_index (same logic as tokenizer)
                 temp_position_ids, rope_delta_array = get_rope_index(
@@ -961,7 +958,7 @@ class Qwen2_5VLModel(
                     video_token_id=video_token_id,
                     vision_start_token_id=vision_start_token_id,
                     tokens_per_second=tokens_per_second,
-                    input_ids=ctx.tokens[: ctx.current_length].reshape(1, -1),
+                    input_ids=ctx.tokens[: len(ctx.tokens)].reshape(1, -1),
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=None,
                     second_per_grid_ts=None,
@@ -974,7 +971,7 @@ class Qwen2_5VLModel(
 
                 # Slice to get only the active portion and write directly
                 src_slice = temp_position_ids[
-                    :, ctx.processed_length : ctx.current_position
+                    :, ctx.tokens.processed_length : ctx.tokens.current_position
                 ]
                 out_array[:, write_offset : write_offset + active_len] = (
                     src_slice.astype(np.uint32, copy=False)
@@ -985,12 +982,12 @@ class Qwen2_5VLModel(
                 # Recompute this value on the fly.
                 # This assumes that there are no image placeholder tokens in
                 # next_tokens so it is a simple arange operation.
-                context_seq_length = ctx.active_length
+                context_seq_length = ctx.tokens.active_length
                 temp_position_ids = np.arange(context_seq_length)
                 temp_position_ids = temp_position_ids.reshape(1, 1, -1)
                 temp_position_ids = np.tile(temp_position_ids, (3, 1, 1))
                 # Offset by the number of previous tokens (start_idx).
-                delta = ctx.processed_length + ctx.rope_delta
+                delta = ctx.tokens.processed_length + ctx.rope_delta
                 temp_position_ids = temp_position_ids + delta
                 temp_position_ids = temp_position_ids.squeeze(1)
                 out_array[:, write_offset : write_offset + active_len] = (
@@ -1037,12 +1034,12 @@ class Qwen2_5VLModel(
         # Prepare Inputs Needed Regardless of Images
         with Tracer("prepare_input_ids"):
             input_ids = Tensor.from_numpy(
-                np.concatenate([ctx.next_tokens for ctx in context_batch])
+                np.concatenate([ctx.tokens.active for ctx in context_batch])
             ).to(self.devices[0])
 
         with Tracer("prepare_input_row_offsets"):
             input_row_offsets = np.cumsum(
-                [0] + [ctx.active_length for ctx in context_batch],
+                [0] + [ctx.tokens.active_length for ctx in context_batch],
                 dtype=np.uint32,
             )
             input_row_offsets_tensors = Tensor.from_numpy(input_row_offsets).to(

@@ -63,8 +63,13 @@ class Mistral3Tokenizer(TextTokenizer):
     ) -> None:
         """Load chat template from chat_template.json or chat_template.jinja file and set it on the tokenizer."""
 
-        if pipeline_config and hasattr(pipeline_config, "model_config"):
-            revision = revision or pipeline_config.model_config.huggingface_model_revision
+        if revision is None:
+            # Prefer revision from pipeline config when not explicitly provided.
+            model_cfg = getattr(pipeline_config, "model", None)
+            candidate = getattr(model_cfg, "huggingface_model_revision", None)
+            revision = (
+                candidate if isinstance(candidate, str) and candidate else None
+            )
         revision = revision or "main"
 
         # Try both chat_template.json and chat_template.jinja
