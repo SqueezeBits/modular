@@ -583,12 +583,9 @@ class CLIPTextModel(Module, ConfigMixin):
         else:
             session = InferenceSession([Accelerator()])
 
-        text_encoder_path = os.path.join(
-            self.pretrained_model_name_or_path, "text_encoder"
-        )
         weight_files = [
-            os.path.join(text_encoder_path, f)
-            for f in os.listdir(text_encoder_path)
+            os.path.join(self.pretrained_model_name_or_path, f)
+            for f in os.listdir(self.pretrained_model_name_or_path)
             if f.endswith(".safetensors")
         ]
         weights = SafetensorWeights(weight_files)

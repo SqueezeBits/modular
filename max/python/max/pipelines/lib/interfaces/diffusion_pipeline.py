@@ -12,38 +12,40 @@
 # ===----------------------------------------------------------------------=== #
 
 """Pipeline utilities for MAX-optimized pipelines."""
+from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import fnmatch
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import huggingface_hub
 import requests
-from huggingface_hub import (
-    hf_hub_download,
-    model_info,
-    snapshot_download,
-)
 from huggingface_hub.utils import OfflineModeIsEnabled
 from max.dtype import DType
+from max.engine import InferenceSession
 from max.graph import DeviceRef
 from requests.exceptions import HTTPError
 from tqdm import tqdm
 
 from .configuration_utils import ConfigMixin
+from ..config_enums import RepoType
+
+if TYPE_CHECKING:
+    from ..config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
 
-class DiffusionPipeline(ConfigMixin):
+class DiffusionPipeline(ABC, ConfigMixin):
     config_name = "model_index.json"
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
+    def __init__(
+        self,
+        pipeline_config: PipelineConfig,
         device: DeviceRef = DeviceRef.GPU(),
         dtype: DType = DType.bfloat16,
         **kwargs: Any,
@@ -59,55 +61,43 @@ class DiffusionPipeline(ConfigMixin):
         Returns:
             The loaded pipeline.
         """
-        cache_dir = kwargs.pop("cache_dir", None)
-        force_download = kwargs.pop("force_download", False)
-        proxies = kwargs.pop("proxies", None)
-        token = kwargs.pop("token", None)
-        revision = kwargs.pop("revision", None)
-        custom_pipeline = kwargs.pop("custom_pipeline", None)
-        use_safetensors = kwargs.pop("use_safetensors", None)
-
         # 1. Download checkpoints if required
-        if not os.path.isdir(pretrained_model_name_or_path):
-            if pretrained_model_name_or_path.count("/") > 1:
-                raise ValueError(
-                    f'The provided pretrained_model_name_or_path "{pretrained_model_name_or_path}"'
-                    " is neither a valid local path nor a valid repo id. Please check the parameter."
-                )
-            cached_folder = cls.download(
+        # NOTE: In contrast to TextGenerationPipeline where each files,
+        # such as configs and weights, are downloaded individually,
+        # DiffusionPipeline downloads the entire snapshot at once,
+        # since it normally contains multiple components.
+        pretrained_model_name_or_path = pipeline_config.model_config.huggingface_model_repo.repo_id
+        if pipeline_config.model_config.huggingface_model_repo.repo_type == RepoType.online:
+            cached_folder = self.download(
                 pretrained_model_name_or_path,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                proxies=proxies,
-                token=token,
-                revision=revision,
-                use_safetensors=use_safetensors,
-                custom_pipeline=custom_pipeline,
-                **kwargs,
+                force_download=pipeline_config.model_config.force_download,
+                revision=pipeline_config.model_config.huggingface_model_revision,
             )
         else:
             cached_folder = pretrained_model_name_or_path
 
         # 2. Load pipeline configuration
-        config_dict = cls.load_config(cached_folder)
-        init_dict = cls.extract_init_dict(config_dict)
+        config_dict = self.load_config(cached_folder)
+        init_dict = self.extract_init_dict(config_dict)
 
         # 3. Load sub models
-        loaded_sub_models = cls.load_sub_models(
+        loaded_sub_models = self.load_sub_models(
             cached_folder,
             init_dict,
             device=device,
             dtype=dtype,
         )
+        for name, model in loaded_sub_models.items():
+            setattr(self, name, model)
+        
+        self.init_remainig_components()
+    
+    @abstractmethod
+    def init_remainig_components(self):
+        pass
 
-        # 4. Instantiate the pipeline
-        pipeline = cls(loaded_sub_models)
-
-        return pipeline
-
-    @classmethod
     def load_sub_models(
-        cls,
+        self,
         pretrained_model_name_or_path: str | os.PathLike,
         init_dict: dict,
         device: DeviceRef = DeviceRef.GPU(),
@@ -126,7 +116,7 @@ class DiffusionPipeline(ConfigMixin):
         """
         loaded_sub_models = {}
         for name in tqdm(init_dict.keys(), desc="Loading sub models"):
-            component_class = cls.components[name]
+            component_class = self.components[name]
             component_path = os.path.join(pretrained_model_name_or_path, name)
             if "tokenizer" in name:
                 # NOTE: Currently, we are using tokenizers from transformers.
@@ -136,6 +126,7 @@ class DiffusionPipeline(ConfigMixin):
                     component_path
                 )
                 continue
+
             config = component_class.load_config(component_path)
             init_config = component_class.extract_init_dict(config)
             init_config.update(
@@ -149,23 +140,17 @@ class DiffusionPipeline(ConfigMixin):
                 in component_class._get_init_keys(component_class)
             ):
                 init_config["pretrained_model_name_or_path"] = (
-                    pretrained_model_name_or_path
+                    component_path
                 )
             loaded_sub_models[name] = component_class(**init_config)
 
         return loaded_sub_models
 
-    @classmethod
     def download(
-        cls,
+        self,
         pretrained_model_name: str | os.PathLike,
-        cache_dir: str | os.PathLike | None = None,
         force_download: bool = False,
-        proxies: dict | None = None,
-        token: str | None = None,
         revision: str | None = None,
-        use_safetensors: bool | None = None,
-        custom_pipeline: str | None = None,
     ) -> str:
         """Download the pipeline components from the Hugging Face Hub.
 
@@ -173,26 +158,14 @@ class DiffusionPipeline(ConfigMixin):
             pretrained_model_name: Model identifier.
             cache_dir: Cache directory.
             force_download: Whether to force download.
-            proxies: Proxies.
-            token: Authentication token.
             revision: Model revision.
-            use_safetensors: Whether to use safetensors.
-            custom_pipeline: Custom pipeline.
 
         Returns:
             Path to the downloaded model folder.
         """
-        # NOTE: For simplicity, this download method is not exactly
-        # the same as diffusers' download method.
-        # It might be replaced with Max's download method,
-        # when this repository is merged into the main Max repository.
-        use_safetensors = (
-            use_safetensors if use_safetensors is not None else True
-        )
-
         try:
-            info = model_info(
-                pretrained_model_name, token=token, revision=revision
+            info = huggingface_hub.model_info(
+                pretrained_model_name, revision=revision
             )
         except (HTTPError, OfflineModeIsEnabled, requests.ConnectionError) as e:
             logger.warning(
@@ -202,16 +175,13 @@ class DiffusionPipeline(ConfigMixin):
                 e  # save error to reraise it if model is not cached locally
             )
 
-        config_file = hf_hub_download(
+        config_file = huggingface_hub.hf_hub_download(
             pretrained_model_name,
-            cls.config_name,
-            cache_dir=cache_dir,
+            self.config_name,
             revision=revision,
-            proxies=proxies,
             force_download=force_download,
-            token=token,
         )
-        config_dict = cls._dict_from_json_file(config_file)
+        config_dict = self._dict_from_json_file(config_file)
         ignore_filenames = config_dict.pop("_ignore_files", [])
 
         filenames = {sibling.rfilename for sibling in info.siblings}
@@ -227,13 +197,13 @@ class DiffusionPipeline(ConfigMixin):
             "*.onnx.index.*json",
             "*.pb.index.*json",
         ]
-        components = cls._get_init_keys(cls)
+        components = self._get_init_keys(self)
 
         allow_patterns = [f"{k}/*" for k in components]
         allow_patterns += [
             "scheduler_config.json",
             "config.json",
-            cls.config_name,
+            self.config_name,
         ]
         re_ignore_pattern = [
             re.compile(fnmatch.translate(p)) for p in ignore_patterns
@@ -264,16 +234,11 @@ class DiffusionPipeline(ConfigMixin):
             return snapshot_folder
 
         user_agent = {"pipeline_class": cls.__name__}
-        if custom_pipeline is not None and not custom_pipeline.endswith(".py"):
-            user_agent["custom_pipeline"] = custom_pipeline
 
         # download all allow_patterns - ignore_patterns
         try:
-            cached_folder = snapshot_download(
+            cached_folder = huggingface_hub.snapshot_download(
                 pretrained_model_name,
-                cache_dir=cache_dir,
-                proxies=proxies,
-                token=token,
                 revision=revision,
                 allow_patterns=allow_patterns,
                 ignore_patterns=ignore_patterns,
@@ -297,6 +262,9 @@ class DiffusionPipeline(ConfigMixin):
                     " while trying to fetch metadata from the Hub. Please check out the root cause in the stacktrace"
                     " above."
                 ) from model_info_call_error
+    
+    def finalize_pipeline_config(self) -> None:
+        pass
 
     def _execution_device(self) -> DeviceRef:
         r"""Returns the device on which the pipeline's models will be executed.

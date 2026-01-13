@@ -36,12 +36,8 @@ class ImageGenerationPipeline(
         pipeline_config: PipelineConfig,
         diffusion_pipeline: type[DiffusionPipeline],
     ) -> None:
-        self._pipeline_config = pipeline_config
-
-        # from max.graph.weights import load_weights as _load_weights
-        # from max.graph.weights import weights_format as _weights_format
-        self._diffusion_pipeline = diffusion_pipeline.from_pretrained(
-            pipeline_config.model_config.model_path
+        self._diffusion_pipeline = diffusion_pipeline(
+            pipeline_config,
         )
 
     def execute(self, inputs: ImageGenerationInputs) -> ImageGenerationOutput:

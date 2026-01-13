@@ -51,9 +51,9 @@ if TYPE_CHECKING:
     from .config import PipelineConfig
 
 from .audio_generator_pipeline import AudioGeneratorPipeline
-from .config_enums import RepoType, RopeType, SupportedEncoding
+from .config_enums import RopeType, SupportedEncoding
 from .embeddings_pipeline import EmbeddingsPipeline
-from .hf_utils import HuggingFaceRepo
+from .hf_utils import HuggingFaceRepo, get_model_index_path_for_diffusers
 from .interfaces import PipelineModel
 from .pipeline_variants.image_generation import ImageGenerationPipeline
 from .pipeline_variants.text_generation import TextGenerationPipeline
@@ -319,7 +319,7 @@ class PipelineRegistry:
         Returns:
             AutoConfig: The HuggingFace configuration object for the model.
         """
-        model_index_path = self.get_model_index_path_for_diffusers(
+        model_index_path = get_model_index_path_for_diffusers(
             huggingface_repo
         )
 
@@ -346,35 +346,6 @@ class PipelineRegistry:
             )
 
         return self._cached_huggingface_configs[huggingface_repo]
-
-    def get_model_index_path_for_diffusers(
-        self, huggingface_repo: HuggingFaceRepo
-    ) -> str | None:
-        model_index_path: str | None = None
-
-        if huggingface_repo.repo_type == RepoType.local:
-            local_index = Path(huggingface_repo.repo_id) / "model_index.json"
-            if local_index.exists():
-                model_index_path = str(local_index)
-            else:
-                raise ValueError(
-                    f"Failed to find model_index.json in {huggingface_repo.repo_id}."
-                )
-        else:
-            try:
-                if huggingface_hub.file_exists(
-                    huggingface_repo.repo_id,
-                    "model_index.json",
-                    revision=huggingface_repo.revision,
-                ):
-                    model_index_path = huggingface_hub.hf_hub_download(
-                        huggingface_repo.repo_id,
-                        "model_index.json",
-                        revision=huggingface_repo.revision,
-                    )
-            except Exception:
-                model_index_path = None
-        return model_index_path
 
     def get_active_tokenizer(
         self, huggingface_repo: HuggingFaceRepo

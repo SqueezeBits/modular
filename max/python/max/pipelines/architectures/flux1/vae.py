@@ -636,24 +636,22 @@ class Decoder(nn.Module):
         else:
             session = InferenceSession([Accelerator()])
 
-        safe_tensor_folder = os.path.join(pretrained_model_name_or_path, "vae")
-
-        if not os.path.isdir(safe_tensor_folder):
+        if not os.path.isdir(pretrained_model_name_or_path):
             raise ValueError(
-                f"VAE model directory not found: {safe_tensor_folder}. "
+                f"VAE model directory not found: {pretrained_model_name_or_path}. "
                 f"Please check pretrained_model_name_or_path: {pretrained_model_name_or_path}"
             )
 
         safetensors_files = [
-            Path(safe_tensor_folder) / file
-            for file in os.listdir(safe_tensor_folder)
+            Path(pretrained_model_name_or_path) / file
+            for file in os.listdir(pretrained_model_name_or_path)
             if file.endswith(".safetensors")
         ]
 
         if not safetensors_files:
-            available_files = os.listdir(safe_tensor_folder)
+            available_files = os.listdir(pretrained_model_name_or_path)
             raise ValueError(
-                f"No .safetensors files found in {safe_tensor_folder}. "
+                f"No .safetensors files found in {pretrained_model_name_or_path}. "
                 f"Available files: {available_files}"
             )
 
@@ -786,7 +784,6 @@ class AutoencoderKL(ConfigMixin):
         self,
         z: Tensor,
         return_dict: bool = True,
-        generator: Any | None = None,
     ) -> DecoderOutput | Tensor:
         """Decode a batch of images.
 

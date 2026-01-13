@@ -480,7 +480,7 @@ class FluxTransformer2DModel(nn.Module, ConfigMixin):
 
         self.load_state_dict(
             get_weight_registry_from_diffusers(
-                os.path.join(self.pretrained_model_name_or_path, "transformer")
+                self.pretrained_model_name_or_path
             )
         )
         with Graph(

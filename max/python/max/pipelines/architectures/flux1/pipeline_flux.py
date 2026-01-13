@@ -32,9 +32,6 @@ from max.pipelines.lib.image_processor import (
     PipelineImageInput,
     VaeImageProcessor,
 )
-from max.pipelines.lib.interfaces.configuration_utils import (
-    register_to_config,
-)
 from max.pipelines.lib.interfaces.diffusion_pipeline import (
     DiffusionPipeline,
 )
@@ -160,17 +157,7 @@ class FluxPipeline(DiffusionPipeline):
         "image_processor": VaeImageProcessor,
     }
 
-    @register_to_config
-    def __init__(self, loaded_sub_models: dict):
-        """Initialize FluxPipeline.
-
-        Args:
-            loaded_sub_models: Dictionary containing the loaded sub-models.
-        """
-        super().__init__()
-        for name, model in loaded_sub_models.items():
-            setattr(self, name, model)
-
+    def init_remainig_components(self):
         image_processor_class = self.components.get(
             "image_processor", VaeImageProcessor
         )
