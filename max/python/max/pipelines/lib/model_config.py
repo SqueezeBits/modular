@@ -948,6 +948,7 @@ class MAXModelConfig(MAXModelConfigBase):
         # NOTE(bduke): do this even for online repositories, because upstream
         # code originating from `huggingface_hub.hf_hub_download` returns
         # absolute paths for cached files.
+        relative_path = Path(relative_path)
         if relative_path.exists() and relative_path.is_file():
             return str(relative_path.resolve())
 

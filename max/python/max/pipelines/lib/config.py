@@ -28,6 +28,7 @@ from max.config import ConfigFileModel
 from max.driver import DeviceSpec, load_devices
 from max.engine import InferenceSession
 from max.graph.quantization import QuantizationEncoding
+from max.interfaces import PipelineTask
 from max.serve.queue.zmq_queue import generate_zmq_ipc_path
 from pydantic import (
     Field,
@@ -909,6 +910,11 @@ class PipelineConfig(ConfigFileModel):
         # Resolve final pipeline-specific changes to the config before doing
         # memory estimations.
         arch.pipeline_model.finalize_pipeline_config(self)
+
+        if arch.task == PipelineTask.IMAGE_GENERATION:
+            # diffusion pipeline does not use KV cache,
+            # so we can skip profile run.
+            return
 
         MemoryEstimator.estimate_memory_footprint(
             self,
