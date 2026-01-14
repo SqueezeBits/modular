@@ -14,24 +14,26 @@
 """Pipeline utilities for MAX-optimized pipelines."""
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import fnmatch
 import logging
 import os
 import re
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import huggingface_hub
 import requests
 from huggingface_hub.utils import OfflineModeIsEnabled
+from max.config import load_config
+from max.driver import load_devices
 from max.dtype import DType
-from max.engine import InferenceSession
 from max.graph import DeviceRef
+from max.graph.weights import load_weights
+from max.pipelines.lib.interfaces.base_model import BaseModel
 from requests.exceptions import HTTPError
 from tqdm import tqdm
 
-from .configuration_utils import ConfigMixin
 from ..config_enums import RepoType
 
 if TYPE_CHECKING:
@@ -40,7 +42,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class DiffusionPipeline(ABC, ConfigMixin):
+class DiffusionPipeline(ABC):
     config_name = "model_index.json"
 
     def __init__(
@@ -66,6 +68,8 @@ class DiffusionPipeline(ABC, ConfigMixin):
         # such as configs and weights, are downloaded individually,
         # DiffusionPipeline downloads the entire snapshot at once,
         # since it normally contains multiple components.
+        self.pipeline_config = pipeline_config
+        self.devices = load_devices(pipeline_config.model_config.device_specs)
         pretrained_model_name_or_path = pipeline_config.model_config.huggingface_model_repo.repo_id
         if pipeline_config.model_config.huggingface_model_repo.repo_type == RepoType.online:
             cached_folder = self.download(
@@ -76,14 +80,9 @@ class DiffusionPipeline(ABC, ConfigMixin):
         else:
             cached_folder = pretrained_model_name_or_path
 
-        # 2. Load pipeline configuration
-        config_dict = self.load_config(cached_folder)
-        init_dict = self.extract_init_dict(config_dict)
-
-        # 3. Load sub models
+        # 2. Load sub models
         loaded_sub_models = self.load_sub_models(
             cached_folder,
-            init_dict,
             device=device,
             dtype=dtype,
         )
@@ -93,13 +92,12 @@ class DiffusionPipeline(ABC, ConfigMixin):
         self.init_remainig_components()
     
     @abstractmethod
-    def init_remainig_components(self):
+    def init_remainig_components(self) -> None:
         pass
 
     def load_sub_models(
         self,
         pretrained_model_name_or_path: str | os.PathLike,
-        init_dict: dict,
         device: DeviceRef = DeviceRef.GPU(),
         dtype: DType = DType.bfloat16,
     ) -> dict:
@@ -115,34 +113,38 @@ class DiffusionPipeline(ABC, ConfigMixin):
             Dictionary containing the loaded sub-models.
         """
         loaded_sub_models = {}
-        for name in tqdm(init_dict.keys(), desc="Loading sub models"):
-            component_class = self.components[name]
+        for name, component_class in tqdm(self.components.items(), desc="Loading sub models"):
             component_path = os.path.join(pretrained_model_name_or_path, name)
             if "tokenizer" in name:
                 # NOTE: Currently, we are using tokenizers from transformers.
-                # It might be replaced with TextTokenizer in Max,
-                # when this repository is merged into the main Max repository.
+                # TODO(minkyu): Check if we can use Tokenizer in Max,
+                # and remove this conditional path.
                 loaded_sub_models[name] = component_class.from_pretrained(
                     component_path
                 )
                 continue
 
-            config = component_class.load_config(component_path)
-            init_config = component_class.extract_init_dict(config)
-            init_config.update(
-                {
-                    "device": device,
-                    "dtype": dtype,
-                }
-            )
-            if (
-                "pretrained_model_name_or_path"
-                in component_class._get_init_keys(component_class)
-            ):
-                init_config["pretrained_model_name_or_path"] = (
-                    component_path
+            if not hasattr(component_class, "config_name"):
+                raise ValueError(f"Component {name} does not have config_name attribute.")
+            config = load_config(f"{component_path}/{component_class.config_name}")
+            if issubclass(component_class, BaseModel):
+                weight_paths = [
+                    Path(pretrained_model_name_or_path) / weight_path
+                    for weight_path in self.pipeline_config.model_config.weight_path
+                    if weight_path.split("/")[0] == name
+                ]
+                loaded_sub_models[name] = component_class(
+                    config=config,
+                    encoding=self.pipeline_config.model_config.quantization_encoding,
+                    devices=self.devices,
+                    weights=load_weights(weight_paths),
                 )
-            loaded_sub_models[name] = component_class(**init_config)
+            else:
+                loaded_sub_models[name] = component_class(
+                    **config,
+                    device=device,
+                    dtype=dtype,
+                )
 
         return loaded_sub_models
 
@@ -181,7 +183,7 @@ class DiffusionPipeline(ABC, ConfigMixin):
             revision=revision,
             force_download=force_download,
         )
-        config_dict = self._dict_from_json_file(config_file)
+        config_dict = load_config(config_file)
         ignore_filenames = config_dict.pop("_ignore_files", [])
 
         filenames = {sibling.rfilename for sibling in info.siblings}
@@ -197,9 +199,8 @@ class DiffusionPipeline(ABC, ConfigMixin):
             "*.onnx.index.*json",
             "*.pb.index.*json",
         ]
-        components = self._get_init_keys(self)
 
-        allow_patterns = [f"{k}/*" for k in components]
+        allow_patterns = [f"{k}/*" for k in self.components]
         allow_patterns += [
             "scheduler_config.json",
             "config.json",

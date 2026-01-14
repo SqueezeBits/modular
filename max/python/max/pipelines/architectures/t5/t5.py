@@ -12,22 +12,13 @@
 # ===----------------------------------------------------------------------=== #
 
 import math
-import os
 
 import max.nn as nn
-from max.driver import CPU, Accelerator
 from max.dtype import DType
-from max.engine import InferenceSession
-from max.graph import DeviceRef, Graph, TensorType, TensorValue, Weight, ops
-from max.graph.weights import SafetensorWeights
+from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
 from max.nn import Module
-from max.pipelines.lib.interfaces.configuration_utils import (
-    ConfigDict,
-    ConfigMixin,
-    register_to_config,
-)
 
-from .layers.activations import ACT2FN
+from .model_config import T5Config
 
 
 class T5LayerNorm(Module):
@@ -49,7 +40,6 @@ class T5LayerNorm(Module):
         super().__init__()
         self.weight = Weight("weight", dtype, (hidden_size,), device=device)
         self.variance_epsilon = eps
-        self.device = device
         self.dtype = dtype
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
@@ -82,9 +72,7 @@ class T5LayerNorm(Module):
 class T5DenseActDense(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: T5Config,
     ):
         """Construct a dense-activation-dense module.
 
@@ -98,21 +86,17 @@ class T5DenseActDense(Module):
             config.d_model,
             config.d_ff,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.wo = nn.Linear(
             config.d_ff,
             config.d_model,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
-        self.act_fn = ACT2FN.get(config.dense_act_fn)
-        if self.act_fn is None:
-            raise NotImplementedError(
-                f"Activation function {config.dense_act_fn} not implemented yet."
-            )
+        self.act_fn = lambda x: 0.5 * x * (1.0 + ops.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * ops.pow(x, 3.0))))
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
         """Process hidden states through the dense-activation-dense block.
@@ -132,9 +116,7 @@ class T5DenseActDense(Module):
 class T5DenseGatedActDense(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: T5Config,
     ):
         """Construct a dense-gated-activation-dense module.
 
@@ -148,28 +130,24 @@ class T5DenseGatedActDense(Module):
             config.d_model,
             config.d_ff,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.wi_1 = nn.Linear(
             config.d_model,
             config.d_ff,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.wo = nn.Linear(
             config.d_ff,
             config.d_model,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
-        self.act_fn = ACT2FN.get(config.dense_act_fn)
-        if self.act_fn is None:
-            raise NotImplementedError(
-                f"Activation function {config.dense_act_fn} not implemented yet."
-            )
+        self.act_fn = lambda x: 0.5 * x * (1.0 + ops.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * ops.pow(x, 3.0))))
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
         """Process hidden states through the dense-gated-activation-dense block.
@@ -190,9 +168,7 @@ class T5DenseGatedActDense(Module):
 class T5LayerFF(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: T5Config,
     ):
         """Construct a feed-forward layer.
 
@@ -204,18 +180,18 @@ class T5LayerFF(Module):
         super().__init__()
         if config.is_gated_act:
             self.DenseReluDense = T5DenseGatedActDense(
-                config, device=device, dtype=dtype
+                config
             )
         else:
             self.DenseReluDense = T5DenseActDense(
-                config, device=device, dtype=dtype
+                config
             )
 
         self.layer_norm = T5LayerNorm(
             config.d_model,
             eps=config.layer_norm_epsilon,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
@@ -236,11 +212,9 @@ class T5LayerFF(Module):
 class T5Attention(Module):
     def __init__(
         self,
-        config: ConfigDict,
+        config: T5Config,
         has_relative_attention_bias: bool = False,
         layer_idx: int | None = None,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
     ):
         """Construct an attention layer.
 
@@ -265,44 +239,44 @@ class T5Attention(Module):
         self.n_heads = config.num_heads
         self.dropout = config.dropout_rate
         self.inner_dim = self.n_heads * self.key_value_proj_dim
-        self.device = device
-        self.dtype = dtype
+        self.device = config.device
+        self.dtype = config.dtype
 
         self.q = nn.Linear(
             self.d_model,
             self.inner_dim,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.k = nn.Linear(
             self.d_model,
             self.inner_dim,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.v = nn.Linear(
             self.d_model,
             self.inner_dim,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.o = nn.Linear(
             self.inner_dim,
             self.d_model,
             has_bias=False,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
 
         if self.has_relative_attention_bias:
             self.relative_attention_bias = nn.Embedding(
                 self.relative_attention_num_buckets,
                 self.n_heads,
-                device=device,
-                dtype=dtype,
+                device=config.device,
+                dtype=config.dtype,
             )
 
     def _relative_position_bucket(
@@ -484,11 +458,9 @@ class T5Attention(Module):
 class T5LayerSelfAttention(Module):
     def __init__(
         self,
-        config: ConfigDict,
+        config: T5Config,
         has_relative_attention_bias: bool = False,
         layer_idx: int | None = None,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
     ):
         """Construct a self-attention layer.
 
@@ -504,14 +476,12 @@ class T5LayerSelfAttention(Module):
             config,
             has_relative_attention_bias=has_relative_attention_bias,
             layer_idx=layer_idx,
-            device=device,
-            dtype=dtype,
         )
         self.layer_norm = T5LayerNorm(
             config.d_model,
             eps=config.layer_norm_epsilon,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
 
     def __call__(
@@ -559,11 +529,9 @@ class T5LayerSelfAttention(Module):
 class T5Block(Module):
     def __init__(
         self,
-        config: ConfigDict,
+        config: T5Config,
         has_relative_attention_bias: bool = False,
         layer_idx: int | None = None,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
     ):
         """Construct a T5 block.
 
@@ -587,11 +555,9 @@ class T5Block(Module):
                 config,
                 has_relative_attention_bias=has_relative_attention_bias,
                 layer_idx=layer_idx,
-                device=device,
-                dtype=dtype,
             )
         )
-        layers.append(T5LayerFF(config, device=device, dtype=dtype))
+        layers.append(T5LayerFF(config))
         self.layer = nn.LayerList(layers)
 
     def __call__(
@@ -669,10 +635,8 @@ class T5Block(Module):
 class T5Stack(Module):
     def __init__(
         self,
-        config: ConfigDict,
+        config: T5Config,
         embed_tokens: nn.Embedding | None = None,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
     ):
         """Construct a T5 stack.
 
@@ -683,6 +647,7 @@ class T5Stack(Module):
             dtype: Data type for the module.
         """
         super().__init__()
+        self.config = config
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
 
@@ -692,8 +657,6 @@ class T5Stack(Module):
                     config,
                     has_relative_attention_bias=bool(i == 0),
                     layer_idx=i,
-                    device=device,
-                    dtype=dtype,
                 )
                 for i in range(config.num_layers)
             ]
@@ -701,12 +664,12 @@ class T5Stack(Module):
         self.final_layer_norm = T5LayerNorm(
             config.d_model,
             eps=config.layer_norm_epsilon,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.dropout = config.dropout_rate
-        self.device = device
-        self.dtype = dtype
+        self.device = config.device
+        self.dtype = config.dtype
 
     def __call__(
         self,
@@ -797,33 +760,10 @@ class T5Stack(Module):
         return hidden_states
 
 
-class T5EncoderModel(Module, ConfigMixin):
-    config_name = "config.json"
-
-    @register_to_config
+class T5EncoderModel(Module):
     def __init__(
         self,
-        vocab_size: int = 32128,
-        d_model: int = 512,
-        d_kv: int = 64,
-        d_ff: int = 2048,
-        num_layers: int = 6,
-        num_decoder_layers: int | None = None,
-        num_heads: int = 8,
-        relative_attention_num_buckets: int = 32,
-        relative_attention_max_distance: int = 128,
-        dropout_rate: float = 0.1,
-        layer_norm_epsilon: float = 1e-6,
-        initializer_factor: float = 1.0,
-        feed_forward_proj: str = "relu",
-        is_encoder_decoder: bool = True,
-        use_cache: bool = True,
-        pad_token_id: int = 0,
-        eos_token_id: int = 1,
-        classifier_dropout: float = 0.0,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
-        pretrained_model_name_or_path: str | None = None,
+        config: T5Config,
     ):
         """Construct a T5 encoder model.
 
@@ -851,28 +791,24 @@ class T5EncoderModel(Module, ConfigMixin):
             pretrained_model_name_or_path: Path to pretrained model.
         """
         super().__init__()
-        act_info = self.config.feed_forward_proj.split("-")
-        self.config.dense_act_fn = act_info[-1]
-        self.config.is_gated_act = act_info[0] == "gated"
+        act_info = config.feed_forward_proj.split("-")
+        config.dense_act_fn = act_info[-1]
+        config.is_gated_act = act_info[0] == "gated"
 
         self.shared = nn.Embedding(
-            vocab_size, d_model, device=device, dtype=dtype
+            config.vocab_size, config.d_model, device=config.device, dtype=config.dtype
         )
 
-        encoder_config = self.config
+        encoder_config = config
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
 
         self.encoder = T5Stack(
-            encoder_config, self.shared, device=device, dtype=dtype
+            encoder_config, self.shared
         )
-        self.device = device
-        self.dtype = dtype
-        self.pretrained_model_name_or_path = pretrained_model_name_or_path
-
-        if pretrained_model_name_or_path is not None:
-            self.load_model()
+        self.device = config.device
+        self.dtype = config.dtype
 
     def input_types(self) -> tuple[TensorType, ...]:
         """Get input types for the model.
@@ -886,36 +822,6 @@ class T5EncoderModel(Module, ConfigMixin):
                 shape=["batch_size", "sequence_length"],
                 device=self.device,
             ),
-        )
-
-    def load_model(self) -> None:
-        """Load pretrained model weights."""
-        if self.device.is_cpu():
-            session = InferenceSession([CPU()])
-        else:
-            session = InferenceSession([Accelerator()])
-
-        weight_files = [
-            os.path.join(self.pretrained_model_name_or_path, f)
-            for f in os.listdir(self.pretrained_model_name_or_path)
-            if f.endswith(".safetensors")
-        ]
-        weights = SafetensorWeights(weight_files)
-        weight_registry = {}
-        for name, weight in weights.items():
-            weight_registry[name] = weight.data().data
-        self.load_state_dict(weight_registry)
-
-        with Graph("t5_encoder_model", input_types=self.input_types()) as graph:
-            outputs = self.encoder(
-                input_ids=graph.inputs[0],
-                attention_mask=None,
-            )
-            graph.output(outputs)
-            compiled_graph = graph
-
-        self.session = session.load(
-            compiled_graph, weights_registry=self.state_dict()
         )
 
     def __call__(

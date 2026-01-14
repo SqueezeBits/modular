@@ -41,10 +41,10 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from .clip import CLIPTextModel
-from .t5 import T5EncoderModel
-from .transformer_flux import FluxTransformer2DModel
-from .vae import AutoencoderKL
+from ..autoencoder_kl import AutoencoderKLModel
+from ..clip import ClipModel
+from ..t5 import T5Model
+from .model import Flux1Model
 
 
 def retrieve_timesteps(
@@ -148,13 +148,12 @@ class FluxPipeline(DiffusionPipeline):
     # when this repository is merged into the main Max repository.
     components = {
         "scheduler": FlowMatchEulerDiscreteScheduler,
-        "vae": AutoencoderKL,
-        "text_encoder": CLIPTextModel,
+        "vae": AutoencoderKLModel,
+        "text_encoder": ClipModel,
         "tokenizer": CLIPTokenizer,
-        "text_encoder_2": T5EncoderModel,
+        "text_encoder_2": T5Model,
         "tokenizer_2": T5TokenizerFast,
-        "transformer": FluxTransformer2DModel,
-        "image_processor": VaeImageProcessor,
+        "transformer": Flux1Model,
     }
 
     def init_remainig_components(self):
@@ -642,17 +641,17 @@ class FluxPipeline(DiffusionPipeline):
             else sigmas
         )
         if (
-            hasattr(self.scheduler.config, "use_flow_sigmas")
-            and self.scheduler.config.use_flow_sigmas
+            hasattr(self.scheduler, "use_flow_sigmas")
+            and self.scheduler.use_flow_sigmas
         ):
             sigmas = None
         image_seq_len = latents.shape[1].dim
         mu = calculate_shift(
             image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.5),
-            self.scheduler.config.get("max_shift", 1.15),
+            self.scheduler.base_image_seq_len,
+            self.scheduler.max_image_seq_len,
+            self.scheduler.base_shift,
+            self.scheduler.max_shift,
         )
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -662,9 +661,6 @@ class FluxPipeline(DiffusionPipeline):
             mu=mu,
         )
 
-        num_warmup_steps = max(
-            timesteps.shape[0] - num_inference_steps * self.scheduler.order, 0
-        )
         self._num_timesteps = timesteps.shape[0]
 
         # handle guidance
@@ -718,16 +714,15 @@ class FluxPipeline(DiffusionPipeline):
             timestep = np.full((batch_size,), t) / 1000.0
             timestep = Tensor.from_dlpack(timestep).to(prompt_embeds.device)
 
-            with self.transformer.cache_context("cond"):
-                noise_pred = self.transformer.session.execute(
-                    latents,
-                    prompt_embeds,
-                    pooled_prompt_embeds,
-                    timestep,
-                    latent_image_ids,
-                    text_ids,
-                    guidance,
-                )[0]
+            noise_pred = self.transformer(
+                latents,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                timestep,
+                latent_image_ids,
+                text_ids,
+                guidance,
+            )[0]
 
             if do_true_cfg:
                 if negative_image_embeds is not None:
@@ -735,16 +730,15 @@ class FluxPipeline(DiffusionPipeline):
                         negative_image_embeds
                     )
 
-                with self.transformer.cache_context("uncond"):
-                    neg_noise_pred = self.transformer.session.execute(
-                        latents,
-                        negative_prompt_embeds,
-                        negative_pooled_prompt_embeds,
-                        timestep,
-                        latent_image_ids,
-                        negative_text_ids,
-                        guidance,
-                    )[0]
+                neg_noise_pred = self.transformer(
+                    latents,
+                    negative_prompt_embeds,
+                    negative_pooled_prompt_embeds,
+                    timestep,
+                    latent_image_ids,
+                    negative_text_ids,
+                    guidance,
+                )[0]
                 noise_pred = neg_noise_pred + true_cfg_scale * (
                     noise_pred - neg_noise_pred
                 )
@@ -783,7 +777,7 @@ class FluxPipeline(DiffusionPipeline):
             latents = (
                 latents / self.vae.config.scaling_factor
             ) + self.vae.config.shift_factor
-            image = self.vae.decode(latents, return_dict=False)[0]
+            image = self.vae.decode(latents)[0]
 
             image = Tensor_v3.from_dlpack(image)  # V2 Tensor to V3 Tensor
             image = self.image_processor.postprocess(

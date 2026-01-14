@@ -19,16 +19,11 @@ from os import PathLike
 from typing import Any
 
 import max.nn as nn
-from max.driver import CPU, Accelerator, DLPackArray
+from max.driver import DLPackArray
 from max.dtype import DType
-from max.engine import InferenceSession
-from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops
+from max.graph import DeviceRef, TensorType, TensorValue, ops
 from max.graph.weights import SafetensorWeights
-from max.nn import Module
-from max.pipelines.lib.interfaces.configuration_utils import (
-    ConfigMixin,
-    register_to_config,
-)
+from max.nn import LayerNorm, Module
 
 from .layers.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -39,8 +34,8 @@ from .layers.normalizations import (
     AdaLayerNormContinuous,
     AdaLayerNormZero,
     AdaLayerNormZeroSingle,
-    WeightedLayerNorm,
 )
+from .model_config import FluxConfig
 
 logger = logging.getLogger(__name__)
 
@@ -195,8 +190,13 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
         )
 
-        self.norm2 = WeightedLayerNorm(
-            dim, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype
+        self.norm2 = LayerNorm(
+            dim,
+            eps=1e-6,
+            devices=[device],
+            dtype=dtype,
+            keep_dtype=True,
+            elementwise_affine=False,
         )
         self.ff = FeedForward(
             dim=dim,
@@ -206,8 +206,13 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
         )
 
-        self.norm2_context = WeightedLayerNorm(
-            dim, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype
+        self.norm2_context = LayerNorm(
+            dim,
+            eps=1e-6,
+            devices=[device],
+            dtype=dtype,
+            keep_dtype=True,
+            elementwise_affine=False,
         )
         self.ff_context = FeedForward(
             dim=dim,
@@ -303,26 +308,10 @@ class FluxTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class FluxTransformer2DModel(nn.Module, ConfigMixin):
-    config_name = "config.json"
-
-    @register_to_config
+class FluxTransformer2DModel(nn.Module):
     def __init__(
         self,
-        patch_size: int = 1,
-        in_channels: int = 64,
-        out_channels: int | None = None,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
-        attention_head_dim: int = 128,
-        num_attention_heads: int = 24,
-        joint_attention_dim: int = 4096,
-        pooled_projection_dim: int = 768,
-        guidance_embeds: bool = False,
-        axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.bfloat16,
-        pretrained_model_name_or_path: str | None = None,
+        config: FluxConfig,
     ):
         """Initialize Flux Transformer 2D model.
 
@@ -340,9 +329,21 @@ class FluxTransformer2DModel(nn.Module, ConfigMixin):
             axes_dims_rope: Dimensions for rotary position embeddings.
             device: Device to place the module on.
             dtype: Data type for the module.
-            pretrained_model_name_or_path: Path to pretrained model.
         """
         super().__init__()
+        patch_size = config.patch_size
+        in_channels = config.in_channels
+        out_channels = config.out_channels
+        num_layers = config.num_layers
+        num_single_layers = config.num_single_layers
+        attention_head_dim = config.attention_head_dim
+        num_attention_heads = config.num_attention_heads
+        joint_attention_dim = config.joint_attention_dim
+        pooled_projection_dim = config.pooled_projection_dim
+        guidance_embeds = config.guidance_embeds
+        axes_dims_rope = config.axes_dims_rope
+        device = config.device
+        dtype = config.dtype
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
 
@@ -420,12 +421,6 @@ class FluxTransformer2DModel(nn.Module, ConfigMixin):
         self.pooled_projection_dim = pooled_projection_dim
 
         self._cache_context_warning_shown = False
-        self.pretrained_model_name_or_path = pretrained_model_name_or_path
-        if pretrained_model_name_or_path is None:
-            raise ValueError(
-                "pretrained_model_name_or_path is required to load model"
-            )
-        self.load_model()
 
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the model.
@@ -469,35 +464,6 @@ class FluxTransformer2DModel(nn.Module, ConfigMixin):
             img_ids_type,
             txt_ids_type,
             guidance_type,
-        )
-
-    def load_model(self) -> None:
-        """Load pretrained model weights and compile the model graph."""
-        if self.max_device.is_cpu():
-            session = InferenceSession([CPU()])
-        else:
-            session = InferenceSession([Accelerator()])
-
-        self.load_state_dict(
-            get_weight_registry_from_diffusers(
-                self.pretrained_model_name_or_path
-            )
-        )
-        with Graph(
-            "flux_transformer_2d_model", input_types=self.input_types()
-        ) as graph:
-            outputs = self(
-                *graph.inputs,
-                joint_attention_kwargs={},
-                controlnet_block_samples=None,
-                controlnet_single_block_samples=None,
-                return_dict=False,
-                controlnet_blocks_repeat=False,
-            )
-            graph.output(*outputs)
-            compiled_graph = graph
-        self.session = session.load(
-            compiled_graph, weights_registry=self.state_dict()
         )
 
     @contextmanager

@@ -24,26 +24,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+import math
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
 import max.nn as nn
-from max.driver import CPU, Accelerator, Tensor
 from max.dtype import DType
-from max.engine import InferenceSession
-from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops
-from max.graph.weights import SafetensorWeights
+from max.graph import DeviceRef, TensorType, TensorValue, ops
+from max.nn import GroupNorm
 from max.nn.layer.layer_list import LayerList
-from max.pipelines.lib.interfaces.configuration_utils import (
-    ConfigMixin,
-    register_to_config,
-)
 
-from .layers.normalizations import WeightedGroupNorm
-from .layers.upsampling import Upsample2D
-from .layers.vae_attention import Attention
+from .layers import Upsample2D
+from .model_config import AutoencoderKLConfig
 
 
 class ResnetBlock2D(nn.Module):
@@ -88,7 +79,7 @@ class ResnetBlock2D(nn.Module):
         self.out_channels = out_channels
         self.use_conv_shortcut = use_conv_shortcut
 
-        self.norm1 = WeightedGroupNorm(
+        self.norm1 = GroupNorm(
             num_groups=groups,
             num_channels=in_channels,
             eps=eps,
@@ -111,7 +102,7 @@ class ResnetBlock2D(nn.Module):
             permute=True,
         )
 
-        self.norm2 = WeightedGroupNorm(
+        self.norm2 = GroupNorm(
             num_groups=groups_out,
             num_channels=out_channels,
             eps=eps,
@@ -296,6 +287,122 @@ class UpDecoderBlock2D(nn.Module):
         return hidden_states
 
 
+class VAEAttention(nn.Module):
+    """Spatial attention module for VAE models.
+
+    This module performs self-attention on 2D spatial features by:
+    1. Converting [N, C, H, W] to [N, H*W, C] sequence format
+    2. Applying scaled dot-product attention (optimized for small sequences)
+    3. Converting back to [N, C, H, W] format
+
+    Note: Manual attention is used instead of flash_attention_gpu because
+    VAE attention typically has small sequence lengths (H*W) where flash
+    attention overhead outweighs benefits.
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        heads: int,
+        dim_head: int,
+        num_groups: int = 32,
+        eps: float = 1e-6,
+        device: DeviceRef | None = None,
+        dtype: DType | None = None,
+    ) -> None:
+        """Initialize VAE attention module.
+
+        Args:
+            query_dim: Dimension of query (number of channels).
+            heads: Number of attention heads.
+            dim_head: Dimension of each attention head.
+            num_groups: Number of groups for GroupNorm.
+            eps: Epsilon value for GroupNorm.
+            device: Device reference.
+            dtype: Data type.
+        """
+        super().__init__()
+        self.query_dim = query_dim
+        self.heads = heads
+        self.dim_head = dim_head
+        self.inner_dim = heads * dim_head
+
+        self.group_norm = GroupNorm(
+            num_groups=num_groups,
+            num_channels=query_dim,
+            eps=eps,
+            affine=True,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.to_q = nn.Linear(
+            query_dim, self.inner_dim, has_bias=True, device=device, dtype=dtype
+        )
+        self.to_k = nn.Linear(
+            query_dim, self.inner_dim, has_bias=True, device=device, dtype=dtype
+        )
+        self.to_v = nn.Linear(
+            query_dim, self.inner_dim, has_bias=True, device=device, dtype=dtype
+        )
+        self.to_out = LayerList(
+            [
+                nn.Linear(
+                    self.inner_dim,
+                    query_dim,
+                    has_bias=True,
+                    device=device,
+                    dtype=dtype,
+                )
+            ]
+        )
+
+        self.scale = 1.0 / math.sqrt(dim_head)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        """Apply spatial attention to 2D image tensor.
+
+        Args:
+            x: Input tensor of shape [N, C, H, W].
+
+        Returns:
+            Output tensor of shape [N, C, H, W] with residual connection.
+        """
+        residual = x
+
+        x = self.group_norm(x)
+
+        n, c, h, w = x.shape
+        seq_len = h * w
+
+        x = ops.reshape(x, (n, c, seq_len))
+        x = ops.permute(x, (0, 2, 1))
+
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        q = ops.reshape(q, (n, seq_len, self.heads, self.dim_head))
+        q = ops.permute(q, (0, 2, 1, 3))
+        k = ops.reshape(k, (n, seq_len, self.heads, self.dim_head))
+        k = ops.permute(k, (0, 2, 1, 3))
+        v = ops.reshape(v, (n, seq_len, self.heads, self.dim_head))
+        v = ops.permute(v, (0, 2, 1, 3))
+
+        attn = q @ ops.permute(k, (0, 1, 3, 2)) * self.scale
+        attn = ops.softmax(attn, axis=-1)
+        out = attn @ v
+
+        out = ops.permute(out, (0, 2, 1, 3))
+        out = ops.reshape(out, (n, seq_len, self.inner_dim))
+
+        out = self.to_out[0](out)
+
+        out = ops.permute(out, (0, 2, 1))
+        out = ops.reshape(out, (n, c, h, w))
+
+        return residual + out
+
 class MidBlock2D(nn.Module):
     """Internal MAX module for MidBlock2D graph generation."""
 
@@ -338,7 +445,7 @@ class MidBlock2D(nn.Module):
 
         for _i in range(num_layers):
             if add_attention:
-                attn = Attention(
+                attn = VAEAttention(
                     query_dim=in_channels,
                     heads=in_channels // attention_head_dim,
                     dim_head=attention_head_dim,
@@ -448,6 +555,9 @@ class Decoder(nn.Module):
         super().__init__()
         self.layers_per_block = layers_per_block
         self.session = None
+        self.in_channels = in_channels
+        self.device = device
+        self.dtype = dtype
 
         self.post_quant_conv = None
         if use_post_quant_conv:
@@ -536,7 +646,7 @@ class Decoder(nn.Module):
         if norm_type == "spatial":
             raise NotImplementedError("SpatialNorm not implemented in MAX VAE")
         else:
-            self.conv_norm_out = WeightedGroupNorm(
+            self.conv_norm_out = GroupNorm(
                 num_groups=norm_num_groups,
                 num_channels=block_out_channels[0],
                 eps=1e-6,
@@ -586,9 +696,7 @@ class Decoder(nn.Module):
 
         return sample
 
-    def input_types(
-        self, in_channels: int, device: DeviceRef, dtype: DType
-    ) -> tuple[TensorType, ...]:
+    def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the decoder model.
 
         Args:
@@ -600,122 +708,24 @@ class Decoder(nn.Module):
             Tuple of TensorType specifications for decoder input.
         """
         latent_type = TensorType(
-            dtype,
+            self.dtype,
             shape=[
                 "batch_size",
-                in_channels,
+                self.in_channels,
                 "latent_height",
                 "latent_width",
             ],
-            device=device,
+            device=self.device,
         )
 
         return (latent_type,)
 
-    def load_model(
-        self,
-        pretrained_model_name_or_path: str,
-        device: DeviceRef,
-        dtype: DType,
-        in_channels: int,
-    ) -> None:
-        """Load pretrained model weights and compile the decoder graph.
 
-        This method loads SafeTensors weights from the specified path,
-        filters decoder and post-quantization convolution weights, and
-        compiles the decoder graph for inference.
-
-        Args:
-            pretrained_model_name_or_path: Path to pretrained model weights.
-            device: Device reference for module placement.
-            dtype: Data type for module parameters.
-            in_channels: Number of input channels (latent channels).
-        """
-        if device.is_cpu():
-            session = InferenceSession([CPU()])
-        else:
-            session = InferenceSession([Accelerator()])
-
-        if not os.path.isdir(pretrained_model_name_or_path):
-            raise ValueError(
-                f"VAE model directory not found: {pretrained_model_name_or_path}. "
-                f"Please check pretrained_model_name_or_path: {pretrained_model_name_or_path}"
-            )
-
-        safetensors_files = [
-            Path(pretrained_model_name_or_path) / file
-            for file in os.listdir(pretrained_model_name_or_path)
-            if file.endswith(".safetensors")
-        ]
-
-        if not safetensors_files:
-            available_files = os.listdir(pretrained_model_name_or_path)
-            raise ValueError(
-                f"No .safetensors files found in {pretrained_model_name_or_path}. "
-                f"Available files: {available_files}"
-            )
-
-        weights = SafetensorWeights(safetensors_files)
-
-        weight_registry = {}
-        for name, weight in weights.items():
-            if name.startswith("decoder.") or name.startswith(
-                "post_quant_conv."
-            ):
-                # Remove "decoder." or "post_quant_conv." prefix for state_dict loading
-                if name.startswith("decoder."):
-                    weight_registry[name[len("decoder.") :]] = (
-                        weight.data().data
-                    )
-                elif name.startswith("post_quant_conv."):
-                    weight_registry[name[len("post_quant_conv.") :]] = (
-                        weight.data().data
-                    )
-
-        self.load_state_dict(weight_registry)
-
-        with Graph(
-            "vae_decoder",
-            input_types=self.input_types(in_channels, device, dtype),
-        ) as graph:
-            outputs = self(*graph.inputs)
-            graph.output(outputs)
-            compiled_graph = graph
-
-        self.session = session.load(
-            compiled_graph, weights_registry=self.state_dict()
-        )
-
-
-class AutoencoderKL(ConfigMixin):
+class AutoencoderKL(nn.Module):
     r"""A VAE model with KL loss for encoding images into latents and decoding latent representations into images."""
-
-    config_name = "config.json"
-
-    @register_to_config
     def __init__(
         self,
-        in_channels: int = 3,
-        out_channels: int = 3,
-        down_block_types: tuple[str] = ("DownEncoderBlock2D",),
-        up_block_types: tuple[str] = ("UpDecoderBlock2D",),
-        block_out_channels: tuple[int] = (64,),
-        layers_per_block: int = 1,
-        act_fn: str = "silu",
-        latent_channels: int = 4,
-        norm_num_groups: int = 32,
-        sample_size: int = 32,
-        scaling_factor: float = 0.18215,
-        shift_factor: float | None = None,
-        latents_mean: tuple[float] | None = None,
-        latents_std: tuple[float] | None = None,
-        force_upcast: bool = True,
-        use_quant_conv: bool = True,
-        use_post_quant_conv: bool = True,
-        mid_block_add_attention: bool = True,
-        pretrained_model_name_or_path: str | None = None,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.bfloat16,
+        config: AutoencoderKLConfig,
     ):
         """Initialize VAE AutoencoderKL model.
 
@@ -742,68 +752,21 @@ class AutoencoderKL(ConfigMixin):
             device: Device reference for model placement.
             dtype: Data type for model parameters.
         """
-        self.latent_channels = latent_channels
-        self.max_device = device
-        self.max_dtype = dtype
-
+        super().__init__()
         self.decoder = Decoder(
-            in_channels=latent_channels,
-            out_channels=out_channels,
-            up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            norm_num_groups=norm_num_groups,
-            act_fn=act_fn,
+            in_channels=config.latent_channels,
+            out_channels=config.out_channels,
+            up_block_types=config.up_block_types,
+            block_out_channels=config.block_out_channels,
+            layers_per_block=config.layers_per_block,
+            norm_num_groups=config.norm_num_groups,
+            act_fn=config.act_fn,
             norm_type="group",
-            mid_block_add_attention=mid_block_add_attention,
-            use_post_quant_conv=use_post_quant_conv,
-            device=device,
-            dtype=dtype,
+            mid_block_add_attention=config.mid_block_add_attention,
+            use_post_quant_conv=config.use_post_quant_conv,
+            device=config.device,
+            dtype=config.dtype,
         )
 
-        self.pretrained_model_name_or_path = pretrained_model_name_or_path
-        if pretrained_model_name_or_path is None:
-            raise ValueError(
-                "pretrained_model_name_or_path is required to load model"
-            )
-        self.load_model()
-
-    def load_model(self) -> None:
-        """Load pretrained model weights and compile the model graph.
-
-        This method delegates decoder graph compilation to the Decoder class.
-        """
-        self.decoder.load_model(
-            pretrained_model_name_or_path=self.pretrained_model_name_or_path,
-            device=self.max_device,
-            dtype=self.max_dtype,
-            in_channels=self.latent_channels,
-        )
-
-    def decode(
-        self,
-        z: Tensor,
-        return_dict: bool = True,
-    ) -> DecoderOutput | Tensor:
-        """Decode a batch of images.
-
-        Args:
-            z (`Tensor`): Input batch of latent vectors (MAX Tensor).
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
-            generator: Not used, kept for compatibility.
-
-        Returns:
-            [`~models.vae.DecoderOutput`] or `tuple`:
-                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
-                returned.
-        """
-        # Execute decoder using compiled graph
-        results = self.decoder.session.execute(z)
-
-        dec = results[0]
-
-        if not return_dict:
-            return (dec,)
-
-        return DecoderOutput(sample=dec)
+    def __call__(self, *args, **kwargs):
+        pass

@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import enum
+import json
 import logging
+import os
 import types
 from abc import abstractmethod
 from collections.abc import Mapping
@@ -1070,6 +1072,20 @@ class MAXConfig:
         # Return the wrapped parser
         return MAXConfigArgumentParser(parser, self)
 
+
+def load_config(config_path: str | os.PathLike) -> dict:
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Configuration file not found: {config_path}"
+        )
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config_dict = json.loads(f.read())
+    except Exception as e:
+            raise ValueError(
+                f"Failed to load configuration from {config_path}: {e}"
+            ) from e
+    return config_dict
 
 all = [
     "MAXBaseModel",

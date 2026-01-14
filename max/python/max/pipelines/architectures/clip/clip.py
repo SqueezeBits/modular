@@ -11,31 +11,20 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-import os
+from functools import partial
 
 import max.nn as nn
-from max.driver import CPU, Accelerator
 from max.dtype import DType
-from max.engine import InferenceSession
-from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops
-from max.graph.weights import SafetensorWeights
-from max.nn import Module
-from max.pipelines.lib.interfaces.configuration_utils import (
-    ConfigDict,
-    ConfigMixin,
-    register_to_config,
-)
+from max.graph import TensorType, TensorValue, ops
+from max.nn import LayerNorm, Module
 
-from .layers.activations import ACT2FN
-from .layers.normalizations import WeightedLayerNorm
+from .model_config import ClipConfig
 
 
 class CLIPTextEmbeddings(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: ClipConfig,
     ):
         """Initialize CLIP text embeddings.
 
@@ -45,21 +34,20 @@ class CLIPTextEmbeddings(Module):
             dtype: Data type for the module.
         """
         super().__init__()
+        self.config = config
         self.embed_dim = config.hidden_size
         self.position_embedding = nn.Embedding(
             config.max_position_embeddings,
             self.embed_dim,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.token_embedding = nn.Embedding(
             config.vocab_size,
             self.embed_dim,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
-        self.device = device
-        self.dtype = dtype
 
     def __call__(
         self,
@@ -89,7 +77,7 @@ class CLIPTextEmbeddings(Module):
 
         if position_ids is None:
             position_ids = ops.range(
-                0, seq_length, step=1, dtype=DType.int32, device=self.device
+                0, seq_length, step=1, dtype=DType.int32, device=self.config.device
             )
             position_ids = ops.unsqueeze(position_ids, 0)
 
@@ -105,9 +93,7 @@ class CLIPTextEmbeddings(Module):
 class CLIPAttention(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: ClipConfig,
     ):
         """Initialize CLIP attention module.
 
@@ -133,29 +119,29 @@ class CLIPAttention(Module):
             self.embed_dim,
             self.embed_dim,
             has_bias=True,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.v_proj = nn.Linear(
             self.embed_dim,
             self.embed_dim,
             has_bias=True,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.q_proj = nn.Linear(
             self.embed_dim,
             self.embed_dim,
             has_bias=True,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.out_proj = nn.Linear(
             self.embed_dim,
             self.embed_dim,
             has_bias=True,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
 
     def __call__(
@@ -226,9 +212,7 @@ class CLIPAttention(Module):
 class CLIPMLP(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: ClipConfig,
     ):
         """Initialize CLIP MLP.
 
@@ -243,21 +227,17 @@ class CLIPMLP(Module):
             config.hidden_size,
             config.intermediate_size,
             has_bias=True,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
         self.fc2 = nn.Linear(
             config.intermediate_size,
             config.hidden_size,
             has_bias=True,
-            device=device,
-            dtype=dtype,
+            device=config.device,
+            dtype=config.dtype,
         )
-        self.act_fn = ACT2FN.get(config.hidden_act)
-        if self.act_fn is None:
-            raise NotImplementedError(
-                f"Activation function {config.hidden_act} not implemented yet."
-            )
+        self.act_fn = partial(ops.gelu, approximate="quick")
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
         """Apply MLP block.
@@ -277,9 +257,7 @@ class CLIPMLP(Module):
 class CLIPEncoderLayer(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: ClipConfig,
     ):
         """Initialize CLIP encoder layer.
 
@@ -290,19 +268,21 @@ class CLIPEncoderLayer(Module):
         """
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.self_attn = CLIPAttention(config, device=device, dtype=dtype)
-        self.layer_norm1 = WeightedLayerNorm(
+        self.self_attn = CLIPAttention(config)
+        self.layer_norm1 = LayerNorm(
             self.embed_dim,
             eps=config.layer_norm_eps,
-            device=device,
-            dtype=dtype,
+            devices=[config.device],
+            dtype=config.dtype,
+            keep_dtype=True,
         )
-        self.mlp = CLIPMLP(config, device=device, dtype=dtype)
-        self.layer_norm2 = WeightedLayerNorm(
+        self.mlp = CLIPMLP(config)
+        self.layer_norm2 = LayerNorm(
             self.embed_dim,
             eps=config.layer_norm_eps,
-            device=device,
-            dtype=dtype,
+            devices=[config.device],
+            dtype=config.dtype,
+            keep_dtype=True,
         )
 
     def __call__(
@@ -342,9 +322,7 @@ class CLIPEncoderLayer(Module):
 class CLIPEncoder(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: ClipConfig,
     ):
         """Initialize CLIP encoder.
 
@@ -356,7 +334,7 @@ class CLIPEncoder(Module):
         super().__init__()
         self.layers = nn.LayerList(
             [
-                CLIPEncoderLayer(config, device=device, dtype=dtype)
+                CLIPEncoderLayer(config)
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -390,9 +368,7 @@ class CLIPEncoder(Module):
 class CLIPTextTransformer(Module):
     def __init__(
         self,
-        config: ConfigDict,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
+        config: ClipConfig,
     ):
         """Initialize CLIP text transformer.
 
@@ -404,18 +380,19 @@ class CLIPTextTransformer(Module):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
-        self.embeddings = CLIPTextEmbeddings(config, device=device, dtype=dtype)
-        self.encoder = CLIPEncoder(config, device=device, dtype=dtype)
-        self.final_layer_norm = WeightedLayerNorm(
+        self.embeddings = CLIPTextEmbeddings(config)
+        self.encoder = CLIPEncoder(config)
+        self.final_layer_norm = LayerNorm(
             self.embed_dim,
             eps=config.layer_norm_eps,
-            device=device,
-            dtype=dtype,
+            devices=[config.device],
+            dtype=config.dtype,
+            keep_dtype=True,
         )
         self.eos_token_id = config.eos_token_id
 
     def _create_causal_mask(
-        self, input_shape: tuple[int, int], dtype: DType, device: DeviceRef
+        self, input_shape: tuple[int, int]
     ) -> TensorValue:
         """Create causal mask for the transformer.
 
@@ -430,17 +407,17 @@ class CLIPTextTransformer(Module):
         _, seq_length = input_shape
 
         rows = ops.range(
-            0, seq_length, step=1, dtype=DType.int32, device=device
+            0, seq_length, step=1, dtype=DType.int32, device=self.config.device
         )
         rows = ops.unsqueeze(rows, 1)
         cols = ops.range(
-            0, seq_length, step=1, dtype=DType.int32, device=device
+            0, seq_length, step=1, dtype=DType.int32, device=self.config.device
         )
         cols = ops.unsqueeze(cols, 0)
         mask = ops.greater(cols, rows)
-        mask_float = mask.cast(dtype)
+        mask_float = mask.cast(self.config.dtype)
 
-        min_val = DType.finfo(dtype).min
+        min_val = DType.finfo(self.config.dtype).min
 
         causal_mask = mask_float * min_val
         causal_mask = ops.unsqueeze(causal_mask, 0)
@@ -472,7 +449,7 @@ class CLIPTextTransformer(Module):
 
         input_shape = input_ids.shape
         causal_attention_mask = self._create_causal_mask(
-            input_shape, hidden_states.dtype, hidden_states.device
+            input_shape
         )
 
         if attention_mask is not None:
@@ -505,30 +482,10 @@ class CLIPTextTransformer(Module):
         return last_hidden_state, pooled_output
 
 
-class CLIPTextModel(Module, ConfigMixin):
-    config_name = "config.json"
-
-    @register_to_config
+class CLIPTextModel(Module):
     def __init__(
         self,
-        vocab_size: int = 49408,
-        hidden_size: int = 512,
-        intermediate_size: int = 2048,
-        projection_dim: int = 512,
-        num_hidden_layers: int = 12,
-        num_attention_heads: int = 8,
-        max_position_embeddings: int = 77,
-        hidden_act: str = "quick_gelu",
-        layer_norm_eps: float = 1e-5,
-        attention_dropout: float = 0.0,
-        initializer_range: float = 0.02,
-        initializer_factor: float = 1.0,
-        pad_token_id: int = 1,
-        bos_token_id: int = 49406,
-        eos_token_id: int = 49407,
-        device: DeviceRef = DeviceRef.CPU(),
-        dtype: DType = DType.float32,
-        pretrained_model_name_or_path: str | None = None,
+        config: ClipConfig,
     ):
         """Initialize CLIP text model with MAX.
 
@@ -554,13 +511,9 @@ class CLIPTextModel(Module, ConfigMixin):
         """
         super().__init__()
         self.text_model = CLIPTextTransformer(
-            self.config, device=device, dtype=dtype
+            config
         )
-        self.device = device
-        self.dtype = dtype
-        self.pretrained_model_name_or_path = pretrained_model_name_or_path
-        if pretrained_model_name_or_path is not None:
-            self.load_model()
+        self.device = config.device
 
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the model.
@@ -574,37 +527,6 @@ class CLIPTextModel(Module, ConfigMixin):
                 shape=["batch_size", "sequence_length"],
                 device=self.device,
             ),
-        )
-
-    def load_model(self) -> None:
-        """Load pretrained model weights and compile the model graph."""
-        if self.device.is_cpu():
-            session = InferenceSession([CPU()])
-        else:
-            session = InferenceSession([Accelerator()])
-
-        weight_files = [
-            os.path.join(self.pretrained_model_name_or_path, f)
-            for f in os.listdir(self.pretrained_model_name_or_path)
-            if f.endswith(".safetensors")
-        ]
-        weights = SafetensorWeights(weight_files)
-        weight_registry = {}
-        for name, weight in weights.items():
-            weight_registry[name] = weight.data().data
-        self.load_state_dict(weight_registry)
-
-        with Graph("clip_text_model", input_types=self.input_types()) as graph:
-            outputs = self(
-                *graph.inputs,
-                attention_mask=None,
-                position_ids=None,
-            )
-            graph.output(*outputs)
-            compiled_graph = graph
-
-        self.session = session.load(
-            compiled_graph, weights_registry=self.state_dict()
         )
 
     def __call__(

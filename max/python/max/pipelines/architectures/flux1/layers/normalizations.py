@@ -14,11 +14,8 @@
 
 import max.nn as nn
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
-from max.nn import (
-    Module,
-    RMSNorm,
-)
+from max.graph import DeviceRef, TensorValue, ops
+from max.nn import LayerNorm, RMSNorm
 
 
 class AdaLayerNormZeroSingle(nn.Module):
@@ -48,13 +45,14 @@ class AdaLayerNormZeroSingle(nn.Module):
             dtype=dtype,
         )
         if norm_type == "layer_norm":
-            self.norm = WeightedLayerNorm(
+            self.norm = LayerNorm(
                 embedding_dim,
-                elementwise_affine=False,
                 use_bias=False,
                 eps=1e-6,
-                device=device,
+                devices=[device],
                 dtype=dtype,
+                keep_dtype=True,
+                elementwise_affine=False,
             )
         else:
             raise ValueError(
@@ -123,13 +121,14 @@ class AdaLayerNormZero(nn.Module):
             device=device,
         )
         if norm_type == "layer_norm":
-            self.norm = WeightedLayerNorm(
+            self.norm = LayerNorm(
                 embedding_dim,
-                elementwise_affine=False,
                 use_bias=False,
                 eps=1e-6,
-                device=device,
+                devices=[device],
                 dtype=dtype,
+                keep_dtype=True,
+                elementwise_affine=False,
             )
         elif norm_type == "fp32_layer_norm":
             # self.norm = FP32LayerNorm(embedding_dim, elementwise_affine=False, bias=False)
@@ -221,12 +220,13 @@ class AdaLayerNormContinuous(nn.Module):
             dtype=dtype,
         )
         if norm_type == "layer_norm":
-            self.norm = WeightedLayerNorm(
+            self.norm = LayerNorm(
                 embedding_dim,
-                elementwise_affine=False,
                 eps=eps,
-                device=device,
+                devices=[device],
                 dtype=dtype,
+                keep_dtype=True,
+                elementwise_affine=False,
             )
         elif norm_type == "rms_norm":
             self.norm = RMSNorm(
@@ -253,185 +253,3 @@ class AdaLayerNormContinuous(nn.Module):
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
         return x
 
-
-class WeightedLayerNorm(Module):
-    """Layer normalization block.
-
-    Max.nn.LayerNorm is FP32 only and forcely use weight.
-    This layer is a workaround to use layer norm in bfloat16 and no weight.
-    """
-
-    def __init__(
-        self,
-        dims: int,
-        device: DeviceRef,
-        dtype: DType,
-        eps: float = 1e-5,
-        elementwise_affine: bool = True,
-        use_bias: bool = True,
-    ) -> None:
-        """Initialize weighted layer normalization module.
-
-        Args:
-            dims: Number of dimensions for normalization.
-            device: Device to place the module on.
-            dtype: Data type for the module.
-            eps: Epsilon for numerical stability.
-            elementwise_affine: Whether to use learnable affine parameters.
-            use_bias: Whether to use bias in affine transformation.
-        """
-        super().__init__()
-        self.eps = eps
-        self.device = device
-        self.dtype = dtype
-        if elementwise_affine:
-            self.weight = Weight("weight", dtype, (dims,), device=device)
-            if use_bias:
-                self.bias = Weight("bias", dtype, (dims,), device=device)
-            else:
-                self.bias = None
-        else:
-            self.weight = None
-            self.bias = None
-
-    def __call__(self, input: TensorValue):
-        """Apply layer normalization to input tensor.
-
-        Args:
-            input: Input tensor to normalize.
-
-        Returns:
-            Normalized tensor.
-        """
-        gamma = (
-            self.weight
-            if self.weight
-            else ops.broadcast_to(
-                ops.constant(1.0, self.dtype, self.device),
-                shape=(input.shape[-1],),
-            )
-        )
-        bias = (
-            self.bias
-            if self.bias
-            # If bias wasn't passed then use bias-less layer norm (beta = 0).
-            else ops.broadcast_to(
-                ops.constant(0.0, self.dtype, self.device),
-                shape=(input.shape[-1],),
-            )
-        )
-        return ops.layer_norm(
-            input,
-            gamma=gamma,
-            beta=bias,
-            epsilon=self.eps,
-        )
-
-
-class WeightedGroupNorm(Module):
-    """Group normalization block with configurable dtype.
-
-    This is a custom implementation that replaces max.nn.GroupNorm to support
-    configurable dtype for weight and bias parameters. MAX's native GroupNorm
-    hardcodes weight/bias to float32 (see max.nn.norm.group_norm.GroupNorm),
-    which causes dtype mismatch errors when loading bfloat16 checkpoints.
-
-    This implementation allows weight/bias to use the same dtype as the input
-    (e.g., bfloat16), matching PyTorch's behavior where weight/bias dtype
-    matches input dtype.
-    """
-
-    def __init__(
-        self,
-        num_groups: int,
-        num_channels: int,
-        device: DeviceRef,
-        dtype: DType,
-        eps: float = 1e-5,
-        affine: bool = True,
-    ) -> None:
-        """Initialize WeightedGroupNorm module.
-
-        Args:
-            num_groups: Number of groups to separate the channels into
-            num_channels: Number of input channels
-            device: Device to place the module on
-            dtype: Data type for weight and bias parameters (e.g., DType.bfloat16)
-            eps: Small constant added to denominator for numerical stability
-            affine: If True, apply learnable affine transform parameters
-        """
-        super().__init__()
-        self.num_groups = num_groups
-        self.num_channels = num_channels
-        self.eps = eps
-        self.affine = affine
-        self.device = device
-        self.dtype = dtype
-
-        if self.num_channels % self.num_groups != 0:
-            raise ValueError(
-                f"num_channels({self.num_channels}) should be divisible by "
-                f"num_groups({self.num_groups})"
-            )
-
-        self.weight: Weight | None = None
-        self.bias: Weight | None = None
-        if self.affine:
-            self.weight = Weight(
-                "weight", dtype, (self.num_channels,), device=device
-            )
-            self.bias = Weight(
-                "bias", dtype, (self.num_channels,), device=device
-            )
-
-    def __call__(self, x: TensorValue) -> TensorValue:
-        """Apply group normalization to input tensor.
-
-        Args:
-            x: Input tensor of shape [N, C, *] where C is number of channels
-
-        Returns:
-            Normalized tensor of same shape as input
-        """
-        # Input shape validation
-        if len(x.shape) < 2:
-            raise ValueError(
-                f"Expected input tensor with >=2 dimensions, got shape {x.shape}"
-            )
-        if x.shape[1] != self.num_channels:
-            raise ValueError(
-                f"Expected {self.num_channels} channels, got shape {x.shape}"
-            )
-
-        gamma = (
-            self.weight
-            if self.affine and self.weight
-            else ops.broadcast_to(
-                ops.constant(1.0, self.dtype, self.device),
-                shape=(self.num_channels,),
-            )
-        )
-
-        beta = (
-            self.bias
-            if self.affine and self.bias
-            else ops.broadcast_to(
-                ops.constant(0.0, self.dtype, self.device),
-                shape=(self.num_channels,),
-            )
-        )
-
-        return ops.custom(
-            "group_norm",
-            x.device,
-            [
-                x,
-                gamma,
-                beta,
-                ops.constant(self.eps, dtype=x.dtype, device=DeviceRef.CPU()),
-                ops.constant(
-                    self.num_groups, dtype=DType.int32, device=DeviceRef.CPU()
-                ),
-            ],
-            [TensorType(dtype=x.dtype, shape=x.shape, device=x.device)],
-        )[0].tensor

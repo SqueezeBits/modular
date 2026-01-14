@@ -23,11 +23,6 @@ from max.experimental.compile_utils import max_compile
 from max.graph import DeviceRef, TensorType, TensorValue, ops
 from PIL import Image
 
-from .interfaces.configuration_utils import (
-    ConfigMixin,
-    register_to_config,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -41,10 +36,9 @@ PipelineImageInput = (
 )
 
 
-class VaeImageProcessor(ConfigMixin):
+class VaeImageProcessor:
     config_name = "config.json"
 
-    @register_to_config
     def __init__(
         self,
         do_resize: bool = True,
@@ -85,6 +79,7 @@ class VaeImageProcessor(ConfigMixin):
                 " if you intended to convert the image into grayscale format, please set `do_convert_rgb = False`",
             )
 
+        self.do_normalize = do_normalize
         self.device = device
         self.dtype = dtype
         self._denormalize_conditionally = max_compile(
@@ -128,7 +123,7 @@ class VaeImageProcessor(ConfigMixin):
                 The input image tensor.
         """
         images = (
-            self.denormalize(images) if self.config.do_normalize else images
+            self.denormalize(images) if self.do_normalize else images
         )
         images = ops.cast(images, DType.float32)
         return images
