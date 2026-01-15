@@ -1146,12 +1146,14 @@ class PipelineConfig(ConfigFileModel):
         pipeline_class = get_pipeline_for_task(task, self)
 
         # Get reserved memory info from KVCache config
-        kv_config = self.model._kv_cache
-        if kv_config._available_cache_memory is None:
-            raise ValueError(
-                "KVCache config is not available after config resolution."
-            )
-        memory_str = to_human_readable_bytes(kv_config._available_cache_memory)
+        memory_str = None
+        if task != PipelineTask.IMAGE_GENERATION:
+            kv_config = self.model._kv_cache
+            if kv_config._available_cache_memory is None:
+                raise ValueError(
+                    "KVCache config is not available after config resolution."
+                )
+            memory_str = to_human_readable_bytes(kv_config._available_cache_memory)
 
         devices_str = ", ".join(
             f"{d.device_type}[{d.id}]" for d in self.model.device_specs
