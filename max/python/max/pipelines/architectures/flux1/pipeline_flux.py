@@ -158,7 +158,7 @@ class FluxPipeline(DiffusionPipeline):
         "transformer": Flux1Model,
     }
 
-    def init_remainig_components(self):
+    def init_remaining_components(self):
         image_processor_class = self.components.get(
             "image_processor", VaeImageProcessor
         )

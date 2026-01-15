@@ -58,10 +58,10 @@ class DiffusionPipeline(ABC):
         for name, model in loaded_sub_models.items():
             setattr(self, name, model)
         
-        self.init_remainig_components()
+        self.init_remaining_components()
     
     @abstractmethod
-    def init_remainig_components(self) -> None:
+    def init_remaining_components(self) -> None:
         pass
 
     def load_sub_models(
