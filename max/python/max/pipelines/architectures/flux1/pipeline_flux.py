@@ -145,9 +145,6 @@ class FluxPipelineOutput:
 class FluxPipeline(DiffusionPipeline):
     config_name = "model_index.json"
 
-    # NOTE: This component is a temporary helper dictionary for pipeline initialization.
-    # It might be replaced with PipelineRegistry in Max,
-    # when this repository is merged into the main Max repository.
     components = {
         "scheduler": FlowMatchEulerDiscreteScheduler,
         "vae": AutoencoderKLModel,
@@ -158,7 +155,7 @@ class FluxPipeline(DiffusionPipeline):
         "transformer": Flux1Model,
     }
 
-    def init_remaining_components(self):
+    def init_remaining_components(self) -> None:
         image_processor_class = self.components.get(
             "image_processor", VaeImageProcessor
         )

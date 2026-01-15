@@ -12,6 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 """Pipeline utilities for MAX-optimized pipelines."""
+
 from __future__ import annotations
 
 import os
@@ -28,10 +29,27 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     from ..config import PipelineConfig
+    from ..diffusion_schedulers import FlowMatchEulerDiscreteScheduler
 
 
 class DiffusionPipeline(ABC):
     config_name: str | None = None
+    """
+    The name of the config file of the pipeline.
+
+    It can be found in the downloaded path or HuggingFace hub.
+    It's usually "model_index.json" or "config.json" for Diffusion models.
+    """
+
+    components: (
+        dict[str, type[BaseModel] | type[FlowMatchEulerDiscreteScheduler]]
+        | None
+    ) = None
+    """The components of the pipeline.
+    
+    It can be found in the downloaded path or HuggingFace hub.
+    It's usually contains text_encoder, tokenizer, transformer, vae, etc.
+    """
 
     def __init__(
         self,
@@ -57,9 +75,9 @@ class DiffusionPipeline(ABC):
         loaded_sub_models = self.load_sub_models(cached_folder)
         for name, model in loaded_sub_models.items():
             setattr(self, name, model)
-        
+
         self.init_remaining_components()
-    
+
     @abstractmethod
     def init_remaining_components(self) -> None:
         pass
@@ -77,7 +95,14 @@ class DiffusionPipeline(ABC):
             Dictionary containing the loaded sub-models.
         """
         loaded_sub_models = {}
-        for name, component_class in tqdm(self.components.items(), desc="Loading sub models"):
+        if self.components is None:
+            raise ValueError(
+                f"`components` for {self.__class__.__name__} pipeline is not set. "
+                "Please set proper components based on its sub-directories in the downloaded path."
+            )
+        for name, component_class in tqdm(
+            self.components.items(), desc="Loading sub models"
+        ):
             component_path = os.path.join(pretrained_model_name_or_path, name)
             if "tokenizer" in name:
                 # NOTE: Currently, we are using tokenizers from transformers.
@@ -88,9 +113,17 @@ class DiffusionPipeline(ABC):
                 )
                 continue
 
-            if not hasattr(component_class, "config_name"):
-                raise ValueError(f"Component {name} does not have config_name attribute.")
-            config = load_config(f"{component_path}/{component_class.config_name}")
+            if (
+                not hasattr(component_class, "config_name")
+                or component_class.config_name is None
+            ):
+                raise ValueError(
+                    f"`config_name` for {component_class.__name__} is not set. "
+                    "Please set proper config file name in the downloaded path."
+                )
+            config = load_config(
+                f"{component_path}/{component_class.config_name}"
+            )
             if issubclass(component_class, BaseModel):
                 weight_paths = [
                     Path(pretrained_model_name_or_path) / weight_path
@@ -111,7 +144,7 @@ class DiffusionPipeline(ABC):
                 )
 
         return loaded_sub_models
-    
+
     def finalize_pipeline_config(self) -> None:
         return
 
