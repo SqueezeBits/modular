@@ -14,44 +14,31 @@
 """Pipeline utilities for MAX-optimized pipelines."""
 from __future__ import annotations
 
-import fnmatch
-import logging
 import os
-import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import huggingface_hub
-import requests
-from huggingface_hub.utils import OfflineModeIsEnabled
 from max.config import load_config
 from max.driver import load_devices
-from max.dtype import DType
 from max.graph import DeviceRef
 from max.graph.weights import load_weights
 from max.pipelines.lib.interfaces.base_model import BaseModel
-from requests.exceptions import HTTPError
 from tqdm import tqdm
-
-from ..config_enums import RepoType
 
 if TYPE_CHECKING:
     from ..config import PipelineConfig
 
-logger = logging.getLogger(__name__)
-
 
 class DiffusionPipeline(ABC):
-    config_name = "model_index.json"
+    config_name: str | None = None
 
     def __init__(
         self,
         pipeline_config: PipelineConfig,
-        device: DeviceRef = DeviceRef.GPU(),
-        dtype: DType = DType.bfloat16,
+        cached_folder: str,
         **kwargs: Any,
-    ) -> "DiffusionPipeline":
+    ) -> DiffusionPipeline:
         """Load a pipeline from a pretrained model.
 
         Args:
@@ -63,29 +50,11 @@ class DiffusionPipeline(ABC):
         Returns:
             The loaded pipeline.
         """
-        # 1. Download checkpoints if required
-        # NOTE: In contrast to TextGenerationPipeline where each files,
-        # such as configs and weights, are downloaded individually,
-        # DiffusionPipeline downloads the entire snapshot at once,
-        # since it normally contains multiple components.
         self.pipeline_config = pipeline_config
         self.devices = load_devices(pipeline_config.model_config.device_specs)
-        pretrained_model_name_or_path = pipeline_config.model_config.huggingface_model_repo.repo_id
-        if pipeline_config.model_config.huggingface_model_repo.repo_type == RepoType.online:
-            cached_folder = self.download(
-                pretrained_model_name_or_path,
-                force_download=pipeline_config.model_config.force_download,
-                revision=pipeline_config.model_config.huggingface_model_revision,
-            )
-        else:
-            cached_folder = pretrained_model_name_or_path
 
-        # 2. Load sub models
-        loaded_sub_models = self.load_sub_models(
-            cached_folder,
-            device=device,
-            dtype=dtype,
-        )
+        # Load sub models
+        loaded_sub_models = self.load_sub_models(cached_folder)
         for name, model in loaded_sub_models.items():
             setattr(self, name, model)
         
@@ -98,16 +67,11 @@ class DiffusionPipeline(ABC):
     def load_sub_models(
         self,
         pretrained_model_name_or_path: str | os.PathLike,
-        device: DeviceRef = DeviceRef.GPU(),
-        dtype: DType = DType.bfloat16,
     ) -> dict:
         """Load sub-models for the pipeline.
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model.
-            init_dict: Dictionary containing the init parameters.
-            device: Device to load the models on.
-            dtype: Data type for the models.
 
         Returns:
             Dictionary containing the loaded sub-models.
@@ -142,130 +106,14 @@ class DiffusionPipeline(ABC):
             else:
                 loaded_sub_models[name] = component_class(
                     **config,
-                    device=device,
-                    dtype=dtype,
+                    device=DeviceRef.from_device(self.devices[0]),
+                    dtype=self.pipeline_config.model_config.quantization_encoding.dtype,
                 )
 
         return loaded_sub_models
-
-    def download(
-        self,
-        pretrained_model_name: str | os.PathLike,
-        force_download: bool = False,
-        revision: str | None = None,
-    ) -> str:
-        """Download the pipeline components from the Hugging Face Hub.
-
-        Args:
-            pretrained_model_name: Model identifier.
-            cache_dir: Cache directory.
-            force_download: Whether to force download.
-            revision: Model revision.
-
-        Returns:
-            Path to the downloaded model folder.
-        """
-        try:
-            info = huggingface_hub.model_info(
-                pretrained_model_name, revision=revision
-            )
-        except (HTTPError, OfflineModeIsEnabled, requests.ConnectionError) as e:
-            logger.warning(
-                f"Couldn't connect to the Hub: {e}.\nWill try to load from local cache."
-            )
-            model_info_call_error = (
-                e  # save error to reraise it if model is not cached locally
-            )
-
-        config_file = huggingface_hub.hf_hub_download(
-            pretrained_model_name,
-            self.config_name,
-            revision=revision,
-            force_download=force_download,
-        )
-        config_dict = load_config(config_file)
-        ignore_filenames = config_dict.pop("_ignore_files", [])
-
-        filenames = {sibling.rfilename for sibling in info.siblings}
-        filenames = set(filenames) - set(ignore_filenames)
-
-        ignore_patterns = [
-            "*.bin",
-            "*.msgpack",
-            "*.onnx",
-            "*.pb",
-            "*.bin.index.*json",
-            "*.msgpack.index.*json",
-            "*.onnx.index.*json",
-            "*.pb.index.*json",
-        ]
-
-        allow_patterns = [f"{k}/*" for k in self.components]
-        allow_patterns += [
-            "scheduler_config.json",
-            "config.json",
-            self.config_name,
-        ]
-        re_ignore_pattern = [
-            re.compile(fnmatch.translate(p)) for p in ignore_patterns
-        ]
-        re_allow_pattern = [
-            re.compile(fnmatch.translate(p)) for p in allow_patterns
-        ]
-
-        expected_files = [
-            f
-            for f in filenames
-            if not any(p.match(f) for p in re_ignore_pattern)
-        ]
-        expected_files = [
-            f
-            for f in expected_files
-            if any(p.match(f) for p in re_allow_pattern)
-        ]
-
-        snapshot_folder = Path(config_file).parent
-        pipeline_is_cached = all(
-            (snapshot_folder / f).is_file() for f in expected_files
-        )
-
-        if pipeline_is_cached and not force_download:
-            # if the pipeline is cached, we can directly return it
-            # else call snapshot_download
-            return snapshot_folder
-
-        user_agent = {"pipeline_class": cls.__name__}
-
-        # download all allow_patterns - ignore_patterns
-        try:
-            cached_folder = huggingface_hub.snapshot_download(
-                pretrained_model_name,
-                revision=revision,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                user_agent=user_agent,
-            )
-
-            return cached_folder
-
-        except FileNotFoundError:
-            # Means we tried to load pipeline with `local_files_only=True` but the files have not been found in local cache.
-            # This can happen in two cases:
-            # 1. If the user passed `local_files_only=True`                    => we raise the error directly
-            # 2. If we forced `local_files_only=True` when `model_info` failed => we raise the initial error
-            if model_info_call_error is None:
-                # 1. user passed `local_files_only=True`
-                raise
-            else:
-                # 2. we forced `local_files_only=True` when `model_info` failed
-                raise OSError(
-                    f"Cannot load model {pretrained_model_name}: model is not cached locally and an error occurred"
-                    " while trying to fetch metadata from the Hub. Please check out the root cause in the stacktrace"
-                    " above."
-                ) from model_info_call_error
     
     def finalize_pipeline_config(self) -> None:
-        pass
+        return
 
     def _execution_device(self) -> DeviceRef:
         r"""Returns the device on which the pipeline's models will be executed.

@@ -202,8 +202,6 @@ class FlowMatchEulerDiscreteScheduler:
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
 
-        self.device = device
-        self.dtype = dtype
         self.load_model()
 
     @property
