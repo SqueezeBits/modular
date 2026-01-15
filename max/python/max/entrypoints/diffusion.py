@@ -31,11 +31,11 @@ class DiffusionPipeline:
     def __call__(
         self,
         prompt: str,
-        height: int,
-        width: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        num_images_per_prompt: int,
+        height: int = 1024,
+        width: int = 1024,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 3.5,
+        num_images_per_prompt: int = 1,
     ) -> ImageGenerationOutput:
         # TODO: consider all possible diffusion tasks,
         # e.g. T2I, I2I, T2V, I2V, V2V.
