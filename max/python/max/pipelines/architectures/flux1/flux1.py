@@ -29,7 +29,7 @@ from .layers.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
-from .layers.fluxattention import FeedForward, FluxAttention, FluxPosEmbed
+from .layers.flux_attention import FeedForward, FluxAttention, FluxPosEmbed
 from .layers.normalizations import (
     AdaLayerNormContinuous,
     AdaLayerNormZero,
@@ -284,8 +284,6 @@ class FluxTransformerBlock(nn.Module):
         ff_output = ops.unsqueeze(gate_mlp, 1) * ff_output
 
         hidden_states = hidden_states + ff_output
-        # if len(attention_outputs) == 3:
-        #     hidden_states = hidden_states + ip_attn_output
 
         # Process attention outputs for the `encoder_hidden_states`.
         context_attn_output = ops.unsqueeze(c_gate_msa, 1) * context_attn_output
@@ -520,9 +518,6 @@ class FluxTransformer2DModel(nn.Module):
         """
         if joint_attention_kwargs is not None:
             joint_attention_kwargs = joint_attention_kwargs.copy()
-            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
 
         hidden_states = self.x_embedder(hidden_states)
 
@@ -538,26 +533,8 @@ class FluxTransformer2DModel(nn.Module):
         )
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        # if txt_ids.ndim == 3:
-        #     logger.warning(
-        #         "Passing `txt_ids` 3d torch.Tensor is deprecated."
-        #         "Please remove the batch dimension and pass it as a 2d torch Tensor"
-        #     )
-        #     txt_ids = txt_ids[0]
-        # if img_ids.ndim == 3:
-        #     logger.warning(
-        #         "Passing `img_ids` 3d torch.Tensor is deprecated."
-        #         "Please remove the batch dimension and pass it as a 2d torch Tensor"
-        #     )
-        #     img_ids = img_ids[0]
-
         ids = ops.concat((txt_ids, img_ids), axis=0)
         image_rotary_emb = self.pos_embed(ids)
-
-        # if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
-        #     ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
-        #     ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
-        #     joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -568,18 +545,6 @@ class FluxTransformer2DModel(nn.Module):
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
-            # # controlnet residual
-            # if controlnet_block_samples is not None:
-            #     interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
-            #     interval_control = int(np.ceil(interval_control))
-            #     # For Xlabs ControlNet.
-            #     if controlnet_blocks_repeat:
-            #         hidden_states = (
-            #             hidden_states + controlnet_block_samples[index_block % len(controlnet_block_samples)]
-            #         )
-            #     else:
-            #         hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
-
         for block in self.single_transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
@@ -589,17 +554,7 @@ class FluxTransformer2DModel(nn.Module):
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
-            # # controlnet residual
-            # if controlnet_single_block_samples is not None:
-            #     interval_control = len(self.single_transformer_blocks) / len(controlnet_single_block_samples)
-            #     interval_control = int(np.ceil(interval_control))
-            #     hidden_states = hidden_states + controlnet_single_block_samples[index_block // interval_control]
-
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
         return (output,)
-        # if not return_dict:
-        #     return (output,)
-
-        # return Transformer2DModelOutput(sample=output)

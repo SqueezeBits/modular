@@ -1,17 +1,18 @@
-from max.driver import Accelerator, CPU, Device
+from max.driver import CPU, Accelerator, Device
+from max.engine import InferenceSession, Model
 from max.graph import Graph
 from max.graph.weights import Weights
-from max.engine import InferenceSession, Model
-from max.pipelines.lib.interfaces.base_model import BaseModel
 from max.pipelines.lib import SupportedEncoding
+from max.pipelines.lib.interfaces.base_model import BaseModel
 
-from .model_config import FluxConfig
 from .flux1 import FluxTransformer2DModel
+from .model_config import FluxConfig
+from .weight_adapters import convert_safetensor_state_dict
 
 
 class Flux1Model(BaseModel):
     config_name = FluxConfig.config_name
-    
+
     def __init__(
         self,
         config: dict,
@@ -39,9 +40,8 @@ class Flux1Model(BaseModel):
             session = InferenceSession([CPU()])
         else:
             session = InferenceSession([Accelerator()])
-        state_dict = {
-            key: value.data() for key, value in self.weights.items()
-        }
+        state_dict = {key: value.data() for key, value in self.weights.items()}
+        state_dict = convert_safetensor_state_dict(state_dict)
         flux.load_state_dict(state_dict)
         with Graph(
             "flux_transformer_2d_model", input_types=flux.input_types()
@@ -59,9 +59,6 @@ class Flux1Model(BaseModel):
         self.session = session.load(
             compiled_graph, weights_registry=flux.state_dict()
         )
-    
+
     def __call__(self, *args, **kwargs):
-        return self.session.execute(
-            *args,
-            **kwargs
-        )
+        return self.session.execute(*args, **kwargs)

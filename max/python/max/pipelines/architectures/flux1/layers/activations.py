@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-import math
-from functools import partial
-
 import max.nn as nn
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, ops
@@ -57,18 +54,3 @@ class GELU(nn.Module):
         hidden_states = self.proj(hidden_states)
         hidden_states = ops.gelu(hidden_states, approximate=self.approximate)
         return hidden_states
-
-
-# fmt: off
-ACT2FN = {
-    "silu": ops.silu,
-    "gelu": ops.gelu,
-    "gelu_tanh": partial(ops.gelu, approximate="tanh"),
-    "gelu_quick": partial(ops.gelu, approximate="quick"),
-    "quick_gelu": partial(ops.gelu, approximate="quick"),
-    "gelu_new": lambda x: 0.5 * x * (1.0 + ops.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * ops.pow(x, 3.0)))),
-    "relu": ops.relu,
-    "tanh": ops.tanh,
-    "sigmoid": ops.sigmoid,
-}
-# fmt: on

@@ -26,7 +26,6 @@ from max.nn.kernels import flash_attention_gpu
 
 from .activations import GELU
 from .embeddings import apply_rotary_emb
-from .identity import Identity
 
 
 class FluxAttention(Module):
@@ -317,11 +316,10 @@ class FeedForward(Module):
             raise NotImplementedError(
                 f"Activation function {activation_fn} is not implemented"
             )
-        # Due to align to diffusers, we add an identity layer instead of a dropout layer here.
+
         self.net = nn.Sequential(
             [
                 act_fn,
-                Identity(),
                 Linear(
                     inner_dim,
                     dim_out,

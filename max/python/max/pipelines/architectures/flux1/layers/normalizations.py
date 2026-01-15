@@ -252,4 +252,3 @@ class AdaLayerNormContinuous(nn.Module):
         scale, shift = ops.chunk(emb, 2, axis=1)
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
         return x
-
