@@ -346,6 +346,7 @@ class FluxTransformer2DModel(nn.Module):
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
+        self.guidance_embeds = guidance_embeds
 
         text_time_guidance_cls = (
             CombinedTimestepGuidanceTextProjEmbeddings
@@ -528,7 +529,7 @@ class FluxTransformer2DModel(nn.Module):
 
         temb = (
             self.time_text_embed(timestep, pooled_projections)
-            if guidance is None
+            if not self.guidance_embeds
             else self.time_text_embed(timestep, guidance, pooled_projections)
         )
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)

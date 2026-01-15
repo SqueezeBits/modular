@@ -671,7 +671,11 @@ class FluxPipeline(DiffusionPipeline):
                 dtype=prompt_embeds.dtype,
             )
         else:
-            guidance = None
+            guidance = Tensor_v3.zeros(
+                [latents.shape[0].dim],
+                device=device,
+                dtype=prompt_embeds.dtype,
+            )
 
         if (
             ip_adapter_image is not None
