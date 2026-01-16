@@ -11,15 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from dataclasses import dataclass, field
+from typing import ClassVar
 
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
+from pydantic import Field
 
 
-@dataclass
 class FluxConfigBase(MAXModelConfigBase):
     patch_size: int = 1
     in_channels: int = 64
@@ -33,12 +33,11 @@ class FluxConfigBase(MAXModelConfigBase):
     guidance_embeds: bool = False
     axes_dims_rope: tuple[int, int, int] = (16, 56, 56)
     dtype: DType = DType.bfloat16
-    device: DeviceRef = field(default_factory=DeviceRef.GPU)
+    device: DeviceRef = Field(default_factory=DeviceRef.GPU)
 
 
-@dataclass
 class FluxConfig(FluxConfigBase):
-    config_name = "config.json"
+    config_name: ClassVar[str] = "config.json"
 
     @staticmethod
     def generate(

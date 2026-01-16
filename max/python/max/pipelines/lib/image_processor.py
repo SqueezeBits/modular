@@ -99,7 +99,7 @@ class VaeImageProcessor:
             `np.ndarray` or `Tensor`:
                 The denormalized image array.
         """
-        if isinstance(images, Tensor | TensorValue):
+        if isinstance(images, (Tensor, TensorValue)):
             images = images * 0.5 + 0.5
             images = F.min(
                 images,

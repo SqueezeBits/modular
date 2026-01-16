@@ -11,15 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from dataclasses import dataclass, field
+from typing import ClassVar
 
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
+from pydantic import Field
 
 
-@dataclass
 class ClipConfigBase(MAXModelConfigBase):
     vocab_size: int = 49408
     hidden_size: int = 512
@@ -28,7 +28,7 @@ class ClipConfigBase(MAXModelConfigBase):
     num_hidden_layers: int = 12
     num_attention_heads: int = 8
     max_position_embeddings: int = 77
-    hidden_act: str = ("quick_gelu",)
+    hidden_act: str = "quick_gelu"
     layer_norm_eps: float = 1e-5
     attention_dropout: float = 0.0
     initializer_range: float = 0.02
@@ -37,12 +37,11 @@ class ClipConfigBase(MAXModelConfigBase):
     bos_token_id: int = 49406
     eos_token_id: int = 49407
     dtype: DType = DType.bfloat16
-    device: DeviceRef = field(default_factory=DeviceRef.GPU)
+    device: DeviceRef = Field(default_factory=DeviceRef.GPU)
 
 
-@dataclass
 class ClipConfig(ClipConfigBase):
-    config_name = "config.json"
+    config_name: ClassVar[str] = "config.json"
 
     @staticmethod
     def generate(

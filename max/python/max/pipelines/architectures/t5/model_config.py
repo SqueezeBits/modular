@@ -11,15 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from dataclasses import dataclass, field
+from typing import ClassVar
 
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
+from pydantic import Field
 
 
-@dataclass
 class T5ConfigBase(MAXModelConfigBase):
     vocab_size: int = 32128
     d_model: int = 512
@@ -34,18 +34,20 @@ class T5ConfigBase(MAXModelConfigBase):
     layer_norm_epsilon: float = 1e-6
     initializer_factor: float = 1.0
     feed_forward_proj: str = "relu"
+    dense_act_fn: str | None = Field(default=None, exclude=True)
+    is_gated_act: bool = Field(default=False, exclude=True)
+    is_decoder: bool = Field(default=False, exclude=True)
     is_encoder_decoder: bool = True
     use_cache: bool = True
     pad_token_id: int = 0
     eos_token_id: int = 1
     classifier_dropout: float = 0.0
-    device: DeviceRef = field(default_factory=DeviceRef.GPU)
+    device: DeviceRef = Field(default_factory=DeviceRef.GPU)
     dtype: DType = DType.bfloat16
 
 
-@dataclass
 class T5Config(T5ConfigBase):
-    config_name = "config.json"
+    config_name: ClassVar[str] = "config.json"
 
     @staticmethod
     def generate(

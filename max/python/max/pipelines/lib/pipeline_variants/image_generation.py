@@ -57,17 +57,17 @@ class ImageGenerationPipeline(
         # DiffusionPipeline downloads the entire snapshot at once,
         # since it normally contains multiple components.
         pretrained_model_name_or_path = (
-            pipeline_config.model_config.huggingface_model_repo.repo_id
+            pipeline_config.model.huggingface_model_repo.repo_id
         )
         if (
-            pipeline_config.model_config.huggingface_model_repo.repo_type
+            pipeline_config.model.huggingface_model_repo.repo_type
             == RepoType.online
         ):
             cached_folder = self.download(
                 pretrained_model_name_or_path,
                 config_name=diffusion_pipeline.config_name,
-                force_download=pipeline_config.model_config.force_download,
-                revision=pipeline_config.model_config.huggingface_model_revision,
+                force_download=pipeline_config.model.force_download,
+                revision=pipeline_config.model.huggingface_model_revision,
             )
         else:
             cached_folder = pretrained_model_name_or_path

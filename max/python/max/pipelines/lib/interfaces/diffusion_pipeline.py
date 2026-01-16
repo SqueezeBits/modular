@@ -65,7 +65,7 @@ class DiffusionPipeline(ABC):
             **kwargs: Additional pipeline-specific arguments.
         """
         self.pipeline_config = pipeline_config
-        self.devices = load_devices(pipeline_config.model_config.device_specs)
+        self.devices = load_devices(pipeline_config.model.device_specs)
 
         # Load sub models
         loaded_sub_models = self.load_sub_models(cached_folder)
@@ -123,12 +123,12 @@ class DiffusionPipeline(ABC):
             if issubclass(component_class, BaseModel):
                 weight_paths = [
                     Path(pretrained_model_name_or_path) / weight_path
-                    for weight_path in self.pipeline_config.model_config.weight_path
+                    for weight_path in self.pipeline_config.model.weight_path
                     if weight_path.split("/")[0] == name
                 ]
                 loaded_sub_models[name] = component_class(
                     config=config,
-                    encoding=self.pipeline_config.model_config.quantization_encoding,
+                    encoding=self.pipeline_config.model.quantization_encoding,
                     devices=self.devices,
                     weights=load_weights(weight_paths),
                 )
@@ -136,7 +136,7 @@ class DiffusionPipeline(ABC):
                 loaded_sub_models[name] = component_class(
                     **config,
                     device=DeviceRef.from_device(self.devices[0]),
-                    dtype=self.pipeline_config.model_config.quantization_encoding.dtype,
+                    dtype=self.pipeline_config.model.quantization_encoding.dtype,
                 )
 
         return loaded_sub_models

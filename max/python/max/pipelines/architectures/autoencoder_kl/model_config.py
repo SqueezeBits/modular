@@ -11,21 +11,21 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from dataclasses import dataclass, field
+from typing import ClassVar
 
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
+from pydantic import Field
 
 
-@dataclass
 class AutoencoderKLConfigBase(MAXModelConfigBase):
     in_channels: int = 3
     out_channels: int = 3
-    down_block_types: tuple[str] = ("DownEncoderBlock2D",)
-    up_block_types: tuple[str] = ("UpDecoderBlock2D",)
-    block_out_channels: tuple[int] = (64,)
+    down_block_types: list[str] = Field(default_factory=list, max_length=4)
+    up_block_types: list[str] = Field(default_factory=list, max_length=4)
+    block_out_channels: list[int] = Field(default_factory=list, max_length=4)
     layers_per_block: int = 1
     act_fn: str = "silu"
     latent_channels: int = 4
@@ -39,13 +39,12 @@ class AutoencoderKLConfigBase(MAXModelConfigBase):
     use_quant_conv: bool = True
     use_post_quant_conv: bool = True
     mid_block_add_attention: bool = True
-    device: DeviceRef = field(default_factory=DeviceRef.CPU)
+    device: DeviceRef = Field(default_factory=DeviceRef.CPU)
     dtype: DType = DType.bfloat16
 
 
-@dataclass
 class AutoencoderKLConfig(AutoencoderKLConfigBase):
-    config_name = "config.json"
+    config_name: ClassVar[str] = "config.json"
 
     @staticmethod
     def generate(

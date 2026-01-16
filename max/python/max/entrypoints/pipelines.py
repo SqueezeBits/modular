@@ -492,7 +492,7 @@ def diffusion_generate(
     except Exception as exc:
         logger.exception(
             "Diffusion generation failed for model %s with prompt %r",
-            pipeline_config.model_config.model_path,
+            pipeline_config.model.model_path,
             prompt,
         )
         raise click.ClickException("Diffusion generation failed.") from exc
