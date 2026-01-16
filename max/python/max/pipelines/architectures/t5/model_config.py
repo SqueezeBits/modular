@@ -1,10 +1,22 @@
-from dataclasses import dataclass
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2025, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
 
-from max.graph import DeviceRef
-from max.dtype import DType
-from max.pipelines.lib import MAXModelConfigBase
-from max.pipelines.lib import SupportedEncoding
+from dataclasses import dataclass, field
+
 from max.driver import Device
+from max.dtype import DType
+from max.graph import DeviceRef
+from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
 
 
 @dataclass
@@ -27,7 +39,7 @@ class T5ConfigBase(MAXModelConfigBase):
     pad_token_id: int = 0
     eos_token_id: int = 1
     classifier_dropout: float = 0.0
-    device: DeviceRef = DeviceRef.GPU()
+    device: DeviceRef = field(default_factory=DeviceRef.GPU)
     dtype: DType = DType.bfloat16
 
 
@@ -40,14 +52,16 @@ class T5Config(T5ConfigBase):
         config_dict: dict,
         encoding: SupportedEncoding,
         devices: list[Device],
-    ):
+    ) -> T5ConfigBase:
         init_dict = {
-            key: value for key, value in config_dict.items() if key in T5ConfigBase.__annotations__
+            key: value
+            for key, value in config_dict.items()
+            if key in T5ConfigBase.__annotations__
         }
-        init_dict.update({
-            "dtype": encoding.dtype,
-            "device": DeviceRef.from_device(devices[0]),
-        })
-        return T5ConfigBase(
-            **init_dict
+        init_dict.update(
+            {
+                "dtype": encoding.dtype,
+                "device": DeviceRef.from_device(devices[0]),
+            }
         )
+        return T5ConfigBase(**init_dict)

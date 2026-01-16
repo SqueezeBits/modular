@@ -20,10 +20,8 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
-import huggingface_hub
 import numpy as np
 import numpy.typing as npt
 from max.driver import load_devices
@@ -319,9 +317,7 @@ class PipelineRegistry:
         Returns:
             AutoConfig: The HuggingFace configuration object for the model.
         """
-        model_index_path = get_model_index_path_for_diffusers(
-            huggingface_repo
-        )
+        model_index_path = get_model_index_path_for_diffusers(huggingface_repo)
 
         if model_index_path is not None:
             with open(model_index_path, encoding="utf-8") as f:

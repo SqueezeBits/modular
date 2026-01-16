@@ -545,9 +545,7 @@ class FlowMatchEulerDiscreteScheduler:
         sample = sample.cast(DType.float32)
 
         if per_token_timesteps is not None:
-            per_token_sigmas = (
-                per_token_timesteps / self.num_train_timesteps
-            )
+            per_token_sigmas = per_token_timesteps / self.num_train_timesteps
 
             sigmas = sigmas[:, None, None]
             lower_mask = sigmas < per_token_sigmas[None] - 1e-6

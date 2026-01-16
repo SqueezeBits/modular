@@ -45,6 +45,7 @@ class ImageGenerationPipeline(
     Pipeline[ImageGenerationInputs, ImageGenerationOutput],
 ):
     """Pipeline wrapper for diffusion image generation."""
+
     def __init__(
         self,
         pipeline_config: PipelineConfig,
@@ -55,8 +56,13 @@ class ImageGenerationPipeline(
         # such as configs and weights, are downloaded individually,
         # DiffusionPipeline downloads the entire snapshot at once,
         # since it normally contains multiple components.
-        pretrained_model_name_or_path = pipeline_config.model_config.huggingface_model_repo.repo_id
-        if pipeline_config.model_config.huggingface_model_repo.repo_type == RepoType.online:
+        pretrained_model_name_or_path = (
+            pipeline_config.model_config.huggingface_model_repo.repo_id
+        )
+        if (
+            pipeline_config.model_config.huggingface_model_repo.repo_type
+            == RepoType.online
+        ):
             cached_folder = self.download(
                 pretrained_model_name_or_path,
                 config_name=diffusion_pipeline.config_name,
@@ -67,8 +73,7 @@ class ImageGenerationPipeline(
             cached_folder = pretrained_model_name_or_path
 
         self._diffusion_pipeline = diffusion_pipeline(
-            pipeline_config,
-            cached_folder
+            pipeline_config, cached_folder
         )
 
     def download(
@@ -100,7 +105,7 @@ class ImageGenerationPipeline(
             model_info_call_error = (
                 e  # save error to reraise it if model is not cached locally
             )
-        
+
         if config_name is None:
             raise ValueError(
                 f"config_name for {pretrained_model_name} pipeline is not set. "

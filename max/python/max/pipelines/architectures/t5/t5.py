@@ -94,7 +94,16 @@ class T5DenseActDense(Module):
             device=config.device,
             dtype=config.dtype,
         )
-        self.act_fn = lambda x: 0.5 * x * (1.0 + ops.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * ops.pow(x, 3.0))))
+        self.act_fn = (
+            lambda x: 0.5
+            * x
+            * (
+                1.0
+                + ops.tanh(
+                    math.sqrt(2.0 / math.pi) * (x + 0.044715 * ops.pow(x, 3.0))
+                )
+            )
+        )
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
         """Process hidden states through the dense-activation-dense block.
@@ -143,7 +152,16 @@ class T5DenseGatedActDense(Module):
             device=config.device,
             dtype=config.dtype,
         )
-        self.act_fn = lambda x: 0.5 * x * (1.0 + ops.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * ops.pow(x, 3.0))))
+        self.act_fn = (
+            lambda x: 0.5
+            * x
+            * (
+                1.0
+                + ops.tanh(
+                    math.sqrt(2.0 / math.pi) * (x + 0.044715 * ops.pow(x, 3.0))
+                )
+            )
+        )
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
         """Process hidden states through the dense-gated-activation-dense block.
@@ -173,13 +191,9 @@ class T5LayerFF(Module):
         """
         super().__init__()
         if config.is_gated_act:
-            self.DenseReluDense = T5DenseGatedActDense(
-                config
-            )
+            self.DenseReluDense = T5DenseGatedActDense(config)
         else:
-            self.DenseReluDense = T5DenseActDense(
-                config
-            )
+            self.DenseReluDense = T5DenseActDense(config)
 
         self.layer_norm = T5LayerNorm(
             config.d_model,
@@ -763,7 +777,10 @@ class T5EncoderModel(Module):
         config.is_gated_act = act_info[0] == "gated"
 
         self.shared = nn.Embedding(
-            config.vocab_size, config.d_model, device=config.device, dtype=config.dtype
+            config.vocab_size,
+            config.d_model,
+            device=config.device,
+            dtype=config.dtype,
         )
 
         encoder_config = config
@@ -771,9 +788,7 @@ class T5EncoderModel(Module):
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
 
-        self.encoder = T5Stack(
-            encoder_config, self.shared
-        )
+        self.encoder = T5Stack(encoder_config, self.shared)
         self.device = config.device
         self.dtype = config.dtype
 

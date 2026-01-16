@@ -75,7 +75,11 @@ class CLIPTextEmbeddings(Module):
 
         if position_ids is None:
             position_ids = ops.range(
-                0, seq_length, step=1, dtype=DType.int32, device=self.config.device
+                0,
+                seq_length,
+                step=1,
+                dtype=DType.int32,
+                device=self.config.device,
             )
             position_ids = ops.unsqueeze(position_ids, 0)
 
@@ -323,10 +327,7 @@ class CLIPEncoder(Module):
         """
         super().__init__()
         self.layers = nn.LayerList(
-            [
-                CLIPEncoderLayer(config)
-                for _ in range(config.num_hidden_layers)
-            ]
+            [CLIPEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
 
     def __call__(
@@ -379,9 +380,7 @@ class CLIPTextTransformer(Module):
         )
         self.eos_token_id = config.eos_token_id
 
-    def _create_causal_mask(
-        self, input_shape: tuple[int, int]
-    ) -> TensorValue:
+    def _create_causal_mask(self, input_shape: tuple[int, int]) -> TensorValue:
         """Create causal mask for the transformer.
 
         Args:
@@ -434,9 +433,7 @@ class CLIPTextTransformer(Module):
         )
 
         input_shape = input_ids.shape
-        causal_attention_mask = self._create_causal_mask(
-            input_shape
-        )
+        causal_attention_mask = self._create_causal_mask(input_shape)
 
         if attention_mask is not None:
             inverted_mask = (
@@ -480,9 +477,7 @@ class CLIPTextModel(Module):
                 device/dtype settings.
         """
         super().__init__()
-        self.text_model = CLIPTextTransformer(
-            config
-        )
+        self.text_model = CLIPTextTransformer(config)
         self.device = config.device
 
     def input_types(self) -> tuple[TensorType, ...]:

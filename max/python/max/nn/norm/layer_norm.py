@@ -42,7 +42,9 @@ class LayerNorm(Module, Shardable):
         super().__init__()
         self.devices = devices
         if elementwise_affine:
-            self.weight = Weight("weight", dtype, (dims,), device=self.devices[0])
+            self.weight = Weight(
+                "weight", dtype, (dims,), device=self.devices[0]
+            )
             self.bias = (
                 Weight("bias", dtype, (dims,), device=self.devices[0])
                 if use_bias
@@ -59,7 +61,9 @@ class LayerNorm(Module, Shardable):
 
     def __call__(self, input: TensorValue):
         # TODO: AIPIPE-95 Replace with a broadcasting rmo.layer_norm
-        bias = (self.bias if self.bias 
+        bias = (
+            self.bias
+            if self.bias
             # If bias wasn't passed then use bias-less layer norm (beta = 0).
             else ops.broadcast_to(
                 ops.constant(0.0, self.dtype, input.device),
@@ -67,7 +71,8 @@ class LayerNorm(Module, Shardable):
             )
         )
         gamma = (
-            self.weight if self.weight
+            self.weight
+            if self.weight
             else ops.broadcast_to(
                 ops.constant(1.0, self.dtype, input.device),
                 shape=(input.shape[-1],),

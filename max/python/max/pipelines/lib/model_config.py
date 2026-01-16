@@ -805,7 +805,7 @@ class MAXModelConfig(MAXModelConfigBase):
                 weight_files = self.huggingface_weight_repo.files_for_encoding(
                     encoding=self._applied_dtype_cast_from
                 )
-            
+
             if not weight_files:
                 weight_files = self.huggingface_weight_repo.weight_files
 

@@ -403,6 +403,7 @@ class VAEAttention(nn.Module):
 
         return residual + out
 
+
 class MidBlock2D(nn.Module):
     """Internal MAX module for MidBlock2D graph generation."""
 
@@ -718,6 +719,7 @@ class Decoder(nn.Module):
 
 class AutoencoderKL(nn.Module):
     r"""A VAE model with KL loss for encoding images into latents and decoding latent representations into images."""
+
     def __init__(
         self,
         config: AutoencoderKLConfig,

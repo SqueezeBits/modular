@@ -21,6 +21,7 @@ from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
 
 class DiffusionPipeline:
     """Entrypoint for image-generation diffusion pipelines."""
+
     def __init__(self, pipeline_config: PipelineConfig) -> None:
         # NOTE: Currently, this entrypoint is implemented minimally
         # for offline image generation.

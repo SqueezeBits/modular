@@ -231,9 +231,7 @@ class FluxPipeline(DiffusionPipeline):
                 text_inputs.input_ids, device=device, dtype=DType.int64
             )
 
-            text_encoder_outputs = self.text_encoder(
-                text_input_ids
-            )
+            text_encoder_outputs = self.text_encoder(text_input_ids)
             prompt_embeds = text_encoder_outputs[0]
             pooled_prompt_embeds = text_encoder_outputs[1]
 
@@ -253,9 +251,7 @@ class FluxPipeline(DiffusionPipeline):
                 text_inputs_2.input_ids, device=device, dtype=DType.int64
             )
 
-            prompt_embeds_2 = self.text_encoder_2(
-                text_input_ids_2
-            )[0]
+            prompt_embeds_2 = self.text_encoder_2(text_input_ids_2)[0]
         else:
             prompt_embeds_2 = None
 

@@ -1,10 +1,23 @@
-from dataclasses import dataclass
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2025, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
 
-from max.graph import DeviceRef
-from max.dtype import DType
-from max.pipelines.lib import MAXModelConfigBase
-from max.pipelines.lib import SupportedEncoding
+from dataclasses import dataclass, field
+
 from max.driver import Device
+from max.dtype import DType
+from max.graph import DeviceRef
+from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
+
 
 @dataclass
 class ClipConfigBase(MAXModelConfigBase):
@@ -15,7 +28,7 @@ class ClipConfigBase(MAXModelConfigBase):
     num_hidden_layers: int = 12
     num_attention_heads: int = 8
     max_position_embeddings: int = 77
-    hidden_act: str = "quick_gelu",
+    hidden_act: str = ("quick_gelu",)
     layer_norm_eps: float = 1e-5
     attention_dropout: float = 0.0
     initializer_range: float = 0.02
@@ -24,7 +37,7 @@ class ClipConfigBase(MAXModelConfigBase):
     bos_token_id: int = 49406
     eos_token_id: int = 49407
     dtype: DType = DType.bfloat16
-    device: DeviceRef = DeviceRef.GPU()
+    device: DeviceRef = field(default_factory=DeviceRef.GPU)
 
 
 @dataclass
@@ -36,14 +49,16 @@ class ClipConfig(ClipConfigBase):
         config_dict: dict,
         encoding: SupportedEncoding,
         devices: list[Device],
-    ):
+    ) -> ClipConfigBase:
         init_dict = {
-            key: value for key, value in config_dict.items() if key in ClipConfigBase.__annotations__
+            key: value
+            for key, value in config_dict.items()
+            if key in ClipConfigBase.__annotations__
         }
-        init_dict.update({
-            "dtype": encoding.dtype,
-            "device": DeviceRef.from_device(devices[0]),
-        })
-        return ClipConfigBase(
-            **init_dict
+        init_dict.update(
+            {
+                "dtype": encoding.dtype,
+                "device": DeviceRef.from_device(devices[0]),
+            }
         )
+        return ClipConfigBase(**init_dict)

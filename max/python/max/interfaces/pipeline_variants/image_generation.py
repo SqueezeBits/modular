@@ -35,5 +35,6 @@ class ImageGenerationInputs(PipelineInputs):
 @dataclass(kw_only=True)
 class ImageGenerationOutput:
     """Output container for generated images."""
+
     images: list[Image]
     """List of generated images."""

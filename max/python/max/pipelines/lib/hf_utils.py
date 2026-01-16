@@ -304,7 +304,7 @@ def _repo_exists_with_retry(repo_id: str, revision: str) -> bool:
             )
             time.sleep(delay_in_seconds)
 
-    assert False, (  # noqa: B011
+    raise AssertionError(
         "This should never be reached due to the raise in the last attempt"
     )
 
@@ -624,30 +624,30 @@ def generate_local_model_path(repo_id: str, revision: str) -> str:
 
 
 def get_model_index_path_for_diffusers(
-    huggingface_repo: HuggingFaceRepo
-    ) -> str | None:
-        model_index_path: str | None = None
+    huggingface_repo: HuggingFaceRepo,
+) -> str | None:
+    model_index_path: str | None = None
 
-        if huggingface_repo.repo_type == RepoType.local:
-            local_index = Path(huggingface_repo.repo_id) / "model_index.json"
-            if local_index.exists():
-                model_index_path = str(local_index)
-            else:
-                raise ValueError(
-                    f"Failed to find model_index.json in {huggingface_repo.repo_id}."
-                )
+    if huggingface_repo.repo_type == RepoType.local:
+        local_index = Path(huggingface_repo.repo_id) / "model_index.json"
+        if local_index.exists():
+            model_index_path = str(local_index)
         else:
-            try:
-                if huggingface_hub.file_exists(
+            raise ValueError(
+                f"Failed to find model_index.json in {huggingface_repo.repo_id}."
+            )
+    else:
+        try:
+            if huggingface_hub.file_exists(
+                huggingface_repo.repo_id,
+                "model_index.json",
+                revision=huggingface_repo.revision,
+            ):
+                model_index_path = huggingface_hub.hf_hub_download(
                     huggingface_repo.repo_id,
                     "model_index.json",
                     revision=huggingface_repo.revision,
-                ):
-                    model_index_path = huggingface_hub.hf_hub_download(
-                        huggingface_repo.repo_id,
-                        "model_index.json",
-                        revision=huggingface_repo.revision,
-                    )
-            except Exception:
-                model_index_path = None
-        return model_index_path
+                )
+        except Exception:
+            model_index_path = None
+    return model_index_path
