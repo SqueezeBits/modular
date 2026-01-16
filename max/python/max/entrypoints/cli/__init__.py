@@ -30,7 +30,7 @@ from .encode import pipeline_encode
 from .generate import generate_text_for_pipeline, stream_text_to_console
 from .list import list_pipelines_to_console, list_pipelines_to_json
 from .metrics import TextGenerationMetrics
-from .serve import serve_api_server_and_model_worker
+from .serve import serve_api_server_and_model_worker, serve_diffusion_api_server
 
 __all__ = [
     "DevicesOptionType",
@@ -48,6 +48,7 @@ __all__ = [
     "pipeline_encode",
     "sampling_params_options",
     "serve_api_server_and_model_worker",
+    "serve_diffusion_api_server",
     "stream_text_to_console",
     "validate_field_type",
 ]

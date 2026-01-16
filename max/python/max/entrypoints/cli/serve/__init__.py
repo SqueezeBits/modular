@@ -12,5 +12,6 @@
 # ===----------------------------------------------------------------------=== #
 
 from .serve_api_and_model_worker import serve_api_server_and_model_worker
+from .serve_diffusion_api import serve_diffusion_api_server
 
-__all__ = ["serve_api_server_and_model_worker"]
+__all__ = ["serve_api_server_and_model_worker", "serve_diffusion_api_server"]

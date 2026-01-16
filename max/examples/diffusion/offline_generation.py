@@ -14,7 +14,7 @@
 import argparse
 from pathlib import Path
 
-from max.entrypoints.diffusion import DiffusionPipeline
+from max.entrypoints.diffusion import ImageGenerator
 from max.experimental.realization_context import set_seed
 from max.pipelines import PipelineConfig
 
@@ -30,20 +30,19 @@ def main() -> None:
     model_path = args.model_path
     set_seed(args.seed)
     pipeline_config = PipelineConfig(model_path=model_path)
-    pipe = DiffusionPipeline(pipeline_config)
+    pipe = ImageGenerator(pipeline_config)
 
     prompt = "A cat holding a sign that says hello world"
     print(f"Prompt: {prompt}")
 
-    result = pipe(
-        prompt=prompt,
+    # Generate images using the new API
+    images = pipe.generate(
+        prompt,
         height=1024,
         width=1024,
         num_inference_steps=50,
         guidance_scale=3.5,
     )
-
-    images = result.images
 
     output_path = Path("output.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
