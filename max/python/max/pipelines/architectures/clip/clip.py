@@ -29,9 +29,7 @@ class CLIPTextEmbeddings(Module):
         """Initialize CLIP text embeddings.
 
         Args:
-            config: CLIP configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: CLIP configuration for embedding dimensions and device/dtype.
         """
         super().__init__()
         self.config = config
@@ -98,9 +96,7 @@ class CLIPAttention(Module):
         """Initialize CLIP attention module.
 
         Args:
-            config: CLIP configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: CLIP configuration for attention dimensions and device/dtype.
         """
         super().__init__()
         self.config = config
@@ -217,9 +213,7 @@ class CLIPMLP(Module):
         """Initialize CLIP MLP.
 
         Args:
-            config: CLIP configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: CLIP configuration for MLP dimensions and device/dtype.
         """
         super().__init__()
         self.config = config
@@ -262,9 +256,7 @@ class CLIPEncoderLayer(Module):
         """Initialize CLIP encoder layer.
 
         Args:
-            config: CLIP configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: CLIP configuration for encoder layer structure.
         """
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -327,9 +319,7 @@ class CLIPEncoder(Module):
         """Initialize CLIP encoder.
 
         Args:
-            config: CLIP configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: CLIP configuration for encoder depth and dimensions.
         """
         super().__init__()
         self.layers = nn.LayerList(
@@ -373,9 +363,7 @@ class CLIPTextTransformer(Module):
         """Initialize CLIP text transformer.
 
         Args:
-            config: CLIP configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: CLIP configuration for embeddings, encoder, and device/dtype.
         """
         super().__init__()
         self.config = config
@@ -398,8 +386,6 @@ class CLIPTextTransformer(Module):
 
         Args:
             input_shape: Shape of the input tensor.
-            dtype: Data type for the mask.
-            device: Device for the mask.
 
         Returns:
             Causal mask tensor.
@@ -490,24 +476,8 @@ class CLIPTextModel(Module):
         """Initialize CLIP text model with MAX.
 
         Args:
-            vocab_size: Vocabulary size.
-            hidden_size: Hidden size.
-            intermediate_size: Intermediate size.
-            projection_dim: Projection dimension.
-            num_hidden_layers: Number of hidden layers.
-            num_attention_heads: Number of attention heads.
-            max_position_embeddings: Maximum position embeddings.
-            hidden_act: Hidden activation function.
-            layer_norm_eps: Layer norm epsilon.
-            attention_dropout: Attention dropout.
-            initializer_range: Initializer range.
-            initializer_factor: Initializer factor.
-            pad_token_id: Pad token ID.
-            bos_token_id: BOS token ID.
-            eos_token_id: EOS token ID.
-            device: Device to place the module on.
-            dtype: Data type for the module.
-            pretrained_model_name_or_path: Path to pretrained model.
+            config: CLIP configuration for vocabulary size, dimensions, and
+                device/dtype settings.
         """
         super().__init__()
         self.text_model = CLIPTextTransformer(

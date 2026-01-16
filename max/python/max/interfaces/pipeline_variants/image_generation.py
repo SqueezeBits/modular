@@ -19,9 +19,11 @@ from PIL.Image import Image
 
 @dataclass(eq=True)
 class ImageGenerationInputs(PipelineInputs):
-    # NOTE: current implementation only considers offline generation,
-    # without request scheduling.
-    # `ImageGenerationContext` should be used after request scheduling is implemented.
+    """Inputs for image-generation pipelines."""
+
+    # NOTE: Current implementation only considers offline generation without
+    # request scheduling. `ImageGenerationContext` should be used once
+    # request scheduling is implemented.
     prompt: str
     height: int
     width: int
@@ -32,5 +34,6 @@ class ImageGenerationInputs(PipelineInputs):
 
 @dataclass(kw_only=True)
 class ImageGenerationOutput:
+    """Output container for generated images."""
     images: list[Image]
     """List of generated images."""

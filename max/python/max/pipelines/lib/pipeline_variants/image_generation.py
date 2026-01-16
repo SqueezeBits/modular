@@ -40,16 +40,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 class ImageGenerationPipeline(
     Pipeline[ImageGenerationInputs, ImageGenerationOutput],
 ):
+    """Pipeline wrapper for diffusion image generation."""
     def __init__(
         self,
         pipeline_config: PipelineConfig,
         diffusion_pipeline: type[DiffusionPipeline],
     ) -> None:
         # Download checkpoints if required
-        # NOTE: Unlike TextGenerationPipeline where each files,
+        # NOTE: Unlike TextGenerationPipeline where each file,
         # such as configs and weights, are downloaded individually,
         # DiffusionPipeline downloads the entire snapshot at once,
         # since it normally contains multiple components.
@@ -80,7 +82,7 @@ class ImageGenerationPipeline(
 
         Args:
             pretrained_model_name: Model identifier.
-            cache_dir: Cache directory.
+            config_name: Pipeline config filename in the repo.
             force_download: Whether to force download.
             revision: Model revision.
 

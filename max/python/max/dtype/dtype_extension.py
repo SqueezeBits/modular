@@ -23,6 +23,9 @@ class finfo:
 
     This class mimics torch.finfo behavior without torch dependency,
     including support for bfloat16.
+
+    NOTE: Currently, it's applied through patching.
+    This extension is better to be implemented in dtype library itself.
     """
 
     def __init__(self, dtype: DType):

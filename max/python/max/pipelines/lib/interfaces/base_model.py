@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from max.pipelines.lib import SupportedEncoding
 
 class BaseModel(ABC):
+    """Base interface for pipeline models with weight-backed execution."""
     def __init__(
         self,
         config: dict,
@@ -25,4 +26,5 @@ class BaseModel(ABC):
     
     @abstractmethod
     def load_model(self) -> Model:
+        """Load and return a runtime model instance."""
         ...

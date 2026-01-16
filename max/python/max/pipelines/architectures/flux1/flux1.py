@@ -263,12 +263,6 @@ class FluxTransformerBlock(nn.Module):
             **joint_attention_kwargs,
         )
 
-        # attn_output is a tuple of (attn_output, context_attn_output) because not using FluxIPAdapterAttnProcessor
-        # if len(attention_outputs) == 2:
-        #     attn_output, context_attn_output = attention_outputs
-        # elif len(attention_outputs) == 3:
-        #     attn_output, context_attn_output, ip_attn_output = attention_outputs
-
         attn_output, context_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
@@ -314,19 +308,8 @@ class FluxTransformer2DModel(nn.Module):
         """Initialize Flux Transformer 2D model.
 
         Args:
-            patch_size: Size of the patch.
-            in_channels: Number of input channels.
-            out_channels: Number of output channels. Defaults to in_channels if None.
-            num_layers: Number of transformer blocks.
-            num_single_layers: Number of single transformer blocks.
-            attention_head_dim: Dimension of each attention head.
-            num_attention_heads: Number of attention heads.
-            joint_attention_dim: Dimension for joint attention.
-            pooled_projection_dim: Dimension of pooled projection.
-            guidance_embeds: Whether to use guidance embeddings.
-            axes_dims_rope: Dimensions for rotary position embeddings.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: Flux configuration containing model dimensions, attention
+                settings, and device/dtype information.
         """
         super().__init__()
         patch_size = config.patch_size

@@ -699,11 +699,6 @@ class Decoder(nn.Module):
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the decoder model.
 
-        Args:
-            in_channels: Number of input channels (latent channels).
-            device: Device reference for module placement.
-            dtype: Data type for module parameters.
-
         Returns:
             Tuple of TensorType specifications for decoder input.
         """
@@ -730,27 +725,8 @@ class AutoencoderKL(nn.Module):
         """Initialize VAE AutoencoderKL model.
 
         Args:
-            in_channels: Number of input image channels (default: 3 for RGB).
-            out_channels: Number of output image channels (default: 3 for RGB).
-            down_block_types: Types of downsampling blocks (encoder, currently unused).
-            up_block_types: Types of upsampling blocks for decoder.
-            block_out_channels: Tuple of channel counts for each decoder block.
-            layers_per_block: Number of ResNet layers per decoder block.
-            act_fn: Activation function name (e.g., "silu").
-            latent_channels: Number of latent space channels.
-            norm_num_groups: Number of groups for GroupNorm layers.
-            sample_size: Input image size (currently unused).
-            scaling_factor: Scaling factor for latent normalization.
-            shift_factor: Optional shift factor for latent normalization.
-            latents_mean: Optional mean values for latent normalization.
-            latents_std: Optional std values for latent normalization.
-            force_upcast: Whether to force upcast (currently unused).
-            use_quant_conv: Whether to use quantization convolution (currently unused).
-            use_post_quant_conv: Whether to use post-quantization convolution.
-            mid_block_add_attention: Whether to add attention in decoder middle block.
-            pretrained_model_name_or_path: Path to pretrained model weights.
-            device: Device reference for model placement.
-            dtype: Data type for model parameters.
+            config: Autoencoder configuration containing channel sizes, block
+                structure, normalization settings, and device/dtype information.
         """
         super().__init__()
         self.decoder = Decoder(

@@ -508,6 +508,7 @@ def _extract_max_config_data(
         config_dict: The loaded YAML configuration dictionary.
         config_class: The config class we're extracting data for.
         section_name: Optional specific section name to look for.
+        config_file_path: Path to the config file for resolving inheritance.
 
     Returns:
         Configuration data for the specific config class.

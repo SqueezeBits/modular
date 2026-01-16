@@ -60,13 +60,9 @@ class DiffusionPipeline(ABC):
         """Load a pipeline from a pretrained model.
 
         Args:
-            pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            device: Device to run the pipeline on.
-            dtype: Data type for the pipeline.
-            **kwargs: Additional arguments.
-
-        Returns:
-            The loaded pipeline.
+            pipeline_config: Pipeline configuration for model and runtime setup.
+            cached_folder: Local path to the downloaded model snapshot.
+            **kwargs: Additional pipeline-specific arguments.
         """
         self.pipeline_config = pipeline_config
         self.devices = load_devices(pipeline_config.model_config.device_specs)

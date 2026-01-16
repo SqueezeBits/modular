@@ -77,9 +77,7 @@ class T5DenseActDense(Module):
         """Construct a dense-activation-dense module.
 
         Args:
-            config: T5 configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: T5 configuration for feed-forward dimensions and dtype.
         """
         super().__init__()
         self.wi = nn.Linear(
@@ -121,9 +119,7 @@ class T5DenseGatedActDense(Module):
         """Construct a dense-gated-activation-dense module.
 
         Args:
-            config: T5 configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: T5 configuration for feed-forward dimensions and dtype.
         """
         super().__init__()
         self.wi_0 = nn.Linear(
@@ -173,9 +169,7 @@ class T5LayerFF(Module):
         """Construct a feed-forward layer.
 
         Args:
-            config: T5 configuration.
-            device: Device to place the module on.
-            dtype: Data type for the module.
+            config: T5 configuration for gating, dimensions, and dtype.
         """
         super().__init__()
         if config.is_gated_act:
@@ -222,8 +216,6 @@ class T5Attention(Module):
             config: T5 configuration.
             has_relative_attention_bias: Whether to use relative attention bias.
             layer_idx: Index of the layer.
-            device: Device to place the module on.
-            dtype: Data type for the module.
         """
         super().__init__()
         self.is_decoder = config.is_decoder
@@ -468,8 +460,6 @@ class T5LayerSelfAttention(Module):
             config: T5 configuration.
             has_relative_attention_bias: Whether to use relative attention bias.
             layer_idx: Index of the layer.
-            device: Device to place the module on.
-            dtype: Data type for the module.
         """
         super().__init__()
         self.SelfAttention = T5Attention(
@@ -539,8 +529,6 @@ class T5Block(Module):
             config: T5 configuration.
             has_relative_attention_bias: Whether to use relative attention bias.
             layer_idx: Index of the layer.
-            device: Device to place the module on.
-            dtype: Data type for the module.
         """
         super().__init__()
         layers = list()
@@ -643,8 +631,6 @@ class T5Stack(Module):
         Args:
             config: T5 configuration.
             embed_tokens: Embedding module.
-            device: Device to place the module on.
-            dtype: Data type for the module.
         """
         super().__init__()
         self.config = config
@@ -768,27 +754,8 @@ class T5EncoderModel(Module):
         """Construct a T5 encoder model.
 
         Args:
-            vocab_size: Vocabulary size.
-            d_model: Dimensionality of the model.
-            d_kv: Dimensionality of the key/value projection.
-            d_ff: Dimensionality of the feed-forward layer.
-            num_layers: Number of layers.
-            num_decoder_layers: Number of decoder layers.
-            num_heads: Number of attention heads.
-            relative_attention_num_buckets: Number of relative attention buckets.
-            relative_attention_max_distance: Maximum distance for relative attention.
-            dropout_rate: Dropout rate.
-            layer_norm_epsilon: Layer norm epsilon.
-            initializer_factor: Initializer factor.
-            feed_forward_proj: Feed-forward projection.
-            is_encoder_decoder: Whether the model is an encoder-decoder model.
-            use_cache: Whether to use cache.
-            pad_token_id: Pad token ID.
-            eos_token_id: EOS token ID.
-            classifier_dropout: Classifier dropout.
-            device: Device to place the module on.
-            dtype: Data type for the module.
-            pretrained_model_name_or_path: Path to pretrained model.
+            config: T5 configuration for vocabulary size, layer counts, and
+                device/dtype settings.
         """
         super().__init__()
         act_info = config.feed_forward_proj.split("-")

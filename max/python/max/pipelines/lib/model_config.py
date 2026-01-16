@@ -509,7 +509,6 @@ class MAXModelConfig(MAXModelConfigBase):
         are consistent.
 
         Args:
-            weight_path: The path to the weight file.
             default_encoding: The default encoding to use if no encoding is provided.
         """
 
@@ -582,6 +581,7 @@ class MAXModelConfig(MAXModelConfigBase):
         Note: We currently only support float32 to bfloat16 weight type casting.
 
         Args:
+            from_encoding: The source encoding to cast from.
             to_encoding: The desired encoding to cast to.
 
         Raises:

@@ -20,7 +20,11 @@ from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
 
 
 class DiffusionPipeline:
+    """Entrypoint for image-generation diffusion pipelines."""
     def __init__(self, pipeline_config: PipelineConfig) -> None:
+        # NOTE: Currently, this entrypoint is implemented minimally
+        # for offline image generation.
+        # It will be developed further to support serving as well.
         self.pipeline_config = pipeline_config
         _, model_factory = PIPELINE_REGISTRY.retrieve_factory(
             pipeline_config,
@@ -37,6 +41,7 @@ class DiffusionPipeline:
         guidance_scale: float = 3.5,
         num_images_per_prompt: int = 1,
     ) -> ImageGenerationOutput:
+        """Generate images from a prompt with the configured pipeline."""
         # TODO: consider all possible diffusion tasks,
         # e.g. T2I, I2I, T2V, I2V, V2V.
         inputs = ImageGenerationInputs(

@@ -21,10 +21,8 @@ from max.graph import DeviceRef, TensorValue, ops
 def apply_rotary_emb(
     x: TensorValue,
     freqs_cis: tuple[TensorValue, TensorValue],
-    # use_real: bool = True,
-    # use_real_unbind_dim: int = -1,
     sequence_dim: int = 2,
-) -> tuple[TensorValue, TensorValue]:
+) -> TensorValue:
     """Apply rotary embeddings to input tensors using the given frequency tensor.
 
     This function applies rotary embeddings to the given query or key 'x' tensors using the provided frequency
@@ -32,13 +30,14 @@ def apply_rotary_emb(
     for broadcasting compatibility. The resulting tensors contain rotary embeddings and are returned as real tensors.
 
     Args:
-        x (`Tensor`):
-            Query or key tensor to apply rotary embeddings. [B, H, S, D] xk (Tensor): Key tensor to apply
-        freqs_cis (`Tuple[Tensor]`): Precomputed frequency tensor for complex exponentials. ([S, D], [S, D],)
+        x: Query or key tensor to apply rotary embeddings. Shape depends on
+            caller; the last dimension is split into complex pairs.
+        freqs_cis: Precomputed cosine/sine frequency tensors for complex
+            exponentials. Shape ([S, D], [S, D]).
         sequence_dim: Dimension representing the sequence (1 or 2).
 
     Returns:
-        Tuple[Tensor, Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+        Tensor: Tensor with rotary embeddings applied.
     """
     cos, sin = freqs_cis  # [S, D]
     if sequence_dim == 2:
@@ -53,7 +52,6 @@ def apply_rotary_emb(
     cos, sin = cos.to(x.device), sin.to(x.device)
 
     # Used for flux, cogvideox, hunyuan-dit
-    # x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, H, S, D//2]
     half_last_dim = x.shape[-1] // 2
     chunks = ops.chunk(
         x.reshape(list(x.shape[:-1]) + [half_last_dim, 2]), chunks=2, axis=-1
