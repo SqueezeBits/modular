@@ -415,11 +415,10 @@ class FluxPipeline(DiffusionPipeline):
         # functionality comparison with the original diffusers pipeline.
         if os.environ.get("USE_TORCH_RANDN", "0") == "1":
             import torch
-            from diffusers.utils.torch_utils import randn_tensor
 
             seed = int(os.environ.get("SEED", 42))
             generator = torch.Generator(device="cuda").manual_seed(seed)
-            latents = randn_tensor(
+            latents = torch.randn(
                 shape,
                 generator=generator,
                 device="cuda",

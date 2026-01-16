@@ -11,6 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+import argparse
 import os
 from pathlib import Path
 
@@ -19,12 +20,21 @@ from max.pipelines import PipelineConfig
 
 
 def main() -> None:
-    model_path = "black-forest-labs/FLUX.1-dev"
-    use_torch_randn = True
-    if use_torch_randn:
-        seed = 42
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model-path", type=str, default="black-forest-labs/FLUX.1-dev"
+    )
+    parser.add_argument("--use-torch-randn", type=bool, default=True)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    model_path = args.model_path
+    if args.use_torch_randn:
+        # NOTE: Use torch randn for latent initialization.
+        # Currently, It's not possible to set seed for Max random generation,
+        # so, use torch randn to test different seeds.
         os.environ["USE_TORCH_RANDN"] = "1"
-        os.environ["SEED"] = str(seed)
+        os.environ["SEED"] = str(args.seed)
     pipeline_config = PipelineConfig(model_path=model_path)
     pipe = DiffusionPipeline(pipeline_config)
 
