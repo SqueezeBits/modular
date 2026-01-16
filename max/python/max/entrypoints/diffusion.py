@@ -66,7 +66,7 @@ from max.interfaces import (
 from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
 
 if TYPE_CHECKING:
-    from max.pipelines.core import ImageGenerationPipeline
+    from max.pipelines.lib.pipeline_variants.image_generation import ImageGenerationPipeline
 
 
 # ============================================================================
