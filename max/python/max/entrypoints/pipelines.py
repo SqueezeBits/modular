@@ -441,7 +441,7 @@ def diffusion_group() -> None:
 )
 @click.option(
     "--use-torch-randn/--no-use-torch-randn",
-    default=True,
+    default=False,
     show_default=True,
     help=(
         "Use torch-based random latents (set USE_TORCH_RANDN and SEED env vars)."
@@ -467,9 +467,8 @@ def diffusion_generate(
     **config_kwargs: Any,
 ) -> None:
     """Generate images using a diffusion pipeline."""
+    from max.entrypoints.cli.generate import generate_image
     from max.pipelines import PipelineConfig
-
-    from .cli.generate import generate_image
 
     if use_torch_randn:
         os.environ["USE_TORCH_RANDN"] = "1"
