@@ -43,6 +43,8 @@ from httpx import AsyncClient
 from max.interfaces import (
     AudioGenerationRequest,
     GenerationStatus,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
     LoRAOperation,
     LoRARequest,
     LoRAStatus,
@@ -61,6 +63,7 @@ from max.pipelines.lib import PipelineConfig
 from max.profiler import traced
 from max.serve.config import Settings
 from max.serve.parser import LlamaToolParser, parse_json_from_text
+from max.serve.pipelines.diffusion import ImageGeneratorPipeline
 from max.serve.pipelines.llm import (
     AudioGeneratorPipeline,
     TokenGeneratorOutput,
@@ -1427,6 +1430,102 @@ async def create_streaming_audio_speech(
         # but we don't necessarily want to expose the full error description
         # to the user. There are many different ValueErrors that can be raised.
         raise HTTPException(status_code=400, detail="Value error.") from e
+
+
+@router.post("/images/generations", response_model=None)
+async def create_image_generation(
+    request: Request,
+) -> JSONResponse:
+    """Image generation endpoint following OpenAI /v1/images/generations API.
+
+    This endpoint generates images from text prompts using diffusion models.
+    """
+    request_id = request.state.request_id
+    record_request_start()
+    stopwatch = StopWatch()
+
+    try:
+        # Parse request body
+        body = await request.body()
+        import json as json_module
+        body_dict = json_module.loads(body)
+
+        # Create ImageGenerationRequest from body
+        image_request = ImageGenerationRequest(
+            prompt=body_dict.get("prompt", ""),
+            model=body_dict.get("model"),
+            n=body_dict.get("n", 1),
+            size=body_dict.get("size", "1024x1024"),
+            quality=body_dict.get("quality", "standard"),
+            response_format=body_dict.get("response_format", "b64_json"),
+            style=body_dict.get("style"),
+            num_inference_steps=body_dict.get("num_inference_steps", 50),
+            guidance_scale=body_dict.get("guidance_scale", 3.5),
+            seed=body_dict.get("seed"),
+        )
+
+        # Get the pipeline
+        pipeline = request.app.state.pipeline
+        if not isinstance(pipeline, ImageGeneratorPipeline):
+            raise HTTPException(
+                status_code=400,
+                detail="This server is not configured for image generation. "
+                "Please start with --task image_generation.",
+            )
+
+        # Generate images using the pipeline's generator
+        response = pipeline.generator.create(image_request)
+
+        record_request_end(
+            status_code=200,
+            request_path="/v1/images/generations",
+            elapsed_ms=stopwatch.elapsed_ms,
+        )
+
+        return JSONResponse(content=response.to_dict())
+
+    except JSONDecodeError as e:
+        logger.exception("JSONDecodeError in request %s", request_id)
+        record_request_end(
+            status_code=400,
+            request_path="/v1/images/generations",
+            elapsed_ms=stopwatch.elapsed_ms,
+        )
+        raise HTTPException(status_code=400, detail="Missing JSON.") from e
+    except (TypeError, ValidationError) as e:
+        logger.exception("TypeError in request %s", request_id)
+        record_request_end(
+            status_code=400,
+            request_path="/v1/images/generations",
+            elapsed_ms=stopwatch.elapsed_ms,
+        )
+        raise HTTPException(status_code=400, detail="Invalid JSON.") from e
+    except InputError as e:
+        logger.warning(
+            "Input validation error in request %s: %s", request_id, str(e)
+        )
+        record_request_end(
+            status_code=400,
+            request_path="/v1/images/generations",
+            elapsed_ms=stopwatch.elapsed_ms,
+        )
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except ValueError as e:
+        logger.exception("ValueError in request %s", request_id)
+        record_request_end(
+            status_code=400,
+            request_path="/v1/images/generations",
+            elapsed_ms=stopwatch.elapsed_ms,
+        )
+        raise HTTPException(status_code=400, detail="Value error.") from e
+    except Exception as e:
+        logger.exception("Error in image generation request %s", request_id)
+        record_request_end(
+            status_code=500,
+            request_path="/v1/images/generations",
+            elapsed_ms=stopwatch.elapsed_ms,
+        )
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/load_lora_adapter", response_model=None)

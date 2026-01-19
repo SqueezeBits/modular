@@ -16,6 +16,7 @@ from typing import cast
 
 from max.interfaces import (
     EmbeddingsContext,
+    ImageGenerationContext,
     MAXPullQueue,
     Pipeline,
     PipelineInputsType,
@@ -45,6 +46,10 @@ from .base import CancelRequest, PrefillRequest, PrefillResponse
 from .config import TokenGenerationSchedulerConfig
 from .decode_scheduler import load_decode_scheduler
 from .embeddings_scheduler import EmbeddingsScheduler, EmbeddingsSchedulerConfig
+from .image_generation_scheduler import (
+    ImageGenerationScheduler,
+    ImageGenerationSchedulerConfig,
+)
 from .prefill_scheduler import load_prefill_scheduler
 from .text_generation_scheduler import load_text_generation_scheduler
 
@@ -54,6 +59,8 @@ __all__ = [
     "CancelRequest",
     "EmbeddingsScheduler",
     "EmbeddingsSchedulerConfig",
+    "ImageGenerationScheduler",
+    "ImageGenerationSchedulerConfig",
     "PrefillRequest",
     "PrefillResponse",
     "TokenGenerationSchedulerConfig",
@@ -122,6 +129,28 @@ def load_scheduler(
             response_queue=response_queue,
             cancel_queue=cancel_queue,
             paged_manager=paged_manager,
+            offload_queue_draining=pipeline_config.experimental_background_queue,
+        )
+    elif pipeline.__class__.__name__ == "ImageGenerationPipeline":
+        from max.pipelines.lib.pipeline_variants.image_generation import (
+            ImageGenerationPipeline,
+        )
+
+        image_scheduler_config = ImageGenerationSchedulerConfig(
+            max_batch_size=pipeline_config.max_batch_size
+            if pipeline_config.max_batch_size is not None
+            else 1
+        )
+        image_pipeline = cast(ImageGenerationPipeline, pipeline)
+        return ImageGenerationScheduler(
+            scheduler_config=image_scheduler_config,
+            pipeline=image_pipeline,
+            request_queue=cast(
+                MAXPullQueue[ImageGenerationContext],
+                request_queue,
+            ),
+            response_queue=response_queue,
+            cancel_queue=cancel_queue,
             offload_queue_draining=pipeline_config.experimental_background_queue,
         )
     elif pipeline_config.pipeline_role == PipelineRole.PrefillAndDecode:

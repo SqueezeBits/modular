@@ -22,7 +22,7 @@ from max.driver import Tensor
 from max.dtype import DType
 from max.experimental import Tensor as Tensor_v3
 from max.experimental import functional as F
-from max.experimental import random
+from max.experimental.random import normal
 from max.graph import DeviceRef
 from max.pipelines.lib.diffusion_schedulers import (
     FlowMatchEulerDiscreteScheduler,
@@ -34,6 +34,7 @@ from max.pipelines.lib.image_processor import (
 from max.pipelines.lib.interfaces.diffusion_pipeline import (
     DiffusionPipeline,
 )
+from max.experimental.realization_context import set_seed
 from tqdm import tqdm
 from transformers import (
     CLIPTokenizer,
@@ -80,13 +81,9 @@ def retrieve_timesteps(
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
-        raise ValueError(
-            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
-        )
+        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -96,9 +93,7 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = int(timesteps.shape[0])
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
+        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -155,17 +150,9 @@ class FluxPipeline(DiffusionPipeline):
     }
 
     def init_remaining_components(self) -> None:
-        image_processor_class = self.components.get(
-            "image_processor", VaeImageProcessor
-        )
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1)
-            if getattr(self, "vae", None)
-            else 8
-        )
-        image_processor = image_processor_class(
-            vae_scale_factor=self.vae_scale_factor * 2
-        )
+        image_processor_class = self.components.get("image_processor", VaeImageProcessor)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        image_processor = image_processor_class(vae_scale_factor=self.vae_scale_factor * 2)
         self.image_processor = image_processor
 
     def encode_prompt(
@@ -204,13 +191,9 @@ class FluxPipeline(DiffusionPipeline):
         if lora_scale is not None and isinstance(self, FluxPipeline):
             self._lora_scale = lora_scale
 
-            if self.text_encoder is not None and hasattr(
-                self.text_encoder, "set_lora_scale"
-            ):
+            if self.text_encoder is not None and hasattr(self.text_encoder, "set_lora_scale"):
                 self.text_encoder.set_lora_scale(lora_scale)
-            if self.text_encoder_2 is not None and hasattr(
-                self.text_encoder_2, "set_lora_scale"
-            ):
+            if self.text_encoder_2 is not None and hasattr(self.text_encoder_2, "set_lora_scale"):
                 self.text_encoder_2.set_lora_scale(lora_scale)
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -219,16 +202,12 @@ class FluxPipeline(DiffusionPipeline):
             text_inputs = self.tokenizer(
                 prompt,
                 padding="max_length",
-                max_length=min(
-                    max_sequence_length, self.tokenizer.model_max_length
-                ),
+                max_length=min(max_sequence_length, self.tokenizer.model_max_length),
                 truncation=True,
                 return_length=False,
                 return_overflowing_tokens=False,
             )
-            text_input_ids = Tensor_v3.constant(
-                text_inputs.input_ids, device=device, dtype=DType.int64
-            )
+            text_input_ids = Tensor_v3.constant(text_inputs.input_ids, device=device, dtype=DType.int64)
 
             text_encoder_outputs = self.text_encoder(text_input_ids)
             prompt_embeds = text_encoder_outputs[0]
@@ -246,9 +225,7 @@ class FluxPipeline(DiffusionPipeline):
                 return_length=False,
                 return_overflowing_tokens=False,
             )
-            text_input_ids_2 = Tensor_v3.constant(
-                text_inputs_2.input_ids, device=device, dtype=DType.int64
-            )
+            text_input_ids_2 = Tensor_v3.constant(text_inputs_2.input_ids, device=device, dtype=DType.int64)
 
             prompt_embeds_2 = self.text_encoder_2(text_input_ids_2)[0]
         else:
@@ -264,24 +241,14 @@ class FluxPipeline(DiffusionPipeline):
         )
 
         bs_embed, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = Tensor_v3.from_dlpack(
-            prompt_embeds
-        )  # V2 Tensor to V3 Tensor
-        pooled_prompt_embeds = Tensor_v3.from_dlpack(
-            pooled_prompt_embeds
-        )  # V2 Tensor to V3 Tensor
+        prompt_embeds = Tensor_v3.from_dlpack(prompt_embeds)  # V2 Tensor to V3 Tensor
+        pooled_prompt_embeds = Tensor_v3.from_dlpack(pooled_prompt_embeds)  # V2 Tensor to V3 Tensor
 
         prompt_embeds = F.tile(prompt_embeds, (1, num_images_per_prompt, 1))
-        prompt_embeds = prompt_embeds.reshape(
-            (bs_embed * num_images_per_prompt, seq_len, -1)
-        )
+        prompt_embeds = prompt_embeds.reshape((bs_embed * num_images_per_prompt, seq_len, -1))
 
-        pooled_prompt_embeds = F.tile(
-            pooled_prompt_embeds, (1, num_images_per_prompt)
-        )
-        pooled_prompt_embeds = pooled_prompt_embeds.reshape(
-            (bs_embed * num_images_per_prompt, -1)
-        )
+        pooled_prompt_embeds = F.tile(pooled_prompt_embeds, (1, num_images_per_prompt))
+        pooled_prompt_embeds = pooled_prompt_embeds.reshape((bs_embed * num_images_per_prompt, -1))
 
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
@@ -315,9 +282,7 @@ class FluxPipeline(DiffusionPipeline):
                 latent_image_id_channels,
             ),
         )
-        latent_image_ids = (
-            Tensor_v3.from_dlpack(latent_image_ids).to(device).cast(dtype)
-        )
+        latent_image_ids = Tensor_v3.from_dlpack(latent_image_ids).to(device).cast(dtype)
 
         return latent_image_ids
 
@@ -366,9 +331,7 @@ class FluxPipeline(DiffusionPipeline):
         )
         latents = F.permute(latents, (0, 3, 1, 4, 2, 5))
 
-        latents = F.reshape(
-            latents, (batch_size.dim, channels.dim // (2 * 2), height, width)
-        )
+        latents = F.reshape(latents, (batch_size.dim, channels.dim // (2 * 2), height, width))
 
         return latents
 
@@ -404,19 +367,13 @@ class FluxPipeline(DiffusionPipeline):
         shape = (batch_size, num_channels_latents, height, width)
 
         if latents is not None:
-            latent_image_ids = self._prepare_latent_image_ids(
-                batch_size, height // 2, width // 2, device, dtype
-            )
+            latent_image_ids = self._prepare_latent_image_ids(batch_size, height // 2, width // 2, device, dtype)
             return latents.to(device).cast(dtype), latent_image_ids
 
-        latents = random.normal(shape, device=device, dtype=dtype)
-        latents = self._pack_latents(
-            latents, batch_size, num_channels_latents, height, width
-        )
+        latents = normal(shape, device=device, dtype=dtype)
+        latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
 
-        latent_image_ids = self._prepare_latent_image_ids(
-            batch_size, height // 2, width // 2, device, dtype
-        )
+        latent_image_ids = self._prepare_latent_image_ids(batch_size, height // 2, width // 2, device, dtype)
 
         return latents, latent_image_ids
 
@@ -560,13 +517,10 @@ class FluxPipeline(DiffusionPipeline):
         device = self._execution_device()
 
         lora_scale = (
-            self._joint_attention_kwargs.get("scale", None)
-            if self._joint_attention_kwargs is not None
-            else None
+            self._joint_attention_kwargs.get("scale", None) if self._joint_attention_kwargs is not None else None
         )
         has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None
-            and negative_pooled_prompt_embeds is not None
+            negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
         )
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         (
@@ -612,15 +566,8 @@ class FluxPipeline(DiffusionPipeline):
         )
 
         # 5. Prepare timesteps
-        sigmas = (
-            np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-            if sigmas is None
-            else sigmas
-        )
-        if (
-            hasattr(self.scheduler, "use_flow_sigmas")
-            and self.scheduler.use_flow_sigmas
-        ):
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if hasattr(self.scheduler, "use_flow_sigmas") and self.scheduler.use_flow_sigmas:
             sigmas = None
         image_seq_len = latents.shape[1].dim
         mu = calculate_shift(
@@ -661,9 +608,7 @@ class FluxPipeline(DiffusionPipeline):
             or negative_ip_adapter_image is not None
             or negative_ip_adapter_image_embeds is not None
         ):
-            raise NotImplementedError(
-                "IP adapter is not supported for Max yet."
-            )
+            raise NotImplementedError("IP adapter is not supported for Max yet.")
 
         if self._joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
@@ -683,9 +628,7 @@ class FluxPipeline(DiffusionPipeline):
             t = timesteps[i]
             self._current_timestep = t
             if image_embeds is not None:
-                self._joint_attention_kwargs["ip_adapter_image_embeds"] = (
-                    image_embeds
-                )
+                self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
 
             # NOTE: Convert timesteps to a Max Tensor before denoising loop,
             # as in the original implementation, results in a significant slow down.
@@ -707,9 +650,7 @@ class FluxPipeline(DiffusionPipeline):
 
             if do_true_cfg:
                 if negative_image_embeds is not None:
-                    self._joint_attention_kwargs["ip_adapter_image_embeds"] = (
-                        negative_image_embeds
-                    )
+                    self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
 
                 neg_noise_pred = self.transformer(
                     latents,
@@ -723,15 +664,11 @@ class FluxPipeline(DiffusionPipeline):
                 # TODO: negative prompt path is very slow, need to optimize.
                 noise_pred = Tensor_v3.from_dlpack(noise_pred)
                 neg_noise_pred = Tensor_v3.from_dlpack(neg_noise_pred)
-                noise_pred = neg_noise_pred + true_cfg_scale * (
-                    noise_pred - neg_noise_pred
-                )
+                noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
             # compute the previous noisy sample x_t -> x_t-1
             latents_dtype = latents.dtype
-            latents = self.scheduler.step(
-                noise_pred, t, latents, return_dict=False
-            )[0]
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
@@ -740,14 +677,10 @@ class FluxPipeline(DiffusionPipeline):
                 callback_kwargs = {}
                 for k in callback_on_step_end_tensor_inputs:
                     callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(
-                    self, i, t, callback_kwargs
-                )
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
                 latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop(
-                    "prompt_embeds", prompt_embeds
-                )
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
         self._current_timestep = None
 
@@ -755,18 +688,12 @@ class FluxPipeline(DiffusionPipeline):
             image = latents
         else:
             latents = Tensor_v3.from_dlpack(latents)  # V2 Tensor to V3 Tensor
-            latents = self._unpack_latents(
-                latents, height, width, self.vae_scale_factor
-            )
-            latents = (
-                latents / self.vae.config.scaling_factor
-            ) + self.vae.config.shift_factor
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents)[0]
 
             image = Tensor_v3.from_dlpack(image)  # V2 Tensor to V3 Tensor
-            image = self.image_processor.postprocess(
-                image, output_type=output_type
-            )
+            image = self.image_processor.postprocess(image, output_type=output_type)
 
         if not return_dict:
             return (image,)

@@ -17,11 +17,12 @@ This example demonstrates how to use the ImageGenerationRequest and
 ImageGenerationResponse classes for OpenAI-compatible image generation.
 
 Usage:
-    python openai_api_example.py
+    python openai_api_example.py --seed 42 --prompt "A futuristic city skyline at sunset with flying cars" --model-path "black-forest-labs/FLUX.1-dev"
 """
 
 import base64
 import os
+import argparse
 from pathlib import Path
 
 from max.entrypoints.diffusion import ImageGenerator
@@ -31,16 +32,21 @@ from max.pipelines import PipelineConfig
 
 def main() -> None:
     # Configure random seed for reproducibility
-    seed = 42
-    os.environ["USE_TORCH_RANDN"] = "1"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--prompt", type=str, default="A futuristic city skyline at sunset with flying cars")
+    parser.add_argument("--model-path", type=str, default="black-forest-labs/FLUX.1-dev")
+    args = parser.parse_args()
+    seed = args.seed
     os.environ["SEED"] = str(seed)
+    model_path = args.model_path
 
     # Initialize the generator
-    model_path = "black-forest-labs/FLUX.1-schnell"
     pipeline_config = PipelineConfig(model_path=model_path)
     generator = ImageGenerator(pipeline_config)
 
     print(f"Model loaded: {generator.model_name}")
+    print(f"Seed: {os.getenv('SEED', 'not set')}")
 
     # Create an OpenAI-compatible request
     request = ImageGenerationRequest(
@@ -51,7 +57,7 @@ def main() -> None:
         response_format="b64_json",
         output_format="png",
         # Diffusion-specific parameters
-        num_inference_steps=30,
+        num_inference_steps=28,
         guidance_scale=3.5,
         seed=seed,
     )
@@ -82,46 +88,5 @@ def main() -> None:
             print(f"Revised prompt: {image_data.revised_prompt}")
 
 
-def batch_generation_example() -> None:
-    """Example: Generate multiple images with different prompts."""
-    os.environ["USE_TORCH_RANDN"] = "1"
-    os.environ["SEED"] = "42"
-
-    model_path = "black-forest-labs/FLUX.1-schnell"
-    pipeline_config = PipelineConfig(model_path=model_path)
-    generator = ImageGenerator(pipeline_config)
-
-    prompts = [
-        "A serene mountain landscape with a lake",
-        "A cute robot playing with a kitten",
-        "An abstract painting of emotions",
-    ]
-
-    output_dir = Path("outputs/batch")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for idx, prompt in enumerate(prompts):
-        request = ImageGenerationRequest(
-            prompt=prompt,
-            size="512x512",  # Smaller for faster generation
-            n=1,
-            response_format="b64_json",
-            num_inference_steps=20,
-            guidance_scale=3.5,
-        )
-
-        print(f"\n[{idx + 1}/{len(prompts)}] Generating: {prompt[:50]}...")
-        response = generator.create(request)
-
-        if response.data and response.data[0].b64_json:
-            image_bytes = base64.b64decode(response.data[0].b64_json)
-            output_path = output_dir / f"batch_{idx}.png"
-            with open(output_path, "wb") as f:
-                f.write(image_bytes)
-            print(f"Saved to: {output_path}")
-
-
 if __name__ == "__main__":
     main()
-    # Uncomment to run batch generation:
-    # batch_generation_example()

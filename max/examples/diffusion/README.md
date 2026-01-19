@@ -7,7 +7,7 @@ This directory contains examples for using the MAX diffusion pipeline for image 
 The MAX diffusion pipeline supports:
 - **Offline generation**: Direct Python API for generating images
 - **OpenAI-compatible API**: Server with `/v1/images/generations` endpoint
-- **Multiple models**: FLUX.1-dev, FLUX.1-schnell, and other diffusion models
+- **Multiple models**: FLUX.1-dev, and other diffusion models
 
 ## Examples
 
@@ -23,7 +23,7 @@ python offline_generation.py
 from max.entrypoints.diffusion import ImageGenerator
 from max.pipelines import PipelineConfig
 
-config = PipelineConfig(model_path="black-forest-labs/FLUX.1-schnell")
+config = PipelineConfig(model_path="black-forest-labs/FLUX.1-dev")
 generator = ImageGenerator(config)
 
 # Generate returns a list of PIL Images
@@ -50,7 +50,7 @@ from max.entrypoints.diffusion import ImageGenerator
 from max.interfaces import ImageGenerationRequest
 from max.pipelines import PipelineConfig
 
-config = PipelineConfig(model_path="black-forest-labs/FLUX.1-schnell")
+config = PipelineConfig(model_path="black-forest-labs/FLUX.1-dev")
 generator = ImageGenerator(config)
 
 # Use OpenAI-compatible request format
@@ -74,7 +74,7 @@ Connecting to the OpenAI-compatible server:
 
 ```bash
 # Start the server
-max images serve --model black-forest-labs/FLUX.1-schnell --port 8000
+max images serve --model black-forest-labs/FLUX.1-dev --port 8000
 
 # Run the client
 python client_example.py
@@ -87,7 +87,7 @@ python client_example.py
 ```bash
 # Basic generation
 max images generate \
-    --model black-forest-labs/FLUX.1-schnell \
+    --model black-forest-labs/FLUX.1-dev \
     --prompt "A beautiful sunset over mountains" \
     --size 1024x1024 \
     --output output.png
@@ -108,7 +108,7 @@ max images generate \
 ```bash
 # Start OpenAI-compatible API server
 max images serve \
-    --model black-forest-labs/FLUX.1-schnell \
+    --model black-forest-labs/FLUX.1-dev \
     --port 8000
 ```
 
@@ -192,7 +192,7 @@ client = OpenAI(
 )
 
 response = client.images.generate(
-    model="black-forest-labs/FLUX.1-schnell",
+    model="black-forest-labs/FLUX.1-dev",
     prompt="A majestic dragon flying over a castle",
     size="1024x1024",
     n=1,
@@ -208,8 +208,7 @@ with open("dragon.png", "wb") as f:
 
 ## Supported Models
 
-- `black-forest-labs/FLUX.1-dev` - High quality, slower
-- `black-forest-labs/FLUX.1-schnell` - Fast generation
+- `black-forest-labs/FLUX.1-dev` - Flux 1 Dev
 
 ## Environment Variables
 

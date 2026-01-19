@@ -19,7 +19,7 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import click
 from click import shell_completion
@@ -397,6 +397,12 @@ def images_group() -> None:
 
 @images_group.command(name="generate", cls=WithLazyPipelineOptions)
 @click.option(
+    "--model",
+    type=str,
+    required=True,
+    help="Specify the repository ID of a Hugging Face model to use for image generation (e.g., 'black-forest-labs/FLUX.1-dev').",
+)
+@click.option(
     "--prompt",
     type=str,
     required=True,
@@ -451,14 +457,6 @@ def images_group() -> None:
     help="Output image path (numbered if multiple images are generated).",
 )
 @click.option(
-    "--use-torch-randn/--no-use-torch-randn",
-    default=False,
-    show_default=True,
-    help=(
-        "Use torch-based random latents (set USE_TORCH_RANDN and SEED env vars)."
-    ),
-)
-@click.option(
     "--seed",
     type=int,
     default=None,
@@ -479,15 +477,15 @@ def images_group() -> None:
     help="Classifier-free guidance scale (diffusion model parameter).",
 )
 def images_generate(
+    model: str,
     prompt: str,
     n: int,
     size: str,
     quality: str,
-    response_format: str,
+    response_format: Literal["url", "b64_json"],
     output_format: str,
     style: str | None,
     output: Path,
-    use_torch_randn: bool,
     seed: int | None,
     num_inference_steps: int,
     guidance_scale: float,
@@ -498,20 +496,25 @@ def images_generate(
     This command follows the OpenAI /v1/images/generations API schema.
 
     Example:
-        max images generate --model black-forest-labs/FLUX.1-schnell \\
+        max images generate --model black-forest-labs/FLUX.1-dev \\
             --prompt "A beautiful sunset over mountains" \\
             --size 1024x1024 --n 1 --output sunset.png
     """
     from max.entrypoints.diffusion import ImageGenerator
     from max.experimental.realization_context import set_seed
     from max.interfaces import ImageGenerationRequest
-    from max.pipelines import PipelineConfig
+    from max.pipelines.lib.config import ImageGenerationConfig
 
     # Set random seed if provided
     set_seed(seed)
 
-    # Create pipeline config and generator
-    pipeline_config = PipelineConfig(**config_kwargs)
+    """
+    TODO:
+    - This configuration is dummy for now. Just for logging purpose.
+    - Modifications are required to enable the use of pipeline config.
+    """
+    config_kwargs["model"] = model
+    pipeline_config = ImageGenerationConfig(**config_kwargs)
     pipeline_config.log_basic_config()
 
     try:
@@ -582,7 +585,7 @@ def images_serve(
       - GET  /health                 (health check)
 
     Example:
-        max images serve --model black-forest-labs/FLUX.1-schnell --port 8000
+        max images serve --model black-forest-labs/FLUX.1-dev --port 8000
 
     Then use curl to generate images:
         curl http://localhost:8000/v1/images/generations \\

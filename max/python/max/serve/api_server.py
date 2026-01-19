@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 from max.interfaces import PipelinesFactory, PipelineTask, PipelineTokenizer
 from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
 from max.serve.config import APIType, MetricRecordingMethod, Settings
+from max.serve.pipelines.diffusion import ImageGeneratorPipeline
 from max.serve.pipelines.llm import (
     AudioGeneratorPipeline,
     TokenGeneratorPipeline,
@@ -106,35 +107,40 @@ async def lifespan(
         )
         METRICS.configure(client=metric_client)
 
-        # start model worker
-        scheduler_zmq_configs = SchedulerZmqConfigs(
-            serving_settings.pipeline_task,
-            context_type=PIPELINE_REGISTRY.retrieve_context_type(
-                serving_settings.pipeline_config
-            ),
-        )
-        worker_monitor = await exit_stack.enter_async_context(
-            start_model_worker(
-                serving_settings.model_factory,
-                serving_settings.pipeline_config,
-                settings,
-                metric_client,
-                scheduler_zmq_configs=scheduler_zmq_configs,
+        # Image generation uses a direct pipeline without model worker
+        if serving_settings.pipeline_task == PipelineTask.IMAGE_GENERATION:
+            scheduler_zmq_configs = None
+            lora_queue = None
+        else:
+            # start model worker
+            scheduler_zmq_configs = SchedulerZmqConfigs(
+                serving_settings.pipeline_task,
+                context_type=PIPELINE_REGISTRY.retrieve_context_type(
+                    serving_settings.pipeline_config
+                ),
             )
-        )
+            worker_monitor = await exit_stack.enter_async_context(
+                start_model_worker(
+                    serving_settings.model_factory,
+                    serving_settings.pipeline_config,
+                    settings,
+                    metric_client,
+                    scheduler_zmq_configs=scheduler_zmq_configs,
+                )
+            )
 
-        lora_queue: LoRAQueue | None = (
-            LoRAQueue(
-                serving_settings.pipeline_config.zmq_endpoint_base,
-                serving_settings.pipeline_config.lora_config.lora_paths,
+            lora_queue = (
+                LoRAQueue(
+                    serving_settings.pipeline_config.zmq_endpoint_base,
+                    serving_settings.pipeline_config.lora_config.lora_paths,
+                )
+                if serving_settings.pipeline_config.lora_config
+                else None
             )
-            if serving_settings.pipeline_config.lora_config
-            else None
-        )
 
         METRICS.pipeline_load(serving_settings.pipeline_config.model.model_name)
 
-        pipeline: TokenGeneratorPipeline | AudioGeneratorPipeline
+        pipeline: TokenGeneratorPipeline | AudioGeneratorPipeline | ImageGeneratorPipeline
         if serving_settings.pipeline_task in (
             PipelineTask.TEXT_GENERATION,
             PipelineTask.EMBEDDINGS_GENERATION,
@@ -151,6 +157,12 @@ async def lifespan(
                 tokenizer=serving_settings.tokenizer,
                 lora_queue=lora_queue,
                 scheduler_zmq_configs=scheduler_zmq_configs,
+            )
+        elif serving_settings.pipeline_task == PipelineTask.IMAGE_GENERATION:
+            # Image generation uses a simpler pipeline without scheduler
+            pipeline = ImageGeneratorPipeline(
+                model_name=serving_settings.pipeline_config.model.model_name,
+                pipeline_config=serving_settings.pipeline_config,
             )
         else:
             raise ValueError(

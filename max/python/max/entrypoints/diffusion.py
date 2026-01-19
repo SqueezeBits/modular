@@ -66,12 +66,9 @@ from max.interfaces import (
 from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
 
 if TYPE_CHECKING:
-    from max.pipelines.lib.pipeline_variants.image_generation import ImageGenerationPipeline
-
-
-# ============================================================================
-# Internal Request/Response Types
-# ============================================================================
+    from max.pipelines.lib.pipeline_variants.image_generation import (
+        ImageGenerationPipeline,
+    )
 
 
 @dataclass
@@ -101,11 +98,6 @@ class _ThreadControl:
 
     ready: Event = field(default_factory=Event)
     cancel: Event = field(default_factory=Event)
-
-
-# ============================================================================
-# Main ImageGenerator Class
-# ============================================================================
 
 
 class ImageGenerator:
@@ -139,7 +131,7 @@ class ImageGenerator:
             pipeline_config: Configuration specifying the model and parameters.
         """
         self.pipeline_config = pipeline_config
-        self.model_name = pipeline_config.model_config.model_path
+        self.model_name = pipeline_config.model.model_path
 
         # Initialize thread control and queues
         self._thread_control = _ThreadControl()
@@ -167,10 +159,6 @@ class ImageGenerator:
         self._thread_control.cancel.set()
         if self._worker_thread.is_alive():
             self._worker_thread.join(timeout=5.0)
-
-    # ========================================================================
-    # Public API: Direct Generation
-    # ========================================================================
 
     def generate(
         self,
@@ -229,10 +217,6 @@ class ImageGenerator:
         # Submit request and wait for response
         return self._submit_and_wait(request)
 
-    # ========================================================================
-    # Public API: OpenAI-Compatible
-    # ========================================================================
-
     def create(
         self,
         request: ImageGenerationRequest,
@@ -280,10 +264,6 @@ class ImageGenerator:
             prompt=request.prompt,
         )
 
-    # ========================================================================
-    # Internal Methods
-    # ========================================================================
-
     def _submit_and_wait(self, request: _ImageRequest) -> list[Image]:
         """Submit a request to the queue and wait for response."""
         response_queue: queue.Queue[_ImageResponse] = queue.Queue()
@@ -295,10 +275,6 @@ class ImageGenerator:
             return response.images
         finally:
             self._pending_requests.pop(request.id, None)
-
-    # ========================================================================
-    # Class Methods
-    # ========================================================================
 
     @classmethod
     def from_model(cls, model: str, **kwargs) -> ImageGenerator:
@@ -322,16 +298,7 @@ class ImageGenerator:
         return cls(config)
 
 
-# ============================================================================
-# Legacy Alias (for backward compatibility)
-# ============================================================================
-
 DiffusionPipeline = ImageGenerator
-
-
-# ============================================================================
-# Background Worker
-# ============================================================================
 
 
 def _run_worker(

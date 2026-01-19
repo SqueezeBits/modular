@@ -18,7 +18,7 @@ image generation server using various client methods.
 
 Prerequisites:
     1. Start the server:
-       max images serve --model black-forest-labs/FLUX.1-schnell --port 8000
+       max images serve --model black-forest-labs/FLUX.1-dev --port 8000
 
     2. Run this client:
        python client_example.py
@@ -30,12 +30,20 @@ Dependencies:
 import base64
 from pathlib import Path
 
+from argparse import ArgumentParser
+
+parser = ArgumentParser()
+parser.add_argument("--port", type=int, default=8000)
+args = parser.parse_args()
+
+PORT = args.port
+
 
 def example_with_requests() -> None:
     """Example using the requests library."""
     import requests
 
-    base_url = "http://localhost:8000"
+    base_url = f"http://localhost:{PORT}"
 
     # Check server health
     response = requests.get(f"{base_url}/health")
@@ -96,7 +104,7 @@ def example_with_openai_client() -> None:
 
     # Point to local server
     client = OpenAI(
-        base_url="http://localhost:8000/v1",
+        base_url=f"http://localhost:{PORT}/v1",
         api_key="not-needed",  # API key not required for local server
     )
 
@@ -110,7 +118,7 @@ def example_with_openai_client() -> None:
     # Note: The OpenAI client's images.generate() may not support
     # all diffusion-specific parameters. Use raw HTTP for full control.
     response = client.images.generate(
-        model="black-forest-labs/FLUX.1-schnell",
+        model="black-forest-labs/FLUX.1-dev",
         prompt="A majestic dragon flying over a medieval castle",
         size="1024x1024",
         n=1,
@@ -144,7 +152,7 @@ def example_with_httpx_async() -> None:
 
     async def generate_image():
         async with httpx.AsyncClient(timeout=300.0) as client:
-            base_url = "http://localhost:8000"
+            base_url = f"http://localhost:{PORT}"
 
             # Generate image
             request_data = {
@@ -188,13 +196,14 @@ def example_curl_commands() -> None:
     print("=" * 60)
 
     print("\n1. Check server health:")
-    print("   curl http://localhost:8000/health")
+    print(f"   curl http://localhost:{PORT}/health")
 
     print("\n2. List available models:")
-    print("   curl http://localhost:8000/v1/models")
+    print(f"   curl http://localhost:{PORT}/v1/models")
 
     print("\n3. Generate an image:")
-    print("""   curl http://localhost:8000/v1/images/generations \\
+    print(
+        f"""   curl http://localhost:{PORT}/v1/images/generations \\
      -H "Content-Type: application/json" \\
      -d '{
        "prompt": "A beautiful sunset over mountains",
@@ -203,13 +212,16 @@ def example_curl_commands() -> None:
        "response_format": "b64_json",
        "num_inference_steps": 30,
        "guidance_scale": 3.5
-     }'""")
+     }'"""
+    )
 
     print("\n4. Generate and save image (with jq):")
-    print("""   curl -s http://localhost:8000/v1/images/generations \\
+    print(
+        f"""   curl -s http://localhost:{PORT}/v1/images/generations \\
      -H "Content-Type: application/json" \\
      -d '{"prompt": "A cat", "size": "512x512"}' \\
-     | jq -r '.data[0].b64_json' | base64 -d > output.png""")
+     | jq -r '.data[0].b64_json' | base64 -d > output.png"""
+    )
 
 
 if __name__ == "__main__":
@@ -217,24 +229,24 @@ if __name__ == "__main__":
     print("Diffusion API Client Examples")
     print("=" * 60)
     print("\nMake sure the server is running:")
-    print("  max images serve --model black-forest-labs/FLUX.1-schnell --port 8000")
+    print(f"  max images serve --model black-forest-labs/FLUX.1-dev --port {PORT}")
     print()
 
     # Print curl examples first
-    example_curl_commands()
+    # example_curl_commands()
 
     # Uncomment to run the examples:
-    # print("\n" + "=" * 60)
-    # print("Running requests example...")
-    # print("=" * 60)
-    # example_with_requests()
+    print("\n" + "=" * 60)
+    print("Running requests example...")
+    print("=" * 60)
+    example_with_requests()
 
-    # print("\n" + "=" * 60)
-    # print("Running OpenAI client example...")
-    # print("=" * 60)
-    # example_with_openai_client()
+    print("\n" + "=" * 60)
+    print("Running OpenAI client example...")
+    print("=" * 60)
+    example_with_openai_client()
 
-    # print("\n" + "=" * 60)
-    # print("Running httpx async example...")
-    # print("=" * 60)
-    # example_with_httpx_async()
+    print("\n" + "=" * 60)
+    print("Running httpx async example...")
+    print("=" * 60)
+    example_with_httpx_async()

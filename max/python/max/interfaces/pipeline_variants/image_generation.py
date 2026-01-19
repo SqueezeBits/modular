@@ -23,10 +23,62 @@ import base64
 import io
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
 
+from max.interfaces.context import BaseContext
 from max.interfaces.pipeline import PipelineInputs
+from max.interfaces.request import RequestID
 from PIL.Image import Image
+
+
+@runtime_checkable
+class ImageGenerationContext(BaseContext, Protocol):
+    """Protocol defining the interface for image generation contexts.
+
+    An ``ImageGenerationContext`` represents model inputs for image generation
+    pipelines, managing the state and parameters needed for generating images
+    from text prompts using diffusion models.
+    """
+
+    @property
+    def request_id(self) -> RequestID:
+        """Unique identifier for this request."""
+        ...
+
+    @property
+    def prompt(self) -> str:
+        """The text prompt for image generation."""
+        ...
+
+    @property
+    def height(self) -> int:
+        """The height of the generated image in pixels."""
+        ...
+
+    @property
+    def width(self) -> int:
+        """The width of the generated image in pixels."""
+        ...
+
+    @property
+    def num_inference_steps(self) -> int:
+        """Number of denoising steps."""
+        ...
+
+    @property
+    def guidance_scale(self) -> float:
+        """Classifier-free guidance scale."""
+        ...
+
+    @property
+    def num_images_per_prompt(self) -> int:
+        """Number of images to generate per prompt."""
+        ...
+
+
+ImageGenerationContextType = TypeVar(
+    "ImageGenerationContextType", bound=ImageGenerationContext
+)
 
 
 # Default image generation parameters
@@ -59,6 +111,15 @@ class ImageGenerationOutput:
 
     images: list[Image]
     """List of generated images."""
+
+    @property
+    def is_done(self) -> bool:
+        """Indicates whether image generation is complete.
+
+        Returns:
+            bool: Always True, as image generation is a single-step operation.
+        """
+        return True
 
 
 @dataclass

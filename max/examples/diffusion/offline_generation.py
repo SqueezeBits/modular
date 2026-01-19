@@ -21,9 +21,7 @@ from max.pipelines import PipelineConfig
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model-path", type=str, default="black-forest-labs/FLUX.1-dev"
-    )
+    parser.add_argument("--model-path", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -34,13 +32,14 @@ def main() -> None:
 
     prompt = "A cat holding a sign that says hello world"
     print(f"Prompt: {prompt}")
+    print(f"Seed: {args.seed}")
 
     # Generate images using the new API
     images = pipe.generate(
         prompt,
         height=1024,
         width=1024,
-        num_inference_steps=50,
+        num_inference_steps=28,
         guidance_scale=3.5,
     )
 
