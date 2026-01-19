@@ -10,6 +10,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-
-from .image_generation import ImageGenerationPipeline
-from .text_generation import TextGenerationPipeline
