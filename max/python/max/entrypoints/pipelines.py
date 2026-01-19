@@ -19,7 +19,7 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import click
 from click import shell_completion
@@ -385,52 +385,69 @@ def cli_pipeline(
     )
 
 
-@main.group(name="diffusion", cls=ModelGroup)
-def diffusion_group() -> None:
-    """Commands for diffusion-based image/video generation pipelines."""
+# ============================================================================
+# Images Group (OpenAI-compatible /v1/images/* endpoints)
+# ============================================================================
 
 
-@diffusion_group.command(name="generate", cls=WithLazyPipelineOptions)
+@main.group(name="images", cls=ModelGroup)
+def images_group() -> None:
+    """Commands for image generation (OpenAI-compatible /v1/images/* API)."""
+
+
+@images_group.command(name="generate", cls=WithLazyPipelineOptions)
+@click.option(
+    "--model",
+    type=str,
+    required=True,
+    help="Specify the repository ID of a Hugging Face model to use for image generation (e.g., 'black-forest-labs/FLUX.1-dev').",
+)
 @click.option(
     "--prompt",
     type=str,
-    default="A cat holding a sign that says hello world",
-    help="The text prompt to use for image generation.",
+    required=True,
+    help="A text description of the desired image(s).",
 )
 @click.option(
-    "--height",
-    type=click.IntRange(min=64),
-    default=1024,
-    show_default=True,
-    help="Generated image height in pixels.",
-)
-@click.option(
-    "--width",
-    type=click.IntRange(min=64),
-    default=1024,
-    show_default=True,
-    help="Generated image width in pixels.",
-)
-@click.option(
-    "--num-inference-steps",
-    type=click.IntRange(min=1),
-    default=50,
-    show_default=True,
-    help="Number of denoising steps to run.",
-)
-@click.option(
-    "--guidance-scale",
-    type=float,
-    default=3.5,
-    show_default=True,
-    help="Classifier-free guidance scale.",
-)
-@click.option(
-    "--num-images-per-prompt",
-    type=click.IntRange(min=1),
+    "--n",
+    type=click.IntRange(min=1, max=10),
     default=1,
     show_default=True,
-    help="Number of images to generate for a single prompt.",
+    help="The number of images to generate (1-10).",
+)
+@click.option(
+    "--size",
+    type=str,
+    default="1024x1024",
+    show_default=True,
+    help="The size of generated images (e.g., '1024x1024', '1792x1024', '1024x1792').",
+)
+@click.option(
+    "--quality",
+    type=click.Choice(["auto", "standard", "hd", "high", "medium", "low"]),
+    default="auto",
+    show_default=True,
+    help="The quality of the image.",
+)
+@click.option(
+    "--response-format",
+    type=click.Choice(["b64_json", "url"]),
+    default="b64_json",
+    show_default=True,
+    help="The format in which generated images are returned.",
+)
+@click.option(
+    "--output-format",
+    type=click.Choice(["png", "jpeg", "webp"]),
+    default="png",
+    show_default=True,
+    help="The output image format.",
+)
+@click.option(
+    "--style",
+    type=click.Choice(["vivid", "natural"]),
+    default=None,
+    help="The style of generated images.",
 )
 @click.option(
     "--output",
@@ -440,59 +457,177 @@ def diffusion_group() -> None:
     help="Output image path (numbered if multiple images are generated).",
 )
 @click.option(
-    "--use-torch-randn/--no-use-torch-randn",
-    default=False,
-    show_default=True,
-    help=(
-        "Use torch-based random latents (set USE_TORCH_RANDN and SEED env vars)."
-    ),
-)
-@click.option(
     "--seed",
     type=int,
-    default=42,
-    show_default=True,
-    help="Random seed for torch-based latent initialization.",
+    default=None,
+    help="Random seed for reproducibility.",
 )
-def diffusion_generate(
+@click.option(
+    "--num-inference-steps",
+    type=click.IntRange(min=1),
+    default=50,
+    show_default=True,
+    help="Number of denoising steps (diffusion model parameter).",
+)
+@click.option(
+    "--guidance-scale",
+    type=float,
+    default=3.5,
+    show_default=True,
+    help="Classifier-free guidance scale (diffusion model parameter).",
+)
+def images_generate(
+    model: str,
     prompt: str,
-    height: int,
-    width: int,
+    n: int,
+    size: str,
+    quality: str,
+    response_format: Literal["url", "b64_json"],
+    output_format: str,
+    style: str | None,
+    output: Path,
+    seed: int | None,
     num_inference_steps: int,
     guidance_scale: float,
-    num_images_per_prompt: int,
-    output: Path,
-    use_torch_randn: bool,
-    seed: int,
     **config_kwargs: Any,
 ) -> None:
-    """Generate images using a diffusion pipeline."""
-    from max.entrypoints.cli.generate import generate_image
-    from max.experimental.realization_context import set_seed
-    from max.pipelines import PipelineConfig
+    """Generate images from a text prompt.
 
-    set_seed(seed)
-    pipeline_config = PipelineConfig(**config_kwargs)
+    This command follows the OpenAI /v1/images/generations API schema.
+
+    Example:
+        max images generate --model black-forest-labs/FLUX.1-dev \\
+            --prompt "A beautiful sunset over mountains" \\
+            --size 1024x1024 --n 1 --output sunset.png
+    """
+    from max.entrypoints.diffusion import ImageGenerator
+    from max.experimental.realization_context import set_seed
+    from max.interfaces import ImageGenerationRequest
+    from max.pipelines.lib.config import ImageGenerationConfig
+
+    # Set random seed if provided
+    if seed is not None:
+        set_seed(seed)
+
+    """
+    TODO:
+    - This configuration is dummy for now. Just for logging purpose.
+    - Modifications are required to enable the use of pipeline config.
+    """
+    config_kwargs["model"] = model
+    pipeline_config = ImageGenerationConfig(**config_kwargs)
     pipeline_config.log_basic_config()
 
     try:
-        generate_image(
-            pipeline_config=pipeline_config,
+        generator = ImageGenerator(pipeline_config)
+
+        # Create OpenAI-compatible request
+        request = ImageGenerationRequest(
             prompt=prompt,
-            height=height,
-            width=width,
+            n=n,
+            size=size,
+            quality=quality,
+            response_format=response_format,
+            output_format=output_format,
+            style=style,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
-            num_images_per_prompt=num_images_per_prompt,
-            output=output,
+            seed=seed,
         )
+
+        logger.info(f"Generating {n} image(s) with prompt: {prompt[:50]}...")
+
+        # Generate images directly (not using OpenAI response format for CLI)
+        images = generator.generate(
+            prompts=prompt,
+            height=request.get_dimensions()[1],
+            width=request.get_dimensions()[0],
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=n,
+            use_tqdm=True,
+        )
+
+        # Save images
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if len(images) == 1:
+            images[0].save(output)
+            logger.info(f"Image saved to: {output}")
+        else:
+            for i, img in enumerate(images):
+                numbered_output = output.with_stem(f"{output.stem}_{i}")
+                img.save(numbered_output)
+                logger.info(f"Image saved to: {numbered_output}")
+
     except Exception as exc:
         logger.exception(
-            "Diffusion generation failed for model %s with prompt %r",
+            "Image generation failed for model %s with prompt %r",
             pipeline_config.model.model_path,
             prompt,
         )
-        raise click.ClickException("Diffusion generation failed.") from exc
+        raise click.ClickException("Image generation failed.") from exc
+
+
+@images_group.command(name="serve", cls=WithLazyPipelineOptions)
+@common_server_options
+def images_serve(
+    profile_serve: bool,
+    sim_failure: int,
+    port: int,
+    headless: bool,
+    log_prefix: str | None,
+    **config_kwargs: Any,
+) -> None:
+    """Start an OpenAI-compatible image generation server.
+
+    This command launches a server with the following endpoints:
+      - POST /v1/images/generations  (create image)
+      - GET  /v1/models              (list models)
+      - GET  /health                 (health check)
+
+    Example:
+        max images serve --model black-forest-labs/FLUX.1-dev --port 8000
+
+    Then use curl to generate images:
+        curl http://localhost:8000/v1/images/generations \\
+          -H "Content-Type: application/json" \\
+          -d '{"prompt": "A cat", "size": "1024x1024"}'
+    """
+    from max.entrypoints.cli import serve_diffusion_api_server
+    from max.pipelines import PipelineConfig
+    from max.serve.config import Settings
+    from max.serve.telemetry.common import configure_logging
+
+    # Initialize Settings
+    setting_kwargs: dict[str, Any] = {}
+    if port is not None:
+        setting_kwargs["MAX_SERVE_PORT"] = port
+    if log_prefix is not None:
+        setting_kwargs["MAX_SERVE_LOG_PREFIX"] = log_prefix
+    if headless is not None:
+        setting_kwargs["MAX_SERVE_HEADLESS"] = headless
+
+    settings = Settings(**setting_kwargs)
+
+    # Initialize pipeline config
+    pipeline_config = PipelineConfig(**config_kwargs)
+    pipeline_config.log_basic_config()
+
+    # Configure logging
+    configure_logging(settings)
+
+    if headless:
+        logger.error("Headless mode is not supported for image serving yet")
+        raise click.ClickException("Headless mode not supported")
+
+    serve_diffusion_api_server(
+        settings=settings,
+        pipeline_config=pipeline_config,
+    )
+
+
+# Legacy alias for backward compatibility
+diffusion_group = images_group
 
 
 @main.command(name="encode", cls=WithLazyPipelineOptions)

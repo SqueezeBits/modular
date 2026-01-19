@@ -74,6 +74,7 @@ class PipelineTask(str, Enum):
         from .pipeline_variants import (
             AudioGenerationOutput,
             EmbeddingsGenerationOutput,
+            ImageGenerationOutput,
             TextGenerationOutput,
         )
         from .scheduler import SchedulerResult
@@ -87,6 +88,8 @@ class PipelineTask(str, Enum):
             return dict[RequestID, SchedulerResult[EmbeddingsGenerationOutput]]
         elif self == PipelineTask.AUDIO_GENERATION:
             return dict[RequestID, SchedulerResult[AudioGenerationOutput]]
+        elif self == PipelineTask.IMAGE_GENERATION:
+            return dict[RequestID, SchedulerResult[ImageGenerationOutput]]
         else:
             raise ValueError(
                 f"PipelineTask ({self}) does not have an output_type defined."

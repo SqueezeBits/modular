@@ -29,7 +29,6 @@ flux1_arch = SupportedArchitecture(
     supported_encodings={SupportedEncoding.bfloat16: []},
     example_repo_ids=[
         "black-forest-labs/FLUX.1-dev",
-        "black-forest-labs/FLUX.1-schnell",
     ],
     pipeline_model=FluxPipeline,
     tokenizer=TextTokenizer,
