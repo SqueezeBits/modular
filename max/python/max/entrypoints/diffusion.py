@@ -53,8 +53,6 @@ from threading import Event, Thread
 from typing import TYPE_CHECKING
 
 import tqdm
-from PIL.Image import Image
-
 from max.interfaces import (
     ImageGenerationInputs,
     ImageGenerationOutput,
@@ -64,6 +62,7 @@ from max.interfaces import (
     RequestID,
 )
 from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
+from PIL.Image import Image
 
 if TYPE_CHECKING:
     from max.pipelines.lib.pipeline_variants.image_generation import (
@@ -376,7 +375,7 @@ def _process_request(
     else:
         true_cfg_scale = 4.0
 
-    prompt_iter = zip(request.prompts, request.negative_prompts)
+    prompt_iter = zip(request.prompts, request.negative_prompts, strict=False)
     if request.use_tqdm:
         prompt_iter = tqdm.tqdm(prompt_iter, desc="Generating images")
 

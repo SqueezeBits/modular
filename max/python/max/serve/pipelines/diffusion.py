@@ -44,7 +44,9 @@ class ImageGeneratorPipeline:
         """Initialize the image generator."""
         from max.entrypoints.diffusion import ImageGenerator
 
-        self.logger.info("Loading image generator for model: %s", self.model_name)
+        self.logger.info(
+            "Loading image generator for model: %s", self.model_name
+        )
         self._generator = ImageGenerator(self.pipeline_config)
         self.logger.info("Image generator loaded successfully")
         return self
@@ -63,5 +65,7 @@ class ImageGeneratorPipeline:
     def generator(self) -> Any:
         """Get the underlying image generator."""
         if self._generator is None:
-            raise RuntimeError("Image generator not initialized. Use async with.")
+            raise RuntimeError(
+                "Image generator not initialized. Use async with."
+            )
         return self._generator

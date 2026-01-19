@@ -28,7 +28,6 @@ import signal
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
 
 import uvloop
 from fastapi import FastAPI, HTTPException, Request
@@ -171,7 +170,9 @@ def create_diffusion_app(
 
             logger.debug(
                 "Processing image generation request: prompt=%r, size=%s, n=%d",
-                internal_request.prompt[:50] if len(internal_request.prompt) > 50 else internal_request.prompt,
+                internal_request.prompt[:50]
+                if len(internal_request.prompt) > 50
+                else internal_request.prompt,
                 internal_request.size,
                 internal_request.n or 1,
             )
@@ -226,7 +227,9 @@ def create_diffusion_app(
                 }
             )
 
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Model '{model_id}' not found"
+        )
 
     return app
 

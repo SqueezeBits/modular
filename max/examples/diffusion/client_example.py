@@ -28,9 +28,8 @@ Dependencies:
 """
 
 import base64
-from pathlib import Path
-
 from argparse import ArgumentParser
+from pathlib import Path
 
 parser = ArgumentParser()
 parser.add_argument("--port", type=int, default=8000)
@@ -150,7 +149,7 @@ def example_with_httpx_async() -> None:
         print("Please install httpx: pip install httpx")
         return
 
-    async def generate_image():
+    async def generate_image() -> None:
         async with httpx.AsyncClient(timeout=300.0) as client:
             base_url = f"http://localhost:{PORT}"
 
@@ -206,7 +205,7 @@ def example_curl_commands() -> None:
         f"""   curl http://localhost:{PORT}/v1/images/generations \\
      -H "Content-Type: application/json" \\
      -d '{
-       "prompt": "A beautiful sunset over mountains",
+            "prompt": "A beautiful sunset over mountains",
        "size": "1024x1024",
        "n": 1,
        "response_format": "b64_json",
@@ -229,7 +228,9 @@ if __name__ == "__main__":
     print("Diffusion API Client Examples")
     print("=" * 60)
     print("\nMake sure the server is running:")
-    print(f"  max images serve --model black-forest-labs/FLUX.1-dev --port {PORT}")
+    print(
+        f"  max images serve --model black-forest-labs/FLUX.1-dev --port {PORT}"
+    )
     print()
 
     # Print curl examples first

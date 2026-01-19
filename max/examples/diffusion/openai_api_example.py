@@ -20,9 +20,9 @@ Usage:
     python openai_api_example.py --seed 42 --prompt "A futuristic city skyline at sunset with flying cars" --model-path "black-forest-labs/FLUX.1-dev"
 """
 
+import argparse
 import base64
 import os
-import argparse
 from pathlib import Path
 
 from max.entrypoints.diffusion import ImageGenerator
@@ -34,8 +34,14 @@ def main() -> None:
     # Configure random seed for reproducibility
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--prompt", type=str, default="A futuristic city skyline at sunset with flying cars")
-    parser.add_argument("--model-path", type=str, default="black-forest-labs/FLUX.1-dev")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="A futuristic city skyline at sunset with flying cars",
+    )
+    parser.add_argument(
+        "--model-path", type=str, default="black-forest-labs/FLUX.1-dev"
+    )
     args = parser.parse_args()
     seed = args.seed
     os.environ["SEED"] = str(seed)

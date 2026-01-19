@@ -44,7 +44,6 @@ from max.interfaces import (
     AudioGenerationRequest,
     GenerationStatus,
     ImageGenerationRequest,
-    ImageGenerationResponse,
     LoRAOperation,
     LoRARequest,
     LoRAStatus,
@@ -1448,6 +1447,7 @@ async def create_image_generation(
         # Parse request body
         body = await request.body()
         import json as json_module
+
         body_dict = json_module.loads(body)
 
         # Create ImageGenerationRequest from body

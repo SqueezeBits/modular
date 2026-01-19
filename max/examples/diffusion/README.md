@@ -5,6 +5,7 @@ This directory contains examples for using the MAX diffusion pipeline for image 
 ## Overview
 
 The MAX diffusion pipeline supports:
+
 - **Offline generation**: Direct Python API for generating images
 - **OpenAI-compatible API**: Server with `/v1/images/generations` endpoint
 - **Multiple models**: FLUX.1-dev, and other diffusion models

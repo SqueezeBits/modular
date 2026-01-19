@@ -21,7 +21,9 @@ from max.pipelines import PipelineConfig
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="black-forest-labs/FLUX.1-dev")
+    parser.add_argument(
+        "--model-path", type=str, default="black-forest-labs/FLUX.1-dev"
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
