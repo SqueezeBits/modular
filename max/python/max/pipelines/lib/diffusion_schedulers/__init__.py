@@ -10,25 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Interfaces for MAX pipelines."""
 
-from .diffusion_pipeline import DiffusionPipeline
-from .generate import GenerateMixin
-from .kv_cache import KVCacheMixin, get_paged_manager
-from .pipeline_model import (
-    AlwaysSignalBuffersMixin,
-    ModelInputs,
-    ModelOutputs,
-    PipelineModel,
+from .scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
 )
-
-__all__ = [
-    "AlwaysSignalBuffersMixin",
-    "DiffusionPipeline",
-    "GenerateMixin",
-    "KVCacheMixin",
-    "ModelInputs",
-    "ModelOutputs",
-    "PipelineModel",
-    "get_paged_manager",
-]
