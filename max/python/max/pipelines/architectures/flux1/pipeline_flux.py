@@ -22,7 +22,7 @@ from max.driver import Tensor
 from max.dtype import DType
 from max.experimental import Tensor as Tensor_v3
 from max.experimental import functional as F
-from max.experimental.random import normal
+from max.experimental import random
 from max.graph import DeviceRef
 from max.pipelines.lib.diffusion_schedulers import (
     FlowMatchEulerDiscreteScheduler,
@@ -409,7 +409,7 @@ class FluxPipeline(DiffusionPipeline):
             )
             return latents.to(device).cast(dtype), latent_image_ids
 
-        latents = normal(shape, device=device, dtype=dtype)
+        latents = random.normal(shape, device=device, dtype=dtype)
         latents = self._pack_latents(
             latents, batch_size, num_channels_latents, height, width
         )
