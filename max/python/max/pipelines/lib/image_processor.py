@@ -15,7 +15,7 @@ import logging
 
 import numpy as np
 import PIL.Image
-from max.driver import Tensor as DTensor
+from max.driver import Buffer as DTensor
 from max.dtype import DType
 from max.experimental import Tensor
 from max.experimental import functional as F

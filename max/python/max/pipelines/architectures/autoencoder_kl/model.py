@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from max.driver import CPU, Accelerator, Device, Tensor
+from max.driver import CPU, Accelerator, Buffer, Device
 from max.engine import InferenceSession, Model
 from max.graph import Graph
 from max.graph.weights import Weights
@@ -70,5 +70,5 @@ class AutoencoderKLModel(MaxModel):
             compiled_graph, weights_registry=autoencoder_kl.state_dict()
         )
 
-    def decode(self, *args, **kwargs) -> list[Tensor]:
+    def decode(self, *args, **kwargs) -> list[Buffer]:
         return self.decode_session.execute(*args, **kwargs)

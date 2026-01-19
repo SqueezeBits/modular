@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 import PIL.Image
-from max.driver import Tensor
+from max.driver import Buffer as Tensor
 from max.dtype import DType
 from max.experimental import Tensor as Tensor_v3
 from max.experimental import functional as F

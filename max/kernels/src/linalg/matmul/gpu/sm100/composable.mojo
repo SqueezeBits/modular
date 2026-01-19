@@ -26,13 +26,13 @@ from buffer.buffer import NDBuffer
 from buffer.dimlist import DimList
 from gpu import WARP_SIZE, barrier
 from gpu import lane_id as get_lane_id, warp_id as get_warp_id
-from gpu.cluster import block_rank_in_cluster
+from gpu.primitives.cluster import block_rank_in_cluster
 from gpu.host import DeviceContext, FuncAttribute
 from gpu.host.nvidia.tma import TensorMapSwizzle
 from gpu import block_idx, lane_id, thread_idx
 from gpu.memory import external_memory
-from gpu.mma_sm100 import *
-from gpu.tcgen05 import *
+from gpu.compute.arch.mma_nvidia_sm100 import *
+from gpu.compute.arch.tcgen05 import *
 
 # Additional imports for testing
 from internal_utils import assert_almost_equal
@@ -51,7 +51,7 @@ from layout.tma_async import (
     SharedMemBarrier,
     TMATensorTile,
     _tma_desc_tile_layout,
-    create_tma_tile,
+    create_tensor_tile,
 )
 
 from utils.index import Index, IndexList
@@ -242,7 +242,7 @@ struct TMALoadOp[
         b: LayoutTensor[Self.b_type, ...],
         ctx: DeviceContext,
     ) -> Self.args_type:
-        var a_tma_op = create_tma_tile[
+        var a_tma_op = create_tensor_tile[
             Index(
                 Self.block_tile_shape[0] // Self.cluster_shape[0],
                 Self.block_tile_shape[2],
@@ -250,7 +250,7 @@ struct TMALoadOp[
             swizzle_mode = Self.a_swizzle,
         ](ctx, a)
 
-        var b_tma_op = create_tma_tile[
+        var b_tma_op = create_tensor_tile[
             Index(
                 Self.block_tile_shape[1] // Self.cluster_shape[1],
                 Self.block_tile_shape[2],

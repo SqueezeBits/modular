@@ -31,7 +31,7 @@ from gpu.host._amdgpu_hip import HIP
 from gpu.host._nvidia_cuda import CUDA
 from comm import MAX_GPUS
 from comm.allreduce import elementwise_epilogue_type
-from gpu.grid_controls import PDLLevel
+from gpu.primitives.grid_controls import PDLLevel
 
 comptime ncclComm_t = OpaquePointer
 
@@ -104,7 +104,7 @@ comptime CCL_LIBRARY = _Global["CCL_LIBRARY", _init_ccl_dylib]
 
 @always_inline
 fn _get_ccl_function[
-    func_name: StaticString, result_type: AnyTrivialRegType
+    func_name: StaticString, result_type: __TypeOfAllTypes
 ]() raises -> result_type:
     return _ffi_get_dylib_function[CCL_LIBRARY(), func_name, result_type]()
 
@@ -207,6 +207,10 @@ struct Communicators(ImplicitlyCopyable):
     var ngpus: Int
     var comms: InlineArray[ncclComm_t, MAX_GPUS]
 
+    fn __copyinit__(out self, rhs: Self):
+        self.ngpus = rhs.ngpus
+        self.comms = rhs.comms.copy()
+
 
 fn _dtype_to_ccl[dtype: DType]() raises -> ncclDataType_t:
     @parameter
@@ -243,7 +247,7 @@ fn _get_global_comms(ngpus: Int) raises -> Communicators:
         ncclCommInitAll(comms.unsafe_ptr(), ngpus, devlist.unsafe_ptr())
     )
 
-    var c = Communicators(ngpus=ngpus, comms=comms)
+    var c = Communicators(ngpus=ngpus, comms=comms.copy())
     var ptr = UnsafePointer[Communicators].alloc(1)
     ptr.init_pointee_move(c)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
