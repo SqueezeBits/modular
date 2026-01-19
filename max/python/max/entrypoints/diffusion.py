@@ -77,12 +77,13 @@ class _ImageRequest:
 
     id: RequestID
     prompts: Sequence[str]
-    height: int
-    width: int
-    num_inference_steps: int
-    guidance_scale: float
-    num_images_per_prompt: int
-    use_tqdm: bool
+    negative_prompts: Sequence[str] | None = None
+    height: int = 1024
+    width: int = 1024
+    num_inference_steps: int = 50
+    guidance_scale: float = 3.5
+    num_images_per_prompt: int = 1
+    use_tqdm: bool = True
 
 
 @dataclass
@@ -353,19 +354,43 @@ def _process_request(
     all_images: list[Image] = []
 
     # Create iterator with optional progress bar
-    prompt_iter = request.prompts
+    if request.negative_prompts is None or len(request.prompts) != len(
+        request.negative_prompts
+    ):
+        if (
+            request.negative_prompts is None
+            or len(request.negative_prompts) == 0
+        ):
+            request.negative_prompts = [None] * len(request.prompts)
+        else:
+            raise ValueError(
+                "Number of prompts and negative prompts must be the same."
+            )
+
+    # TODO: temp hard coding for true cfg scale. Need to be removed.
+    if all(
+        negative_prompt is not None
+        for negative_prompt in request.negative_prompts
+    ):
+        true_cfg_scale = 1.0
+    else:
+        true_cfg_scale = 4.0
+
+    prompt_iter = zip(request.prompts, request.negative_prompts)
     if request.use_tqdm:
         prompt_iter = tqdm.tqdm(prompt_iter, desc="Generating images")
 
     # Generate images for each prompt
-    for prompt in prompt_iter:
+    for prompt, negative_prompt in prompt_iter:
         inputs = ImageGenerationInputs(
             prompt=prompt,
+            negative_prompt=negative_prompt,
             height=request.height,
             width=request.width,
             num_inference_steps=request.num_inference_steps,
             guidance_scale=request.guidance_scale,
             num_images_per_prompt=request.num_images_per_prompt,
+            true_cfg_scale=true_cfg_scale,
         )
 
         output: ImageGenerationOutput = pipeline.execute(inputs)

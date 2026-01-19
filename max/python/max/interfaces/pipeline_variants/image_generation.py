@@ -96,13 +96,13 @@ class ImageGenerationInputs(PipelineInputs):
     """Inputs for image-generation pipelines."""
 
     prompt: str
-    negative_prompt: str | None
-    true_cfg_scale: float
-    height: int
-    width: int
-    num_inference_steps: int
-    guidance_scale: float
-    num_images_per_prompt: int
+    negative_prompt: str | None = None
+    true_cfg_scale: float | None = None
+    height: int = 1024
+    width: int = 1024
+    num_inference_steps: int = 50
+    guidance_scale: float = 3.5
+    num_images_per_prompt: int = 1
 
 
 @dataclass(kw_only=True)
@@ -364,7 +364,9 @@ class ImageGenerationResponse:
             if self.usage.input_tokens_details is not None:
                 usage_dict["input_tokens_details"] = {
                     "text_tokens": self.usage.input_tokens_details.text_tokens,
-                    "image_tokens": self.usage.input_tokens_details.image_tokens,
+                    "image_tokens": (
+                        self.usage.input_tokens_details.image_tokens
+                    ),
                 }
             result["usage"] = usage_dict
 

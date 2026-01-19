@@ -506,7 +506,8 @@ def images_generate(
     from max.pipelines.lib.config import ImageGenerationConfig
 
     # Set random seed if provided
-    set_seed(seed)
+    if seed is not None:
+        set_seed(seed)
 
     """
     TODO:
