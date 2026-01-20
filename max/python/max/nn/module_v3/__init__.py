@@ -16,8 +16,13 @@ from .embedding import Embedding
 from .linear import Linear
 from .module import Module, module_dataclass
 from .sequential import Sequential
-
+from .conv import Conv2d
+from .norm import GroupNorm, RMSNorm, GemmaRMSNorm
 __all__ = [
+    "Conv2d",
+    "GroupNorm",
+    "RMSNorm",
+    "GemmaRMSNorm",
     "Embedding",
     "Linear",
     "Module",
