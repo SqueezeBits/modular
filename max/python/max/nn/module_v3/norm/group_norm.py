@@ -85,10 +85,10 @@ class GroupNorm(Module[[Tensor], Tensor]):
             result = norm(x)
     """
 
-    weight: Tensor
-    """The weight tensor with shape [num_channels]."""
-    bias: Tensor
-    """The bias tensor with shape [num_channels]."""
+    weight: Tensor | None
+    """The weight tensor with shape [num_channels] (None if affine=False)."""
+    bias: Tensor | None
+    """The bias tensor with shape [num_channels] (None if affine=False)."""
     num_groups: int
     """Number of groups to separate the channels into."""
     num_channels: int
@@ -124,8 +124,12 @@ class GroupNorm(Module[[Tensor], Tensor]):
         self.eps = eps
         self.affine = affine
 
-        self.weight = Tensor.ones([num_channels])
-        self.bias = Tensor.zeros([num_channels])
+        if self.affine:
+            self.weight = Tensor.ones([num_channels])
+            self.bias = Tensor.zeros([num_channels])
+        else:
+            self.weight = None
+            self.bias = None
 
     def __rich_repr__(self):
         """Rich representation for debugging."""
@@ -152,4 +156,12 @@ class GroupNorm(Module[[Tensor], Tensor]):
                 f"Expected {self.num_channels} channels, got shape {x.shape}"
             )
 
-        return group_norm(x, self.weight, self.bias, self.num_groups, self.eps)
+        if self.affine:
+            weight = self.weight
+            bias = self.bias
+        else:
+            # Create temporary tensors of ones and zeros when affine=False
+            weight = Tensor.ones([self.num_channels], dtype=x.dtype, device=x.device)
+            bias = Tensor.zeros([self.num_channels], dtype=x.dtype, device=x.device)
+
+        return group_norm(x, weight, bias, self.num_groups, self.eps)
