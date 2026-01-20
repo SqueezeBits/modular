@@ -20,8 +20,10 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import huggingface_hub
 import requests
+from PIL import Image
 from huggingface_hub.utils import EntryNotFoundError, OfflineModeIsEnabled
 from max.config import load_config
 from max.interfaces import (
@@ -205,21 +207,33 @@ class PixelGenerationPipeline(
                     " above."
                 ) from model_info_call_error
 
-    def execute(self, inputs: PixelGenerationInputs[PixelGenerationContextType]) -> PipelineOutputsDict[PixelGenerationOutput]:
-        results: dict[RequestID, PixelGenerationOutput] = {}
-        for batch in inputs.batches:
-            for request_id, context in batch.items():
-                model_inputs = self._diffusion_pipeline.prepare_model_inputs(context)
-                outputs = self._diffusion_pipeline.execute(model_inputs)
+    def execute(self, inputs: PixelGenerationInputs[PixelGenerationContextType]) -> list[PixelGenerationOutput]:
+        # TODO: handle batch inference
+        breakpoint()
+        outputs: list[PixelGenerationOutput] = []
+        for request_id, context in inputs.batch.items():
+            output = self._diffusion_pipeline.execute(context)
 
-                context.status = GenerationStatus.END_OF_SEQUENCE
+            context.status = GenerationStatus.END_OF_SEQUENCE
 
-                results[request_id] = PixelGenerationOutput(
-                    final_status=GenerationStatus.END_OF_SEQUENCE,
-                    steps_executed=context.num_inference_steps,
-                    pixel_data=outputs.images,
-                )
-                return results
+            if hasattr(output, 'images'):
+                pixel_data = output.images
+            else:
+                pixel_data = output
+            
+            if isinstance(pixel_data, list) and isinstance(pixel_data[0], Image.Image):
+                pixel_data = np.array([np.array(img).astype(np.float32) for img in pixel_data])
+            elif isinstance(pixel_data, np.ndarray):
+                pass
+            else:
+                raise ValueError(f"Unsupported pixel data type: {type(pixel_data)}")
+
+            outputs.append(PixelGenerationOutput(
+                request_id=request_id,
+                final_status=GenerationStatus.END_OF_SEQUENCE,
+                pixel_data=pixel_data,
+            ))
+        return outputs
 
     def release(self, request_id: RequestID) -> None:
         pass

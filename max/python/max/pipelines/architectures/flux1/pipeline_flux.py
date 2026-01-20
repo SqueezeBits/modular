@@ -24,7 +24,7 @@ from max.experimental import Tensor as Tensor_v3
 from max.experimental import functional as F
 from max.experimental import random
 from max.graph import DeviceRef
-from max.pipelines.lib import ModelInputs
+from max.interfaces import PixelGenerationContext
 from max.pipelines.lib.diffusion_schedulers import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -45,20 +45,6 @@ from ..autoencoder_kl import AutoencoderKLModel
 from ..clip import ClipModel
 from ..t5 import T5Model
 from .model import Flux1Model
-
-if TYPE_CHECKING:
-    from max.interfaces import PixelGenerationContextType
-
-@dataclass
-class FluxPipelineInputs(ModelInputs):
-    prompt: str
-    negative_prompt: str | None = None
-    true_cfg_scale: float = 1.0
-    height: int = 1024
-    width: int = 1024
-    num_inference_steps: int = 50
-    guidance_scale: float = 3.5
-    num_images_per_prompt: int = 1
 
 
 @dataclass
@@ -788,19 +774,7 @@ class FluxPipeline(DiffusionPipeline):
 
         return FluxPipelineOutput(images=image)
     
-    def prepare_model_inputs(self, context: PixelGenerationContextType) -> FluxPipelineInputs:
-        return FluxPipelineInputs(
-            prompt=context.prompt,
-            negative_prompt=context.negative_prompt,
-            true_cfg_scale=context.true_cfg_scale,
-            height=context.height,
-            width=context.width,
-            num_inference_steps=context.num_inference_steps,
-            guidance_scale=context.guidance_scale,
-            num_images_per_prompt=context.num_images_per_prompt,
-        )
-    
-    def execute(self, inputs: FluxPipelineInputs) -> FluxPipelineOutput:
+    def execute(self, inputs: PixelGenerationContext) -> FluxPipelineOutput:
         return self(
             prompt=inputs.prompt,
             negative_prompt=inputs.negative_prompt,

@@ -161,11 +161,11 @@ def generate_image(
     num_images_per_prompt: int,
     output: Path,
 ) -> None:
-    from ..diffusion import DiffusionPipeline
+    from ..diffusion import PixelGenerator
 
-    pipeline = DiffusionPipeline(pipeline_config)
-    result = pipeline(
-        prompt=prompt,
+    pipeline = PixelGenerator(pipeline_config)
+    result = pipeline.generate(
+        prompts=prompt,
         height=height,
         width=width,
         num_inference_steps=num_inference_steps,

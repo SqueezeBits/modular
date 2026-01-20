@@ -910,7 +910,7 @@ class PipelineConfig(ConfigFileModel):
         # memory estimations.
         arch.pipeline_model.finalize_pipeline_config(self)
 
-        if arch.task == PipelineTask.IMAGE_GENERATION:
+        if arch.task == PipelineTask.PIXEL_GENERATION:
             # diffusion pipeline does not use KV cache,
             # so we can skip profile run.
             return
@@ -1146,7 +1146,7 @@ class PipelineConfig(ConfigFileModel):
 
         # Get reserved memory info from KVCache config
         memory_str = None
-        if task != PipelineTask.IMAGE_GENERATION:
+        if task != PipelineTask.PIXEL_GENERATION:
             kv_config = self.model._kv_cache
             if kv_config._available_cache_memory is None:
                 raise ValueError(

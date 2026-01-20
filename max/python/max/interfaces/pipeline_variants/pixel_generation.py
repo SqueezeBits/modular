@@ -80,6 +80,10 @@ class PixelGenerationRequest(Request):
     """
     Optional dictionary of options to pass when applying the chat template.
     """
+    true_cfg_scale: float = 1.0
+    """
+    Scale for true CFG.
+    """
 
     def __post_init__(self) -> None:
         """Validates mutual exclusivity and converts dict messages after initialization."""

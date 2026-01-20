@@ -17,6 +17,7 @@ import functools
 import logging
 import os
 import sys
+from random import randint
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
@@ -440,14 +441,6 @@ def diffusion_group() -> None:
     help="Output image path (numbered if multiple images are generated).",
 )
 @click.option(
-    "--use-torch-randn/--no-use-torch-randn",
-    default=False,
-    show_default=True,
-    help=(
-        "Use torch-based random latents (set USE_TORCH_RANDN and SEED env vars)."
-    ),
-)
-@click.option(
     "--seed",
     type=int,
     default=42,
@@ -462,8 +455,7 @@ def diffusion_generate(
     guidance_scale: float,
     num_images_per_prompt: int,
     output: Path,
-    use_torch_randn: bool,
-    seed: int,
+    seed: int | None,
     **config_kwargs: Any,
 ) -> None:
     """Generate images using a diffusion pipeline."""
@@ -471,7 +463,11 @@ def diffusion_generate(
     from max.experimental.realization_context import set_seed
     from max.pipelines import PipelineConfig
 
-    set_seed(seed)
+    if seed is not None:
+        set_seed(seed)
+    else:
+        seed = randint(0, 10 ** 9)
+        set_seed(seed)
     pipeline_config = PipelineConfig(**config_kwargs)
     pipeline_config.log_basic_config()
 
