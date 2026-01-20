@@ -14,7 +14,7 @@
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import PIL.Image
@@ -24,6 +24,7 @@ from max.experimental import Tensor as Tensor_v3
 from max.experimental import functional as F
 from max.experimental import random
 from max.graph import DeviceRef
+from max.pipelines.lib import ModelInputs
 from max.pipelines.lib.diffusion_schedulers import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -44,6 +45,35 @@ from ..autoencoder_kl import AutoencoderKLModel
 from ..clip import ClipModel
 from ..t5 import T5Model
 from .model import Flux1Model
+
+if TYPE_CHECKING:
+    from max.interfaces import PixelGenerationContextType
+
+@dataclass
+class FluxPipelineInputs(ModelInputs):
+    prompt: str
+    negative_prompt: str | None = None
+    true_cfg_scale: float = 1.0
+    height: int = 1024
+    width: int = 1024
+    num_inference_steps: int = 50
+    guidance_scale: float = 3.5
+    num_images_per_prompt: int = 1
+
+
+@dataclass
+class FluxPipelineOutput:
+    """Output class for Flux image generation pipelines.
+
+    Args:
+        images (`list[PIL.Image.Image]` or `np.ndarray` or `Tensor`)
+            List of denoised PIL images of length `batch_size` or numpy array or Max tensor of shape `(batch_size,
+            height, width, num_channels)`. PIL images or numpy array present the denoised images of the diffusion
+            pipeline. Max tensors can represent either the denoised images or the intermediate latents ready to be
+            passed to the decoder.
+    """
+
+    images: list[PIL.Image.Image] | np.ndarray | Tensor
 
 
 def retrieve_timesteps(
@@ -124,21 +154,6 @@ def calculate_shift(
     b = base_shift - m * base_seq_len
     mu = image_seq_len * m + b
     return mu
-
-
-@dataclass
-class FluxPipelineOutput:
-    """Output class for Flux image generation pipelines.
-
-    Args:
-        images (`list[PIL.Image.Image]` or `np.ndarray` or `Tensor`)
-            List of denoised PIL images of length `batch_size` or numpy array or Max tensor of shape `(batch_size,
-            height, width, num_channels)`. PIL images or numpy array present the denoised images of the diffusion
-            pipeline. Max tensors can represent either the denoised images or the intermediate latents ready to be
-            passed to the decoder.
-    """
-
-    images: list[PIL.Image.Image] | np.ndarray | Tensor
 
 
 class FluxPipeline(DiffusionPipeline):
@@ -772,3 +787,27 @@ class FluxPipeline(DiffusionPipeline):
             return (image,)
 
         return FluxPipelineOutput(images=image)
+    
+    def prepare_model_inputs(self, context: PixelGenerationContextType) -> FluxPipelineInputs:
+        return FluxPipelineInputs(
+            prompt=context.prompt,
+            negative_prompt=context.negative_prompt,
+            true_cfg_scale=context.true_cfg_scale,
+            height=context.height,
+            width=context.width,
+            num_inference_steps=context.num_inference_steps,
+            guidance_scale=context.guidance_scale,
+            num_images_per_prompt=context.num_images_per_prompt,
+        )
+    
+    def execute(self, inputs: FluxPipelineInputs) -> FluxPipelineOutput:
+        return self(
+            prompt=inputs.prompt,
+            negative_prompt=inputs.negative_prompt,
+            true_cfg_scale=inputs.true_cfg_scale,
+            height=inputs.height,
+            width=inputs.width,
+            num_inference_steps=inputs.num_inference_steps,
+            guidance_scale=inputs.guidance_scale,
+            num_images_per_prompt=inputs.num_images_per_prompt,
+        )

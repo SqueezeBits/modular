@@ -168,6 +168,11 @@ class PixelGenerationContext(BaseContext, Protocol):
     def model_name(self) -> str:
         """Name of the model."""
         ...
+    
+    @property
+    def true_cfg_scale(self) -> float:
+        """Scale for true CFG."""
+        ...
 
 
 PixelGenerationContextType = TypeVar(

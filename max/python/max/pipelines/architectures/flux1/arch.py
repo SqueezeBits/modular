@@ -24,7 +24,7 @@ from .pipeline_flux import FluxPipeline
 # TODO(minkyu): revisit default_encoding, supported_encodings, tokenizer.
 flux1_arch = SupportedArchitecture(
     name="FluxPipeline",
-    task=PipelineTask.IMAGE_GENERATION,
+    task=PipelineTask.PIXEL_GENERATION,
     default_encoding=SupportedEncoding.bfloat16,
     supported_encodings={SupportedEncoding.bfloat16: []},
     example_repo_ids=[

@@ -12,9 +12,9 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.interfaces import (
-    ImageGenerationInputs,
-    ImageGenerationOutput,
     PipelineTask,
+    PixelGenerationInputs,
+    PixelGenerationOutput,
 )
 from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
 
@@ -29,7 +29,7 @@ class DiffusionPipeline:
         self.pipeline_config = pipeline_config
         _, model_factory = PIPELINE_REGISTRY.retrieve_factory(
             pipeline_config,
-            task=PipelineTask.IMAGE_GENERATION,
+            task=PipelineTask.PIXEL_GENERATION,
         )
         self.pipeline = model_factory()
 
@@ -43,11 +43,11 @@ class DiffusionPipeline:
         num_inference_steps: int = 50,
         guidance_scale: float = 3.5,
         num_images_per_prompt: int = 1,
-    ) -> ImageGenerationOutput:
+    ) -> PixelGenerationOutput:
         """Generate images from a prompt with the configured pipeline."""
         # TODO: consider all possible diffusion tasks,
         # e.g. T2I, I2I, T2V, I2V, V2V.
-        inputs = ImageGenerationInputs(
+        inputs = PixelGenerationInputs(
             prompt=prompt,
             negative_prompt=negative_prompt,
             true_cfg_scale=true_cfg_scale,
@@ -57,5 +57,5 @@ class DiffusionPipeline:
             guidance_scale=guidance_scale,
             num_images_per_prompt=num_images_per_prompt,
         )
-        pipeline_output: ImageGenerationOutput = self.pipeline.execute(inputs)
+        pipeline_output: PixelGenerationOutput = self.pipeline.execute(inputs)
         return pipeline_output
