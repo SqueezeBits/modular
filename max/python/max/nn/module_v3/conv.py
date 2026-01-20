@@ -164,7 +164,6 @@ class Conv2d(Module[[Tensor], Tensor]):
         ):
             raise ValueError("Conv2d not implemented with weight quantization.")
 
-    @F.functional
     def forward(self, x: Tensor) -> Tensor:
         """Apply 2D convolution to input.
 

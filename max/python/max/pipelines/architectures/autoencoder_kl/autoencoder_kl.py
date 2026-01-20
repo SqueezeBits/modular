@@ -152,7 +152,6 @@ class ResnetBlock2D(Module[[Tensor], Tensor]):
                 permute=True,
             )
 
-    @F.functional
     def forward(self, x: Tensor, temb: Tensor | None = None) -> Tensor:
         """Apply ResnetBlock2D forward pass.
 
@@ -259,7 +258,6 @@ class UpDecoderBlock2D(Module[[Tensor], Tensor]):
         else:
             self.upsamplers = None
 
-    @F.functional
     def forward(
         self, hidden_states: Tensor, temb: Tensor | None = None
     ) -> Tensor:
@@ -359,7 +357,6 @@ class VAEAttention(Module[[Tensor], Tensor]):
 
         self.scale = 1.0 / math.sqrt(dim_head)
 
-    @F.functional
     def forward(self, x: Tensor) -> Tensor:
         """Apply spatial attention to 2D image tensor.
 
@@ -495,7 +492,6 @@ class MidBlock2D(Module[[Tensor], Tensor]):
             self.attentions = None
             self.attention_indices = set()
 
-    @F.functional
     def forward(
         self, hidden_states: Tensor, temb: Tensor | None = None
     ) -> Tensor:
@@ -687,7 +683,6 @@ class Decoder(Module[[Tensor], Tensor]):
             permute=True,
         )
 
-    @F.functional
     def forward(self, z: Tensor, temb: Tensor | None = None) -> Tensor:
         """Apply Decoder forward pass.
 
@@ -762,7 +757,6 @@ class AutoencoderKL(Module[[Tensor], Tensor]):
             dtype=config.dtype,
         )
 
-    @F.functional
     def forward(self, z: Tensor, temb: Tensor | None = None) -> Tensor:
         """Apply AutoencoderKL forward pass (decoding only).
 

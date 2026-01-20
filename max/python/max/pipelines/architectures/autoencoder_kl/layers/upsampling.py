@@ -149,7 +149,6 @@ class Upsample2D(Module[[Tensor], Tensor]):
         else:
             self.conv = None
 
-    @F.functional
     def forward(self, x: Tensor) -> Tensor:
         """Apply 2D upsampling with optional convolution.
 
