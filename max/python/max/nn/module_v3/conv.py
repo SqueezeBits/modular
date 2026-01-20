@@ -136,7 +136,9 @@ class Conv2d(Module[[Tensor], Tensor]):
             self.bias = random.normal(
                 [out_channels],
                 dtype=self.dtype,
-                device=self.device.to_device() if self.device is not None else None,
+                device=self.device.to_device()
+                if self.device is not None
+                else None,
             )
         else:
             self.bias = 0

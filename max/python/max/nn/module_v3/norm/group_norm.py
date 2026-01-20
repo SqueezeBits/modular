@@ -161,7 +161,11 @@ class GroupNorm(Module[[Tensor], Tensor]):
             bias = self.bias
         else:
             # Create temporary tensors of ones and zeros when affine=False
-            weight = Tensor.ones([self.num_channels], dtype=x.dtype, device=x.device)
-            bias = Tensor.zeros([self.num_channels], dtype=x.dtype, device=x.device)
+            weight = Tensor.ones(
+                [self.num_channels], dtype=x.dtype, device=x.device
+            )
+            bias = Tensor.zeros(
+                [self.num_channels], dtype=x.dtype, device=x.device
+            )
 
         return group_norm(x, weight, bias, self.num_groups, self.eps)
