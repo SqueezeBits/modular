@@ -60,6 +60,8 @@ __all__ = [
     "EmbeddingsGenerationInputs",
     "EmbeddingsGenerationOutput",
     "ImageContentPart",
+    "ImageGenerationInputs",
+    "ImageGenerationOutput",
     "ImageMetadata",
     "PixelGenerationContext",
     "PixelGenerationContextType",
