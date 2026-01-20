@@ -1153,9 +1153,7 @@ class PipelineConfig(ConfigFileModel):
                 raise ValueError(
                     "KVCache config is not available after config resolution."
                 )
-            memory_str = to_human_readable_bytes(
-                kv_config._available_cache_memory
-            )
+            memory_str = to_human_readable_bytes(kv_config._available_cache_memory)
 
         devices_str = ", ".join(
             f"{d.device_type}[{d.id}]" for d in self.model.device_specs
@@ -1180,63 +1178,25 @@ class PipelineConfig(ConfigFileModel):
     @staticmethod
     def help() -> dict[str, str]:
         return {
-            "max_length": (
-                "Set the maximum sequence length for input data processed by the model. This must be less than the value specified in the Hugging Face configuration file. The default is derived from the Hugging Face configuration value. Larger values may consume more memory."
-            ),
-            "pipeline_role": (
-                "Whether the pipeline should serve both a prefill or decode role or both."
-            ),
-            "max_batch_size": (
-                "Define the maximum batch size to execute with the model. When not specified (None), we determine this value dynamically. For users launching in a server scenario, the expectation is that this value should be set higher based on server capacity."
-            ),
-            "max_queue_size_tg": (
-                "Maximum number of requests in decode queue. By default, this is max-batch-size."
-            ),
-            "min_batch_size_tg": (
-                "Specifies a soft floor on the decode batch size. If the TG batch size is larger than this value, the scheduler will continue to run TG batches. If it falls below, the scheduler will prioritize CE. This is an experimental flag solely for the TTS scheduler."
-            ),
-            "ce_delay_ms": (
-                "Duration of scheduler sleep prior to starting a prefill batch. This is an experimental flag solely for the TTS scheduler. Default is 0.0."
-            ),
-            "enable_prioritize_first_decode": (
-                "When enabled, the scheduler will always run a TG batch immediately after a CE batch, with the same requests. This may be useful for decreasing time-to-first-chunk latency. This is an experimental flag solely for the TTS scheduler. Default is false."
-            ),
-            "experimental_background_queue": (
-                "When enabled, offloads queue draining to a background thread for improved performance. This is an experimental flag. Default is false."
-            ),
-            "enable_chunked_prefill": (
-                "Enable chunked prefill to split context encoding requests into multiple chunks based on `prefill-chunk-size`. Default is true."
-            ),
-            "enable_in_flight_batching": (
-                "When enabled, prioritizes token generation by batching it with context encoding requests. Default is false."
-            ),
-            "max_num_steps": (
-                "Specify the number of steps to run for multi-step scheduling during inference. Default is -1 which specifies a default value based on configuration and platform. Ignored for models which are not auto-regressive (e.g. embedding models)."
-            ),
-            "prefill_chunk_size": (
-                "The target number of un-encoded tokens to include in each batch. This value is used for chunked prefill and memory estimation. Default is 8192."
-            ),
-            "enable_echo": (
-                "Whether the model should be built with echo capabilities. This defaults to false."
-            ),
-            "pool_embeddings": (
-                "Whether to pool embedding outputs. Default is true."
-            ),
-            "use_experimental_kernels": (
-                "Whether to use experimental kernels. Default is false."
-            ),
-            "max_batch_context_length": (
-                "Ensures that the sum of the context length in a batch does not exceed max_batch_context_length. If None, the sum of the context length in batch is not limited."
-            ),
-            "pdl_level": (
-                "Level of overlap of kernel launch via programmatic dependent grid control. Default is 0."
-            ),
-            "custom_architectures": (
-                "A list of custom architecture implementations to register. Each input can either be a raw module name or an import path followed by a colon and the module name."
-            ),
-            "kvcache_ce_watermark": (
-                "Projected cache usage threshold for scheduling CE requests, considers current + incoming request. CE is scheduled if either projected usage stays below this threshold OR no active requests exist. Greater KVCache utilization (as controlled by this parameter) was found to cause more preemptions. Default watermark value is 0.95."
-            ),
+            "max_length": "Set the maximum sequence length for input data processed by the model. This must be less than the value specified in the Hugging Face configuration file. The default is derived from the Hugging Face configuration value. Larger values may consume more memory.",
+            "pipeline_role": "Whether the pipeline should serve both a prefill or decode role or both.",
+            "max_batch_size": "Define the maximum batch size to execute with the model. When not specified (None), we determine this value dynamically. For users launching in a server scenario, the expectation is that this value should be set higher based on server capacity.",
+            "max_queue_size_tg": "Maximum number of requests in decode queue. By default, this is max-batch-size.",
+            "min_batch_size_tg": "Specifies a soft floor on the decode batch size. If the TG batch size is larger than this value, the scheduler will continue to run TG batches. If it falls below, the scheduler will prioritize CE. This is an experimental flag solely for the TTS scheduler.",
+            "ce_delay_ms": "Duration of scheduler sleep prior to starting a prefill batch. This is an experimental flag solely for the TTS scheduler. Default is 0.0.",
+            "enable_prioritize_first_decode": "When enabled, the scheduler will always run a TG batch immediately after a CE batch, with the same requests. This may be useful for decreasing time-to-first-chunk latency. This is an experimental flag solely for the TTS scheduler. Default is false.",
+            "experimental_background_queue": "When enabled, offloads queue draining to a background thread for improved performance. This is an experimental flag. Default is false.",
+            "enable_chunked_prefill": "Enable chunked prefill to split context encoding requests into multiple chunks based on `prefill-chunk-size`. Default is true.",
+            "enable_in_flight_batching": "When enabled, prioritizes token generation by batching it with context encoding requests. Default is false.",
+            "max_num_steps": "Specify the number of steps to run for multi-step scheduling during inference. Default is -1 which specifies a default value based on configuration and platform. Ignored for models which are not auto-regressive (e.g. embedding models).",
+            "prefill_chunk_size": "The target number of un-encoded tokens to include in each batch. This value is used for chunked prefill and memory estimation. Default is 8192.",
+            "enable_echo": "Whether the model should be built with echo capabilities. This defaults to false.",
+            "pool_embeddings": "Whether to pool embedding outputs. Default is true.",
+            "use_experimental_kernels": "Whether to use experimental kernels. Default is false.",
+            "max_batch_context_length": "Ensures that the sum of the context length in a batch does not exceed max_batch_context_length. If None, the sum of the context length in batch is not limited.",
+            "pdl_level": "Level of overlap of kernel launch via programmatic dependent grid control. Default is 0.",
+            "custom_architectures": "A list of custom architecture implementations to register. Each input can either be a raw module name or an import path followed by a colon and the module name.",
+            "kvcache_ce_watermark": "Projected cache usage threshold for scheduling CE requests, considers current + incoming request. CE is scheduled if either projected usage stays below this threshold OR no active requests exist. Greater KVCache utilization (as controlled by this parameter) was found to cause more preemptions. Default watermark value is 0.95.",
         }
 
     @property
@@ -1401,33 +1361,15 @@ class AudioGenerationConfig(PipelineConfig):
 
         # Add AudioGenerationConfig-specific fields
         audio_specific_help = {
-            "audio_decoder": (
-                "The name of the audio decoder model architecture."
-            ),
-            "audio_decoder_weights": (
-                "The path to the audio decoder weights file."
-            ),
-            "chunk_size": (
-                "The chunk sizes to use for streaming. If this is an int, then fixed-size chunks of the given size are used. If this is a list, then variable chunk sizes are used."
-            ),
-            "buffer": (
-                "The number of previous speech tokens to pass to the audio decoder on each generation step. Default is 0."
-            ),
-            "block_causal": (
-                "Whether prior buffered tokens should attend to tokens in the current block. Has no effect if buffer is not set. Default is false."
-            ),
-            "prepend_prompt_speech_tokens": (
-                "Whether the prompt speech tokens should be forwarded to the audio decoder. Options: 'never', 'once', 'rolling'. Default is 'once'."
-            ),
-            "prepend_prompt_speech_tokens_causal": (
-                "Whether the prompt speech tokens should attend to tokens in the currently generated audio block. Has no effect if prepend_prompt_speech_tokens is 'never'. Default is false."
-            ),
-            "audio_decoder_config": (
-                "Parameters to pass to the audio decoder model."
-            ),
-            "prometheus_metrics_mode": (
-                "The mode to use for Prometheus metrics. Default is 'instrument_only'."
-            ),
+            "audio_decoder": "The name of the audio decoder model architecture.",
+            "audio_decoder_weights": "The path to the audio decoder weights file.",
+            "chunk_size": "The chunk sizes to use for streaming. If this is an int, then fixed-size chunks of the given size are used. If this is a list, then variable chunk sizes are used.",
+            "buffer": "The number of previous speech tokens to pass to the audio decoder on each generation step. Default is 0.",
+            "block_causal": "Whether prior buffered tokens should attend to tokens in the current block. Has no effect if buffer is not set. Default is false.",
+            "prepend_prompt_speech_tokens": "Whether the prompt speech tokens should be forwarded to the audio decoder. Options: 'never', 'once', 'rolling'. Default is 'once'.",
+            "prepend_prompt_speech_tokens_causal": "Whether the prompt speech tokens should attend to tokens in the currently generated audio block. Has no effect if prepend_prompt_speech_tokens is 'never'. Default is false.",
+            "audio_decoder_config": "Parameters to pass to the audio decoder model.",
+            "prometheus_metrics_mode": "The mode to use for Prometheus metrics. Default is 'instrument_only'.",
         }
 
         # Check for conflicts

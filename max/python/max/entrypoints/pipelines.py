@@ -385,11 +385,6 @@ def cli_pipeline(
     )
 
 
-# ============================================================================
-# Images Group (OpenAI-compatible /v1/images/* endpoints)
-# ============================================================================
-
-
 @main.group(name="images", cls=ModelGroup)
 def images_group() -> None:
     """Commands for image generation (OpenAI-compatible /v1/images/* API)."""
