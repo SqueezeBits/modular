@@ -1345,7 +1345,7 @@ async def openai_get_models(request: Request) -> ListModelsResponse:
         Model(id=pipeline.model_name, object="model", created=None, owned_by="")
     ]
 
-    if lora_queue := request.app.state.pipeline.lora_queue:
+    if lora_queue := getattr(request.app.state.pipeline, "lora_queue", None):
         model_list += [
             Model(id=lora, object="model", created=None, owned_by="")
             for lora in lora_queue.list_loras()

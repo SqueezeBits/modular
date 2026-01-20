@@ -32,7 +32,7 @@ def main() -> None:
 
     pipelines_cli.main(
         prog_name="pipelines",
-        args=["images", *sys.argv[1:]],
+        args=[*sys.argv[1:]],
     )
 
 

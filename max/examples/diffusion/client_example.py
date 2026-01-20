@@ -46,7 +46,7 @@ def example_with_requests() -> None:
 
     # Check server health
     response = requests.get(f"{base_url}/health")
-    print(f"Server health: {response.json()}")
+    print(f"Server health: {response.status_code} OK")
 
     # List available models
     response = requests.get(f"{base_url}/v1/models")
