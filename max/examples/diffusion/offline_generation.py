@@ -42,7 +42,7 @@ def main() -> None:
         prompts=prompt,
         height=1024,
         width=1024,
-        num_inference_steps=28,
+        num_inference_steps=50,
         guidance_scale=3.5,
     )
 
