@@ -209,7 +209,6 @@ class PixelGenerationPipeline(
 
     def execute(self, inputs: PixelGenerationInputs[PixelGenerationContextType]) -> list[PixelGenerationOutput]:
         # TODO: handle batch inference
-        breakpoint()
         outputs: list[PixelGenerationOutput] = []
         for request_id, context in inputs.batch.items():
             output = self._diffusion_pipeline.execute(context)

@@ -22,15 +22,42 @@ from threading import Event, Thread
 
 import tqdm
 from max.interfaces import (
-    PixelGenerationContext,
+    GenerationStatus,
     PixelGenerationInputs,
     PixelGenerationOutput,
     PixelGenerationRequest,
     PipelineTask,
     RequestID,
 )
+from max.interfaces.pipeline_variants.text_generation import (
+    TextGenerationRequestMessage,
+)
 from max.pipelines.lib import PIPELINE_REGISTRY, PipelineConfig
 from PIL.Image import Image
+
+
+@dataclass
+class PixelContext:
+    """Concrete implementation of PixelGenerationContext protocol."""
+
+    request_id: RequestID
+    prompt: str | None = None
+    negative_prompt: str | None = None
+    messages: list[TextGenerationRequestMessage] | None = None
+    max_text_encoder_length: int = 512
+    height: int = 1024
+    width: int = 1024
+    num_inference_steps: int = 50
+    guidance_scale: float = 3.5
+    num_images_per_prompt: int = 1
+    seed: int | None = None
+    model_name: str = ""
+    true_cfg_scale: float = 1.0
+    status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
+
+    @property
+    def is_done(self) -> bool:
+        return self.status.is_done
 
 
 @dataclass
@@ -256,7 +283,7 @@ def _run_worker(
 def _process_request(
     pipeline,
     request: _PixelBatchRequest,
-) -> _PixelBatchResponse:
+) -> list[PixelGenerationOutput]:
     """Process a single pixel generation request.
 
     Args:
@@ -282,31 +309,30 @@ def _process_request(
     else:
         true_cfg_scale = 4.0
 
-    prompt_iter = zip(request.prompts, negative_prompts, strict=False)
+    prompt_list = list(zip(request.prompts, negative_prompts, strict=False))
     if request.use_tqdm:
-        prompt_iter = tqdm.tqdm(prompt_iter, desc="Generating images")
+        prompt_list = list(tqdm.tqdm(prompt_list, desc="Generating images"))
 
     # Generate images for each prompt using the internal diffusion pipeline
-    request_id = RequestID()
-    inputs = PixelGenerationInputs(
-        batch={
-            request_id: PixelGenerationContext(
-                request_id=request_id,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                height=request.height,
-                width=request.width,
-                num_inference_steps=request.num_inference_steps,
-                guidance_scale=request.guidance_scale,
-                num_images_per_prompt=request.num_images_per_prompt,
-                true_cfg_scale=true_cfg_scale,
-            )
-            for prompt, negative_prompt in prompt_iter
-        }
-    )
+    batch: dict[RequestID, PixelContext] = {}
+    for prompt, negative_prompt in prompt_list:
+        request_id = RequestID()
+        batch[request_id] = PixelContext(
+            request_id=request_id,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=request.height,
+            width=request.width,
+            num_inference_steps=request.num_inference_steps,
+            guidance_scale=request.guidance_scale,
+            num_images_per_prompt=request.num_images_per_prompt,
+            true_cfg_scale=true_cfg_scale,
+        )
+
+    inputs = PixelGenerationInputs(batch=batch)
 
     outputs: list[PixelGenerationOutput] = pipeline.execute(inputs)
 
-    return _PixelBatchResponse(outputs=outputs)
+    return outputs
 
 
