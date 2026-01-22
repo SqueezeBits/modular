@@ -40,7 +40,7 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from ..autoencoder_kl import AutoencoderKLModel
+from ..autoencoders import AutoencoderKLModel
 from ..clip import ClipModel
 from ..t5 import T5Model
 from .model import Flux1Model
@@ -682,7 +682,7 @@ class FluxPipeline(DiffusionPipeline):
                 )
 
             # NOTE: Convert timesteps to a Max Tensor before denoising loop,
-            # as in the original implementation, results in a significant slow down.
+            # as in the original diffusers implementation, results in a significant slow down.
             # As a workaround, we keep timesteps as a numpy array and convert it
             # to a Max Tensor here. This might require a more efficient way to handle this.
             # Converting to a Max module V3 Tensor also results in a significant slow down.
