@@ -11,13 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .group_norm import GroupNorm
-from .layer_norm import LayerNorm
-from .rms_norm import GemmaRMSNorm, RMSNorm
-
-__all__ = [
-    "GemmaRMSNorm",
-    "GroupNorm",
-    "LayerNorm",
-    "RMSNorm",
-]
+from .attention import VAEAttention
+from .resnet import ResnetBlock2D
+from .upsampling import Upsample2D
