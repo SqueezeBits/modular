@@ -42,7 +42,7 @@ from max.interfaces import (
     TextGenerationOutput,
     TextGenerationRequest,
 )
-from max.nn import ReturnLogits
+from max.nn import ReturnHiddenStates, ReturnLogits
 from max.nn.kv_cache import KVCacheInputsSequence
 from max.profiler import Tracer, traced
 from max.support.algorithm import flatten2d
@@ -221,6 +221,7 @@ class TextGenerationPipeline(
             return_logits=ReturnLogits.ALL
             if self._pipeline_config.enable_echo
             else ReturnLogits.LAST_TOKEN,
+            return_hidden_states=self._pipeline_config.return_hidden_states,
         )
 
         # Load sampler.
@@ -526,6 +527,7 @@ class TextGenerationPipeline(
         flat_batch: list[TextGenerationContextType],
         num_steps: int,
         enable_log_probs: bool,
+        all_layers_hidden_states: tuple[Any, ...] | None = None,
     ) -> dict[RequestID, TextGenerationOutput]:
         """
         Update the context objects and prepare the response objects for each context in the batch after generation.
@@ -562,7 +564,12 @@ class TextGenerationPipeline(
                 if context.is_done:
                     break
 
-            res[context.request_id] = context.to_generation_output()
+            output = context.to_generation_output()
+            if all_layers_hidden_states is not None:
+                output = dataclasses.replace(
+                    output, hidden_states=all_layers_hidden_states
+                )
+            res[context.request_id] = output
 
         return res
 
@@ -608,6 +615,9 @@ class TextGenerationPipeline(
 
         curr_step_inputs = model_inputs
         batch_log_probabilities: list[list[LogProbabilities | None]] = []
+        # Store hidden states from the first step for text encoder use cases
+        all_layers_hidden_states: tuple[Any, ...] | None = None
+
         for i in range(num_steps):
             with Tracer(f"multistep_execution_loop_step_{i}"):
                 # Execute the model and get next tokens.
@@ -615,6 +625,9 @@ class TextGenerationPipeline(
                     model_outputs = self._pipeline_model.execute(
                         model_inputs=curr_step_inputs
                     )
+                    # Store hidden states from the first step
+                    if i == 0 and model_outputs.hidden_states is not None:
+                        all_layers_hidden_states = model_outputs.hidden_states
                 except Exception:
                     batch_size = len(flat_batch)
                     cache_tokens = sum(
@@ -731,6 +744,7 @@ class TextGenerationPipeline(
             flat_batch,
             num_steps,
             inputs.enable_log_probs,
+            all_layers_hidden_states,
         )
 
         # Update the cache lengths in our kv_cache manager.

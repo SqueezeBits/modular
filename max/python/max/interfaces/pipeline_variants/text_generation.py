@@ -342,6 +342,9 @@ class TextGenerationOutput:
     log_probabilities: list[LogProbabilities] | None = None
     """Optional list of log probabilities for each token."""
 
+    hidden_states: tuple[Any, ...] | None = None
+    """Optional tuple of hidden states from all layers."""
+
     @property
     def is_done(self) -> bool:
         """

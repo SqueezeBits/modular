@@ -29,6 +29,7 @@ from max.driver import DeviceSpec, load_devices
 from max.engine import InferenceSession
 from max.graph.quantization import QuantizationEncoding
 from max.interfaces import PipelineTask
+from max.nn import ReturnHiddenStates
 from max.serve.queue.zmq_queue import generate_zmq_ipc_path
 from pydantic import (
     Field,
@@ -140,6 +141,11 @@ class PipelineConfig(ConfigFileModel):
 
     pool_embeddings: bool = Field(default=True)
     """Whether to pool embedding outputs."""
+
+    return_hidden_states: ReturnHiddenStates = Field(
+        default=ReturnHiddenStates.NONE
+    )
+    """Which hidden states to return."""
 
     chat_template: Path | None = Field(default=None)
     """Optional custom chat template to override the one shipped with the
@@ -1191,6 +1197,7 @@ class PipelineConfig(ConfigFileModel):
             "prefill_chunk_size": "The target number of un-encoded tokens to include in each batch. This value is used for chunked prefill and memory estimation. Default is 8192.",
             "enable_echo": "Whether the model should be built with echo capabilities. This defaults to false.",
             "pool_embeddings": "Whether to pool embedding outputs. Default is true.",
+            "return_hidden_states": "Which hidden states to return. Options: 'none', 'last', 'all', 'last_normalized', 'all_normalized', 'all_layers'. Default is 'none'.",
             "use_experimental_kernels": "Whether to use experimental kernels. Default is false.",
             "max_batch_context_length": "Ensures that the sum of the context length in a batch does not exceed max_batch_context_length. If None, the sum of the context length in batch is not limited.",
             "pdl_level": "Level of overlap of kernel launch via programmatic dependent grid control. Default is 0.",

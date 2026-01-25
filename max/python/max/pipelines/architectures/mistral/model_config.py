@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.nn import ReturnLogits
+from max.nn import ReturnHiddenStates, ReturnLogits
 from max.nn.kv_cache import KVCacheParams
 from max.pipelines.lib import KVCacheConfig, MAXModelConfigBase, PipelineConfig
 from transformers import AutoConfig
@@ -40,6 +40,7 @@ class MistralConfig(MAXModelConfigBase):
     dtype: DType
     kv_params: KVCacheParams
     return_logits: ReturnLogits
+    return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE
 
     attention_multiplier: float
     devices: list[DeviceRef]

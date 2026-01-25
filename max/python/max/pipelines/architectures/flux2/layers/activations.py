@@ -11,7 +11,19 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .arch import mistral3_arch
-from .text_encoder import Mistral3TextEncoderModel
+"""Activation functions for Flux2."""
 
-__all__ = ["mistral3_arch", "Mistral3TextEncoderModel"]
+from functools import partial
+
+from max.experimental import functional as F
+
+ACT2FN = {
+    "silu": F.silu,
+    "gelu": F.gelu,
+    "gelu_tanh": partial(F.gelu, approximate="tanh"),
+    "gelu_quick": partial(F.gelu, approximate="quick"),
+    "quick_gelu": partial(F.gelu, approximate="quick"),
+    "relu": F.relu,
+    "tanh": F.tanh,
+    "sigmoid": F.sigmoid,
+}

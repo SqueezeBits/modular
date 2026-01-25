@@ -29,7 +29,7 @@ from max.graph.weights import (
     Weights,
     WeightsAdapter,
 )
-from max.nn import Module, ReturnLogits, Signals
+from max.nn import Module, ReturnHiddenStates, ReturnLogits, Signals
 from max.nn.kv_cache import KVCacheInputs, KVCacheParams, PagedCacheValues
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
@@ -101,6 +101,7 @@ class MistralModel(PipelineModel[TextContext], KVCacheMixin):
         weights: Weights,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
+        return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
         text_huggingface_config: AutoConfig | None = None,
     ) -> None:
         super().__init__(
@@ -113,6 +114,7 @@ class MistralModel(PipelineModel[TextContext], KVCacheMixin):
             weights,
             adapter,
             return_logits,
+            return_hidden_states,
         )
         # Override the huggingface_config to use the text huggingface_config if provided
         if text_huggingface_config is not None:
@@ -133,21 +135,29 @@ class MistralModel(PipelineModel[TextContext], KVCacheMixin):
             *model_inputs.signal_buffers,
             *curr_kv_cache_inputs,
         )
-        if len(model_outputs) == 3:
-            assert isinstance(model_outputs[0], Buffer)
-            assert isinstance(model_outputs[1], Buffer)
-            assert isinstance(model_outputs[2], Buffer)
-            return ModelOutputs(
-                next_token_logits=model_outputs[0],
-                logits=model_outputs[1],
-                logit_offsets=model_outputs[2],
-            )
+
+        next_token_logits = model_outputs[0]
+        logits = next_token_logits
+        logit_offsets = None
+        hidden_states = None
+
+        if self.return_logits == ReturnLogits.LAST_TOKEN:
+            if len(model_outputs) > 1:
+                hidden_states = tuple(model_outputs[1:])
         else:
-            assert isinstance(model_outputs[0], Buffer)
-            return ModelOutputs(
-                next_token_logits=model_outputs[0],
-                logits=model_outputs[0],
-            )
+            # Expecting logits and offsets
+            if len(model_outputs) >= 3:
+                logits = model_outputs[1]
+                logit_offsets = model_outputs[2]
+                if len(model_outputs) > 3:
+                    hidden_states = tuple(model_outputs[3:])
+
+        return ModelOutputs(
+            next_token_logits=next_token_logits,
+            logits=logits,
+            logit_offsets=logit_offsets,
+            hidden_states=hidden_states,
+        )
 
     def prepare_initial_token_inputs(
         self,
@@ -341,6 +351,7 @@ class MistralModel(PipelineModel[TextContext], KVCacheMixin):
             dtype=self.dtype,
             kv_params=self.kv_params,
             return_logits=self.return_logits,
+            return_hidden_states=self.return_hidden_states,
             attention_multiplier=math.sqrt(1 / self.kv_params.head_dim),
             head_dim=self.huggingface_config.head_dim,
             rope_theta=self.huggingface_config.rope_theta,

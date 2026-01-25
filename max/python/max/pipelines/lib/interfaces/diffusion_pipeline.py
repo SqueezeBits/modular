@@ -125,6 +125,15 @@ class DiffusionPipeline(ABC):
                     for weight_path in self.pipeline_config.model.weight_path
                     if weight_path.split("/")[0] == name
                 ]
+                # Add model_path for components that need it (e.g., Mistral3TextEncoderModel)
+                # For text encoders, provide both the root model path and the component path
+                # This allows components like Mistral3TextEncoderModel to construct
+                # the text_encoder subdirectory path internally
+                if "text_encoder" in name:
+                    config["text_encoder_path"] = str(component_path)
+                    config["model_path"] = str(component_path)
+                    # Also provide the root model path for components that need it
+                    config["root_model_path"] = str(pretrained_model_name_or_path)
                 loaded_sub_models[name] = component_class(
                     config=config,
                     encoding=self.pipeline_config.model.quantization_encoding,

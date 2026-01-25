@@ -11,7 +11,9 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .arch import mistral3_arch
-from .text_encoder import Mistral3TextEncoderModel
+"""Flux2 architecture package."""
 
-__all__ = ["mistral3_arch", "Mistral3TextEncoderModel"]
+from .arch import flux2_arch
+from .model import Flux2Model
+
+__all__ = ["Flux2Model", "flux2_arch"]
