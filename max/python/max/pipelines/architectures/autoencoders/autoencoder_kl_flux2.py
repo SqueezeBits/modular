@@ -115,6 +115,11 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             devices: List of devices to use.
             weights: Model weights.
         """
+        # Initialize BatchNorm statistics BEFORE super().__init__()
+        # because super().__init__() calls load_model() which sets these values
+        self.bn_running_mean: Optional[Tensor] = None
+        self.bn_running_var: Optional[Tensor] = None
+
         super().__init__(
             config=config,
             encoding=encoding,
@@ -123,9 +128,6 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             config_class=AutoencoderKLFlux2Config,
             autoencoder_class=AutoencoderKLFlux2,
         )
-        # Initialize BatchNorm statistics (will be loaded in load_model)
-        self.bn_running_mean: Optional[Tensor] = None
-        self.bn_running_var: Optional[Tensor] = None
 
     def load_model(self) -> None:
         """Load and compile the decoder model with BatchNorm statistics.
@@ -137,6 +139,10 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
         # BaseAutoencoderModel filters out encoder weights, but we need to
         # explicitly handle decoder, post_quant_conv, and BatchNorm statistics
         state_dict = {}
+
+        all_keys = [key for key, _ in self.weights.items()]
+        bn_keys = [k for k in all_keys if "bn" in k.lower() or "running" in k.lower()]
+
         for key, value in self.weights.items():
             if key.startswith("decoder."):
                 # Remove "decoder." prefix for decoder weights
@@ -144,20 +150,22 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             elif key.startswith("post_quant_conv."):
                 # Keep post_quant_conv prefix as-is
                 state_dict[key] = value.data()
-            elif key == "bn.running_mean":
+            elif key == "bn.running_mean" or key == "latent_bn.running_mean":
                 # Load BatchNorm running mean as Tensor
                 # value.data() returns WeightData (DLPackArray), access .data for DLPackArray
                 # then convert to module_v3 Tensor
                 self.bn_running_mean = Tensor.from_dlpack(value.data().data).to(
                     self.devices[0]
                 )
-            elif key == "bn.running_var":
+                print(f"[DEBUG] Loaded bn_running_mean from key: {key}")
+            elif key == "bn.running_var" or key == "latent_bn.running_var":
                 # Load BatchNorm running variance as Tensor
                 # value.data() returns WeightData (DLPackArray), access .data for DLPackArray
                 # then convert to module_v3 Tensor
                 self.bn_running_var = Tensor.from_dlpack(value.data().data).to(
                     self.devices[0]
                 )
+                print(f"[DEBUG] Loaded bn_running_var from key: {key}")
             # Note: encoder weights are filtered out (not included in state_dict)
 
         # Compile decoder

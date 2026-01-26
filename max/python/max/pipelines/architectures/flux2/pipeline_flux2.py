@@ -446,40 +446,76 @@ class Flux2Pipeline(DiffusionPipeline):
         return latents
 
     @staticmethod
-    def _unpack_latents(
-        latents: Tensor_v3,
-        height: int,
-        width: int,
-        vae_scale_factor: int,
-    ) -> Tensor_v3:
-        """Unpack latents for Flux2 (similar to Flux1).
+    def _unpack_latents_with_ids(x: Tensor_v3, x_ids: Tensor_v3) -> Tensor_v3:
+        """Using position ids to scatter tokens into place.
 
         Args:
-            latents: Packed latent tensor.
-            height: Target height.
-            width: Target width.
-            vae_scale_factor: VAE scale factor.
+            x: Latent tensor of shape [B, seq_len, C].
+            x_ids: Position IDs tensor of shape [B, seq_len, 4].
 
         Returns:
-            Unpacked latents.
+            Unpacked latents of shape [B, C, H, W].
         """
-        batch_size, _, channels = latents.shape
+        batch_size = x.shape[0].dim
+        seq_len = x.shape[1].dim
+        ch = x.shape[2].dim
 
-        # VAE applies compression but we must also account for packing which requires
-        # latent height and width to be divisible by 2.
-        height = 2 * (height // (vae_scale_factor * 2))
-        width = 2 * (width // (vae_scale_factor * 2))
+        # Get h_ids and w_ids from position tensor (columns 1 and 2)
+        h_ids = x_ids[:, :, 1].cast(DType.int64)  # [B, seq_len]
+        w_ids = x_ids[:, :, 2].cast(DType.int64)  # [B, seq_len]
+
+        # Calculate H and W from max indices + 1
+        h = int(h_ids.max().item()) + 1
+        w = int(w_ids.max().item()) + 1
+
+        flat_ids = h_ids * w + w_ids
+
+        # Create output tensor and scatter data into place
+        x_list = []
+        for b in range(batch_size):
+            data_b = x[b]  # [seq_len, C]
+            flat_ids_b = flat_ids[b]  # [seq_len]
+
+            # Initialize output with zeros
+            out = Tensor_v3.zeros([h * w, ch], dtype=x.dtype, device=x.device)
+
+            # Scatter: out[flat_ids[i], :] = data[i, :] for each i
+            indices = F.reshape(flat_ids_b, [seq_len, 1]).cast(DType.int64)
+            out = F.scatter_nd(out, data_b, indices)
+
+            # Reshape from (H * W, C) to (C, H, W)
+            out = F.reshape(out, [h, w, ch])
+            out = F.permute(out, (2, 0, 1))  # [C, H, W]
+            x_list.append(out)
+
+        # Stack batches
+        result = F.stack(x_list, axis=0)  # [B, C, H, W]
+        return result
+
+    @staticmethod
+    def _unpatchify_latents(latents: Tensor_v3) -> Tensor_v3:
+        """Unpatchify latents from (B, C, H, W) to (B, C//4, H*2, W*2).
+
+        Args:
+            latents: Patchified latents of shape [B, C, H, W].
+
+        Returns:
+            Unpatchified latents of shape [B, C//4, H*2, W*2].
+        """
+        batch_size = latents.shape[0].dim
+        num_channels_latents = latents.shape[1].dim
+        height = latents.shape[2].dim
+        width = latents.shape[3].dim
 
         latents = F.reshape(
             latents,
-            (batch_size.dim, height // 2, width // 2, channels.dim // 4, 2, 2),
+            (batch_size, num_channels_latents // 4, 2, 2, height, width),
         )
-        latents = F.permute(latents, (0, 3, 1, 4, 2, 5))
-
+        latents = F.permute(latents, (0, 1, 4, 2, 5, 3))
         latents = F.reshape(
-            latents, (batch_size.dim, channels.dim // (2 * 2), height, width)
+            latents,
+            (batch_size, num_channels_latents // 4, height * 2, width * 2),
         )
-
         return latents
 
     def prepare_latents(
@@ -731,8 +767,13 @@ class Flux2Pipeline(DiffusionPipeline):
             # Convert timestep to V2 Tensor (Buffer) for compiled Model
             # Note: Compiled Model can accept Tensor_v3 (auto-converts), but we convert
             # timestep to V2 for consistency with Flux1 pattern
-            timestep = np.full((batch_size,), t) / 1000.0
-            timestep = Tensor.from_dlpack(timestep).to(prompt_embeds.device)
+            # Must cast to prompt_embeds.dtype (bfloat16) to match compiled model input type
+            timestep_np = np.full((batch_size,), t, dtype=np.float32) / 1000.0
+            timestep = (
+                Tensor_v3.from_dlpack(timestep_np)
+                .to(prompt_embeds.device)
+                .cast(prompt_embeds.dtype)
+            )
 
             # Flux2 transformer call (no pooled_prompt_embeds)
             # Compiled Model accepts Tensor_v3 and auto-converts to V2 internally
@@ -785,14 +826,35 @@ class Flux2Pipeline(DiffusionPipeline):
         if output_type == "latent":
             image = latents
         else:
-            latents = Tensor_v3.from_dlpack(latents)  # V2 Tensor to V3 Tensor
-            latents = self._unpack_latents(
-                latents, height, width, self.vae_scale_factor
-            )
-            latents = (
-                latents / self.vae.config.scaling_factor
-            ) + self.vae.config.shift_factor
-            image = self.vae.decode(latents)
+            # Convert to Tensor_v3 if needed (latents may be driver.Tensor after scheduler.step)
+            if not isinstance(latents, Tensor_v3):
+                latents = Tensor_v3.from_dlpack(latents)
+
+            # Unpack latents using position IDs (Flux2 specific)
+            latents_v3 = self._unpack_latents_with_ids(latents, latent_image_ids)
+
+            # Apply BatchNorm inverse transform (Flux2 specific)
+            # Flux2 uses BatchNorm statistics instead of scaling_factor/shift_factor
+            bn_mean = self.vae.bn.running_mean
+            bn_var = self.vae.bn.running_var
+            num_channels = bn_mean.shape[0].dim
+            bn_mean = F.reshape(bn_mean, (1, num_channels, 1, 1))
+            bn_var = F.reshape(bn_var, (1, num_channels, 1, 1))
+            bn_std = F.sqrt(bn_var + self.vae.config.batch_norm_eps)
+            latents_v3 = latents_v3 * bn_std + bn_mean
+
+            # Unpatchify latents: (B, C, H, W) -> (B, C//4, H*2, W*2)
+            latents_v3 = self._unpatchify_latents(latents_v3)
+
+            # Cast to bfloat16 for VAE decode (VAE expects bf16 inputs)
+            latents_v3 = latents_v3.cast(DType.bfloat16)
+
+            # VAE decode
+            image = self.vae.decode(latents_v3)
+
+            # Convert to Tensor_v3 if decode returns driver.Tensor
+            if not isinstance(image, Tensor_v3):
+                image = Tensor_v3.from_dlpack(image)
 
             image = self.image_processor.postprocess(
                 image, output_type=output_type
