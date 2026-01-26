@@ -37,7 +37,7 @@ from pydantic import (
 )
 from typing_extensions import Self
 
-from .config_enums import PipelineRole
+from .config_enums import PipelineRole, PixelGenerationType
 from .kv_cache_config import KVCacheConfig
 from .lora_config import LoRAConfig
 from .memory_estimation import MemoryEstimator, to_human_readable_bytes
@@ -752,6 +752,14 @@ class PipelineConfig(ConfigFileModel):
                 # We should be able to override this value for all config objects.
                 continue
 
+    def _is_diffusers_pipeline(self) -> bool:
+        """Check if this config is for a diffusers pipeline.
+
+        Returns True for configs that use diffusers-style models (e.g., PixelGenerationConfig).
+        Subclasses for diffusers pipelines should override this to return True.
+        """
+        return False
+
     def resolve(self) -> None:
         """
         Validates and resolves the config.
@@ -947,6 +955,7 @@ class PipelineConfig(ConfigFileModel):
         arch = PIPELINE_REGISTRY.retrieve_architecture(
             huggingface_repo=model_config.huggingface_model_repo,
             use_legacy_module=self.use_legacy_module,
+            pipeline_config=self,
         )
 
         # If nothing is provided, we should not update any more params.
@@ -1020,6 +1029,11 @@ class PipelineConfig(ConfigFileModel):
         # Resolve final pipeline-specific changes to the config before doing
         # memory estimations.
         arch.pipeline_model.finalize_pipeline_config(self)
+
+        if self._is_diffusers_pipeline():
+            # Skip profiling for diffusers models,
+            # since diffusers models don't need to compute a budget for KV Cache.
+            return
 
         MemoryEstimator.estimate_memory_footprint(
             self,
@@ -1484,5 +1498,94 @@ class AudioGenerationConfig(PipelineConfig):
             prepend_prompt_speech_tokens_causal=prepend_prompt_speech_tokens_causal,
             run_model_test_mode=run_model_test_mode,
             prometheus_metrics_mode=prometheus_metrics_mode,
+            **config_flags,
+        )
+
+
+class PixelGenerationConfig(PipelineConfig):
+    """Configuration for pixel generation pipelines.
+
+    This config extends PipelineConfig to support diffusers-style pipelines
+    with multi-folder repository structures. Inference parameters like
+    num_inference_steps, guidance_scale, height, and width come from API
+    requests (PixelGenerationRequest), not this server config.
+
+    Access diffusers-style model configurations via `model.diffusers_config`.
+    """
+
+    # Generation mode - architectural choice set at server startup
+    generation_type: PixelGenerationType = Field(
+        default=PixelGenerationType.TEXT_TO_IMAGE,
+        description="The type of pixel generation to perform.",
+    )
+
+    # Scheduler override - server-wide setting
+    scheduler_type: str | None = Field(
+        default=None,
+        description="Optional scheduler override. Uses model default if not specified.",
+    )
+
+    def __init__(
+        self,
+        generation_type: PixelGenerationType = PixelGenerationType.TEXT_TO_IMAGE,
+        scheduler_type: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Must call the superclass's __init__ first, otherwise PipelineConfig's
+        # init will override values defined in the PixelGenerationConfig.
+        PipelineConfig.__init__(self, **kwargs)
+
+        self.generation_type = generation_type
+        self.scheduler_type = scheduler_type
+
+    @property
+    def is_video(self) -> bool:
+        """Whether this config produces video output."""
+        return self.generation_type.outputs_video
+
+    @property
+    def requires_input_image(self) -> bool:
+        """Whether this config requires an input image."""
+        return self.generation_type.requires_input_image
+
+    def _is_diffusers_pipeline(self) -> bool:
+        """Check if this config is for a diffusers pipeline.
+
+        Returns True if the model is a diffusers-style model with model_index.json.
+        This enables skipping text-generation-specific validation during resolve().
+        """
+        return self.model.diffusers_config is not None
+
+    @staticmethod
+    def help() -> dict[str, str]:
+        """Return help text for PixelGenerationConfig-specific fields."""
+        return {
+            "generation_type": "The type of pixel generation: text_to_image, text_to_video, image_to_image, image_to_video, image_editing, video_to_video, inpainting, outpainting, or controlnet.",
+            "scheduler_type": "Optional scheduler override (e.g., 'ddim', 'euler'). Uses model default if not specified.",
+        }
+
+    @classmethod
+    def from_flags(
+        cls, pixel_flags: dict[str, str], **config_flags: Any
+    ) -> PixelGenerationConfig:
+        """Create a PixelGenerationConfig from CLI flags.
+        Only server-side configuration is parsed here. Inference parameters
+        like num_inference_steps, guidance_scale, height, and width come
+        from API requests (PixelGenerationRequest).
+        """
+        generation_type = PixelGenerationType(
+            pixel_flags.pop("generation_type", "text_to_image")
+        )
+
+        scheduler_type = pixel_flags.pop("scheduler_type", None)
+
+        if pixel_flags:
+            raise ValueError(
+                f"Unknown pixel generation option(s): {pixel_flags}"
+            )
+
+        return cls(
+            generation_type=generation_type,
+            scheduler_type=scheduler_type,
             **config_flags,
         )
