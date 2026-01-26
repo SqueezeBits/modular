@@ -859,6 +859,31 @@ class Flux2Pipeline(DiffusionPipeline):
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
         batch_size = latents.shape[0].dim
+
+        # Compile transformer once before loop (matching max_diffusers pattern)
+        # This avoids repeated _ensure_compiled calls and wrapper overhead
+        text_seq_len = prompt_embeds.shape[1].dim
+        compiled_model = self.transformer._ensure_compiled(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            text_seq_len=text_seq_len,
+        )
+
+        # Pre-convert unchanging tensors to driver_tensor to avoid repeated conversions
+        # and reduce memory allocations during the loop (matching max_diffusers pattern)
+        encoder_hidden_states_drv = prompt_embeds.driver_tensor
+        guidance_drv = guidance.driver_tensor
+        txt_ids_drv = text_ids.driver_tensor
+        img_ids_drv = latent_image_ids.driver_tensor
+
+        # For true CFG
+        negative_encoder_hidden_states_drv = (
+            negative_prompt_embeds.driver_tensor if do_true_cfg else None
+        )
+        negative_txt_ids_drv = (
+            negative_text_ids.driver_tensor if do_true_cfg else None
+        )
+
         for i in tqdm(range(self._num_timesteps), desc="Denoising"):
             if self._interrupt:
                 continue
@@ -866,37 +891,42 @@ class Flux2Pipeline(DiffusionPipeline):
             t = timesteps[i]
             self._current_timestep = t
 
-            # Convert timestep to V2 Tensor (Buffer) for compiled Model
-            # Note: Compiled Model can accept Tensor_v3 (auto-converts), but we convert
-            # timestep to V2 for consistency with Flux1 pattern
+            # Convert timestep to driver_tensor
             # Must cast to prompt_embeds.dtype (bfloat16) to match compiled model input type
             timestep_np = np.full((batch_size,), t, dtype=np.float32) / 1000.0
-            timestep = (
+            timestep_v3 = (
                 Tensor_v3.from_dlpack(timestep_np)
                 .to(prompt_embeds.device)
                 .cast(prompt_embeds.dtype)
             )
+            timestep_drv = timestep_v3.driver_tensor
 
-            # Flux2 transformer call (no pooled_prompt_embeds)
-            # Compiled Model accepts Tensor_v3 and auto-converts to V2 internally
-            noise_pred = self.transformer(
-                latents,
-                prompt_embeds,
-                timestep,
-                latent_image_ids,
-                text_ids,
-                guidance,
+            # Convert latents to driver_tensor
+            hidden_states_drv = latents.driver_tensor
+
+            # Call compiled model directly (bypassing Flux2Model wrapper)
+            noise_pred_drv = compiled_model(
+                hidden_states_drv,
+                encoder_hidden_states_drv,
+                timestep_drv,
+                img_ids_drv,
+                txt_ids_drv,
+                guidance_drv,
             )[0]
 
+            # Convert back to Tensor_v3 for scheduler
+            noise_pred = Tensor_v3.from_dlpack(noise_pred_drv)
+
             if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    latents,
-                    negative_prompt_embeds,
-                    timestep,
-                    latent_image_ids,
-                    negative_text_ids,
-                    guidance,
+                neg_noise_pred_drv = compiled_model(
+                    hidden_states_drv,
+                    negative_encoder_hidden_states_drv,
+                    timestep_drv,
+                    img_ids_drv,
+                    negative_txt_ids_drv,
+                    guidance_drv,
                 )[0]
+                neg_noise_pred = Tensor_v3.from_dlpack(neg_noise_pred_drv)
                 noise_pred = neg_noise_pred + true_cfg_scale * (
                     noise_pred - neg_noise_pred
                 )
@@ -907,8 +937,12 @@ class Flux2Pipeline(DiffusionPipeline):
                 noise_pred, t, latents, return_dict=False
             )[0]
 
+            # Convert driver.Tensor back to Tensor_v3 if needed
+            if not isinstance(latents, Tensor_v3):
+                latents = Tensor_v3.from_dlpack(latents)
+
             if latents.dtype != latents_dtype:
-                latents = latents.to(latents_dtype)
+                latents = latents.cast(latents_dtype)
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}
