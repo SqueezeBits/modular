@@ -42,6 +42,80 @@ from ..autoencoders import AutoencoderKLFlux2Model
 from ..mistral3 import Mistral3TextEncoderModel
 from ..mistral3.tokenizer import Mistral3Tokenizer
 from .model import Flux2Model
+from .system_messages import SYSTEM_MESSAGE
+
+
+def format_input(
+    prompts: list[str],
+    system_message: str = SYSTEM_MESSAGE,
+    images: list[PIL.Image.Image] | list[list[PIL.Image.Image]] | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Format a batch of text prompts into the conversation format expected by apply_chat_template.
+
+    Optionally, add images to the input.
+
+    Adapted from:
+    https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/text_encoder.py#L68
+
+    Args:
+        prompts: List of text prompts.
+        system_message: System message to use (default: SYSTEM_MESSAGE).
+        images: Optional list of images to add to the input.
+
+    Returns:
+        List of conversations, where each conversation is a list of message dicts.
+    """
+    # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
+    # when truncation is enabled. The processor counts [IMG] tokens and fails
+    # if the count changes after truncation.
+    cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
+
+    if images is None or len(images) == 0:
+        return [
+            [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": system_message}],
+                },
+                {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            ]
+            for prompt in cleaned_txt
+        ]
+    else:
+        assert len(images) == len(
+            prompts
+        ), "Number of images must match number of prompts"
+        messages = [
+            [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": system_message}],
+                },
+            ]
+            for _ in cleaned_txt
+        ]
+
+        for i, (el, img_list) in enumerate(zip(messages, images)):
+            # optionally add the images per batch element.
+            if img_list is not None:
+                el.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image_obj}
+                            for image_obj in img_list
+                        ],
+                    }
+                )
+            # add the text.
+            el.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": cleaned_txt[i]}],
+                }
+            )
+
+        return messages
 
 
 def retrieve_timesteps(
@@ -111,17 +185,34 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-def calculate_shift(
-    image_seq_len: int,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-) -> float:
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
+def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+    """Compute empirical mu for Flux2 timestep scheduling.
+
+    Taken from:
+    https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/sampling.py#L251
+
+    Args:
+        image_seq_len: Length of image sequence (H*W after packing).
+        num_steps: Number of inference steps.
+
+    Returns:
+        Empirical mu value for scheduler.
+    """
+    a1, b1 = 8.73809524e-05, 1.89833333
+    a2, b2 = 0.00016927, 0.45666666
+
+    if image_seq_len > 4300:
+        mu = a2 * image_seq_len + b2
+        return float(mu)
+
+    m_200 = a2 * image_seq_len + b2
+    m_10 = a1 * image_seq_len + b1
+
+    a = (m_200 - m_10) / 190.0
+    b = m_200 - 200.0 * a
+    mu = a * num_steps + b
+
+    return float(mu)
 
 
 @dataclass
@@ -214,18 +305,42 @@ class Flux2Pipeline(DiffusionPipeline):
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
         if prompt_embeds is None:
-            # Tokenize prompt
-            text_inputs = self.tokenizer(
-                prompt,
+            # Format prompt using Flux2 chat template
+            messages_batch = format_input(
+                prompts=prompt, system_message=SYSTEM_MESSAGE
+            )
+
+            # Use HuggingFace tokenizer's apply_chat_template
+            # Access the delegate tokenizer from Mistral3Tokenizer
+            hf_tokenizer = self.tokenizer.delegate
+            inputs = hf_tokenizer.apply_chat_template(
+                messages_batch,
+                add_generation_prompt=False,
+                tokenize=True,
+                return_dict=True,
                 padding="max_length",
-                max_length=max_sequence_length,
                 truncation=True,
+                max_length=max_sequence_length,
                 return_length=False,
                 return_overflowing_tokens=False,
             )
-            # Pass numpy array directly to text_encoder to avoid unnecessary
-            # GPU -> CPU transfer. text_encoder internally handles numpy input.
-            text_input_ids = np.array(text_inputs.input_ids, dtype=np.int64)
+
+            # Extract real tokens only (using attention mask)
+            input_ids = inputs["input_ids"][0]
+            attention_mask = inputs.get("attention_mask", None)
+            attention_mask = (
+                attention_mask[0]
+                if attention_mask is not None
+                else [1] * len(input_ids)
+            )
+
+            # Filter to keep only real tokens (where mask == 1)
+            real_token_ids = [
+                token_id
+                for token_id, mask in zip(input_ids, attention_mask)
+                if mask == 1
+            ]
+            text_input_ids = np.array([real_token_ids], dtype=np.int64)
 
             # Encode with Mistral3 text encoder
             # Mistral3TextEncoderModel returns tuple of hidden states (all layers)
@@ -410,39 +525,21 @@ class Flux2Pipeline(DiffusionPipeline):
         return latent_image_ids
 
     @staticmethod
-    def _pack_latents(
-        latents: Tensor_v3,
-        batch_size: int,
-        num_channels_latents: int,
-        height: int,
-        width: int,
-    ) -> Tensor_v3:
-        """Pack latents for Flux2 (similar to Flux1).
+    def _pack_latents(latents: Tensor_v3) -> Tensor_v3:
+        """Pack latents: (B, C, H, W) -> (B, H*W, C).
 
         Args:
-            latents: Latent tensor.
-            batch_size: Batch size.
-            num_channels_latents: Number of latent channels.
-            height: Latent height.
-            width: Latent width.
+            latents: Latent tensor of shape (B, C, H, W).
 
         Returns:
-            Packed latents.
+            Packed latents of shape (B, H*W, C).
         """
-        latents = F.reshape(
-            latents,
-            (batch_size, num_channels_latents, height // 2, 2, width // 2, 2),
-        )
-        latents = F.permute(latents, (0, 2, 4, 1, 3, 5))
-        latents = F.reshape(
-            latents,
-            (
-                batch_size,
-                (height // 2) * (width // 2),
-                num_channels_latents * 4,
-            ),
-        )
-
+        batch_size = latents.shape[0].dim
+        num_channels = latents.shape[1].dim
+        height = latents.shape[2].dim
+        width = latents.shape[3].dim
+        latents = F.reshape(latents, (batch_size, num_channels, height * width))
+        latents = F.permute(latents, (0, 2, 1))
         return latents
 
     @staticmethod
@@ -532,7 +629,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
         Args:
             batch_size: The number of images to generate.
-            num_channels_latents: The number of latent channels.
+            num_channels_latents: The number of latent channels (before packing).
             height: The height of the generated image.
             width: The width of the generated image.
             dtype: The data type for the latents.
@@ -542,27 +639,35 @@ class Flux2Pipeline(DiffusionPipeline):
         Returns:
             Tuple of latents and latent image ids.
         """
-        # VAE applies compression but we must also account for packing which requires
-        # latent height and width to be divisible by 2.
+        # VAE applies 8x compression on images but we must also account for packing
+        # which requires latent height and width to be divisible by 2.
         height = 2 * (int(height) // (self.vae_scale_factor * 2))
         width = 2 * (int(width) // (self.vae_scale_factor * 2))
 
-        shape = (batch_size, num_channels_latents, height, width)
+        # Flux2 latent shape: (B, C*4, H//2, W//2) before packing
+        # After packing: (B, (H//2)*(W//2), C*4)
+        shape = (batch_size, num_channels_latents * 4, height // 2, width // 2)
 
         if latents is not None:
+            latents = (
+                latents
+                if isinstance(latents, Tensor_v3)
+                else Tensor_v3.from_dlpack(latents)
+            )
             latent_image_ids = self._prepare_latent_image_ids(
                 batch_size, height // 2, width // 2, device, dtype
             )
             return latents.to(device).cast(dtype), latent_image_ids
 
         latents = random.normal(shape, device=device, dtype=dtype)
-        latents = self._pack_latents(
-            latents, batch_size, num_channels_latents, height, width
-        )
 
+        # Prepare latent IDs before packing
         latent_image_ids = self._prepare_latent_image_ids(
             batch_size, height // 2, width // 2, device, dtype
         )
+
+        # Pack latents: (B, C, H, W) -> (B, H*W, C)
+        latents = self._pack_latents(latents)
 
         return latents, latent_image_ids
 
@@ -728,12 +833,9 @@ class Flux2Pipeline(DiffusionPipeline):
         ):
             sigmas = None
         image_seq_len = latents.shape[1].dim
-        mu = calculate_shift(
-            image_seq_len,
-            self.scheduler.base_image_seq_len,
-            self.scheduler.max_image_seq_len,
-            self.scheduler.base_shift,
-            self.scheduler.max_shift,
+        mu = compute_empirical_mu(
+            image_seq_len=image_seq_len,
+            num_steps=num_inference_steps,
         )
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -835,22 +937,22 @@ class Flux2Pipeline(DiffusionPipeline):
 
             # Apply BatchNorm inverse transform (Flux2 specific)
             # Flux2 uses BatchNorm statistics instead of scaling_factor/shift_factor
+            # VAE weights and bn stats are already bfloat16 - no cast needed
             bn_mean = self.vae.bn.running_mean
             bn_var = self.vae.bn.running_var
+
             num_channels = bn_mean.shape[0].dim
             bn_mean = F.reshape(bn_mean, (1, num_channels, 1, 1))
             bn_var = F.reshape(bn_var, (1, num_channels, 1, 1))
             bn_std = F.sqrt(bn_var + self.vae.config.batch_norm_eps)
+
             latents_v3 = latents_v3 * bn_std + bn_mean
 
             # Unpatchify latents: (B, C, H, W) -> (B, C//4, H*2, W*2)
             latents_v3 = self._unpatchify_latents(latents_v3)
 
-            # Cast to bfloat16 for VAE decode (VAE expects bf16 inputs)
-            latents_v3 = latents_v3.cast(DType.bfloat16)
-
-            # VAE decode
-            image = self.vae.decode(latents_v3)
+            # VAE decode (weights and graph are bfloat16, no dtype conversion needed)
+            image = self.vae.decode(latents_v3.driver_tensor)
 
             # Convert to Tensor_v3 if decode returns driver.Tensor
             if not isinstance(image, Tensor_v3):

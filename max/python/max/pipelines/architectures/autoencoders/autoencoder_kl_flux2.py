@@ -134,38 +134,48 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
 
         Extracts decoder weights and BatchNorm statistics (running_mean, running_var)
         from the full model weights and compiles the decoder for inference.
+        
+        Following max-diffusers pattern: all weights are converted to bfloat16.
         """
-        # Extract decoder weights (excluding encoder weights)
-        # BaseAutoencoderModel filters out encoder weights, but we need to
-        # explicitly handle decoder, post_quant_conv, and BatchNorm statistics
+        from max.graph import DeviceRef
+        
+        # Helper functions to convert weights to target dtype (bfloat16)
+        # Following max-diffusers pattern: to_bf16() and to_bf16_gpu()
+        target_dtype = self.config.dtype
+        
+        def to_bf16(data) -> Tensor:
+            """Convert weight data to bfloat16 Tensor."""
+            return Tensor.from_dlpack(data).cast(target_dtype)
+        
+        def to_bf16_gpu(data) -> Tensor:
+            """Convert weight data to bfloat16 Tensor on target device."""
+            return Tensor.from_dlpack(data).to(self.devices[0]).cast(target_dtype)
+        
+        def to_bf16_dlpack(data):
+            """Convert weight data to bfloat16 and return as DLPackArray for compile()."""
+            tensor = Tensor.from_dlpack(data).cast(target_dtype)
+            return tensor.driver_tensor
+
         state_dict = {}
 
-        all_keys = [key for key, _ in self.weights.items()]
-        bn_keys = [k for k in all_keys if "bn" in k.lower() or "running" in k.lower()]
-
         for key, value in self.weights.items():
+            weight_data = value.data().data  # Get DLPackArray from WeightData
+            
             if key.startswith("decoder."):
                 # Remove "decoder." prefix for decoder weights
-                state_dict[key.removeprefix("decoder.")] = value.data()
+                # Convert to bfloat16 following max-diffusers pattern
+                # compile() expects DLPackArray, so convert Tensor back to driver_tensor
+                state_dict[key.removeprefix("decoder.")] = to_bf16_dlpack(weight_data)
             elif key.startswith("post_quant_conv."):
                 # Keep post_quant_conv prefix as-is
-                state_dict[key] = value.data()
+                # compile() expects DLPackArray, so convert Tensor back to driver_tensor
+                state_dict[key] = to_bf16_dlpack(weight_data)
             elif key == "bn.running_mean" or key == "latent_bn.running_mean":
-                # Load BatchNorm running mean as Tensor
-                # value.data() returns WeightData (DLPackArray), access .data for DLPackArray
-                # then convert to module_v3 Tensor
-                self.bn_running_mean = Tensor.from_dlpack(value.data().data).to(
-                    self.devices[0]
-                )
-                print(f"[DEBUG] Loaded bn_running_mean from key: {key}")
+                # Load BatchNorm running mean as Tensor and convert to bfloat16
+                self.bn_running_mean = to_bf16_gpu(weight_data)
             elif key == "bn.running_var" or key == "latent_bn.running_var":
-                # Load BatchNorm running variance as Tensor
-                # value.data() returns WeightData (DLPackArray), access .data for DLPackArray
-                # then convert to module_v3 Tensor
-                self.bn_running_var = Tensor.from_dlpack(value.data().data).to(
-                    self.devices[0]
-                )
-                print(f"[DEBUG] Loaded bn_running_var from key: {key}")
+                # Load BatchNorm running variance as Tensor and convert to bfloat16
+                self.bn_running_var = to_bf16_gpu(weight_data)
             # Note: encoder weights are filtered out (not included in state_dict)
 
         # Compile decoder
