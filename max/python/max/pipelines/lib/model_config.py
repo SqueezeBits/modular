@@ -37,6 +37,7 @@ from transformers import AutoConfig
 from transformers.generation import GenerationConfig
 
 from .config_enums import RepoType, RopeType, SupportedEncoding
+from .diffusers_config import DiffusersConfig
 from .hf_utils import (
     HuggingFaceRepo,
     try_to_load_from_cache,
@@ -199,6 +200,9 @@ class MAXModelConfig(MAXModelConfigBase):
     _huggingface_config: AutoConfig | None = PrivateAttr(default=None)
     """Hugging Face config. This should only be set by internal code."""
 
+    _diffusers_config: DiffusersConfig | None = PrivateAttr(default=None)
+    """Diffusers config (model_index.json). This should only be set by internal code."""
+
     _weights_repo_id: str | None = PrivateAttr(default=None)
     """Hugging Face repo id to load weights from only. This should only be set by internal code."""
 
@@ -237,29 +241,30 @@ class MAXModelConfig(MAXModelConfigBase):
     # TODO(SERVSYS-1085): Figure out a better way to avoid having to roll our
     # own custom __getstate__/__setstate__ methods.
     def __getstate__(self) -> dict[str, Any]:
-        """Customize pickling to avoid serializing non-picklable HF config.
+        """Customize pickling to avoid serializing non-picklable configs.
 
-        Drops `_huggingface_config` from the serialized state to ensure
-        the object remains pickleable across processes; it will be
-        lazily re-initialized on access via the `huggingface_config` property.
+        Drops `_huggingface_config` and `_diffusers_config` from the serialized
+        state to ensure the object remains pickleable across processes; they will
+        be lazily re-initialized on access via their respective properties.
         """
         # NOTE: In pydantic v2, PrivateAttr values live in `__pydantic_private__`,
         # not necessarily in `__dict__`. Preserve private state across processes,
-        # but explicitly drop `_huggingface_config` to avoid serializing possibly
-        # non-picklable / remote-code-derived transformer objects.
+        # but explicitly drop `_huggingface_config` and `_diffusers_config` to
+        # avoid serializing possibly non-picklable / remote-code-derived objects.
         state = self.__dict__.copy()
         private = getattr(self, "__pydantic_private__", None)
         if private is not None:
             private_state = dict(private)
             private_state["_huggingface_config"] = None
+            private_state["_diffusers_config"] = None
             state["__pydantic_private__"] = private_state
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore state while ensuring `_huggingface_config` is reset.
+        """Restore state while ensuring lazy-loaded configs are reset.
 
-        `_huggingface_config` is restored as None to preserve the lazy
-        loading behavior defined in `huggingface_config`.
+        `_huggingface_config` and `_diffusers_config` are restored as None
+        to preserve the lazy loading behavior defined in their properties.
         """
         private_state = dict(state.pop("__pydantic_private__", None) or {})
 
@@ -267,6 +272,7 @@ class MAXModelConfig(MAXModelConfigBase):
 
         # Restore pydantic private attrs (and fill any missing defaults).
         private_state.setdefault("_huggingface_config", None)
+        private_state.setdefault("_diffusers_config", None)
         private_state.setdefault("_weights_repo_id", None)
         private_state.setdefault("_applied_dtype_cast_from", None)
         private_state.setdefault("_applied_dtype_cast_to", None)
@@ -446,17 +452,72 @@ class MAXModelConfig(MAXModelConfigBase):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def huggingface_config(self) -> AutoConfig:
-        # Note: For multiprocessing, __getstate__ clears _huggingface_config
-        # before pickling. Each worker process will reload the config fresh,
-        # which properly handles trust_remote_code dynamic class loading.
+    def huggingface_config(self) -> AutoConfig | None:
+        """Get the HuggingFace AutoConfig for this model.
+
+        Lazy-loads the AutoConfig from config.json on first access.
+
+        Note: For multiprocessing, __getstate__ clears _huggingface_config
+        before pickling. Each worker process will reload the config fresh,
+        which properly handles trust_remote_code dynamic class loading.
+
+        Returns:
+            The AutoConfig for this model, or None if this is not a
+            transformers-style model (e.g., diffusers models).
+        """
         if self._huggingface_config is None:
-            self._huggingface_config = (
-                PIPELINE_REGISTRY.get_active_huggingface_config(
-                    huggingface_repo=self.huggingface_model_repo
+            try:
+                self._huggingface_config = (
+                    PIPELINE_REGISTRY.get_active_huggingface_config(
+                        huggingface_repo=self.huggingface_model_repo
+                    )
                 )
-            )
+            except Exception as e:
+                # Not a transformers-style model (e.g., diffusers model)
+                logger.debug(
+                    f"Could not load HuggingFace config for "
+                    f"{self.model_path}: {e}"
+                )
+                return None
         return self._huggingface_config
+
+    @property
+    def diffusers_config(self) -> DiffusersConfig | None:
+        """Get the diffusers config, loading it if necessary.
+
+        Lazy-loads the DiffusersConfig from model_index.json on first access.
+        This is analogous to huggingface_config but for diffusers-style models.
+
+        Note: This property is intentionally NOT a @computed_field to avoid
+        being accessed during Pydantic serialization, which would break
+        transformers-style models that don't have model_index.json.
+
+        Returns:
+            The parsed DiffusersConfig for this model, or None if this is not
+            a diffusers-style model (no model_index.json found).
+        """
+        if self._diffusers_config is None:
+            model_path = Path(self.model_path)
+            try:
+                if model_path.exists():
+                    self._diffusers_config = DiffusersConfig.from_model_path(
+                        model_path
+                    )
+                else:
+                    # Assume it's a HuggingFace repo ID
+                    self._diffusers_config = (
+                        DiffusersConfig.from_huggingface_repo(
+                            repo_id=str(model_path),
+                            revision=self.huggingface_model_revision,
+                        )
+                    )
+            except (FileNotFoundError, OSError) as e:
+                # Not a diffusers-style model - model_index.json doesn't exist
+                logger.debug(
+                    f"Not a diffusers model (no model_index.json): {e}"
+                )
+                return None
+        return self._diffusers_config
 
     @computed_field  # type: ignore[prop-decorator]
     @cached_property
@@ -707,6 +768,13 @@ class MAXModelConfig(MAXModelConfigBase):
             "quantization_encoding must be None (not specified by user)."
         )
 
+        if self.diffusers_config is not None:
+            # Populate weight_path from diffusers components if not already set
+            if not self.weight_path:
+                self.weight_path = self.diffusers_config.all_weight_paths
+            self.quantization_encoding = default_encoding
+            return
+
         # If weight path is not None, infer the quantization_encoding from the weight_path.
         if self.weight_path:
             if os.path.exists(self.weight_path[0]):
@@ -812,6 +880,16 @@ class MAXModelConfig(MAXModelConfigBase):
             default_weights_format: The default weights format to use if no weight_path is provided.
         """
         assert self.quantization_encoding, "quantization_encoding must be set."
+
+        # Handle diffusers-style models: aggregate weight paths from all components
+        if self.diffusers_config is not None:
+            if not self.weight_path:
+                self.weight_path = self.diffusers_config.all_weight_paths
+            if not self.weight_path:
+                raise ValueError(
+                    f"No weight files found in diffusers model at '{self.model_path}'"
+                )
+            return
 
         # If no weight_path is provided, we should grab the default.
         if not self.weight_path:
@@ -920,17 +998,26 @@ class MAXModelConfig(MAXModelConfigBase):
         assert self.quantization_encoding, "quantization_encoding must be set."
 
         if self.quantization_encoding == SupportedEncoding.gptq:
-            hf_quant_config = self.huggingface_config.quantization_config
+            hf_config = self.huggingface_config
+            if hf_config is None:
+                raise ValueError(
+                    "GPTQ quantization requires a HuggingFace config, "
+                    "but model_index.json was found instead of config.json. "
+                    "This model appears to be a diffusers model, not a "
+                    "transformers model."
+                )
+            hf_quant_config = hf_config.quantization_config
 
             # This is a bit hacky, but seems like we need it for now.
             # This warning is for the MAX pipeline to alert users about a GPTQ format we don't support yet.
             # Instead of running our GPTQ pipeline on this unsupported format and outputting gibberish, we exit early with a clear error message.
-            if str(self.huggingface_config.torch_dtype) not in [
+            if str(hf_config.torch_dtype) not in [
                 "float16",
                 "torch.float16",
             ]:
                 raise ValueError(
-                    f"{self.huggingface_config.torch_dtype} scales are not supported for GPTQ-quantized models."
+                    f"{hf_config.torch_dtype} scales are not supported "
+                    "for GPTQ-quantized models."
                 )
             default_quantization_config = QuantizationConfig(
                 quant_method=hf_quant_config["quant_method"],

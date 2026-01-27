@@ -22,8 +22,9 @@ from max.config import (
 )
 
 from .bfloat16_utils import float32_to_bfloat16_as_uint16
-from .config import AudioGenerationConfig, PipelineConfig
+from .config import AudioGenerationConfig, PipelineConfig, PixelGenerationConfig
 from .config_enums import PipelineRole, RepoType, RopeType, SupportedEncoding
+from .diffusers_config import DiffusersComponentConfig, DiffusersConfig
 from .embeddings_pipeline import EmbeddingsPipeline, EmbeddingsPipelineType
 from .float8 import parse_float8_config
 from .hf_utils import (
@@ -78,6 +79,8 @@ __all__ = [
     "AlwaysSignalBuffersMixin",
     "AudioGenerationConfig",
     "CompilationTimer",
+    "DiffusersComponentConfig",
+    "DiffusersConfig",
     "EAGLESpeculativeDecodingPipeline",
     "EmbeddingsPipeline",
     "EmbeddingsPipelineType",
@@ -97,6 +100,7 @@ __all__ = [
     "PipelineConfig",
     "PipelineModel",
     "PipelineRole",
+    "PixelGenerationConfig",
     "PreTrainedPipelineTokenizer",
     "ProfilingConfig",
     "RepoType",

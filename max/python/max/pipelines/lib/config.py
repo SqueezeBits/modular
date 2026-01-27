@@ -37,7 +37,7 @@ from pydantic import (
 )
 from typing_extensions import Self
 
-from .config_enums import PipelineRole
+from .config_enums import PipelineRole, PixelGenerationType
 from .kv_cache_config import KVCacheConfig
 from .lora_config import LoRAConfig
 from .memory_estimation import MemoryEstimator, to_human_readable_bytes
@@ -416,15 +416,15 @@ class PipelineConfig(ConfigFileModel):
                 assert self.draft_model is not None
                 # We need to set the architecture to EagleLlamaForCausalLM for Eagle speculative decoding
                 if self.speculative.is_eagle():
-                    assert (
-                        len(self.draft_model.huggingface_config.architectures)
-                        == 1
+                    draft_hf_config = self.draft_model.huggingface_config
+                    assert draft_hf_config is not None, (
+                        "Eagle speculative decoding requires a transformers-style "
+                        "draft model with huggingface_config"
                     )
-                    hf_arch = self.draft_model.huggingface_config.architectures[
-                        0
-                    ]
+                    assert len(draft_hf_config.architectures) == 1
+                    hf_arch = draft_hf_config.architectures[0]
                     if hf_arch == "LlamaForCausalLM":
-                        self.draft_model.huggingface_config.architectures[0] = (
+                        draft_hf_config.architectures[0] = (
                             "EagleLlamaForCausalLM"
                         )
 
@@ -752,6 +752,14 @@ class PipelineConfig(ConfigFileModel):
                 # We should be able to override this value for all config objects.
                 continue
 
+    def _is_diffusers_pipeline(self) -> bool:
+        """Check if this config is for a diffusers pipeline.
+
+        Returns True for configs that use diffusers-style models (e.g., PixelGenerationConfig).
+        Subclasses for diffusers pipelines should override this to return True.
+        """
+        return False
+
     def resolve(self) -> None:
         """
         Validates and resolves the config.
@@ -947,6 +955,7 @@ class PipelineConfig(ConfigFileModel):
         arch = PIPELINE_REGISTRY.retrieve_architecture(
             huggingface_repo=model_config.huggingface_model_repo,
             use_legacy_module=self.use_legacy_module,
+            pipeline_config=self,
         )
 
         # If nothing is provided, we should not update any more params.
@@ -1020,6 +1029,11 @@ class PipelineConfig(ConfigFileModel):
         # Resolve final pipeline-specific changes to the config before doing
         # memory estimations.
         arch.pipeline_model.finalize_pipeline_config(self)
+
+        if self._is_diffusers_pipeline():
+            # Skip profiling for diffusers models,
+            # since diffusers models don't need to compute a budget for KV Cache.
+            return
 
         MemoryEstimator.estimate_memory_footprint(
             self,
@@ -1486,3 +1500,52 @@ class AudioGenerationConfig(PipelineConfig):
             prometheus_metrics_mode=prometheus_metrics_mode,
             **config_flags,
         )
+
+
+class PixelGenerationConfig(PipelineConfig):
+    """Configuration for pixel generation pipelines.
+
+    This config extends PipelineConfig to support diffusers-style pipelines
+    with multi-folder repository structures. Inference parameters like
+    num_inference_steps, guidance_scale, height, and width come from API
+    requests (PixelGenerationRequest), not this server config.
+
+    Access diffusers-style model configurations via `model.diffusers_config`.
+    """
+
+    # Generation mode - architectural choice set at server startup
+    generation_type: PixelGenerationType = Field(
+        default=PixelGenerationType.TEXT_TO_IMAGE,
+        description="The type of pixel generation to perform.",
+    )
+
+    def __init__(
+        self,
+        generation_type: PixelGenerationType = PixelGenerationType.TEXT_TO_IMAGE,
+        **kwargs: Any,
+    ) -> None:
+        # Must call the superclass's __init__ first, otherwise PipelineConfig's
+        # init will override values defined in the PixelGenerationConfig.
+        PipelineConfig.__init__(self, **kwargs)
+
+        self.generation_type = generation_type
+
+    def _is_diffusers_pipeline(self) -> bool:
+        """Check if this config is for a diffusers pipeline.
+
+        Returns True if the model is a diffusers-style model with model_index.json.
+        This enables skipping text-generation-specific validation during resolve().
+        """
+        return self.model.diffusers_config is not None
+
+    @staticmethod
+    def help() -> dict[str, str]:
+        """Return help text for PixelGenerationConfig-specific fields."""
+        supported_generation_types = ", ".join(
+            generation_type.name for generation_type in PixelGenerationType
+        )
+        return {
+            "generation_type": (
+                f"The type of pixel generation: {supported_generation_types}."
+            ),
+        }

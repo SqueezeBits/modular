@@ -86,6 +86,16 @@ class PipelineRole(str, Enum):
         )
 
 
+class PixelGenerationType(str, Enum):
+    """Specifies the type of pixel-based generation for image/video pipelines.
+    This determines the input/output modalities and conditioning requirements
+    for diffusion-based generation pipelines.
+    """
+
+    TEXT_TO_IMAGE = "text_to_image"
+    """Generate an image from a text prompt."""
+
+
 class SupportedEncoding(str, Enum):
     """All possible encodings which may be supported by a particular model."""
 

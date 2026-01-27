@@ -268,18 +268,17 @@ class SpeculativeDecodingPipelineBase(
         assert self.pipeline_config.draft_model is not None
         draft_config = self.pipeline_config.draft_model.huggingface_config
 
-        if hasattr(self.pipeline_config.model.huggingface_config, "vocab_size"):
-            self.vocab_size = (
-                self.pipeline_config.model.huggingface_config.vocab_size
-            )
-        elif hasattr(
-            self.pipeline_config.model.huggingface_config, "text_config"
-        ):
-            if hasattr(
-                self.pipeline_config.model.huggingface_config.text_config,
-                "vocab_size",
-            ):
-                self.vocab_size = self.pipeline_config.model.huggingface_config.text_config.vocab_size
+        hf_config = self.pipeline_config.model.huggingface_config
+        assert hf_config is not None, (
+            "Speculative decoding requires a transformers-style model with "
+            "huggingface_config"
+        )
+
+        if hasattr(hf_config, "vocab_size"):
+            self.vocab_size = hf_config.vocab_size
+        elif hasattr(hf_config, "text_config"):
+            if hasattr(hf_config.text_config, "vocab_size"):
+                self.vocab_size = hf_config.text_config.vocab_size
             else:
                 raise ValueError(
                     "MAXModelConfig's HuggingFace config must have a 'vocab_size' or 'text_config.vocab_size' param for Speculative Decoding"

@@ -217,6 +217,8 @@ class Llama4Config(ArchConfigWithKVCache):
             An initialized Llama4Config instance.
         """
         huggingface_config = pipeline_config.model.huggingface_config
+        if huggingface_config is None:
+            raise ValueError("huggingface_config is required")
         kv_cache_config = pipeline_config.model.kv_cache
         quantization_encoding = pipeline_config.model.quantization_encoding
         if quantization_encoding is None:

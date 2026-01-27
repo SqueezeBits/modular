@@ -338,6 +338,7 @@ class PipelineRegistry:
         huggingface_repo: HuggingFaceRepo,
         use_legacy_module: bool = True,
         task: PipelineTask | None = None,
+        pipeline_config: PipelineConfig | None = None,
     ) -> SupportedArchitecture | None:
         """Retrieve architecture matching the HuggingFace model config.
 
