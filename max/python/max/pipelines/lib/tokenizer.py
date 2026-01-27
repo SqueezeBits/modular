@@ -24,15 +24,17 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import numpy.typing as npt
+from max.driver import CPU, Device
 from max.interfaces import (
     ImageMetadata,
     PipelineTokenizer,
+    PixelGenerationRequest,
     TextGenerationRequest,
     TextGenerationRequestMessage,
     TextGenerationRequestTool,
     TokenBuffer,
 )
-from max.pipelines.core import TextAndVisionContext, TextContext
+from max.pipelines.core import PixelContext, TextAndVisionContext, TextContext
 from max.support.image import find_contiguous_ranges, hash_image
 from PIL import Image
 from transformers import (
@@ -46,6 +48,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from typing_extensions import ParamSpec
+
+from .diffusion_schedulers import SchedulerFactory
 
 if TYPE_CHECKING:
     from max.pipelines.lib.config import PipelineConfig
@@ -542,7 +546,7 @@ class TextAndVisionTokenizer(
         TextGenerationRequest,
     ],
 ):
-    """Encapsulates creation of TextContext and specific token encode/decode logic."""
+    """Encapsulates creation of TextAndVisionContext and specific token encode/decode logic."""
 
     def __init__(
         self,
@@ -839,3 +843,522 @@ def _convert_image_mode(image: Image.Image, to_mode: str):  # noqa: ANN202
         return _rgba_to_rgb(image)
     else:
         return image.convert(to_mode)
+
+
+class PixelGenerationTokenizer(
+    PipelineTokenizer[
+        PixelContext,
+        tuple[npt.NDArray[np.integer[Any]], npt.NDArray[np.bool_]],
+        PixelGenerationRequest,
+    ]
+):
+    """Encapsulates creation of PixelContext and specific token encode/decode logic.
+
+    Args:
+        model_path: Path to the model/tokenizer
+        revision: Git revision/branch to use
+        max_length: Maximum sequence length
+        trust_remote_code: Whether to trust remote code from the model
+        enable_llama_whitespace_fix: Enable whitespace fix for Llama tokenizers
+        pipeline_config: Optional pipeline configuration
+        chat_template: Optional custom chat template string to override the one
+                        shipped with the HuggingFace model config. This allows
+                        customizing the prompt formatting for different use cases.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        pipeline_config: PipelineConfig,
+        subfolder: str,
+        *,
+        subfolder_2: str | None = None,
+        revision: str | None = None,
+        max_length: int | None = None,
+        max_length_2: int | None = None,
+        trust_remote_code: bool = False,
+        chat_template: str | None = None,
+        context_validators: list[Callable[[PixelContext], None]] | None = None,
+        wrap_prompt_as_chat: bool = False,
+        default_chat_template_options: dict[str, Any] | None = None,
+        **unused_kwargs,
+    ) -> None:
+        self.model_path = model_path
+        self.delegate_2 = None
+        self.max_length_2 = None
+
+        try:
+            self.delegate = AutoTokenizer.from_pretrained(
+                model_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                model_max_length=max_length,
+                subfolder=subfolder,
+            )
+            self.max_length = max_length or self.delegate.model_max_length
+            if subfolder_2 is not None:
+                self.delegate_2 = AutoTokenizer.from_pretrained(
+                    model_path,
+                    revision=revision,
+                    trust_remote_code=trust_remote_code,
+                    model_max_length=max_length_2,
+                    subfolder=subfolder_2,
+                )
+                self.max_length_2 = (
+                    max_length_2 or self.delegate_2.model_max_length
+                )
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load tokenizer from {model_path}. "
+                "This can happen if:\n"
+                "- The model is not fully supported by the transformers python package\n"
+                "- Required configuration files are missing\n"
+                "- The model path is incorrect\n"
+                "- '--trust-remote-code' is needed but not set\n"
+            ) from e
+
+        # Override chat template if provided
+        # This will be used by the delegate(s)'s apply_chat_template method automatically
+        self._custom_template_provided = chat_template is not None
+        if chat_template is not None:
+            self.delegate.chat_template = chat_template
+            logger.info(
+                f"Set custom chat template on tokenizer for {model_path}"
+            )
+
+        self._context_validators = (
+            context_validators if context_validators else []
+        )
+
+        # Prompt wrapping and default chat template options
+        self._wrap_prompt_as_chat = wrap_prompt_as_chat
+        self._default_chat_template_options = default_chat_template_options
+
+        # Extract diffusers_config
+        if not pipeline_config or not hasattr(
+            pipeline_config.model, "diffusers_config"
+        ):
+            raise ValueError(
+                "pipeline_config.model.diffusers_config is required for PixelGenerationTokenizer. "
+                "Please provide a pipeline_config with a valid diffusers_config."
+            )
+        if pipeline_config.model.diffusers_config is None:
+            raise ValueError(
+                "pipeline_config.model.diffusers_config cannot be None. "
+                "Please provide a valid diffusers_config."
+            )
+        self.diffusers_config = pipeline_config.model.diffusers_config
+
+    def _calculate_shift(
+        self,
+        image_seq_len: int,
+        base_seq_len: int = 256,
+        max_seq_len: int = 4096,
+        base_shift: float = 0.5,
+        max_shift: float = 1.15,
+    ) -> float:
+        m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+        b = base_shift - m * base_seq_len
+        mu = image_seq_len * m + b
+        return mu
+
+    @staticmethod
+    def _prepare_latent_image_ids(
+        height: int, width: int
+    ) -> npt.NDArray[np.float32]:
+        latent_image_ids = np.zeros((height, width, 3))
+        latent_image_ids[..., 1] = (
+            latent_image_ids[..., 1] + np.arange(height)[:, None]
+        )
+        latent_image_ids[..., 2] = (
+            latent_image_ids[..., 2] + np.arange(width)[None, :]
+        )
+        return latent_image_ids.reshape(-1, latent_image_ids.shape[-1]).astype(
+            np.float32
+        )
+
+    def _randn_tensor(
+        self,
+        shape: tuple[int, ...],
+        seed: int | None,
+    ) -> npt.NDArray[np.float32]:
+        rng = np.random.RandomState(seed)
+        return rng.standard_normal(shape).astype(np.float32)
+
+    def _prepare_latents(
+        self,
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+        seed: int | None,
+        vae_scale_factor: int,
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+        height = 2 * (int(height) // (vae_scale_factor * 2))
+        width = 2 * (int(width) // (vae_scale_factor * 2))
+        shape = (batch_size, num_channels_latents, height, width)
+
+        latents = self._randn_tensor(shape, seed)
+        latent_image_ids = self._prepare_latent_image_ids(
+            height // 2, width // 2
+        )
+
+        return latents, latent_image_ids
+
+    def _retrieve_timesteps(
+        self,
+        scheduler: Any,
+        num_inference_steps: int,
+        device: Device | None = None,
+        sigmas: npt.NDArray[np.float32] | None = None,
+        **kwargs,
+    ) -> tuple[npt.NDArray[np.float32], int]:
+        r"""
+        Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+        custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+        Args:
+            scheduler (`Any`):
+                The scheduler to get timesteps from.
+            num_inference_steps (`int`):
+                The number of diffusion steps used when generating samples with a pre-trained model.
+            device (`Device`, *optional*):
+                The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
+                `num_inference_steps` must be `None`.
+
+        Returns:
+            `Tuple[npt.NDArray[np.float32], int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+            second element is the number of inference steps.
+        """
+        if sigmas is not None:
+            try:
+                scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+            except TypeError as e:
+                raise ValueError(
+                    f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                    f" sigmas schedules. Please check whether you are using the correct scheduler."
+                ) from e
+            timesteps = scheduler.timesteps
+            num_inference_steps = len(timesteps)
+        else:
+            scheduler.set_timesteps(
+                num_inference_steps, device=device, **kwargs
+            )
+            timesteps = scheduler.timesteps
+        return timesteps.astype(np.float32), num_inference_steps
+
+    async def _generate_tokens_ids(
+        self,
+        prompt: str,
+        prompt_2: str | None = None,
+        negative_prompt: str | None = None,
+        negative_prompt_2: str | None = None,
+        messages: list[TextGenerationRequestMessage] | None = None,
+        chat_template_options: dict[str, Any] | None = None,
+        do_true_cfg: bool = False,
+    ) -> tuple[
+        npt.NDArray[np.integer[Any]],
+        npt.NDArray[np.bool_],
+        npt.NDArray[np.integer[Any]] | None,
+        npt.NDArray[np.integer[Any]] | None,
+        npt.NDArray[np.integer[Any]] | None,
+    ]:
+        """Tokenize prompt(s) with encoder model(s).
+
+        Returns:
+            Tuple of (token_ids, attn_mask, token_ids_2, negative_token_ids, negative_token_ids_2).
+            token_ids_2 and negative_token_ids_2 are None if no secondary tokenizer is configured.
+        """
+        if messages is not None:
+            prompt = self.apply_chat_template(messages, chat_template_options)
+        token_ids, attn_mask = await self.encode(prompt)
+
+        token_ids_2: npt.NDArray[np.integer[Any]] | None = None
+        if self.delegate_2 is not None:
+            token_ids_2, _attn_mask_2 = await self.encode(
+                prompt_2 or prompt,
+                use_secondary=True,
+            )
+
+        negative_token_ids: npt.NDArray[np.integer[Any]] | None = None
+        negative_token_ids_2: npt.NDArray[np.integer[Any]] | None = None
+        if do_true_cfg:
+            negative_token_ids, _attn_mask_neg = await self.encode(
+                negative_prompt or ""
+            )
+            if self.delegate_2 is not None:
+                negative_token_ids_2, _attn_mask_neg_2 = await self.encode(
+                    negative_prompt_2 or negative_prompt or "",
+                    use_secondary=True,
+                )
+
+        return (
+            token_ids,
+            attn_mask,
+            token_ids_2,
+            negative_token_ids,
+            negative_token_ids_2,
+        )
+
+    def apply_chat_template(
+        self,
+        messages: list[TextGenerationRequestMessage],
+        chat_template_options: dict[str, Any] | None = None,
+    ) -> str:
+        templated_message = self.delegate.apply_chat_template(
+            [message.flatten_content() for message in messages],
+            tokenize=False,
+            **(chat_template_options or {}),
+        )
+        if not isinstance(templated_message, str):
+            raise ValueError("Chat template did not return a string")
+        return templated_message
+
+    @property
+    def eos(self) -> int:
+        return self.delegate.eos_token_id
+
+    @property
+    def expects_content_wrapping(self) -> bool:
+        return False
+
+    async def encode(
+        self,
+        prompt: str,
+        add_special_tokens: bool = True,
+        *,
+        use_secondary: bool = False,
+    ) -> tuple[npt.NDArray[np.integer[Any]], npt.NDArray[np.bool_]]:
+        """Transform the provided prompt into a token array."""
+
+        delegate = self.delegate_2 if use_secondary else self.delegate
+        max_sequence_length = (
+            self.max_length_2 if use_secondary else self.max_length
+        )
+
+        tokenizer_output: Any
+
+        def _encode_fn(prompt_str: str) -> Any:
+            assert delegate is not None
+            return delegate(
+                prompt_str,
+                padding="max_length",
+                max_length=max_sequence_length,
+                truncation=True,
+                add_special_tokens=add_special_tokens,
+            )
+
+        # Note: the underlying tokenizer may not be thread safe in some cases, see https://github.com/huggingface/tokenizers/issues/537
+        # Add a standard (non-async) lock in the executor thread if needed.
+        tokenizer_output = await run_with_default_executor(_encode_fn, prompt)
+
+        if (
+            max_sequence_length
+            and len(tokenizer_output.input_ids) > max_sequence_length
+        ):
+            raise ValueError(
+                f"Input string is larger than tokenizer's max length ({len(tokenizer_output.input_ids)} > {max_sequence_length})."
+            )
+
+        encoded_prompt = np.array(tokenizer_output.input_ids)
+        attention_mask = np.array(tokenizer_output.attention_mask).astype(
+            np.bool_
+        )
+
+        return encoded_prompt, attention_mask
+
+    async def decode(
+        self,
+        encoded: tuple[npt.NDArray[np.integer[Any]], npt.NDArray[np.bool_]],
+        **kwargs,
+    ) -> str:
+        raise NotImplementedError(
+            "Decoding is not implemented for this tokenizer."
+        )
+
+    async def postprocess(
+        self,
+        pixel_data: npt.NDArray[np.float32],
+    ) -> npt.NDArray[np.float32]:
+        """Post-process pixel data from model output (NCHW -> NHWC, normalized)."""
+        pixel_data = (pixel_data * 0.5 + 0.5).clip(min=0.0, max=1.0)
+        pixel_data = pixel_data.transpose(0, 2, 3, 1)
+        return pixel_data
+
+    async def new_context(
+        self, request: PixelGenerationRequest
+    ) -> PixelContext:
+        """Create a new PixelContext object, leveraging necessary information from PixelGenerationRequest."""
+        if request.guidance_scale < 1.0 or request.true_cfg_scale < 1.0:
+            logger.warning(
+                f"Guidance scales < 1.0 detected (guidance_scale={request.guidance_scale}, "
+                f"true_cfg_scale={request.true_cfg_scale}). This is mathematically possible"
+                " but may produce lower quality or unexpected results."
+            )
+
+        if request.true_cfg_scale > 1.0 and request.negative_prompt is None:
+            logger.warning(
+                f"true_cfg_scale={request.true_cfg_scale} is set, but no negative_prompt "
+                "is provided. True classifier-free guidance requires a negative prompt; "
+                "falling back to standard generation."
+            )
+
+        do_true_cfg = (
+            request.true_cfg_scale > 1.0 and request.negative_prompt is not None
+        )
+        messages: list[TextGenerationRequestMessage] | None = None
+        chat_template_options: dict[str, Any] | None = None
+        if self._wrap_prompt_as_chat:
+            messages = [
+                TextGenerationRequestMessage(
+                    role="user", content=request.prompt
+                )
+            ]
+            if self._default_chat_template_options:
+                chat_template_options = self._default_chat_template_options
+
+        # 1. Tokenize prompts
+        (
+            token_ids,
+            attn_mask,
+            token_ids_2,
+            negative_token_ids,
+            negative_token_ids_2,
+        ) = await self._generate_tokens_ids(
+            request.prompt,
+            request.prompt_2,
+            request.negative_prompt,
+            request.negative_prompt_2,
+            messages,
+            chat_template_options,
+            do_true_cfg,
+        )
+
+        token_buffer = TokenBuffer(
+            array=token_ids.astype(np.int64, copy=False),
+        )
+        token_buffer_2 = None
+        if token_ids_2 is not None:
+            token_buffer_2 = TokenBuffer(
+                array=token_ids_2.astype(np.int64, copy=False),
+            )
+        negative_token_buffer = None
+        if negative_token_ids is not None:
+            negative_token_buffer = TokenBuffer(
+                array=negative_token_ids.astype(np.int64, copy=False),
+            )
+        negative_token_buffer_2 = None
+        if negative_token_ids_2 is not None:
+            negative_token_buffer_2 = TokenBuffer(
+                array=negative_token_ids_2.astype(np.int64, copy=False),
+            )
+
+        # 3. Resolve image dimensions
+        # Get defaults from diffusers_config
+        vae_config = self.diffusers_config.components["vae"].config_dict
+        transformer_config = self.diffusers_config.components[
+            "transformer"
+        ].config_dict
+        scheduler_config = self.diffusers_config.components[
+            "scheduler"
+        ].config_dict
+
+        # Compute vae_scale_factor from block_out_channels
+        block_out_channels = vae_config.get("block_out_channels", None)
+        vae_scale_factor = (
+            2 ** (len(block_out_channels) - 1) if block_out_channels else 8
+        )
+
+        default_sample_size = 128
+        height = request.height or default_sample_size * vae_scale_factor
+        width = request.width or default_sample_size * vae_scale_factor
+        num_channels_latents = transformer_config["in_channels"] // 4
+
+        latent_height = 2 * (int(height) // (vae_scale_factor * 2))
+        latent_width = 2 * (int(width) // (vae_scale_factor * 2))
+        image_seq_len = (latent_height // 2) * (latent_width // 2)
+
+        mu = self._calculate_shift(
+            image_seq_len,
+            scheduler_config.get("base_image_seq_len", 256),
+            scheduler_config.get("max_image_seq_len", 4096),
+            scheduler_config.get("base_shift", 0.5),
+            scheduler_config.get("max_shift", 1.15),
+        )
+
+        # Create scheduler from config
+        scheduler_component = self.diffusers_config.components["scheduler"]
+        scheduler = SchedulerFactory.create(
+            scheduler_component.class_name, scheduler_config
+        )
+
+        sigmas: npt.NDArray[np.float32] | None = np.linspace(
+            1.0,
+            1.0 / request.num_inference_steps,
+            request.num_inference_steps,
+            dtype=np.float32,
+        )
+        if (
+            hasattr(scheduler.config, "use_flow_sigmas")
+            and scheduler.config.use_flow_sigmas
+        ):
+            sigmas = None
+        timesteps, num_inference_steps = self._retrieve_timesteps(
+            scheduler,
+            request.num_inference_steps,
+            CPU(),
+            sigmas=sigmas,
+            mu=mu,
+        )
+        if request.model_name == "Tongyi-MAI/Z-Image-Turbo":
+            timesteps = ((1000.0 - timesteps) / 1000.0).astype(np.float32)
+        else:
+            timesteps = (timesteps / 1000.0).astype(np.float32)
+        num_warmup_steps: int = max(
+            len(timesteps) - num_inference_steps * scheduler.order, 0
+        )
+
+        latents, latent_image_ids = self._prepare_latents(
+            request.num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            request.seed,
+            vae_scale_factor,
+        )
+
+        guidance: npt.NDArray[np.float32] | None = None
+        if transformer_config.get("guidance_embeds"):
+            guidance = np.array([request.guidance_scale], dtype=np.float32)
+        else:
+            guidance = None
+
+        # 5. Build the context
+        context = PixelContext(
+            request_id=request.request_id,
+            tokens=token_buffer,
+            mask=attn_mask,
+            tokens_2=token_buffer_2,
+            negative_tokens=negative_token_buffer,
+            negative_tokens_2=negative_token_buffer_2,
+            timesteps=timesteps,
+            sigmas=scheduler.sigmas,
+            latents=latents,
+            latent_image_ids=latent_image_ids,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=request.guidance_scale,
+            guidance=guidance,
+            num_images_per_prompt=request.num_images_per_prompt,
+            true_cfg_scale=request.true_cfg_scale,
+            num_warmup_steps=num_warmup_steps,
+            model_name=request.model_name,
+        )
+
+        for validator in self._context_validators:
+            validator(context)
+
+        return context
