@@ -44,6 +44,7 @@ from typing import Any
 import huggingface_hub
 from max.config import ConfigFileModel
 from pydantic import Field, PrivateAttr
+from transformers import AutoConfig
 
 from .hf_utils import HuggingFaceRepo
 
@@ -391,13 +392,17 @@ class DiffusersConfig(ConfigFileModel):
         return component.config_dict
 
     @cached_property
-    def text_encoder_model_repo(self) -> HuggingFaceRepo | None:
+    def text_encoder_hf_config(self) -> AutoConfig | None:
         """Convenience property to get text encoder model repo."""
         from .registry import PIPELINE_REGISTRY
 
+        if self._repo_id is None:
+            return None
+
         hf_repo = HuggingFaceRepo(
             repo_id=self._repo_id,
-            revision=self._revision,
+            revision=self._revision
+            or huggingface_hub.constants.DEFAULT_REVISION,
             trust_remote_code=self._trust_remote_code,
         )
         return PIPELINE_REGISTRY.get_active_huggingface_config(

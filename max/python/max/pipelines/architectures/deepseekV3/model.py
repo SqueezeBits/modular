@@ -282,9 +282,12 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
         n_gpus_per_node = len(model_config.device_specs)
 
         encoding = pipeline_config.model.quantization_encoding
-        assert encoding is not None
+        if encoding is None:
+            raise ValueError("quantization_encoding is required")
         dtype = encoding.dtype.size_in_bytes
         config = model_config.huggingface_config
+        if config is None:
+            raise ValueError("huggingface_config is required")
         n_sparse_layers = (
             config.num_hidden_layers - config.first_k_dense_replace
         )
