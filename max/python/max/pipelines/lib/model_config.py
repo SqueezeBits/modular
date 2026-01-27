@@ -184,11 +184,6 @@ class MAXModelConfig(MAXModelConfigBase):
         description="The KVCache config.",
     )
 
-    diffusers_config: Any | None = Field(
-        default=None,
-        description="The diffusers-based model config.",
-    )
-
     _applied_dtype_cast_from: SupportedEncoding | None = PrivateAttr(
         default=None
     )

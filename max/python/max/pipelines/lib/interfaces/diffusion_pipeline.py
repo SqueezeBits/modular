@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import numpy.typing as npt
-from max.config import load_config
 from max.driver import load_devices
 from max.graph import DeviceRef
 from max.graph.weights import load_weights
@@ -123,9 +122,9 @@ class DiffusionPipeline(ABC):
                     f"`config_name` for {component_class.__name__} is not set. "
                     "Please set proper config file name in the downloaded path."
                 )
-            config = load_config(
-                f"{component_path}/{component_class.config_name}"
-            )
+            # config = load_config(
+            #     f"{component_path}/{component_class.config_name}"
+            # )
             if issubclass(component_class, MaxModel):
                 weight_paths = [
                     Path(pretrained_model_name_or_path) / weight_path

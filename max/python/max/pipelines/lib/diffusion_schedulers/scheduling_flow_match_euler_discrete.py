@@ -16,11 +16,12 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
+from max import random
 from max.driver import CPU, Accelerator, Device
 from max.dtype import DType
 from max.engine import InferenceSession
-from max.experimental import Tensor, random
 from max.graph import DeviceRef, Graph, TensorType
+from max.tensor import Tensor
 
 try:
     import scipy.stats

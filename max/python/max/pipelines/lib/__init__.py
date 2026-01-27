@@ -69,6 +69,7 @@ from .speculative_decoding import (
 from .speech_token_pipeline import SpeechTokenGenerationPipeline
 from .tokenizer import (
     IdentityPipelineTokenizer,
+    PixelGenerationTokenizer,
     PreTrainedPipelineTokenizer,
     TextAndVisionTokenizer,
     TextTokenizer,
@@ -105,6 +106,7 @@ __all__ = [
     "PipelineRole",
     "PixelGenerationConfig",
     "PixelGenerationPipeline",
+    "PixelGenerationTokenizer",
     "PreTrainedPipelineTokenizer",
     "ProfilingConfig",
     "RepoType",

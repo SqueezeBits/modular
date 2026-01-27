@@ -15,10 +15,11 @@
 
 from __future__ import annotations
 
-from .... import functional as F
-from ....driver import CPU
-from ....dtype import DType
-from ....tensor import Tensor
+from max import functional as F
+from max.driver import CPU
+from max.dtype import DType
+from max.tensor import Tensor
+
 from ..module import Module
 
 

@@ -174,3 +174,6 @@ class PixelGenerationPipeline(
         raise NotImplementedError(
             "prepare_batch is not implemented for PixelGenerationPipeline yet."
         )
+
+    def release(self) -> None:
+        pass
