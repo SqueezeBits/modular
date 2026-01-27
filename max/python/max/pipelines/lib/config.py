@@ -416,15 +416,15 @@ class PipelineConfig(ConfigFileModel):
                 assert self.draft_model is not None
                 # We need to set the architecture to EagleLlamaForCausalLM for Eagle speculative decoding
                 if self.speculative.is_eagle():
-                    assert (
-                        len(self.draft_model.huggingface_config.architectures)
-                        == 1
+                    draft_hf_config = self.draft_model.huggingface_config
+                    assert draft_hf_config is not None, (
+                        "Eagle speculative decoding requires a transformers-style "
+                        "draft model with huggingface_config"
                     )
-                    hf_arch = self.draft_model.huggingface_config.architectures[
-                        0
-                    ]
+                    assert len(draft_hf_config.architectures) == 1
+                    hf_arch = draft_hf_config.architectures[0]
                     if hf_arch == "LlamaForCausalLM":
-                        self.draft_model.huggingface_config.architectures[0] = (
+                        draft_hf_config.architectures[0] = (
                             "EagleLlamaForCausalLM"
                         )
 
@@ -1519,16 +1519,9 @@ class PixelGenerationConfig(PipelineConfig):
         description="The type of pixel generation to perform.",
     )
 
-    # Scheduler override - server-wide setting
-    scheduler_type: str | None = Field(
-        default=None,
-        description="Optional scheduler override. Uses model default if not specified.",
-    )
-
     def __init__(
         self,
         generation_type: PixelGenerationType = PixelGenerationType.TEXT_TO_IMAGE,
-        scheduler_type: str | None = None,
         **kwargs: Any,
     ) -> None:
         # Must call the superclass's __init__ first, otherwise PipelineConfig's
@@ -1536,17 +1529,6 @@ class PixelGenerationConfig(PipelineConfig):
         PipelineConfig.__init__(self, **kwargs)
 
         self.generation_type = generation_type
-        self.scheduler_type = scheduler_type
-
-    @property
-    def is_video(self) -> bool:
-        """Whether this config produces video output."""
-        return self.generation_type.outputs_video
-
-    @property
-    def requires_input_image(self) -> bool:
-        """Whether this config requires an input image."""
-        return self.generation_type.requires_input_image
 
     def _is_diffusers_pipeline(self) -> bool:
         """Check if this config is for a diffusers pipeline.
@@ -1559,33 +1541,11 @@ class PixelGenerationConfig(PipelineConfig):
     @staticmethod
     def help() -> dict[str, str]:
         """Return help text for PixelGenerationConfig-specific fields."""
+        supported_generation_types = ", ".join(
+            generation_type.name for generation_type in PixelGenerationType
+        )
         return {
-            "generation_type": "The type of pixel generation: text_to_image, text_to_video, image_to_image, image_to_video, image_editing, video_to_video, inpainting, outpainting, or controlnet.",
-            "scheduler_type": "Optional scheduler override (e.g., 'ddim', 'euler'). Uses model default if not specified.",
+            "generation_type": (
+                f"The type of pixel generation: {supported_generation_types}."
+            ),
         }
-
-    @classmethod
-    def from_flags(
-        cls, pixel_flags: dict[str, str], **config_flags: Any
-    ) -> PixelGenerationConfig:
-        """Create a PixelGenerationConfig from CLI flags.
-        Only server-side configuration is parsed here. Inference parameters
-        like num_inference_steps, guidance_scale, height, and width come
-        from API requests (PixelGenerationRequest).
-        """
-        generation_type = PixelGenerationType(
-            pixel_flags.pop("generation_type", "text_to_image")
-        )
-
-        scheduler_type = pixel_flags.pop("scheduler_type", None)
-
-        if pixel_flags:
-            raise ValueError(
-                f"Unknown pixel generation option(s): {pixel_flags}"
-            )
-
-        return cls(
-            generation_type=generation_type,
-            scheduler_type=scheduler_type,
-            **config_flags,
-        )
