@@ -205,6 +205,7 @@ class ImageGenerationPipeline(
     def execute(self, inputs: ImageGenerationInputs) -> ImageGenerationOutput:
         outputs = self._diffusion_pipeline(
             prompt=inputs.prompt,
+            image=inputs.image,
             negative_prompt=inputs.negative_prompt,
             true_cfg_scale=inputs.true_cfg_scale,
             height=inputs.height,

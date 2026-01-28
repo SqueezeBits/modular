@@ -25,6 +25,7 @@ class ImageGenerationInputs(PipelineInputs):
     # request scheduling. `ImageGenerationContext` should be used once
     # request scheduling is implemented.
     prompt: str
+    image: Image | list[Image] | None
     negative_prompt: str | None
     true_cfg_scale: float
     height: int

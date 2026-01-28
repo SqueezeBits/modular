@@ -14,6 +14,8 @@
 import argparse
 from pathlib import Path
 
+from PIL import Image
+
 from max.entrypoints.diffusion import DiffusionPipeline
 from max.experimental.realization_context import set_seed
 from max.pipelines import PipelineConfig
@@ -25,6 +27,9 @@ def main() -> None:
         "--model-path", type=str, default="black-forest-labs/FLUX.2-dev"
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--input-image", type=str, required=True, help="Path to input image for I2I"
+    )
     args = parser.parse_args()
 
     model_path = args.model_path
@@ -32,11 +37,16 @@ def main() -> None:
     pipeline_config = PipelineConfig(model_path=model_path)
     pipe = DiffusionPipeline(pipeline_config)
 
-    prompt = "A cat holding a sign that says hello world"
+    # Load input image
+    input_image = Image.open(args.input_image)
+    print(f"Loaded input image: {args.input_image} ({input_image.size})")
+
+    prompt = "Change the word Hello world to SqueezeBits"
     print(f"Prompt: {prompt}")
 
     result = pipe(
         prompt=prompt,
+        image=input_image,  # I2I input
         height=512,
         width=512,
         num_inference_steps=28,
@@ -45,7 +55,7 @@ def main() -> None:
 
     images = result.images
 
-    output_path = Path("output.png")
+    output_path = Path("output_i2i.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     images[0].save(output_path)
     print(f"Image saved to: {output_path}")

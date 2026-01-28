@@ -11,18 +11,19 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from typing import ClassVar, Optional
+from typing import Any, ClassVar, Optional
 
 from max.driver import Device
+from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
-from max.nn.module_v3 import Module
+from max.nn.module_v3 import Conv2d, Module
 from max.pipelines.lib import SupportedEncoding
 
 from .model import BaseAutoencoderModel
 from .model_config import AutoencoderKLFlux2Config
-from .vae import Decoder
+from .vae import Decoder, Encoder
 
 
 class AutoencoderKLFlux2(Module[[Tensor], Tensor]):
@@ -44,6 +45,39 @@ class AutoencoderKLFlux2(Module[[Tensor], Tensor]):
                 structure, normalization settings, BatchNorm parameters, and device/dtype information.
         """
         super().__init__()
+        # Encoder: images -> latents (mean and logvar)
+        self.encoder = Encoder(
+            in_channels=config.in_channels,
+            out_channels=config.latent_channels,
+            down_block_types=config.down_block_types,
+            block_out_channels=config.block_out_channels,
+            layers_per_block=config.layers_per_block,
+            norm_num_groups=config.norm_num_groups,
+            act_fn=config.act_fn,
+            double_z=True,  # Output 2*latent_channels for mean and logvar
+            mid_block_add_attention=config.mid_block_add_attention,
+            device=config.device,
+            dtype=config.dtype,
+        )
+
+        # Quantization convolution: encoder output -> latent distribution parameters
+        self.quant_conv: Conv2d | None = None
+        if config.use_quant_conv:
+            self.quant_conv = Conv2d(
+                kernel_size=1,
+                in_channels=2 * config.latent_channels,  # mean + logvar
+                out_channels=2 * config.latent_channels,
+                dtype=config.dtype,
+                stride=1,
+                padding=0,
+                dilation=1,
+                num_groups=1,
+                has_bias=True,
+                device=config.device,
+                permute=True,
+            )
+
+        # Decoder: latents -> images
         self.decoder = Decoder(
             in_channels=config.latent_channels,
             out_channels=config.out_channels,
@@ -115,8 +149,8 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             devices: List of devices to use.
             weights: Model weights.
         """
-        # Initialize BatchNorm statistics BEFORE super().__init__()
-        # because super().__init__() calls load_model() which sets these values
+        # Initialize BatchNorm statistics attributes BEFORE super().__init__()
+        # because super().__init__() calls load_model() which may set these values
         self.bn_running_mean: Optional[Tensor] = None
         self.bn_running_var: Optional[Tensor] = None
 
@@ -129,63 +163,137 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             autoencoder_class=AutoencoderKLFlux2,
         )
 
-    def load_model(self) -> None:
-        """Load and compile the decoder model with BatchNorm statistics.
+    def convert_weights_to_target_dtype(
+        self, target_dtype: DType | None = None
+    ) -> dict[str, Any]:
+        """Convert all weights to target dtype.
 
-        Extracts decoder weights and BatchNorm statistics (running_mean, running_var)
-        from the full model weights and compiles the decoder for inference.
-        
-        Following max-diffusers pattern: all weights are converted to bfloat16.
+        This utility method ensures all weights are converted to the target dtype
+        (from config.dtype) if needed. This provides automatic dtype conversion
+        for Flux2 VAE weights, which are typically float32 but need to be bfloat16
+        for efficiency.
+
+        Args:
+            target_dtype: Target dtype. If None, uses self.config.dtype.
+
+        Returns:
+            Dictionary of converted weights in DLPackArray format, ready for
+            use in compile() calls. Keys are weight names, values are DLPackArray.
         """
-        from max.graph import DeviceRef
-        
-        # Helper functions to convert weights to target dtype (bfloat16)
-        # Following max-diffusers pattern: to_bf16() and to_bf16_gpu()
-        target_dtype = self.config.dtype
-        
-        def to_bf16(data) -> Tensor:
-            """Convert weight data to bfloat16 Tensor."""
-            return Tensor.from_dlpack(data).cast(target_dtype)
-        
-        def to_bf16_gpu(data) -> Tensor:
-            """Convert weight data to bfloat16 Tensor on target device."""
-            return Tensor.from_dlpack(data).to(self.devices[0]).cast(target_dtype)
-        
-        def to_bf16_dlpack(data):
-            """Convert weight data to bfloat16 and return as DLPackArray for compile()."""
-            tensor = Tensor.from_dlpack(data).cast(target_dtype)
-            return tensor.driver_tensor
+        if target_dtype is None:
+            target_dtype = self.config.dtype
 
-        state_dict = {}
-
+        converted_weights = {}
         for key, value in self.weights.items():
-            weight_data = value.data().data  # Get DLPackArray from WeightData
-            
-            if key.startswith("decoder."):
-                # Remove "decoder." prefix for decoder weights
-                # Convert to bfloat16 following max-diffusers pattern
-                # compile() expects DLPackArray, so convert Tensor back to driver_tensor
-                state_dict[key.removeprefix("decoder.")] = to_bf16_dlpack(weight_data)
-            elif key.startswith("post_quant_conv."):
-                # Keep post_quant_conv prefix as-is
-                # compile() expects DLPackArray, so convert Tensor back to driver_tensor
-                state_dict[key] = to_bf16_dlpack(weight_data)
-            elif key == "bn.running_mean" or key == "latent_bn.running_mean":
-                # Load BatchNorm running mean as Tensor and convert to bfloat16
-                self.bn_running_mean = to_bf16_gpu(weight_data)
-            elif key == "bn.running_var" or key == "latent_bn.running_var":
-                # Load BatchNorm running variance as Tensor and convert to bfloat16
-                self.bn_running_var = to_bf16_gpu(weight_data)
-            # Note: encoder weights are filtered out (not included in state_dict)
+            weight_data = value.data()
+            # Automatically convert dtype if it doesn't match target
+            if weight_data.dtype != target_dtype:
+                weight_data = weight_data.astype(target_dtype)
+            # Extract DLPackArray for compile() (compile() expects DLPackArray)
+            converted_weights[key] = weight_data.data
 
-        # Compile decoder
+        return converted_weights
+
+    def load_model(self) -> None:
+        """Load and compile the decoder and encoder models with BatchNorm statistics.
+
+        Converts all weights to target dtype (bfloat16 for Flux2), then loads
+        decoder/encoder/post_quant_conv/quant_conv weights, and finally processes
+        BatchNorm statistics (bn.*) which are specific to Flux2.
+        """
+        # Convert all weights to target dtype (bfloat16 for Flux2)
+        target_dtype = self.config.dtype
+        converted_weights = self.convert_weights_to_target_dtype(target_dtype)
+
+        # Extract BatchNorm statistics
+        bn_mean_data = None
+        bn_var_data = None
+
+        # Prepare decoder weights
+        decoder_state_dict = {}
+        # Prepare encoder weights
+        encoder_state_dict = {}
+        quant_conv_state_dict = {}
+
+        for key, dlpack_data in converted_weights.items():
+            if key in ("bn.running_mean", "latent_bn.running_mean"):
+                bn_mean_data = dlpack_data
+            elif key in ("bn.running_var", "latent_bn.running_var"):
+                bn_var_data = dlpack_data
+            elif key.startswith("decoder."):
+                # Remove "decoder." prefix for decoder weights
+                decoder_state_dict[key.removeprefix("decoder.")] = dlpack_data
+            elif key.startswith("post_quant_conv."):
+                # Keep post_quant_conv prefix as-is (used by decoder)
+                decoder_state_dict[key] = dlpack_data
+            elif key.startswith("encoder."):
+                # Remove "encoder." prefix for encoder weights
+                encoder_state_dict[key.removeprefix("encoder.")] = dlpack_data
+            elif key.startswith("quant_conv."):
+                # Keep quant_conv prefix as-is (used by encoder)
+                quant_conv_state_dict[key] = dlpack_data
+
         with F.lazy():
             autoencoder = self.autoencoder_class(self.config)
-            autoencoder.decoder.to(self.devices[0])
 
-        self.model = autoencoder.decoder.compile(
-            *autoencoder.decoder.input_types(), weights=state_dict
-        )
+            # Compile decoder (always needed)
+            autoencoder.decoder.to(self.devices[0])
+            self.model = autoencoder.decoder.compile(
+                *autoencoder.decoder.input_types(), weights=decoder_state_dict
+            )
+
+            # Compile encoder (optional, only if weights exist)
+            if encoder_state_dict and hasattr(autoencoder, "encoder"):
+                autoencoder.encoder.to(self.devices[0])
+                self.encoder_model = autoencoder.encoder.compile(
+                    *autoencoder.encoder.input_types(), weights=encoder_state_dict
+                )
+
+            # Compile quant_conv (optional, only if weights exist and encoder exists)
+            if (
+                quant_conv_state_dict
+                and hasattr(autoencoder, "quant_conv")
+                and autoencoder.quant_conv is not None
+            ):
+                # quant_conv is a Conv2d layer, compile it separately
+                from max.nn.module_v3 import Module
+
+                # Create a simple wrapper module for quant_conv
+                class QuantConvModule(Module[[Tensor], Tensor]):
+                    def __init__(self, quant_conv):
+                        super().__init__()
+                        self.quant_conv = quant_conv
+
+                    def forward(self, x: Tensor) -> Tensor:
+                        return self.quant_conv(x)
+
+                quant_conv_module = QuantConvModule(autoencoder.quant_conv)
+                quant_conv_module.to(self.devices[0])
+                # quant_conv input: [B, 2*latent_channels, H_latent, W_latent]
+                if self.encoder_model is not None:
+                    from max.graph import TensorType
+
+                    quant_conv_input_type = TensorType(
+                        self.config.dtype,
+                        shape=[
+                            "batch_size",
+                            2 * self.config.latent_channels,
+                            "latent_height",
+                            "latent_width",
+                        ],
+                        device=self.devices[0],
+                    )
+                    self.quant_conv_model = quant_conv_module.compile(
+                        quant_conv_input_type, weights=quant_conv_state_dict
+                    )
+
+        # Convert BatchNorm statistics to Tensor in lazy context
+        if bn_mean_data is not None or bn_var_data is not None:
+            with F.lazy():
+                if bn_mean_data is not None:
+                    self.bn_running_mean = Tensor.from_dlpack(bn_mean_data).to(self.devices[0])
+                if bn_var_data is not None:
+                    self.bn_running_var = Tensor.from_dlpack(bn_var_data).to(self.devices[0])
 
     @property
     def bn(self) -> BatchNormStats:

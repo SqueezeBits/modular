@@ -14,6 +14,7 @@
 """Flux2 image generation pipeline."""
 
 import inspect
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -525,6 +526,91 @@ class Flux2Pipeline(DiffusionPipeline):
         return latent_image_ids
 
     @staticmethod
+    def _prepare_image_ids(
+        image_latents: list[Tensor_v3],
+        scale: int = 10,
+        device: DeviceRef | None = None,
+    ) -> Tensor_v3:
+        """Generate 4D position IDs for multiple image latents.
+
+        This function creates a unique coordinate for every pixel/patch across all
+        input latents with different dimensions. Each image gets a unique T-coordinate
+        to distinguish it from others.
+
+        Args:
+            image_latents: List of image latent tensors, each of shape [1, C, H, W].
+            scale: Time separation factor. T-coordinate for the i-th latent is
+                `scale + scale * i`. Defaults to 10.
+            device: Target device. If None, uses the device of the first latent.
+
+        Returns:
+            Position IDs tensor of shape [1, N_total, 4] where N_total is the sum
+            of (H * W) for all input latents.
+
+        Coordinate Components (Dimension 4):
+            - T (Time): The unique index indicating which latent image the coordinate belongs to.
+            - H (Height): The row index within that latent image.
+            - W (Width): The column index within that latent image.
+            - L (Seq. Length): A sequence length dimension, which is always fixed at 0.
+
+        Raises:
+            ValueError: If image_latents is not a list.
+        """
+        if not isinstance(image_latents, list):
+            raise ValueError(
+                f"Expected `image_latents` to be a list, got {type(image_latents)}."
+            )
+
+        if len(image_latents) == 0:
+            raise ValueError("Expected at least one image latent in the list.")
+
+        # Get device from first latent if not provided
+        if device is None:
+            device = image_latents[0].device
+
+        # Create time offset for each reference image
+        # T-coordinate for i-th image: scale + scale * i
+        image_latent_ids = []
+
+        for i, latent in enumerate(image_latents):
+            # Remove batch dimension: [1, C, H, W] -> [C, H, W]
+            latent_squeezed = F.squeeze(latent, axis=0)
+            _, height, width = latent_squeezed.shape
+            height = height.dim
+            width = width.dim
+
+            # T-coordinate for this image
+            t_coord = scale + scale * i
+
+            # Create coordinates using numpy (similar to _prepare_latent_image_ids)
+            t_coords = np.full((height, width), t_coord, dtype=np.int64)
+            h_coords, w_coords = np.meshgrid(
+                np.arange(height, dtype=np.int64),
+                np.arange(width, dtype=np.int64),
+                indexing="ij",
+            )
+            l_coords = np.zeros((height, width), dtype=np.int64)
+
+            # Stack: (H, W, 4)
+            coords = np.stack([t_coords, h_coords, w_coords, l_coords], axis=-1)
+
+            # Reshape: (H*W, 4)
+            coords = coords.reshape(-1, 4)
+
+            # Convert to Tensor_v3
+            coords_tensor = Tensor_v3.from_dlpack(coords).to(device)
+            image_latent_ids.append(coords_tensor)
+
+        # Concatenate all coordinates along the first dimension
+        # Each tensor is (H*W, 4), so concatenating gives (N_total, 4)
+        image_latent_ids = F.concat(image_latent_ids, axis=0)
+
+        # Add batch dimension: (1, N_total, 4)
+        image_latent_ids = F.unsqueeze(image_latent_ids, 0)
+
+        return image_latent_ids
+
+    @staticmethod
     def _pack_latents(latents: Tensor_v3) -> Tensor_v3:
         """Pack latents: (B, C, H, W) -> (B, H*W, C).
 
@@ -590,6 +676,143 @@ class Flux2Pipeline(DiffusionPipeline):
         return result
 
     @staticmethod
+    def retrieve_latents(
+        encoder_output: "DiagonalGaussianDistribution",
+        generator: Any = None,
+        sample_mode: str = "mode",
+    ) -> Tensor_v3:
+        """Retrieve latents from encoder output.
+
+        This function extracts latents from a DiagonalGaussianDistribution object
+        returned by vae.encode(). It supports both sampling and mode extraction.
+
+        Args:
+            encoder_output: DiagonalGaussianDistribution from vae.encode().
+            generator: Random number generator (currently unused in Max,
+                kept for compatibility with diffusers API).
+            sample_mode: Extraction mode. "mode" returns the mean (deterministic),
+                "sample" returns a random sample from the distribution.
+                Defaults to "mode".
+
+        Returns:
+            Latent tensor of shape [N, C, H, W].
+
+        Raises:
+            AttributeError: If encoder_output does not have the required methods.
+        """
+        # In Max, vae.encode() returns DiagonalGaussianDistribution directly
+        # (unlike diffusers which wraps it in AutoencoderKLOutput)
+        if hasattr(encoder_output, "mode") and sample_mode == "mode":
+            return encoder_output.mode()
+        elif hasattr(encoder_output, "sample") and sample_mode == "sample":
+            return encoder_output.sample(generator=generator)
+        else:
+            raise AttributeError(
+                f"Could not access latents from encoder_output. "
+                f"Expected DiagonalGaussianDistribution with 'mode' or 'sample' method, "
+                f"got {type(encoder_output)}"
+            )
+
+    def _encode_vae_image(
+        self,
+        image: Tensor_v3,
+        generator: Any = None,
+        sample_mode: str = "mode",
+    ) -> Tensor_v3:
+        """Encode a single image using VAE and apply preprocessing.
+
+        This method encodes an image into latents, applies patchification,
+        and normalizes using BatchNorm statistics.
+
+        Args:
+            image: Image tensor of shape [1, C, H, W] (batch size must be 1).
+            generator: Random number generator (currently unused in Max,
+                kept for compatibility with diffusers API).
+            sample_mode: Extraction mode for latent distribution.
+                "mode" returns the mean (deterministic), "sample" returns a
+                random sample. Defaults to "mode".
+
+        Returns:
+            Encoded and preprocessed latent tensor of shape [1, C*4, H_latent, W_latent].
+
+        Raises:
+            ValueError: If image does not have 4 dimensions or batch size is not 1.
+        """
+        # Check image dimensions
+        if len(image.shape) != 4:
+            raise ValueError(f"Expected image dims 4, got {len(image.shape)}.")
+
+        # Encode image using VAE
+        encoder_output = self.vae.encode(image, return_dict=True)
+
+        print(encoder_output)
+        # Extract DiagonalGaussianDistribution from dict if needed
+        if isinstance(encoder_output, dict):
+            encoder_output = encoder_output["latent_dist"]
+
+        # Retrieve latent from distribution
+        image_latents = self.retrieve_latents(
+            encoder_output, generator=generator, sample_mode=sample_mode
+        )
+        print(f"image_latents.shape: {image_latents.shape}")
+        # Patchify latents: (1, C, H, W) -> (1, C*4, H//2, W//2)
+        image_latents = self._patchify_latents(image_latents)
+        print(f"image_latents after patchify.shape: {image_latents.shape}")
+        # BatchNorm normalization
+        # Get BatchNorm statistics (already Tensor_v3)
+        bn_mean = self.vae.bn.running_mean
+        bn_var = self.vae.bn.running_var
+
+        # Reshape for broadcasting: (C,) -> (1, C, 1, 1)
+        num_channels = bn_mean.shape[0].dim
+        bn_mean = F.reshape(bn_mean, (1, num_channels, 1, 1))
+        bn_var = F.reshape(bn_var, (1, num_channels, 1, 1))
+
+        # Calculate standard deviation: sqrt(var + eps)
+        bn_std = F.sqrt(bn_var + self.vae.config.batch_norm_eps)
+
+        # Normalize: (latent - mean) / std
+        image_latents = (image_latents - bn_mean) / bn_std
+
+        return image_latents
+
+    @staticmethod
+    def _patchify_latents(latents: Tensor_v3) -> Tensor_v3:
+        """Patchify latents from (B, C, H, W) to (B, C*4, H//2, W//2).
+
+        This function converts latents into 2x2 patches, effectively
+        increasing the channel dimension by 4 while reducing spatial dimensions by 2.
+
+        Args:
+            latents: Latent tensor of shape [B, C, H, W].
+
+        Returns:
+            Patchified latents of shape [B, C*4, H//2, W//2].
+        """
+        batch_size = latents.shape[0].dim
+        num_channels_latents = latents.shape[1].dim
+        height = latents.shape[2].dim
+        width = latents.shape[3].dim
+
+        # Reshape: (B, C, H//2, 2, W//2, 2)
+        # Split spatial dimensions into patch dimensions
+        latents = F.reshape(
+            latents,
+            (batch_size, num_channels_latents, height // 2, 2, width // 2, 2),
+        )
+        # Permute: (0, 1, 3, 5, 2, 4)
+        # Rearrange: (B, C, H//2, 2, W//2, 2) -> (B, C, 2, 2, H//2, W//2)
+        # This groups the 2x2 patch elements together
+        latents = F.permute(latents, (0, 1, 3, 5, 2, 4))
+        # Reshape: (B, C*4, H//2, W//2)
+        # Flatten the 2x2 patch into channel dimension
+        latents = F.reshape(
+            latents,
+            (batch_size, num_channels_latents * 4, height // 2, width // 2),
+        )
+        return latents
+
+    @staticmethod
     def _unpatchify_latents(latents: Tensor_v3) -> Tensor_v3:
         """Unpatchify latents from (B, C, H, W) to (B, C//4, H*2, W*2).
 
@@ -608,7 +831,10 @@ class Flux2Pipeline(DiffusionPipeline):
             latents,
             (batch_size, num_channels_latents // 4, 2, 2, height, width),
         )
+        # Reverse the patchify permute: (0, 1, 3, 5, 2, 4) -> (0, 1, 4, 2, 5, 3)
+        # From (B, C//4, 2, 2, H, W) to (B, C//4, H, 2, W, 2)
         latents = F.permute(latents, (0, 1, 4, 2, 5, 3))
+        # Reshape to (B, C//4, H*2, W*2)
         latents = F.reshape(
             latents,
             (batch_size, num_channels_latents // 4, height * 2, width * 2),
@@ -671,26 +897,99 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return latents, latent_image_ids
 
+    def prepare_image_latents(
+        self,
+        images: list[Tensor_v3],
+        batch_size: int,
+        device: DeviceRef,
+        dtype: DType,
+        generator: Any = None,
+        sample_mode: str = "mode",
+    ) -> tuple[Tensor_v3, Tensor_v3]:
+        """Prepare multiple images for image-to-image generation.
+
+        This method encodes multiple images, generates position IDs, packs them,
+        and prepares them for concatenation with text latents in the generation loop.
+
+        Args:
+            images: List of image tensors, each of shape [1, C, H, W].
+            batch_size: Batch size for generation.
+            device: Target device.
+            dtype: Data type for tensors.
+            generator: Random number generator (currently unused in Max,
+                kept for compatibility with diffusers API).
+            sample_mode: Extraction mode for latent distribution.
+                "mode" returns the mean (deterministic), "sample" returns a
+                random sample. Defaults to "mode".
+
+        Returns:
+            Tuple of (packed image latents, image_latent_ids).
+            - packed image latents: Shape [batch_size, N_total, C*4] where N_total
+              is the sum of (H*W) for all input images.
+            - image_latent_ids: Shape [batch_size, N_total, 4].
+        """
+        # Encode each image
+        image_latents = []
+        for image in images:
+            # Move to device and cast dtype
+            image = image.to(device).cast(dtype)
+            # Encode using VAE
+            latent = self._encode_vae_image(
+                image=image, generator=generator, sample_mode=sample_mode
+            )
+            image_latents.append(latent)  # (1, C*4, H_latent, W_latent)
+
+        # Generate position IDs for all images
+        image_latent_ids = self._prepare_image_ids(image_latents, device=device)
+
+        # Pack each latent and concatenate
+        packed_latents = []
+        for latent in image_latents:
+            # latent: (1, C*4, H_latent, W_latent)
+            packed = self._pack_latents(latent)  # (1, H*W, C*4)
+            # Remove batch dimension: (H*W, C*4)
+            packed = F.squeeze(packed, axis=0)
+            packed_latents.append(packed)
+
+        # Concatenate all packed latents along sequence dimension
+        # Each packed latent is (H*W, C*4), so concatenating gives (N_total, C*4)
+        image_latents = F.concat(packed_latents, axis=0)  # (N_total, C*4)
+
+        # Add batch dimension: (1, N_total, C*4)
+        image_latents = F.unsqueeze(image_latents, 0)
+
+        # Repeat for batch_size: (batch_size, N_total, C*4)
+        # Using F.tile similar to prompt_embeds
+        image_latents = F.tile(image_latents, (batch_size, 1, 1))
+
+        # Repeat image_latent_ids for batch_size: (batch_size, N_total, 4)
+        image_latent_ids = F.tile(image_latent_ids, (batch_size, 1, 1))
+        image_latent_ids = image_latent_ids.to(device)
+
+        return image_latents, image_latent_ids
+
     def __call__(
         self,
         prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        true_cfg_scale: float = 1.0,
+        image: PipelineImageInput | None = None,
         height: int | None = None,
         width: int | None = None,
-        num_inference_steps: int = 28,
+        num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
-        guidance_scale: float = 3.5,
+        guidance_scale: float = 4.0,
         num_images_per_prompt: int | None = 1,
         latents: Tensor | None = None,
         prompt_embeds: Tensor | None = None,
-        negative_prompt_embeds: Tensor | None = None,
         output_type: str | None = "pil",
         return_dict: bool = True,
         callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] | None = None,
         max_sequence_length: int = 512,
         hidden_states_layers: list[int] | None = None,
+        # Ignored parameters for compatibility with image_generation wrapper
+        negative_prompt: str | list[str] | None = None,
+        true_cfg_scale: float | None = None,
+        **kwargs: Any,
     ):
         r"""Function invoked when calling the pipeline for generation.
 
@@ -698,26 +997,23 @@ class Flux2Pipeline(DiffusionPipeline):
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
                 instead.
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `true_cfg_scale` is
-                not greater than `1`).
-            true_cfg_scale (`float`, *optional*, defaults to 1.0):
-                True classifier-free guidance (guidance scale) is enabled when `true_cfg_scale` > 1 and
-                `negative_prompt` is provided.
+            image (`PIL.Image.Image` or `List[PIL.Image.Image]`, *optional*):
+                Image or list of images to be used as the starting point for image-to-image generation.
+                Images will be preprocessed (resized, cropped, normalized) before encoding.
             height (`int`, *optional*, defaults to self.transformer.config.sample_size * self.vae_scale_factor):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to self.transformer.config.sample_size * self.vae_scale_factor):
                 The width in pixels of the generated image.
-            num_inference_steps (`int`, *optional*, defaults to 28):
+            num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference.
             sigmas (`List[float]`, *optional*):
                 Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
                 their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
                 will be used.
-            guidance_scale (`float`, *optional*, defaults to 3.5):
-                Embedded guidance scale is enabled by setting `guidance_scale` > 1.
+            guidance_scale (`float`, *optional*, defaults to 4.0):
+                Embedded guidance scale is enabled by setting `guidance_scale` > 1. Higher `guidance_scale` encourages
+                a model to generate images more aligned with `prompt` at the expense of lower image quality.
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             latents (`Tensor`, *optional*):
@@ -727,10 +1023,6 @@ class Flux2Pipeline(DiffusionPipeline):
             prompt_embeds (`Tensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`Tensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
             output_type (`str`, *optional*, defaults to `"pil"`):
                 The output format of the generate image. Choose between
                 [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
@@ -748,24 +1040,23 @@ class Flux2Pipeline(DiffusionPipeline):
             max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
             hidden_states_layers (`List[int]`, *optional*, defaults to [10, 20, 30]):
                 List of layer indices (1-based) to extract hidden states from. For Flux2, layers 10, 20, 30 are stacked.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                Ignored. Kept for compatibility with image generation wrapper. Flux2 uses embedded guidance only.
+            true_cfg_scale (`float`, *optional*):
+                Ignored. Kept for compatibility with image generation wrapper. Flux2 uses embedded guidance only.
+            **kwargs:
+                Additional keyword arguments (ignored for compatibility).
 
         Returns:
             [`~pipelines.flux2.Flux2PipelineOutput`] or `tuple`: [`~pipelines.flux2.Flux2PipelineOutput`] if `return_dict`
             is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
             images.
         """
-        height = height or getattr(
-            self.transformer.config, "sample_size", 1024
-        ) * self.vae_scale_factor
-        width = width or getattr(
-            self.transformer.config, "sample_size", 1024
-        ) * self.vae_scale_factor
-
         self._guidance_scale = guidance_scale
         self._current_timestep = None
         self._interrupt = False
 
-        # 2. Define call parameters
+        # 1. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -776,12 +1067,12 @@ class Flux2Pipeline(DiffusionPipeline):
         device = self._execution_device()
 
         lora_scale = None  # Flux2 may not use LoRA in the same way
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None
-        )
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
 
-        # Encode prompts
+        # Component latency tracking
+        component_times = {}
+
+        # 1. Text Encoder (encode_prompt)
+        text_encoder_start = time.time()
         (
             prompt_embeds,
             text_ids,
@@ -794,22 +1085,83 @@ class Flux2Pipeline(DiffusionPipeline):
             lora_scale=lora_scale,
             hidden_states_layers=hidden_states_layers,
         )
+        component_times["text_encoder"] = time.time() - text_encoder_start
 
-        if do_true_cfg:
-            (
-                negative_prompt_embeds,
-                negative_text_ids,
-            ) = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
+        # 2. Process images (if provided)
+        condition_images = None
+        if image is not None:
+            # Convert single image to list
+            if not isinstance(image, list):
+                image = [image]
+
+            # Preprocess images
+            condition_images = []
+            for img in image:
+                # TODO: Add input validation when VaeImageProcessor.check_image_input is implemented
+                # self.image_processor.check_image_input(img)
+
+                # Get image dimensions
+                image_width, image_height = img.size
+
+                # TODO: Add resize logic when VaeImageProcessor._resize_to_target_area is implemented
+                # if image_width * image_height > 1024 * 1024:
+                #     img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
+                #     image_width, image_height = img.size
+
+                # Ensure dimensions are multiples of vae_scale_factor * 2
+                multiple_of = self.vae_scale_factor * 2
+                target_width = (image_width // multiple_of) * multiple_of
+                target_height = (image_height // multiple_of) * multiple_of
+
+                # Resize and crop image to target dimensions
+                if img.size != (target_width, target_height):
+                    # Center crop to target aspect ratio, then resize
+                    img = img.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+
+                condition_images.append(img)
+
+                # Update height/width if not provided
+                if height is None:
+                    height = target_height
+                if width is None:
+                    width = target_width
+
+        # Set default height/width if not provided
+        height = height or getattr(
+            self.transformer.config, "sample_size", 1024
+        ) * self.vae_scale_factor
+        width = width or getattr(
+            self.transformer.config, "sample_size", 1024
+        ) * self.vae_scale_factor
+
+        # 3. Prepare image latents (if images provided) - must be done before prepare_latents
+        image_latents = None
+        image_latent_ids = None
+        if condition_images is not None:
+            # Convert PIL images to Tensor_v3
+            image_tensors = []
+            for img in condition_images:
+                # Convert PIL Image to numpy array, then to Tensor_v3
+                # Normalize to [-1, 1] range (diffusers standard)
+                img_array = (np.array(img).astype(np.float32) / 127.5) - 1.0
+                # Convert from (H, W, C) to (C, H, W) and add batch dimension
+                img_array = np.transpose(img_array, (2, 0, 1))  # (C, H, W)
+                img_array = np.expand_dims(img_array, axis=0)  # (1, C, H, W)
+                # Ensure array is contiguous before from_dlpack
+                img_array = np.ascontiguousarray(img_array)
+                img_tensor = Tensor_v3.from_dlpack(img_array).to(device)
+                image_tensors.append(img_tensor)
+
+            # Prepare image latents
+            image_latents, image_latent_ids = self.prepare_image_latents(
+                images=image_tensors,
+                batch_size=batch_size * num_images_per_prompt,
                 device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-                lora_scale=lora_scale,
-                hidden_states_layers=hidden_states_layers,
+                dtype=prompt_embeds.dtype,
             )
 
         # 4. Prepare latent variables
+        prepare_latents_start = time.time()
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, latent_image_ids = self.prepare_latents(
             batch_size * num_images_per_prompt,
@@ -820,8 +1172,35 @@ class Flux2Pipeline(DiffusionPipeline):
             device,
             latents,
         )
+        component_times["prepare_latents"] = time.time() - prepare_latents_start
 
-        # 5. Prepare timesteps
+        # 5. Prepare image latents (if images provided)
+        # Note: image_latents are used as condition, not as initial latents
+        # They are concatenated with random latents in the denoising loop
+        if condition_images is not None:
+            # Convert PIL images to Tensor_v3
+            image_tensors = []
+            for img in condition_images:
+                # Convert PIL Image to numpy array, then to Tensor_v3
+                # Normalize to [-1, 1] range (diffusers standard)
+                img_array = (np.array(img).astype(np.float32) / 127.5) - 1.0
+                # Convert from (H, W, C) to (C, H, W) and add batch dimension
+                img_array = np.transpose(img_array, (2, 0, 1))  # (C, H, W)
+                img_array = np.expand_dims(img_array, axis=0)  # (1, C, H, W)
+                # Ensure array is contiguous before from_dlpack
+                img_array = np.ascontiguousarray(img_array)
+                img_tensor = Tensor_v3.from_dlpack(img_array).to(device)
+                image_tensors.append(img_tensor)
+
+            # Prepare image latents
+            image_latents, image_latent_ids = self.prepare_image_latents(
+                images=image_tensors,
+                batch_size=batch_size * num_images_per_prompt,
+                device=device,
+                dtype=prompt_embeds.dtype,
+            )
+
+        # 6. Prepare timesteps
         sigmas = (
             np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
             if sigmas is None
@@ -846,6 +1225,20 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
         self._num_timesteps = timesteps.shape[0]
+
+        # Store original random latents length and IDs (before concatenation with image latents)
+        # This is needed to extract only the random latents part from noise_pred and for decoding
+        random_latents_seq_len = latents.shape[1].dim
+        random_latent_ids = latent_image_ids  # Store original random latents IDs
+
+        # Concatenate image latents with random latents if images provided
+        # Image latents are used as condition, concatenated with random latents
+        if image_latents is not None:
+            # Concatenate along sequence dimension: (B, seq_len1, C) + (B, seq_len2, C) -> (B, seq_len1+seq_len2, C)
+            latents = F.concat([latents, image_latents], axis=1)
+            latent_image_ids = F.concat([latent_image_ids, image_latent_ids], axis=1)
+            # Update image_seq_len to include image latents
+            image_seq_len = latents.shape[1].dim
 
         # Handle guidance
         # Flux2 always uses guidance embeddings
@@ -876,18 +1269,14 @@ class Flux2Pipeline(DiffusionPipeline):
         txt_ids_drv = text_ids.driver_tensor
         img_ids_drv = latent_image_ids.driver_tensor
 
-        # For true CFG
-        negative_encoder_hidden_states_drv = (
-            negative_prompt_embeds.driver_tensor if do_true_cfg else None
-        )
-        negative_txt_ids_drv = (
-            negative_text_ids.driver_tensor if do_true_cfg else None
-        )
-
+        # 3. Denoising loop
+        denoising_start = time.time()
+        step_times = []
         for i in tqdm(range(self._num_timesteps), desc="Denoising"):
             if self._interrupt:
                 continue
 
+            step_start = time.time()
             t = timesteps[i]
             self._current_timestep = t
 
@@ -904,7 +1293,8 @@ class Flux2Pipeline(DiffusionPipeline):
             # Convert latents to driver_tensor
             hidden_states_drv = latents.driver_tensor
 
-            # Call compiled model directly (bypassing Flux2Model wrapper)
+            # Transformer forward pass
+            transformer_start = time.time()
             noise_pred_drv = compiled_model(
                 hidden_states_drv,
                 encoder_hidden_states_drv,
@@ -913,36 +1303,51 @@ class Flux2Pipeline(DiffusionPipeline):
                 txt_ids_drv,
                 guidance_drv,
             )[0]
+            transformer_time = time.time() - transformer_start
 
             # Convert back to Tensor_v3 for scheduler
             noise_pred = Tensor_v3.from_dlpack(noise_pred_drv)
 
-            if do_true_cfg:
-                neg_noise_pred_drv = compiled_model(
-                    hidden_states_drv,
-                    negative_encoder_hidden_states_drv,
-                    timestep_drv,
-                    img_ids_drv,
-                    negative_txt_ids_drv,
-                    guidance_drv,
-                )[0]
-                neg_noise_pred = Tensor_v3.from_dlpack(neg_noise_pred_drv)
-                noise_pred = neg_noise_pred + true_cfg_scale * (
-                    noise_pred - neg_noise_pred
-                )
+            # Extract only the random latents part from noise_pred
+            # (diffusers: noise_pred = noise_pred[:, : latents.size(1) :])
+            # Image latents are used as condition only, not denoised
+            if image_latents is not None:
+                noise_pred = noise_pred[:, :random_latents_seq_len, :]
+                # Extract only random latents for scheduler.step
+                random_latents = latents[:, :random_latents_seq_len, :]
+            else:
+                random_latents = latents
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(
-                noise_pred, t, latents, return_dict=False
+            # Scheduler step (only on random latents)
+            scheduler_start = time.time()
+            latents_dtype = random_latents.dtype
+            random_latents = self.scheduler.step(
+                noise_pred, t, random_latents, return_dict=False
             )[0]
+            scheduler_time = time.time() - scheduler_start
 
-            # Convert driver.Tensor back to Tensor_v3 if needed
-            if not isinstance(latents, Tensor_v3):
-                latents = Tensor_v3.from_dlpack(latents)
+            # Convert driver.Tensor back to Tensor_v3 if needed (before concat)
+            if not isinstance(random_latents, Tensor_v3):
+                random_latents = Tensor_v3.from_dlpack(random_latents)
 
-            if latents.dtype != latents_dtype:
-                latents = latents.cast(latents_dtype)
+            if random_latents.dtype != latents_dtype:
+                random_latents = random_latents.cast(latents_dtype)
+
+            # Re-concatenate updated random latents with image latents (if any)
+            if image_latents is not None:
+                latents = F.concat([random_latents, image_latents], axis=1)
+            else:
+                latents = random_latents
+
+            step_time = time.time() - step_start
+            step_times.append(
+                {
+                    "step": i,
+                    "total": step_time,
+                    "transformer": transformer_time,
+                    "scheduler": scheduler_time,
+                }
+            )
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}
@@ -957,14 +1362,23 @@ class Flux2Pipeline(DiffusionPipeline):
                     "prompt_embeds", prompt_embeds
                 )
 
+        component_times["denoising_loop"] = time.time() - denoising_start
+        component_times["denoising_steps"] = step_times
         self._current_timestep = None
 
         if output_type == "latent":
             image = latents
         else:
+            # 4. VAE decode
+            vae_decode_start = time.time()
             # Convert to Tensor_v3 if needed (latents may be driver.Tensor after scheduler.step)
             if not isinstance(latents, Tensor_v3):
                 latents = Tensor_v3.from_dlpack(latents)
+
+            # Extract only random latents for decoding (image latents are condition only)
+            if image_latents is not None:
+                latents = latents[:, :random_latents_seq_len, :]
+                latent_image_ids = random_latent_ids
 
             # Unpack latents using position IDs (Flux2 specific)
             latents_v3 = self._unpack_latents_with_ids(latents, latent_image_ids)
@@ -995,6 +1409,42 @@ class Flux2Pipeline(DiffusionPipeline):
             image = self.image_processor.postprocess(
                 image, output_type=output_type
             )
+            component_times["vae_decode"] = time.time() - vae_decode_start
+
+        # Print component latency summary
+        total_time = sum(
+            v
+            for k, v in component_times.items()
+            if k not in ["denoising_steps"]
+        )
+        print("\n" + "=" * 60)
+        print("Component E2E Latency Summary")
+        print("=" * 60)
+        print(f"{'Component':<30} {'Time (s)':<15} {'% of Total':<15}")
+        print("-" * 60)
+        for component, comp_time in component_times.items():
+            if component == "denoising_steps":
+                continue
+            percentage = (comp_time / total_time * 100) if total_time > 0 else 0
+            print(f"{component:<30} {comp_time:<15.4f} {percentage:<15.2f}%")
+
+        if "denoising_steps" in component_times and component_times["denoising_steps"]:
+            step_times = component_times["denoising_steps"]
+            avg_step_time = sum(s["total"] for s in step_times) / len(step_times)
+            avg_transformer_time = (
+                sum(s["transformer"] for s in step_times) / len(step_times)
+            )
+            avg_scheduler_time = (
+                sum(s["scheduler"] for s in step_times) / len(step_times)
+            )
+            print("-" * 60)
+            print(f"{'Avg Denoising Step':<30} {avg_step_time:<15.4f}")
+            print(f"{'  - Transformer':<30} {avg_transformer_time:<15.4f}")
+            print(f"{'  - Scheduler':<30} {avg_scheduler_time:<15.4f}")
+            print(f"{'Total Steps':<30} {len(step_times):<15}")
+
+        print(f"{'TOTAL':<30} {total_time:<15.4f} {'100.00%':<15}")
+        print("=" * 60 + "\n")
 
         if not return_dict:
             return (image,)

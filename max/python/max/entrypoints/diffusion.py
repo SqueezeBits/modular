@@ -11,6 +11,8 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from PIL.Image import Image
+
 from max.interfaces import (
     ImageGenerationInputs,
     ImageGenerationOutput,
@@ -36,6 +38,7 @@ class DiffusionPipeline:
     def __call__(
         self,
         prompt: str,
+        image: Image | list[Image] | None = None,
         negative_prompt: str | None = None,
         true_cfg_scale: float = 1.0,
         height: int = 1024,
@@ -44,11 +47,28 @@ class DiffusionPipeline:
         guidance_scale: float = 3.5,
         num_images_per_prompt: int = 1,
     ) -> ImageGenerationOutput:
-        """Generate images from a prompt with the configured pipeline."""
+        """Generate images from a prompt with the configured pipeline.
+
+        Args:
+            prompt: Text prompt to guide the image generation.
+            image: Optional input image(s) for image-to-image generation.
+                Can be a single PIL Image or a list of PIL Images.
+            negative_prompt: Optional negative prompt (not used by all models).
+            true_cfg_scale: Traditional CFG scale (not used by all models).
+            height: Height of the generated image in pixels.
+            width: Width of the generated image in pixels.
+            num_inference_steps: Number of denoising steps.
+            guidance_scale: Guidance scale for generation.
+            num_images_per_prompt: Number of images to generate per prompt.
+
+        Returns:
+            ImageGenerationOutput containing the generated images.
+        """
         # TODO: consider all possible diffusion tasks,
         # e.g. T2I, I2I, T2V, I2V, V2V.
         inputs = ImageGenerationInputs(
             prompt=prompt,
+            image=image,
             negative_prompt=negative_prompt,
             true_cfg_scale=true_cfg_scale,
             height=height,
