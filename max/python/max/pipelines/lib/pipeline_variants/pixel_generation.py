@@ -81,6 +81,7 @@ class PixelGenerationPipeline(
         # Retrieve the weights repo id (falls back to model_path when unset).
         weight_paths: list[Path] = get_weight_paths(model_config)
 
+        import os
         self._pipeline_model = pipeline_model(
             pipeline_config=self._pipeline_config,
             session=session,
@@ -113,54 +114,19 @@ class PixelGenerationPipeline(
         self,
         inputs: PixelGenerationInputs[PixelGenerationContextType],
     ) -> PipelineOutputsDict[PixelGenerationOutput]:
-        model_inputs, flat_batch = self.prepare_batch(inputs.batch)
-        if not flat_batch:
-            return {}
-
-        try:
-            model_outputs = self._pipeline_model.execute(
-                model_inputs=model_inputs
-            )
-        except Exception:
-            batch_size = len(flat_batch)
-            logger.error(
-                "Encountered an exception while executing pixel batch: "
-                "batch_size=%d, num_images_per_prompt=%s, height=%s, width=%s, "
-                "num_inference_steps=%s",
-                batch_size,
-                model_inputs.get("num_images_per_prompt"),
-                model_inputs.get("height"),
-                model_inputs.get("width"),
-                model_inputs.get("num_inference_steps"),
-            )
-            raise
-
-        image_list = model_outputs.images
-        num_images_per_prompt = int(model_inputs["num_images_per_prompt"])
-        expected_images = len(flat_batch) * num_images_per_prompt
-        if len(image_list) != expected_images:
-            raise ValueError(
-                "Unexpected number of images returned from pipeline: "
-                f"expected {expected_images}, got {len(image_list)}."
-            )
-
+        # model_inputs, flat_batch = self.prepare_batch(inputs.batch)
+        # TODO: Implement batching method with PixelContext.
+        
         responses: dict[RequestID, PixelGenerationOutput] = {}
-        for index, (request_id, _context) in enumerate(flat_batch):
-            offset = index * num_images_per_prompt
-            if num_images_per_prompt == 1:
-                pixel_data = image_list[offset]
-            else:
-                pixel_data = np.stack(
-                    image_list[offset : offset + num_images_per_prompt],
-                    axis=0,
-                )
-            pixel_data = pixel_data.astype(np.float32, copy=False)
+        for request_id, model_inputs in inputs.batch.items():
+            model_outputs = self._pipeline_model.execute(
+                inputs=model_inputs
+            )
             responses[request_id] = PixelGenerationOutput(
                 request_id=request_id,
                 final_status=GenerationStatus.END_OF_SEQUENCE,
-                pixel_data=pixel_data,
+                pixel_data=model_outputs.images[0],
             )
-
         return responses
 
     def prepare_batch(
@@ -171,9 +137,11 @@ class PixelGenerationPipeline(
     ]:
         """Prepare batched model inputs for pixel generation execution."""
         # TODO: Implement batching method with PixelContext.
-        raise NotImplementedError(
-            "prepare_batch is not implemented for PixelGenerationPipeline yet."
-        )
+        flat_batch = []
+        model_inputs = {}
+        for request_id, model_inputs in batch.items():
+            flat_batch.append((request_id, model_inputs))
+        return flat_batch
 
     def release(self) -> None:
         pass

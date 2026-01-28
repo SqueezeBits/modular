@@ -101,12 +101,17 @@ class FluxAttention(Module):
         )
 
         if not self.pre_only:
-            self.to_out = Sequential(
-                Linear(
-                    self.inner_dim,
-                    self.out_dim,
-                    bias=out_bias,
-                )
+            # self.to_out = Sequential(
+            #     Linear(
+            #         self.inner_dim,
+            #         self.out_dim,
+            #         bias=out_bias,
+            #     )
+            # )
+            self.to_out = Linear(
+                self.inner_dim,
+                self.out_dim,
+                bias=out_bias,
             )
 
         if added_kv_proj_dim is not None:

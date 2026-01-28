@@ -124,12 +124,13 @@ class DiffusersComponentConfig(ConfigFileModel):
         if subfolder.exists() and subfolder.is_dir():
             # Look for config file - try config.json first, then
             # scheduler_config.json (schedulers use scheduler_config.json)
-            possible_config = subfolder / "config.json"
-            if not possible_config.exists():
-                possible_config = subfolder / "scheduler_config.json"
-
-            if possible_config.exists():
-                config_path = possible_config
+            possible_config_list = list(subfolder.glob("*config.json"))
+            if len(possible_config_list) > 0:
+                config_path = possible_config_list[0]
+            else:
+                config_path = None
+            
+            if config_path is not None:
                 try:
                     with open(config_path, encoding="utf-8") as f:
                         config_dict = json.load(f)

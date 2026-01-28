@@ -85,7 +85,7 @@ class FlowMatchEulerDiscreteScheduler:
     """
 
     config_name = "scheduler_config.json"
-
+    
     def __init__(
         self,
         num_train_timesteps: int = 1000,
@@ -202,6 +202,25 @@ class FlowMatchEulerDiscreteScheduler:
         self.sigmas = sigmas
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
+
+        self.config = {
+            "num_train_timesteps": num_train_timesteps,
+            "shift": shift,
+            "use_dynamic_shifting": use_dynamic_shifting,
+            "base_shift": base_shift,
+            "max_shift": max_shift,
+            "base_image_seq_len": base_image_seq_len,
+            "max_image_seq_len": max_image_seq_len,
+            "invert_sigmas": invert_sigmas,
+            "shift_terminal": shift_terminal,
+            "use_karras_sigmas": use_karras_sigmas,
+            "use_exponential_sigmas": use_exponential_sigmas,
+            "use_beta_sigmas": use_beta_sigmas,
+            "time_shift_type": time_shift_type,
+            "stochastic_sampling": stochastic_sampling,
+            "device": device,
+            "dtype": dtype,
+        }
 
         self.load_model()
 

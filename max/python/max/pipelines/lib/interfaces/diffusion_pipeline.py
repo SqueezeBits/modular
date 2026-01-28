@@ -38,6 +38,9 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound="PixelModelInputs")
 
 
+
+
+
 class DiffusionPipeline(ABC):
     config_name: str | None = None
     """
@@ -59,7 +62,6 @@ class DiffusionPipeline(ABC):
     def __init__(
         self,
         pipeline_config: PipelineConfig,
-        cached_folder: str,
         **kwargs: Any,
     ) -> DiffusionPipeline:
         """Load a pipeline from a pretrained model.
@@ -73,7 +75,7 @@ class DiffusionPipeline(ABC):
         self.devices = load_devices(pipeline_config.model.device_specs)
 
         # Load sub models
-        loaded_sub_models = self.load_sub_models(cached_folder)
+        loaded_sub_models = self.load_sub_models(pipeline_config)
         for name, model in loaded_sub_models.items():
             setattr(self, name, model)
 
@@ -85,7 +87,7 @@ class DiffusionPipeline(ABC):
 
     def load_sub_models(
         self,
-        pretrained_model_name_or_path: str | os.PathLike,
+        pipeline_config: PipelineConfig,
     ) -> dict:
         """Load sub-models for the pipeline.
 
@@ -101,45 +103,30 @@ class DiffusionPipeline(ABC):
                 f"`components` for {self.__class__.__name__} pipeline is not set. "
                 "Please set proper components based on its sub-directories in the downloaded path."
             )
+        
+        configs = pipeline_config.model.diffusers_config.components
         for name, component_class in tqdm(
             self.components.items(), desc="Loading sub models"
         ):
-            component_path = os.path.join(pretrained_model_name_or_path, name)
+            cfg = configs[name]
             if "tokenizer" in name:
                 # NOTE: Currently, we are using tokenizers from transformers.
                 # TODO(minkyu): Check if we can use Tokenizer in Max,
                 # and remove this conditional path.
-                loaded_sub_models[name] = component_class.from_pretrained(
-                    component_path
-                )
+                # loaded_sub_models[name] = component_class.from_pretrained(
+                #     cfg.config_dict,
+                # )
                 continue
-
-            if (
-                not hasattr(component_class, "config_name")
-                or component_class.config_name is None
-            ):
-                raise ValueError(
-                    f"`config_name` for {component_class.__name__} is not set. "
-                    "Please set proper config file name in the downloaded path."
-                )
-            # config = load_config(
-            #     f"{component_path}/{component_class.config_name}"
-            # )
             if issubclass(component_class, MaxModel):
-                weight_paths = [
-                    Path(pretrained_model_name_or_path) / weight_path
-                    for weight_path in self.pipeline_config.model.weight_path
-                    if weight_path.split("/")[0] == name
-                ]
                 loaded_sub_models[name] = component_class(
-                    config=config,
+                    config=cfg.config_dict,
                     encoding=self.pipeline_config.model.quantization_encoding,
                     devices=self.devices,
-                    weights=load_weights(weight_paths),
+                    weights=load_weights(cfg.weight_paths),
                 )
             else:
                 loaded_sub_models[name] = component_class(
-                    **config,
+                    **cfg.config_dict,
                     device=DeviceRef.from_device(self.devices[0]),
                     dtype=self.pipeline_config.model.quantization_encoding.dtype,
                 )

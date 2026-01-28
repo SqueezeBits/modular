@@ -892,8 +892,8 @@ class PixelGenerationTokenizer(
                 model_path,
                 revision=revision,
                 trust_remote_code=trust_remote_code,
-                model_max_length=max_length,
                 subfolder=subfolder,
+                **pipeline_config.model.diffusers_config.components['tokenizer'].config_dict
             )
             self.max_length = max_length or self.delegate.model_max_length
             if subfolder_2 is not None:
@@ -901,8 +901,8 @@ class PixelGenerationTokenizer(
                     model_path,
                     revision=revision,
                     trust_remote_code=trust_remote_code,
-                    model_max_length=max_length_2,
                     subfolder=subfolder_2,
+                    **pipeline_config.model.diffusers_config.components['tokenizer_2'].config_dict
                 )
                 self.max_length_2 = (
                     max_length_2 or self.delegate_2.model_max_length
@@ -1317,7 +1317,7 @@ class PixelGenerationTokenizer(
         else:
             timesteps = (timesteps / 1000.0).astype(np.float32)
         num_warmup_steps: int = max(
-            len(timesteps) - num_inference_steps * scheduler.order, 0
+            len(timesteps) - num_inference_steps, 0
         )
 
         latents, latent_image_ids = self._prepare_latents(
