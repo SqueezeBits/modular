@@ -13,6 +13,8 @@
 """Interfaces for MAX pipelines."""
 
 from .arch_config import ArchConfig, ArchConfigWithAttentionKVCache
+from .component_model import ComponentModel
+from .diffusion_pipeline import DiffusionPipeline, PixelModelInputs
 from .generate import GenerateMixin
 from .kv_cache import KVCacheMixin
 from .pipeline_model import (
@@ -26,9 +28,13 @@ __all__ = [
     "AlwaysSignalBuffersMixin",
     "ArchConfig",
     "ArchConfigWithAttentionKVCache",
+    "ComponentModel",
+    "DiffusionPipeline",
     "GenerateMixin",
     "KVCacheMixin",
     "ModelInputs",
     "ModelOutputs",
     "PipelineModel",
+    "PixelModelInputs",
+    "get_paged_manager",
 ]
