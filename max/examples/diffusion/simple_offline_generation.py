@@ -31,12 +31,14 @@ import asyncio
 import os
 
 import numpy as np
+from max.driver import DeviceSpec
 from max.interfaces import (
     PixelGenerationInputs,
     PixelGenerationRequest,
     RequestID,
 )
 from max.pipelines import PipelineConfig
+from max.pipelines.architectures.flux1.pipeline_flux import FluxPipeline
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import PixelGenerationTokenizer
 from max.pipelines.lib.pipeline_variants.pixel_generation import (
@@ -159,7 +161,11 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 1: Initialize pipeline configuration
     # defer_resolve=True prevents automatic model resolution/loading
-    config = PipelineConfig(model_path=args.model, defer_resolve=True)
+    config = PipelineConfig(
+        model_path=args.model,
+        device_specs=[DeviceSpec.accelerator()],
+        use_legacy_module=False,
+    )
 
     # Step 2: Initialize the tokenizer
     # The tokenizer handles prompt encoding and context preparation
@@ -174,6 +180,7 @@ async def generate_image(args: argparse.Namespace) -> None:
     # The pipeline executes the diffusion model
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
+        pipeline_model=FluxPipeline,
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")
