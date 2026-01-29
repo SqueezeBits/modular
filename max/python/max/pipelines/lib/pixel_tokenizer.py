@@ -190,9 +190,9 @@ class PixelGenerationTokenizer(
             scheduler_component.get("class_name"),
             scheduler_component.get("config_dict", {}),
         )
-        self._scheduler_use_flow_sigmas = getattr(
-            self._scheduler.config, "use_flow_sigmas", False
-        )
+        # self._scheduler_use_flow_sigmas = getattr(
+        #     self._scheduler.config, "use_flow_sigmas", False
+        # )
 
     def _calculate_shift(
         self,
@@ -403,7 +403,6 @@ class PixelGenerationTokenizer(
     ) -> npt.NDArray[np.float32]:
         """Post-process pixel data from model output (NCHW -> NHWC, normalized)."""
         pixel_data = (pixel_data * 0.5 + 0.5).clip(min=0.0, max=1.0)
-        pixel_data = pixel_data.transpose(0, 2, 3, 1)
         return pixel_data
 
     async def new_context(
@@ -484,7 +483,7 @@ class PixelGenerationTokenizer(
 
         sigmas: npt.NDArray[np.float32] | None = (
             None
-            if self._scheduler_use_flow_sigmas
+            if False
             else np.linspace(
                 1.0,
                 1.0 / request.num_inference_steps,
@@ -503,9 +502,9 @@ class PixelGenerationTokenizer(
             timesteps = ((1000.0 - timesteps) / 1000.0).astype(np.float32)
         else:
             timesteps = (timesteps / 1000.0).astype(np.float32)
-        num_warmup_steps: int = max(
-            len(timesteps) - num_inference_steps * self._scheduler.order, 0
-        )
+        # num_warmup_steps: int = max(
+        #     len(timesteps) - num_inference_steps * self._scheduler.order, 0
+        # )
 
         latents, latent_image_ids = self._prepare_latents(
             request.num_images_per_prompt,
@@ -538,7 +537,7 @@ class PixelGenerationTokenizer(
             guidance=guidance,
             num_images_per_prompt=request.num_images_per_prompt,
             true_cfg_scale=request.true_cfg_scale,
-            num_warmup_steps=num_warmup_steps,
+            num_warmup_steps=0,
             model_name=request.model_name,
         )
 
