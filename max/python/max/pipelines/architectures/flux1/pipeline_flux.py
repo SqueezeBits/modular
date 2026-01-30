@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from queue import Queue
 from typing import Literal
 
@@ -20,6 +20,7 @@ import PIL.Image
 from max import functional as F
 from max.dtype import DType
 from max.interfaces import PixelGenerationOutput, TokenBuffer
+from max.pipelines import PixelContext
 from max.pipelines.lib.diffusion_schedulers import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -105,6 +106,9 @@ class FluxPipeline(DiffusionPipeline):
             vae_scale_factor=self.vae_scale_factor * 2
         )
         self.image_processor = image_processor
+
+    def prepare_inputs(self, context: PixelContext) -> FluxModelInputs:
+        return FluxModelInputs.from_context(asdict(context))
 
     @staticmethod
     def _pack_latents(
