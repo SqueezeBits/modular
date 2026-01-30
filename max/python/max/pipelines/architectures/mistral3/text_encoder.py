@@ -16,24 +16,19 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 from max.driver import Device, DeviceSpec
-from max.engine import InferenceSession, Model
-from max.graph import DeviceRef, TensorType, TensorValue
+from max.engine import InferenceSession
+from max.graph import TensorValue
 from max.graph.weights import Weights
 from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
-from max.pipelines.core import TextContext
 from max.pipelines.lib import (
-    KVCacheConfig,
     PipelineConfig,
     SupportedEncoding,
 )
-from max.pipelines.lib.hf_utils import download_weight_files
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 from transformers import AutoConfig
 
@@ -170,7 +165,7 @@ class Mistral3TextEncoderModel(ComponentModel):
             pipeline_config=self._pipeline_config,
         )
 
-        # Return the compiled model (for MaxModel interface compatibility)
+        # Return the compiled model (for ComponentModel interface compatibility)
         return self._mistral_model.model
 
     def __call__(
