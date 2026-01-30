@@ -12,5 +12,6 @@
 # ===----------------------------------------------------------------------=== #
 
 from .arch import mistral3_arch
+from .text_encoder import Mistral3TextEncoderModel
 
-__all__ = ["mistral3_arch"]
+__all__ = ["mistral3_arch", "Mistral3TextEncoderModel"]
