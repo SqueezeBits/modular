@@ -236,7 +236,8 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Step 9: Post-process the pixel data
     # The tokenizer's postprocess method converts from model output format
     # (NCHW, [-1, 1]) to display format (NHWC, [0, 1])
-    pixel_data = await tokenizer.postprocess(output.pixel_data)
+    # pixel_data = await tokenizer.postprocess(output.pixel_data)
+    pixel_data = output.pixel_data
 
     # Step 10: Save the image
     # Take the first image if multiple were generated
