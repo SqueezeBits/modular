@@ -424,7 +424,7 @@ class PixelModelInputs:
             )
 
     @classmethod
-    def from_context(cls, context: dict[str, Any]) -> PixelModelInputs:
+    def from_context(cls, context: PixelContext) -> PixelModelInputs:
         """
         Build an instance from a context-like dict.
 
@@ -437,7 +437,7 @@ class PixelModelInputs:
         fmap = {f.name: f for f in fields(cls)}
         kwargs: dict[str, Any] = {}
 
-        for k, v in context.items():
+        for k, v in context.__dict__.items():
             if k not in fmap:
                 continue
 

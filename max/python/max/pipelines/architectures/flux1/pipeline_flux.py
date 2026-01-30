@@ -108,7 +108,7 @@ class FluxPipeline(DiffusionPipeline):
         self.image_processor = image_processor
 
     def prepare_inputs(self, context: PixelContext) -> FluxModelInputs:
-        return FluxModelInputs.from_context(asdict(context))
+        return FluxModelInputs.from_context(context)
 
     @staticmethod
     def _pack_latents(
@@ -333,7 +333,6 @@ class FluxPipeline(DiffusionPipeline):
         sigmas = (
             Tensor.from_dlpack(model_inputs.sigmas)
             .to(self.transformer.devices[0])
-            .cast(dtype)
         )
         batch_size = prompt_embeds.shape[0].dim
 
