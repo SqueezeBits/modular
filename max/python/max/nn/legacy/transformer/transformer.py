@@ -86,6 +86,7 @@ class ReturnHiddenStates(str, Enum):
     ALL = "all"
     LAST_NORMALIZED = "last_normalized"
     ALL_NORMALIZED = "all_normalized"
+    ALL_LAYERS = "all_layers"
 
 
 Block = TypeVar("Block", bound=Module, covariant=True)
