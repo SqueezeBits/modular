@@ -146,6 +146,16 @@ class MistralModel(PipelineModel[TextContext], KVCacheMixin):
         logit_offsets = None
         hidden_states = None
 
+        # Debug: Log the actual outputs length when hidden states are expected
+        if self.return_hidden_states != ReturnHiddenStates.NONE and len(model_outputs) <= 1:
+            import logging
+            logger = logging.getLogger("max.pipelines")
+            logger.warning(
+                f"MistralModel.execute: Expected hidden states (return_hidden_states={self.return_hidden_states}), "
+                f"but model_outputs length is {len(model_outputs)}. "
+                f"return_logits={self.return_logits}"
+            )
+
         if self.return_logits == ReturnLogits.LAST_TOKEN:
             if len(model_outputs) > 1:
                 hidden_states = tuple(model_outputs[1:])

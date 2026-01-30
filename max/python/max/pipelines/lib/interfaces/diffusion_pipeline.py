@@ -112,6 +112,20 @@ class DiffusionPipeline(ABC):
                 weight_paths, relative_paths[name]
             )
 
+            # Add model path information for text_encoder components
+            # (e.g., Mistral3TextEncoderModel needs text_encoder_path)
+            if "text_encoder" in name:
+                # Find text_encoder directory path from weight paths
+                if abs_paths:
+                    # Get the parent directory of the first weight file
+                    # This should be the text_encoder component directory
+                    text_encoder_dir = str(abs_paths[0].parent)
+                    config_dict["text_encoder_path"] = text_encoder_dir
+                    config_dict["model_path"] = text_encoder_dir
+                    # Also provide the root model path for components that need it
+                    if hasattr(self.pipeline_config.model, "model_path"):
+                        config_dict["root_model_path"] = self.pipeline_config.model.model_path
+
             loaded_sub_models[name] = component_cls(
                 config=config_dict,
                 encoding=self.pipeline_config.model.quantization_encoding,

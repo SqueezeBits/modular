@@ -59,7 +59,7 @@ class WeightedRMSNorm(Module):
         Returns:
             Normalized tensor of same shape as input.
         """
-        return rms_norm.rms_norm(
+        return rms_norm(
             x,
             self.weight,
             self.eps,
