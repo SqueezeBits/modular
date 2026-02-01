@@ -195,6 +195,18 @@ class Flux2Pipeline(DiffusionPipeline):
         # Scheduler is not a ComponentModel (no weights), so it is not loaded in _load_sub_models; create it here.
         if not getattr(self, "scheduler", None):
             self.scheduler = FlowMatchEulerDiscreteScheduler()
+        # scheduler_class = self.components.get("scheduler")
+        # if scheduler_class:
+        #     scheduler_config = {}
+        #     if (
+        #         self.pipeline_config.model.diffusers_config
+        #         and "scheduler" in self.pipeline_config.model.diffusers_config
+        #     ):
+        #         scheduler_config = self.pipeline_config.model.diffusers_config[
+        #             "scheduler"
+        #         ]
+        #     self.scheduler = scheduler_class(**scheduler_config)
+
         image_processor_class = self.components.get(
             "image_processor", VaeImageProcessor
         )
@@ -209,7 +221,42 @@ class Flux2Pipeline(DiffusionPipeline):
         self.image_processor = image_processor
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
-        return Flux2ModelInputs.from_context(context)
+        inputs = Flux2ModelInputs.from_context(context)
+        
+        # Flux2 VAE compression is 8, and patch size is 2
+        # So effective latent resolution for IDs is original / 16
+        latent_height = inputs.height // 16
+        latent_width = inputs.width // 16
+        
+        # Generate generic IDs if not already present or if we need to force Flux2 specific layout
+        # We enforce it here to guarantee the 4D shape (1, H*W, 4) required by the model
+        device = self.transformer.devices[0]
+        
+        inputs.latent_image_ids = self._prepare_latent_image_ids(
+            batch_size=1, # Context usually implies single batch, tile later if needed
+            height=latent_height,
+            width=latent_width,
+            device=device,
+            dtype=DType.int64,
+        )
+        
+        return inputs
+
+    def _scheduler_step(
+        self,
+        latents: Tensor,
+        noise_pred: Tensor,
+        sigmas: Tensor,
+        step_index: int,
+    ) -> Tensor:
+        latents_dtype = latents.dtype
+        latents = latents.cast(DType.float32)
+        sigma = sigmas[step_index]
+        sigma_next = sigmas[step_index + 1]
+        dt = sigma_next - sigma
+        latents = latents + dt * noise_pred
+        latents = latents.cast(latents_dtype)
+        return latents
 
     def _prepare_prompt_embeddings(
         self,
