@@ -371,15 +371,21 @@ class PipelineRegistry:
             The matching SupportedArchitecture or None if no match found.
         """
         # Retrieve model architecture names
-        if not is_diffusion_pipeline(huggingface_repo):
+        print(f"DEBUG: Checking is_diffusion_pipeline for {huggingface_repo.repo_id}")
+        is_diffusion = is_diffusion_pipeline(huggingface_repo)
+        print(f"DEBUG: is_diffusion: {is_diffusion}")
+        
+        if not is_diffusion:
             hf_config = self.get_active_huggingface_config(
                 huggingface_repo=huggingface_repo
             )
             architecture_names = getattr(hf_config, "architectures", [])
+            print(f"DEBUG: HF architectures: {architecture_names}")
         else:
             diffusers_config = self.get_active_diffusers_config(
                 huggingface_repo=huggingface_repo
             )
+            print(f"DEBUG: Diffusers config found: {diffusers_config is not None}")
             if diffusers_config is None:
                 logger.debug(
                     f"No diffusers_config found for {huggingface_repo.repo_id}"
@@ -387,6 +393,7 @@ class PipelineRegistry:
                 return None
             if diffusers_arch := diffusers_config.get("_class_name"):
                 architecture_names = [diffusers_arch]
+                print(f"DEBUG: Diffusers arch: {architecture_names}")
             else:
                 logger.debug(
                     f"No `_class_name` found in diffusers_config for {huggingface_repo.repo_id}"
@@ -400,6 +407,7 @@ class PipelineRegistry:
             return None
 
         for architecture_name in architecture_names:
+            print(f"DEBUG: Checking arch: {architecture_name}, use_legacy_module: {use_legacy_module}")
             if use_legacy_module:
                 architecture_name += "_Legacy"
 
@@ -441,6 +449,7 @@ class PipelineRegistry:
                     return self._architectures_by_task[task_key]
 
             # Fall back to name-only match
+            print(f"DEBUG: Checking if {architecture_name} in architectures: {architecture_name in self.architectures}")
             if architecture_name in self.architectures:
                 return self.architectures[architecture_name]
 
@@ -503,20 +512,25 @@ class PipelineRegistry:
             try:
                 # Check if model_index.json exists to identify diffusion pipelines
                 import json
+                import os
+                from .config_enums import RepoType
 
                 from huggingface_hub import hf_hub_download
 
                 # Try to download model_index.json
-                config_path = hf_hub_download(
-                    repo_id=huggingface_repo.repo_id,
-                    filename="model_index.json",
-                    revision=huggingface_repo.revision,
-                )
+                if huggingface_repo.repo_type == RepoType.local:
+                    config_path = os.path.join(huggingface_repo.repo_id, "model_index.json")
+                else:
+                    config_path = hf_hub_download(
+                        repo_id=huggingface_repo.repo_id,
+                        filename="model_index.json",
+                        revision=huggingface_repo.revision,
+                    )
 
                 # Load the config
                 with open(config_path) as f:
                     config = json.load(f)
-
+                
                 self._cached_diffusers_configs[huggingface_repo] = config
             except Exception as e:
                 # If model_index.json doesn't exist, this is not a diffusion pipeline

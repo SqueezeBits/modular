@@ -527,15 +527,28 @@ class MAXModelConfig(MAXModelConfigBase):
             # Try to load the component's config file
             component_config = {}
             try:
-                config_file_path = hf_hub_download(
-                    repo_id=self.huggingface_model_repo.repo_id,
-                    filename=f"{component_name}/config.json",
-                    revision=self.huggingface_model_repo.revision,
-                )
+                if self.huggingface_model_repo.repo_type == RepoType.local:
+                    config_file_path = os.path.join(
+                        self.huggingface_model_repo.repo_id,
+                        component_name,
+                        "config.json",
+                    )
+                else:
+                    config_file_path = hf_hub_download(
+                        repo_id=self.huggingface_model_repo.repo_id,
+                        filename=f"{component_name}/config.json",
+                        revision=self.huggingface_model_repo.revision,
+                    )
                 with open(config_file_path) as f:
                     component_config = json.load(f)
             except Exception as e:
                 logger.debug(f"Could not load config for {component_name}: {e}")
+
+            # Inject root model path into component config
+            # This is needed because some components (like text encoders) need to know
+            # the root model path to find other components (like tokenizers) that might
+            # be in different subdirectories.
+            component_config["root_model_path"] = self.model_path
 
             components[component_name] = {
                 "library": library,
