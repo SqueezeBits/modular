@@ -164,11 +164,33 @@ class Mistral3TextEncoderModel(ComponentModel):
             return_hidden_states=ReturnHiddenStates.ALL_LAYERS,
         )
 
-        # For tokenizer, use text_encoder_path (local path) for AutoTokenizer.from_pretrained
-        # The tokenizer is located in the text_encoder subdirectory, not the root model directory
-        # root_model_path is stored for potential chat_template loading from root directory
+        # For tokenizer, determine the correct path.
+        # It could be in the text_encoder directory (Mistral3) or the root directory (Flux2).
+        tokenizer_path = self._text_encoder_path
+        
+        # Check if tokenizer config exists in text_encoder path
+        import os
+        from pathlib import Path
+        
+        is_local_path = os.path.exists(self._text_encoder_path) or Path(self._text_encoder_path).exists()
+        
+        if is_local_path:
+             # Check for common tokenizer files
+            has_tokenizer = False
+            for f in ["tokenizer.json", "tokenizer_config.json"]:
+                if (Path(self._text_encoder_path) / f).exists():
+                    has_tokenizer = True
+                    break
+            
+            # If not found in text_encoder path, fallback to root/tokenizer if available
+            if not has_tokenizer and self._root_model_path:
+                 root_tokenizer_path = Path(self._root_model_path) / "tokenizer"
+                 if root_tokenizer_path.exists():
+                     pass  # use root_tokenizer_path
+                     tokenizer_path = str(root_tokenizer_path)
+
         self._tokenizer = Mistral3Tokenizer(
-            model_path=self._text_encoder_path,
+            model_path=tokenizer_path,
             pipeline_config=self._pipeline_config,
             root_model_path=self._root_model_path,
         )
