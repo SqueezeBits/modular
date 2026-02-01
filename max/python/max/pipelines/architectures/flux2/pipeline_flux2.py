@@ -261,6 +261,18 @@ class Flux2Pipeline(DiffusionPipeline):
     }
 
     def init_remaining_components(self) -> None:
+        scheduler_class = self.components.get("scheduler")
+        if scheduler_class:
+            scheduler_config = {}
+            if (
+                self.pipeline_config.model.diffusers_config
+                and "scheduler" in self.pipeline_config.model.diffusers_config
+            ):
+                scheduler_config = self.pipeline_config.model.diffusers_config[
+                    "scheduler"
+                ]
+            self.scheduler = scheduler_class(**scheduler_config)
+
         image_processor_class = self.components.get(
             "image_processor", VaeImageProcessor
         )
@@ -275,7 +287,42 @@ class Flux2Pipeline(DiffusionPipeline):
         self.image_processor = image_processor
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
-        return Flux2ModelInputs.from_context(context)
+        inputs = Flux2ModelInputs.from_context(context)
+        
+        # Flux2 VAE compression is 8, and patch size is 2
+        # So effective latent resolution for IDs is original / 16
+        latent_height = inputs.height // 16
+        latent_width = inputs.width // 16
+        
+        # Generate generic IDs if not already present or if we need to force Flux2 specific layout
+        # We enforce it here to guarantee the 4D shape (1, H*W, 4) required by the model
+        device = self.transformer.devices[0]
+        
+        inputs.latent_image_ids = self._prepare_latent_image_ids(
+            batch_size=1, # Context usually implies single batch, tile later if needed
+            height=latent_height,
+            width=latent_width,
+            device=device,
+            dtype=DType.int64,
+        )
+        
+        return inputs
+
+    def _scheduler_step(
+        self,
+        latents: Tensor,
+        noise_pred: Tensor,
+        sigmas: Tensor,
+        step_index: int,
+    ) -> Tensor:
+        latents_dtype = latents.dtype
+        latents = latents.cast(DType.float32)
+        sigma = sigmas[step_index]
+        sigma_next = sigmas[step_index + 1]
+        dt = sigma_next - sigma
+        latents = latents + dt * noise_pred
+        latents = latents.cast(latents_dtype)
+        return latents
 
     def execute(
         self,
@@ -302,7 +349,7 @@ class Flux2Pipeline(DiffusionPipeline):
         latent_image_ids: Tensor = (
             Tensor.from_dlpack(model_inputs.latent_image_ids)
             .to(self.transformer.devices[0])
-            .cast(dtype)
+            # IDs must be int64, do not cast to model dtype
         )
 
         # Flux2 always uses guidance embeddings
@@ -371,9 +418,7 @@ class Flux2Pipeline(DiffusionPipeline):
             noise_pred = Tensor.from_dlpack(noise_pred_drv)
 
             # Scheduler step
-            latents = self.scheduler.step(
-                noise_pred, t, latents, return_dict=False
-            )[0]
+            latents = self._scheduler_step(latents, noise_pred, sigmas, i)
 
             if callback_queue is not None:
                 image = self._decode_latents(
@@ -920,6 +965,9 @@ class Flux2Pipeline(DiffusionPipeline):
         Returns:
             Packed latents of shape (B, H*W, C).
         """
+        # First patchify: (B, C, H, W) -> (B, C*4, H//2, W//2)
+        latents = Flux2Pipeline._patchify_latents(latents)
+        
         batch_size = latents.shape[0].dim
         num_channels = latents.shape[1].dim
         height = latents.shape[2].dim
