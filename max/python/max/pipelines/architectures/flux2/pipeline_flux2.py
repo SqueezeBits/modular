@@ -261,6 +261,9 @@ class Flux2Pipeline(DiffusionPipeline):
     }
 
     def init_remaining_components(self) -> None:
+        # Scheduler is not a ComponentModel (no weights), so it is not loaded in _load_sub_models; create it here.
+        if not getattr(self, "scheduler", None):
+            self.scheduler = FlowMatchEulerDiscreteScheduler()
         image_processor_class = self.components.get(
             "image_processor", VaeImageProcessor
         )
@@ -276,6 +279,23 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         return Flux2ModelInputs.from_context(context)
+
+    def _scheduler_step(
+        self,
+        latents: Tensor,
+        noise_pred: Tensor,
+        sigmas: Tensor,
+        step_index: int,
+    ) -> Tensor:
+        """Flow-matching Euler step (same as Flux1). MAX scheduler is not a ComponentModel, so step is implemented here."""
+        latents_dtype = latents.dtype
+        latents = latents.cast(DType.float32)
+        sigma = sigmas[step_index]
+        sigma_next = sigmas[step_index + 1]
+        dt = sigma_next - sigma
+        latents = latents + dt * noise_pred
+        latents = latents.cast(latents_dtype)
+        return latents
 
     def execute(
         self,
@@ -297,12 +317,21 @@ class Flux2Pipeline(DiffusionPipeline):
             .to(self.transformer.devices[0])
             .cast(dtype)
         )
+        # FLUX.2: tokenizer provides (B, in_channels//4, H, W); transformer expects (B, H*W, in_channels).
+        # Apply patchify (B, 32, 128, 128) -> (B, 128, 64, 64) before packing, matching diffusers Flux2Pipeline.
+        latents = self._patchify_latents(latents)
         latents = self._pack_latents(latents)
 
-        latent_image_ids: Tensor = (
-            Tensor.from_dlpack(model_inputs.latent_image_ids)
-            .to(self.transformer.devices[0])
-            .cast(dtype)
+        # Transformer expects img_ids (batch_size, image_seq_len, 4) int64 (T, H, W, L). Tokenizer provides
+        # (4096, 3) float32; use pipeline's 4D int64 IDs for patchified spatial size.
+        image_seq_len = latents.shape[1].dim
+        patch_h = patch_w = int(image_seq_len**0.5)
+        latent_image_ids = self._prepare_latent_image_ids(
+            batch_size=latents.shape[0].dim,
+            height=patch_h,
+            width=patch_w,
+            device=self.transformer.devices[0],
+            dtype=dtype,
         )
 
         # Flux2 always uses guidance embeddings
@@ -313,16 +342,29 @@ class Flux2Pipeline(DiffusionPipeline):
             dtype=dtype,
         )
 
+        # Flux2: use compute_empirical_mu and scheduler time_shift for correct sigma schedule (diffusers-aligned)
+        image_seq_len = latents.shape[1].dim
+        num_inference_steps = model_inputs.num_inference_steps
+        mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+        base_sigmas = np.linspace(
+            1.0,
+            1.0 / num_inference_steps,
+            num_inference_steps,
+            dtype=np.float32,
+        )
+        self.scheduler.set_timesteps(sigmas=base_sigmas, mu=mu)
         sigmas = (
-            Tensor.from_dlpack(model_inputs.sigmas)
+            Tensor.from_dlpack(np.ascontiguousarray(self.scheduler.sigmas))
             .to(self.transformer.devices[0])
         )
         batch_size = prompt_embeds.shape[0].dim
 
-        timesteps: np.ndarray = model_inputs.timesteps
+        timesteps: np.ndarray = self.scheduler.timesteps
         num_timesteps = timesteps.shape[0]
+        # Model expects timestep in [0, 1]; scheduler.timesteps are in [0, 1000]
+        timesteps_normalized = (timesteps / 1000.0).astype(np.float32)
         timesteps_batched = np.broadcast_to(
-            timesteps[:, None], (num_timesteps, batch_size)
+            timesteps_normalized[:, None], (num_timesteps, batch_size)
         )
         timesteps_batched = Tensor.from_dlpack(timesteps_batched).to(
             self.transformer.devices[0]
@@ -370,10 +412,8 @@ class Flux2Pipeline(DiffusionPipeline):
             # Convert back to Tensor for scheduler
             noise_pred = Tensor.from_dlpack(noise_pred_drv)
 
-            # Scheduler step
-            latents = self.scheduler.step(
-                noise_pred, t, latents, return_dict=False
-            )[0]
+            # Scheduler step (FlowMatch Euler; scheduler is not loaded as ComponentModel)
+            latents = self._scheduler_step(latents, noise_pred, sigmas, i)
 
             if callback_queue is not None:
                 image = self._decode_latents(
@@ -557,7 +597,22 @@ class Flux2Pipeline(DiffusionPipeline):
             image = Tensor.from_dlpack(image)
 
         image = self.image_processor.postprocess(image, output_type=output_type)
+
+        # Match Flux1: pixel_generation expects each image as (H, W, C) so np.stack yields (N, H, W, C).
+        if output_type == "np" and isinstance(image, np.ndarray):
+            image = self._to_hwc(image)
+
         return image
+
+    @staticmethod
+    def _to_hwc(image: np.ndarray) -> np.ndarray:
+        """Convert image to (H, W, C) for compatibility with pixel_generation and save_image (same as Flux1)."""
+        img = np.asarray(image)
+        while img.ndim > 3:
+            img = img.squeeze(0)
+        if img.ndim == 3 and img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))
+        return img.astype(np.float32, copy=False)
 
     def encode_prompt(
         self,
