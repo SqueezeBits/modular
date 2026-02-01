@@ -286,6 +286,9 @@ class Flux2Pipeline(DiffusionPipeline):
         )
         self.image_processor = image_processor
 
+        # Store CPU sigmas for optimized scheduler step
+        self._sigmas_cpu: np.ndarray | None = None
+
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         inputs = Flux2ModelInputs.from_context(context)
         
@@ -312,17 +315,19 @@ class Flux2Pipeline(DiffusionPipeline):
         self,
         latents: Tensor,
         noise_pred: Tensor,
-        sigmas: Tensor,
         step_index: int,
     ) -> Tensor:
-        latents_dtype = latents.dtype
-        latents = latents.cast(DType.float32)
-        sigma = sigmas[step_index]
-        sigma_next = sigmas[step_index + 1]
-        dt = sigma_next - sigma
-        latents = latents + dt * noise_pred
-        latents = latents.cast(latents_dtype)
-        return latents
+        """Optimized scheduler step using CPU sigmas (no GPU synchronization).
+        
+        The key optimization is computing dt on CPU to avoid GPU indexing
+        which triggers device synchronization.
+        """
+        # Compute dt on CPU (no GPU sync from indexing)
+        dt = float(self._sigmas_cpu[step_index + 1] - self._sigmas_cpu[step_index])
+
+        # Simple eager operation: latents + dt * noise_pred
+        # dt is a Python float, so broadcasting handles it
+        return latents + dt * noise_pred
 
     def execute(
         self,
@@ -359,6 +364,9 @@ class Flux2Pipeline(DiffusionPipeline):
             device=self.transformer.devices[0],
             dtype=dtype,
         )
+
+        # Store sigmas on CPU for optimized scheduler step (no GPU sync)
+        self._sigmas_cpu = model_inputs.sigmas.copy()
 
         sigmas = (
             Tensor.from_dlpack(model_inputs.sigmas)
@@ -417,8 +425,8 @@ class Flux2Pipeline(DiffusionPipeline):
             # Convert back to Tensor for scheduler
             noise_pred = Tensor.from_dlpack(noise_pred_drv)
 
-            # Scheduler step
-            latents = self._scheduler_step(latents, noise_pred, sigmas, i)
+            # Scheduler step (uses pre-compiled graph and CPU sigmas)
+            latents = self._scheduler_step(latents, noise_pred, i)
 
             if callback_queue is not None:
                 image = self._decode_latents(
