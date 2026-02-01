@@ -27,7 +27,26 @@ what we publish.
 
 ### Language changes
 
+- Slice literals in subscripts has changed to be more similar to collection
+  literals. They now pass an empty tuple as a required `__slice_literal__`
+  keyword argument to disambiguate slices. If you have defined your own range
+  types, please add a `__slice_literal__: () = ()` argument to their
+  constructors.
+
 ### Library changes
+
+- Math functions in `std.math` (`exp`, `exp2`, `log2`, `erf`, `tanh`, `sin`,
+  `cos`, `tan`, `acos`, `asin`, `atan`, `atan2`, `acosh`, `asinh`, `atanh`,
+  `cosh`, `sinh`, `expm1`, `log10`, `log1p`, `logb`, `cbrt`, `erfc`, `j0`,
+  `j1`, `y0`, `y1`) now use `where dtype.is_floating_point()` clauses on their
+  signatures instead of `__comptime_assert` checks in their bodies.
+  This provides better compile-time error messages at the call site. Callers
+  using these functions with generic `dtype` parameters may need to add
+  evidence proving (either a `where` clause or `__comptime_assert`) that their
+  type is floating point.
+
+- Many kernels in `nn` have been migrated to use `TileTensor`. We will have
+  more documentation on `TileTensor` and its uses over the coming weeks.
 
 - `InlineArray` now requires explicitly using literals for construction. E.g.
 
@@ -35,6 +54,16 @@ what we publish.
   var a: InlineArray[UInt8, 4] = [1, 2, 3, 4]
   # instead of InlineArray[UInt8, 4](1, 2, 3, 4)
   ```
+
+- The following types now conform to `Writable` and have custom implementations
+  of `write_to` and `write_repr_to`.
+  - `Tuple`
+  - `Variant`
+
+- The `testing` module now provides `assert_equal` and `assert_not_equal`
+  overloads for `Tuple`, enabling direct tuple-to-tuple comparisons in tests
+  instead of element-by-element assertions. Element types must conform to
+  `Equatable & Writable`.
 
 - The `__reversed__()` method on `String`, `StringSlice`, and `StringLiteral`
   has been deprecated in favor of the new `codepoints_reversed()` method. The
@@ -49,9 +78,9 @@ what we publish.
   favor of the `StringSlice(str)` constructor, and `String.as_string_slice_mut()`
   has been removed.
 
-- `String.ljust` and `String.rjust` have been renamed to
-  `String.ascii_ljust` and `String.ascii_rjust`. Likewise for their
-  equivalents on `StringSlice` and `StaticString`
+- `String.ljust`, `String.rjust`, and `String.center` have been renamed to
+  `String.ascii_ljust`, `String.ascii_rjust`, and `String.ascii_center`.
+  Likewise for their mequivalents on `StringSlice` and `StaticString`
 
 - `String.resize` will now panic if the new length would truncate a codepoint.
   Previously it would result in a string with invalid UTF-8.
@@ -59,6 +88,18 @@ what we publish.
 - `String.resize` will now panic if `fill_byte` is >=128. Previously it would
   create invalid UTF-8.
 
+- Subscripting into `String` and `StringSlice` will now panic if the index falls
+  in the middle of a UTF-8 encoded code-point. Previously they would return invalid
+  UTF-8. This panic is unconditional. Use `.as_bytes()[...]` if you really want
+  the previous behavior.
+
+- `StringSlice[byte=]` subscripting now returns a `StringSlice` instead of a `String`,
+  This is consistent with range-based subscripting.
+
+- Subscripting `String` and `StringSlice` by byte position will
+  now return an entire Unicode codepoint. Previously it would
+  return a single byte, and produce invalid UTF-8 if the index fell on
+  the starting byte of a multi-byte codepoint.
 - The following types now correctly implement `write_repr_to`
   - `List`, `Set`
 
@@ -73,9 +114,23 @@ what we publish.
 - The Mojo compiler now accepts conjoined `-D` options in addition to the
   non-conjoined form as before. Now, both `-Dfoo` and `-D foo` are accepted.
 
+- `mojo build` now supports several `--print-*` options for discovering target
+  configuration and supported architectures:
+  - `--print-effective-target`: Shows the resolved target configuration after
+    processing all command-line flags.
+  - `--print-supported-targets`: Lists all available LLVM target architectures.
+  - `--print-supported-cpus`: Lists valid CPU names for a given target triple
+    (requires `--target-triple`).
+  - `--print-supported-accelerators`: Lists all supported GPU and accelerator
+    architectures (NVIDIA, AMD, Apple Metal).
+
 ### ❌ Removed
 
 ### 🛠️ Fixed
 
 - [Issue #5845](https://github.com/modular/modular/issues/5845): Functions
   raising custom type with conversion fails when returning StringSlice
+
+- [Issue #5875](https://github.com/modular/modular/issues/5875): Storing
+  `SIMD[DType.bool, N]` with width > 1 to a pointer and reading back
+  element-wise now returns correct values.

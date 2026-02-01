@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -24,17 +25,27 @@ import numpy as np
 from max.driver import Device, DeviceSpec
 from max.engine import InferenceSession
 from max.graph import TensorValue
-from max.graph.weights import Weights
+from max.graph.weights import Weights, WeightsFormat
+from max.interfaces import (
+    RequestID,
+    SamplingParams,
+    SamplingParamsInput,
+    TextGenerationRequest,
+)
 from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.lib import (
     PipelineConfig,
     SupportedEncoding,
 )
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from max.pipelines.lib.memory_estimation import MemoryEstimator
 from transformers import AutoConfig
 
+from .arch import mistral3_arch
 from .model import Mistral3Model
 from .tokenizer import Mistral3Tokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class Mistral3TextEncoderModel(ComponentModel):
@@ -78,10 +89,6 @@ class Mistral3TextEncoderModel(ComponentModel):
                 "model_path or text_encoder_path must be provided in config"
             )
 
-        # For PipelineConfig, use the text_encoder_path
-        self._model_path = self._text_encoder_path
-        
-        # Store root_model_path for tokenizer (needs HuggingFace repo ID, not local path)
         self._root_model_path = config.get("root_model_path")
 
         # Text encoder uses single forward pass, so minimal KV cache is sufficient
@@ -104,76 +111,62 @@ class Mistral3TextEncoderModel(ComponentModel):
         Returns:
             Compiled model callable (Model instance).
         """
-        # Convert Device objects to DeviceSpec objects for PipelineConfig
-        device_specs = []
-        for device in self.devices:
-            if device.label == "cpu":
-                device_specs.append(DeviceSpec.cpu(id=device.id))
-            elif device.label == "gpu":
-                device_specs.append(DeviceSpec.accelerator(id=device.id))
-            else:
-                device_specs.append(
-                    DeviceSpec(id=device.id, device_type=device.label)
-                )
-
+        device_specs = [
+            DeviceSpec.cpu(id=d.id) if d.label == "cpu"
+            else DeviceSpec.accelerator(id=d.id) if d.label == "gpu"
+            else DeviceSpec(id=d.id, device_type=d.label)
+            for d in self.devices
+        ]
         self._pipeline_config = PipelineConfig(
-            model_path=self._model_path,
+            model_path=self._text_encoder_path,
             return_hidden_states=ReturnHiddenStates.ALL_LAYERS,
             device_specs=device_specs,
         )
-
-        # Set minimal device_memory_utilization for KV cache (text encoder only needs single pass)
-        # This is critical to avoid OOM when loading other models (transformer, VAE)
-        self._pipeline_config.model.kv_cache.device_memory_utilization = (
-            self.device_memory_utilization  # 0.3 = 30%
+        model_config = self._pipeline_config.model
+        model_config.kv_cache.device_memory_utilization = (
+            self.device_memory_utilization
         )
 
-        # Create inference session with Device objects (not DeviceSpec)
         self._session = InferenceSession(devices=self.devices)
-
-        # Perform memory estimation to set _available_cache_memory
-        from max.pipelines.lib.memory_estimation import MemoryEstimator
-
-        MemoryEstimator.estimate_memory_footprint(
-            self._pipeline_config,
-            Mistral3Model,
-            self._pipeline_config.model,
-            self.devices,
-        )
-
-        # Load AutoConfig from pretrained path for Mistral3Model
         huggingface_config = AutoConfig.from_pretrained(self._text_encoder_path)
 
-        # Get weight adapter from mistral3_arch
-        from max.graph.weights import WeightsFormat
-        from max.pipelines.architectures.mistral3.arch import mistral3_arch
+        arch_config = mistral3_arch.config.initialize(self._pipeline_config)
+        model_weights_size = Mistral3Model.estimate_weights_size(
+            self._pipeline_config
+        )
+        activation_memory_size = Mistral3Model.estimate_activation_memory(
+            self._pipeline_config, huggingface_config
+        )
+        MemoryEstimator.estimate_memory_footprint(
+            self._pipeline_config,
+            model_config,
+            arch_config,
+            self.devices,
+            model_weights_size,
+            activation_memory_size,
+        )
 
-        adapter = mistral3_arch.weight_adapters.get(WeightsFormat.safetensors, None)
-
-        # Create Mistral3Model with return_hidden_states=ALL_LAYERS
+        adapter = mistral3_arch.weight_adapters.get(
+            WeightsFormat.safetensors, None
+        )
         self._mistral_model = Mistral3Model(
             pipeline_config=self._pipeline_config,
             session=self._session,
             huggingface_config=huggingface_config,
             encoding=self.encoding,
             devices=self.devices,
-            kv_cache_config=self._pipeline_config.model.kv_cache,
+            kv_cache_config=model_config.kv_cache,
             weights=self.weights,
             adapter=adapter,
             return_logits=ReturnLogits.LAST_TOKEN,
             return_hidden_states=ReturnHiddenStates.ALL_LAYERS,
         )
 
-        # For tokenizer, use text_encoder_path (local path) for AutoTokenizer.from_pretrained
-        # The tokenizer is located in the text_encoder subdirectory, not the root model directory
-        # root_model_path is stored for potential chat_template loading from root directory
         self._tokenizer = Mistral3Tokenizer(
             model_path=self._text_encoder_path,
             pipeline_config=self._pipeline_config,
             root_model_path=self._root_model_path,
         )
-
-        # Return the compiled model (for ComponentModel interface compatibility)
         return self._mistral_model.model
 
     def __call__(
@@ -199,123 +192,76 @@ class Mistral3TextEncoderModel(ComponentModel):
         if self._mistral_model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        # Convert input_ids to numpy if needed
-        # Prefer numpy input to avoid GPU->CPU transfer overhead
         if isinstance(input_ids, np.ndarray):
-            input_ids_np = input_ids
+            arr = input_ids
         elif hasattr(input_ids, "to_numpy"):
-            # V2 Buffer Tensor
-            input_ids_np = input_ids.to_numpy()
+            arr = input_ids.to_numpy()
         else:
-            # Fallback: try to convert to numpy
-            input_ids_np = np.asarray(input_ids)
-
-        # Convert to Python list
-        # tolist() already returns a plain Python list, no need for additional list() call
-        if input_ids_np.ndim > 1:
-            input_ids_list = input_ids_np.flatten().tolist()
-        else:
-            input_ids_list = input_ids_np.tolist()
-
-        # Create text generation request
-        from max.interfaces import (
-            RequestID,
-            SamplingParams,
-            SamplingParamsInput,
-            TextGenerationRequest,
-        )
+            arr = np.asarray(input_ids)
+        input_ids_list = arr.ravel().tolist()
 
         sampling_params = SamplingParams.from_input_and_generation_config(
             SamplingParamsInput(max_new_tokens=1),
             sampling_params_defaults=self._pipeline_config.model.sampling_params_defaults,
         )
-
         request = TextGenerationRequest(
             request_id=RequestID(),
-            model_name=self._model_path or "",
+            model_name=self._text_encoder_path or "",
             prompt=input_ids_list,
             sampling_params=sampling_params,
         )
 
-        # Create context using tokenizer
-        # Handle both sync and async contexts
-        # If we're in an async context, use ThreadPoolExecutor to run in a new event loop
-        # This avoids the "asyncio.run() cannot be called from a running event loop" error
         try:
-            # Check if we're in an async context
             asyncio.get_running_loop()
-            # We're in an async context, run in a new thread with new event loop
             loop = asyncio.new_event_loop()
             with ThreadPoolExecutor() as pool:
-                fut = pool.submit(loop.run_until_complete, self._tokenizer.new_context(request))
+                fut = pool.submit(
+                    loop.run_until_complete,
+                    self._tokenizer.new_context(request),
+                )
                 context = fut.result()
             loop.close()
         except RuntimeError:
-            # No event loop running, safe to use asyncio.run()
             context = asyncio.run(self._tokenizer.new_context(request))
 
-        num_steps = 1
         request_id = context.request_id
-
         replica_idx = 0
+        num_steps = 1
         try:
-            # Claim and allocate KV cache
-            self._mistral_model.kv_manager.claim(request_id, replica_idx=replica_idx)
-            self._mistral_model.kv_manager.alloc(context, replica_idx=replica_idx, num_steps=num_steps)
-
-            # get_runtime_inputs expects per-replica batches: Sequence[Sequence[TextGenerationContext]]
-            # For single replica (replica_idx=0), we pass [[context]]
+            self._mistral_model.kv_manager.claim(
+                request_id, replica_idx=replica_idx
+            )
+            self._mistral_model.kv_manager.alloc(
+                context, replica_idx=replica_idx, num_steps=num_steps
+            )
             kv_cache_inputs_list = (
                 self._mistral_model.kv_manager.get_runtime_inputs(
                     [[context]], num_steps=num_steps
                 )
             )
             kv_cache_inputs = kv_cache_inputs_list[0]
-
             model_inputs = self._mistral_model.prepare_initial_token_inputs(
                 replica_batches=[[context]],
                 kv_cache_inputs=kv_cache_inputs,
                 return_n_logits=1,
             )
-
             model_outputs = self._mistral_model.execute(model_inputs=model_inputs)
 
-            # Debug: Check the actual model_outputs structure
-            # The model.execute() returns a tuple from the compiled graph
-            # We need to check if hidden states are actually in the tuple
             if model_outputs.hidden_states is None:
-                # Check if the underlying model.execute() returned multiple outputs
-                # by inspecting the internal model_outputs tuple
-                import logging
-                logger = logging.getLogger("max.pipelines")
-                
-                # Access the raw model outputs to see what was actually returned
-                # model_outputs is a ModelOutputs object, but we need to check
-                # what the underlying model.execute() returned
                 logger.warning(
-                    f"Model did not return hidden states. "
-                    f"return_logits={self._mistral_model.return_logits}, "
-                    f"return_hidden_states={self._mistral_model.return_hidden_states}, "
-                    f"model_outputs type: {type(model_outputs)}, "
-                    f"has hidden_states attr: {hasattr(model_outputs, 'hidden_states')}"
+                    "Model did not return hidden states; "
+                    "graph may not be compiled with return_hidden_states=ALL_LAYERS"
                 )
-                
-                # Try to access the raw outputs from the model
-                # The issue might be that the graph wasn't built with return_hidden_states
-                # Let's check if we can access the internal model outputs
                 raise RuntimeError(
                     "Model did not return hidden states. "
-                    "Check return_hidden_states configuration. "
-                    f"return_logits={self._mistral_model.return_logits}, "
-                    f"return_hidden_states={self._mistral_model.return_hidden_states}. "
-                    "The model graph may not have been compiled with return_hidden_states=ALL_LAYERS."
+                    "Ensure the model graph was compiled with "
+                    "return_hidden_states=ALL_LAYERS."
                 )
-
             return model_outputs.hidden_states
-
         finally:
-            # IMPORTANT: Release KV cache to prevent memory leak
-            self._mistral_model.kv_manager.release(request_id, replica_idx=replica_idx)
+            self._mistral_model.kv_manager.release(
+                request_id, replica_idx=replica_idx
+            )
 
     @property
     def session(self) -> InferenceSession:

@@ -50,6 +50,20 @@ from .model_config import DeepseekV3Config
 logger = logging.getLogger("max.pipelines")
 
 
+def _validate_ep_kernel_limits(
+    ep_config: EPConfig, *, max_local_experts: int = 32
+) -> None:
+    n_ranks = ep_config.n_gpus_per_node * ep_config.n_nodes
+    n_local_experts = ep_config.n_experts // n_ranks
+    if n_local_experts > max_local_experts:
+        raise ValueError(
+            "Expert-parallel local experts per device "
+            f"({n_local_experts}) exceeds kernel limit "
+            f"({max_local_experts}). "
+            "Use more expert-parallel ranks or disable EP."
+        )
+
+
 class DeepseekV3Inputs(DeepseekV2Inputs):
     """A class representing inputs for the DeepseekV3 model."""
 
@@ -123,6 +137,9 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
         kv_cache_config: KVCacheConfig,
         cache_dtype: DType,
     ) -> KVCacheParams:
+        encoding = pipeline_config.model.quantization_encoding
+        if encoding is not None and encoding.is_float4:
+            cache_dtype = DType.bfloat16
         return DeepseekV3Config.construct_kv_params(
             huggingface_config=huggingface_config,
             pipeline_config=pipeline_config,
@@ -149,19 +166,15 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
             graph_mode = "auto"
 
         dtype = self.encoding.dtype
-        if dtype == DType.float8_e4m3fn:
+        if dtype in (DType.float8_e4m3fn, DType.uint8, DType.float4_e2m1fn):
             float8_config = parse_float8_config(config, state_dict, dtype)
         else:
             float8_config = None
 
-        # Disable EP in virtual device mode (compilation-only) since NVSHMEM
-        # functions cannot be linked without real GPU devices
-        if is_virtual_device_mode():
-            ep_config = None
-            logger.info(
-                "Disabling expert parallelism in virtual device mode (compilation-only)"
-            )
-        elif self.pipeline_config.ep_size == 1:
+        nvfp4_enabled = float8_config is not None and float8_config.is_nvfp4
+
+        # Check if EP should be configured
+        if self.pipeline_config.ep_size == 1:
             ep_config = None
         else:
             if self.pipeline_config.ep_size % len(self.devices) != 0:
@@ -170,8 +183,9 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
                     " be set to the total number of GPUs across nodes."
                 )
             n_nodes = self.pipeline_config.ep_size // len(self.devices)
+            dispatch_dtype = DType.bfloat16 if nvfp4_enabled else dtype
             ep_kwargs: dict[str, Any] = dict(
-                dispatch_dtype=dtype,
+                dispatch_dtype=dispatch_dtype,
                 combine_dtype=DType.bfloat16,
                 hidden_size=config.hidden_size,
                 top_k=config.num_experts_per_tok,
@@ -187,10 +201,11 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
                 # the same shape as routed experts.
                 ep_kwargs["fused_shared_expert"] = True
 
-            if float8_config is not None:
+            if float8_config is not None and not nvfp4_enabled:
                 ep_kwargs["dispatch_fp8_config"] = float8_config.input_scale
 
             ep_config = EPConfig(**ep_kwargs)
+            _validate_ep_kernel_limits(ep_config)
 
         # Determine data_parallel_degree: EP requires data-parallel attention
         if ep_config is not None:
@@ -245,6 +260,7 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
         encoding = pipeline_config.model.quantization_encoding
         assert encoding is not None
         dtype = encoding.dtype.size_in_bytes
+        packed_factor = 2 if encoding.is_float4 else 1
         config = model_config.huggingface_config
         assert config is not None
         n_sparse_layers = (
@@ -276,9 +292,12 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
         )
 
         # Calculate the routing experts and the shared experts size.
-        expert_size = (
-            config.moe_intermediate_size * config.hidden_size * 3 * dtype
+        expert_elems = (
+            config.moe_intermediate_size * config.hidden_size * 3
         )  # A factor of 3 accounts for the gate/up/down proj weights.
+        if packed_factor != 1:
+            expert_elems = (expert_elems + packed_factor - 1) // packed_factor
+        expert_size = expert_elems * dtype
         routing_experts_size = (
             n_sparse_layers * config.n_routed_experts * expert_size
         )
@@ -352,7 +371,7 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
                 * max_kv_length
                 * huggingface_config.num_attention_heads
                 * huggingface_config.qk_nope_head_dim
-                * encoding.cache_dtype.size_in_bytes
+                * pipeline_config.model.kv_cache.cache_dtype.size_in_bytes
             )
 
         # Estimate activation memory during Expert Parallel MoE.
@@ -441,7 +460,10 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
             raise ValueError("Only the EP strategy is supported.")
 
         self.ep_comm_initializer: EPCommInitializer | None = None
-        if config.ep_config is not None:
+        # Skip EP initialization in virtual device mode (compilation-only)
+        # since NVSHMEM functions cannot be linked without real GPU devices.
+        # We still keep ep_config to generate the correct graph structure.
+        if config.ep_config is not None and not is_virtual_device_mode():
             self.ep_comm_initializer = EPCommInitializer(config.ep_config)
             self.ep_comm_initializer.ep_init(session)
             if config.ep_config.node_id == -1:

@@ -105,7 +105,14 @@ def update_context_and_prepare_responses(
                     ):
                         log_probs = log_probs_for_step[batch_index]
 
-            context.update(new_token=next_token, log_probabilities=log_probs)
+            if overwrite_future:
+                context.realize_future_token(
+                    new_token=next_token, log_probabilities=log_probs
+                )
+            else:
+                context.update(
+                    new_token=next_token, log_probabilities=log_probs
+                )
 
             if context.is_done:
                 break

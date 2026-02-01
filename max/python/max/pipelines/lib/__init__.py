@@ -35,6 +35,7 @@ from .hf_utils import (
 )
 from .interfaces import (
     AlwaysSignalBuffersMixin,
+    InputKey,
     KVCacheMixin,
     ModelInputs,
     ModelOutputs,
@@ -97,6 +98,7 @@ __all__ = [
     "MemoryEstimator",
     "ModelInputs",
     "ModelOutputs",
+    "OverlapTextGenerationPipeline",
     "PipelineConfig",
     "PipelineModel",
     "PipelineRole",
