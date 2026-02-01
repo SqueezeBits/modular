@@ -19,8 +19,10 @@ import numpy as np
 import PIL.Image
 from max import functional as F
 from max import random
+from max.driver import Accelerator
 from max.dtype import DType
-from max.graph import DeviceRef
+from max.engine import InferenceSession
+from max.graph import DeviceRef, Graph, TensorType, ops
 from max.interfaces import PixelGenerationOutput, TokenBuffer
 from max.pipelines import PixelContext
 from max.pipelines.lib.diffusion_schedulers import (
@@ -220,6 +222,11 @@ class Flux2Pipeline(DiffusionPipeline):
         )
         self.image_processor = image_processor
 
+        # Store CPU sigmas for optimized scheduler step
+        self._sigmas_cpu: np.ndarray | None = None
+        # Compiled scheduler step graph
+        self._scheduler_step_model = None
+
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         inputs = Flux2ModelInputs.from_context(context)
         
@@ -242,21 +249,189 @@ class Flux2Pipeline(DiffusionPipeline):
         
         return inputs
 
+    def _build_scheduler_step_graph(
+        self,
+        dtype: DType,
+        device: DeviceRef,
+    ) -> None:
+        """Build a compiled graph for the scheduler step: latents + dt * noise_pred."""
+        input_types = [
+            TensorType(dtype, shape=["batch", "seq", "channels"], device=device),  # latents
+            TensorType(dtype, shape=["batch", "seq", "channels"], device=device),  # noise_pred
+            TensorType(dtype, shape=[], device=device),  # dt (scalar)
+        ]
+
+        with Graph("scheduler_step", input_types=input_types) as graph:
+            latents_in, noise_pred_in, dt_in = graph.inputs
+            result = latents_in + dt_in * noise_pred_in
+            graph.output(result)
+
+        session = InferenceSession([Accelerator()])
+        self._scheduler_step_model = session.load(graph)
+
     def _scheduler_step(
         self,
-        latents: Tensor,
-        noise_pred: Tensor,
-        sigmas: Tensor,
-        step_index: int,
-    ) -> Tensor:
-        latents_dtype = latents.dtype
-        latents = latents.cast(DType.float32)
-        sigma = sigmas[step_index]
-        sigma_next = sigmas[step_index + 1]
-        dt = sigma_next - sigma
-        latents = latents + dt * noise_pred
-        latents = latents.cast(latents_dtype)
-        return latents
+        latents_drv,  # DriverTensor
+        noise_pred_drv,  # DriverTensor
+        dt_drv,  # DriverTensor (scalar)
+    ):
+        """Execute compiled scheduler step: latents + dt * noise_pred."""
+        result_drv = self._scheduler_step_model.execute(
+            latents_drv,
+            noise_pred_drv,
+            dt_drv,
+        )[0]
+        return result_drv
+
+    def execute(
+        self,
+        model_inputs: Flux2ModelInputs,
+        callback_queue: Queue[np.ndarray] | None = None,
+        output_type: Literal["np", "latent", "pil"] = "np",
+    ) -> Flux2PipelineOutput:
+        """Execute the pipeline."""
+        # 1. Encode prompts
+        prompt_embeds, text_ids = self._prepare_prompt_embeddings(
+            tokens=model_inputs.tokens,
+            num_images_per_prompt=model_inputs.num_images_per_prompt,
+        )
+
+        # 2. Denoise
+        dtype = prompt_embeds.dtype
+        latents: Tensor = (
+            Tensor.from_dlpack(model_inputs.latents)
+            .to(self.transformer.devices[0])
+            .cast(dtype)
+        )
+        latents = self._pack_latents(latents)
+
+        latent_image_ids: Tensor = (
+            Tensor.from_dlpack(model_inputs.latent_image_ids)
+            .to(self.transformer.devices[0])
+            # IDs must be int64, do not cast to model dtype
+        )
+
+        # Flux2 always uses guidance embeddings
+        guidance = Tensor.full(
+            [latents.shape[0]],
+            model_inputs.guidance_scale,
+            device=self.transformer.devices[0],
+            dtype=dtype,
+        )
+
+        # Store sigmas on CPU for optimized scheduler step (no GPU sync)
+        self._sigmas_cpu = model_inputs.sigmas.copy()
+
+        sigmas = (
+            Tensor.from_dlpack(model_inputs.sigmas)
+            .to(self.transformer.devices[0])
+        )
+        batch_size = prompt_embeds.shape[0].dim
+
+        timesteps: np.ndarray = model_inputs.timesteps
+        num_timesteps = timesteps.shape[0]
+
+        # Pre-create all timestep tensors on GPU to avoid per-step CPU→GPU transfer
+        timestep_tensors_drv = []
+        for t in timesteps:
+            timestep_np = np.full((batch_size,), t, dtype=np.float32) / 1000.0
+            timestep_tensor = (
+                Tensor.from_dlpack(timestep_np)
+                .to(self.transformer.devices[0])
+                .cast(dtype)
+            )
+            timestep_tensors_drv.append(timestep_tensor.driver_tensor)
+
+        # Pre-create all dt tensors on GPU for compiled scheduler step
+        dt_tensors_drv = []
+        for i in range(num_timesteps):
+            dt_val = float(self._sigmas_cpu[i + 1] - self._sigmas_cpu[i])
+            dt_np = np.array(dt_val, dtype=np.float32)
+            dt_tensor = (
+                Tensor.from_dlpack(dt_np)
+                .to(self.transformer.devices[0])
+                .cast(dtype)
+            )
+            dt_tensors_drv.append(dt_tensor.driver_tensor)
+
+        # Compile transformer once before loop
+        image_seq_len = latents.shape[1].dim
+        text_seq_len = prompt_embeds.shape[1].dim
+        compiled_model = self.transformer._ensure_compiled(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            text_seq_len=text_seq_len,
+        )
+
+        # Build scheduler step graph if not already built
+        if self._scheduler_step_model is None:
+            device = self.transformer.devices[0]
+            self._build_scheduler_step_graph(dtype, device)
+
+        # Pre-convert unchanging tensors to driver_tensor
+        encoder_hidden_states_drv = prompt_embeds.driver_tensor
+        guidance_drv = guidance.driver_tensor
+        txt_ids_drv = text_ids.driver_tensor
+        img_ids_drv = latent_image_ids.driver_tensor
+
+        # Keep latents as DriverTensor throughout the loop
+        latents_drv = latents.driver_tensor
+
+        for i in tqdm(range(num_timesteps), desc="Denoising"):
+            self._current_timestep = i
+
+            # Use pre-created tensors (no per-step conversion)
+            timestep_drv = timestep_tensors_drv[i]
+            dt_drv = dt_tensors_drv[i]
+
+            # Transformer forward pass
+            noise_pred_drv = compiled_model(
+                latents_drv,
+                encoder_hidden_states_drv,
+                timestep_drv,
+                img_ids_drv,
+                txt_ids_drv,
+                guidance_drv,
+            )[0]
+
+            # Scheduler step (compiled graph execution, no from_dlpack)
+            latents_drv = self._scheduler_step(latents_drv, noise_pred_drv, dt_drv)
+
+            if callback_queue is not None:
+                # Need to convert to Tensor for decoding
+                latents = Tensor.from_dlpack(latents_drv)
+                image = self._decode_latents(
+                    latents,
+                    latent_image_ids,
+                    model_inputs.height,
+                    model_inputs.width,
+                    output_type=output_type,
+                )
+                callback_queue.put_nowait(image)
+
+        # Convert back to Tensor for decoding
+        latents = Tensor.from_dlpack(latents_drv)
+
+        # 3. Decode
+        # Decode all images in the batch
+        batch_size = latents.shape[0].dim
+        image_list = []
+        for b in range(batch_size):
+            # Extract single image latents and IDs
+            latents_b = latents[b : b + 1]  # Keep batch dimension
+            latent_image_ids_b = latent_image_ids[b : b + 1]
+            
+            # Decode single image
+            image_b = self._decode_latents(
+                latents_b,
+                latent_image_ids_b,
+                model_inputs.height,
+                model_inputs.width,
+                output_type=output_type,
+            )
+            image_list.append(image_b)
+
+        return Flux2PipelineOutput(images=image_list)
 
     def _prepare_prompt_embeddings(
         self,
