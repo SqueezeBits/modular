@@ -14,5 +14,6 @@ modular_py_binary(
         requirement("numpy"),
         requirement("pillow"),
         requirement("jinja2"),
+        requirement("torch"),
     ],
 )

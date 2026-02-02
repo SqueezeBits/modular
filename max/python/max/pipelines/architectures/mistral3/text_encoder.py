@@ -117,11 +117,14 @@ class Mistral3TextEncoderModel(ComponentModel):
             else DeviceSpec(id=d.id, device_type=d.label)
             for d in self.devices
         ]
+        # Allow overriding max_length from pipeline config
+        max_length = self.config.get("max_length", None)
+
         self._pipeline_config = PipelineConfig(
             model_path=self._text_encoder_path,
             return_hidden_states=ReturnHiddenStates.ALL_LAYERS,
             device_specs=device_specs,
-            max_length=512,
+            max_length=max_length,
         )
         model_config = self._pipeline_config.model
         model_config.kv_cache.device_memory_utilization = (

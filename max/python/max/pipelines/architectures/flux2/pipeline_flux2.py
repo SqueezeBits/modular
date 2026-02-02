@@ -180,13 +180,24 @@ class Flux2PipelineOutput:
     images: list[PIL.Image.Image] | np.ndarray | Tensor
 
 
+class FluxMistral3TextEncoder(Mistral3TextEncoderModel):
+    """Mistral3 text encoder with forced config for Flux2."""
+
+    def __init__(self, config: dict[str, Any], **kwargs):
+        # Force max_length to 512 for Flux2 context to avoid OOM
+        config = config.copy()
+        config["max_length"] = 512
+        super().__init__(config, **kwargs)
+
+
+
 class Flux2Pipeline(DiffusionPipeline):
     config_name = "model_index.json"
 
     components = {
         "scheduler": FlowMatchEulerDiscreteScheduler,
         "vae": AutoencoderKLFlux2Model,
-        "text_encoder": Mistral3TextEncoderModel,
+        "text_encoder": FluxMistral3TextEncoder,
         "tokenizer": Mistral3Tokenizer,
         "transformer": Flux2Model,
     }
@@ -195,17 +206,6 @@ class Flux2Pipeline(DiffusionPipeline):
         # Scheduler is not a ComponentModel (no weights), so it is not loaded in _load_sub_models; create it here.
         if not getattr(self, "scheduler", None):
             self.scheduler = FlowMatchEulerDiscreteScheduler()
-        # scheduler_class = self.components.get("scheduler")
-        # if scheduler_class:
-        #     scheduler_config = {}
-        #     if (
-        #         self.pipeline_config.model.diffusers_config
-        #         and "scheduler" in self.pipeline_config.model.diffusers_config
-        #     ):
-        #         scheduler_config = self.pipeline_config.model.diffusers_config[
-        #             "scheduler"
-        #         ]
-        #     self.scheduler = scheduler_class(**scheduler_config)
 
         image_processor_class = self.components.get(
             "image_processor", VaeImageProcessor
