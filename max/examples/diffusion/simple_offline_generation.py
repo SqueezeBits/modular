@@ -31,12 +31,14 @@ import asyncio
 import os
 
 import numpy as np
+from max.driver import DeviceSpec
 from max.interfaces import (
     PixelGenerationInputs,
     PixelGenerationRequest,
     RequestID,
 )
 from max.pipelines import PipelineConfig
+from max.pipelines.architectures.flux2.pipeline_flux2 import Flux2Pipeline
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import PixelGenerationTokenizer
 from max.pipelines.lib.pipeline_variants.pixel_generation import (
@@ -159,21 +161,27 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 1: Initialize pipeline configuration
     # defer_resolve=True prevents automatic model resolution/loading
-    config = PipelineConfig(model_path=args.model, defer_resolve=True)
+    config = PipelineConfig(
+        model_path=args.model,
+        device_specs=[DeviceSpec.accelerator()],
+        use_legacy_module=False,
+    )
 
     # Step 2: Initialize the tokenizer
     # The tokenizer handles prompt encoding and context preparation
+    is_flux2 = "FLUX.2" in args.model
     tokenizer = PixelGenerationTokenizer(
         model_path=args.model,
         pipeline_config=config,
         subfolder="tokenizer",  # Tokenizer is in a subfolder for diffusion models
-        max_length=77,  # Standard max length for CLIP-based encoders
+        max_length=512 if is_flux2 else 77,  # Mistral3 uses 512, CLIP uses 77
     )
 
     # Step 3: Initialize the pipeline
     # The pipeline executes the diffusion model
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
+        pipeline_model=Flux2Pipeline if is_flux2 else FluxPipeline,
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")
@@ -227,7 +235,8 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Step 9: Post-process the pixel data
     # The tokenizer's postprocess method converts from model output format
     # (NCHW, [-1, 1]) to display format (NHWC, [0, 1])
-    pixel_data = await tokenizer.postprocess(output.pixel_data)
+    # pixel_data = await tokenizer.postprocess(output.pixel_data)
+    pixel_data = output.pixel_data
 
     # Step 10: Save the image
     # Take the first image if multiple were generated
