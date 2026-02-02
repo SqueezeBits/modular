@@ -240,7 +240,7 @@ class TextTokenizer(
 
         try:
             self.delegate = AutoTokenizer.from_pretrained(
-                model_path,
+                "/home/jovyan/models/models--black-forest-labs--FLUX.2-dev/snapshots/6aab690f8379b70adc89edfa6bb99b3537ba52a3/tokenizer",
                 revision=revision,
                 trust_remote_code=trust_remote_code,
                 # If `max_length` is None, the max length will be taken
