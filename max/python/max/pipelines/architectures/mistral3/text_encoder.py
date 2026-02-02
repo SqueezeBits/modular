@@ -121,6 +121,7 @@ class Mistral3TextEncoderModel(ComponentModel):
             model_path=self._text_encoder_path,
             return_hidden_states=ReturnHiddenStates.ALL_LAYERS,
             device_specs=device_specs,
+            max_length=512,
         )
         model_config = self._pipeline_config.model
         model_config.kv_cache.device_memory_utilization = (
