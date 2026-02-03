@@ -312,6 +312,106 @@ class Flux2Pipeline(DiffusionPipeline):
         # Compiled scheduler step graph
         self._scheduler_step_model = None
 
+        # Cache for compiled graphs to avoid per-call compilation
+        self._patchify_models: dict[str, Any] = {}
+        self._vae_prep_models: dict[str, Any] = {}
+        self._pack_models: dict[str, Any] = {}
+
+    def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
+        """Get or compile a patchify graph for the given shape."""
+        key = f"{batch_size}_{channels}_{height}_{width}_{device}_{dtype}"
+        if key in self._patchify_models:
+            return self._patchify_models[key]
+            
+        input_type = TensorType(dtype, shape=[batch_size, channels, height, width], device=device)
+        with Graph("patchify", input_types=[input_type]) as graph:
+            latents = graph.inputs[0]
+            # Reshape: (B, C, H//2, 2, W//2, 2)
+            latents = ops.reshape(
+                latents, 
+                (batch_size, channels, height // 2, 2, width // 2, 2)
+            )
+            # Permute: (0, 1, 3, 5, 2, 4) -> (B, C, 2, 2, H//2, W//2)
+            latents = ops.permute(latents, (0, 1, 3, 5, 2, 4))
+            # Reshape: (B, C*4, H//2, W//2)
+            latents = ops.reshape(
+                latents,
+                (batch_size, channels * 4, height // 2, width // 2)
+            )
+            graph.output(latents)
+            
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._patchify_models[key] = model
+        return model
+
+    def _ensure_vae_prep_model(self, batch_size, seq_len, channels, height, width, device, dtype):
+        """Compile fused graph: Unpack -> BN -> Unpatchify."""
+        key = f"{batch_size}_{seq_len}_{channels}_{height}_{width}_{device}_{dtype}"
+        if key in self._vae_prep_models:
+            return self._vae_prep_models[key]
+
+        # Inputs: latents, bn_mean, bn_var
+        input_types = [
+             TensorType(dtype, shape=[batch_size, seq_len, channels], device=device),
+             TensorType(dtype, shape=[channels], device=device), # bn_mean
+             TensorType(dtype, shape=[channels], device=device), # bn_var
+        ]
+        
+        with Graph("vae_prep", input_types=input_types) as graph:
+            latents, bn_mean, bn_var = graph.inputs
+            
+            # 1. Fast Unpack (assume sequential packing from _pack_latents)
+            # Reverse _pack_latents: (B, H*W, C) -> (B, C, H*W) -> (B, C, H, W)
+            latents = ops.permute(latents, (0, 2, 1))
+            latents = ops.reshape(latents, (batch_size, channels, height, width))
+            
+            # 2. BatchNorm (Flux2 specific inverse transform: * std + mean)
+            mean_reshaped = ops.reshape(bn_mean, (1, channels, 1, 1))
+            var_reshaped = ops.reshape(bn_var, (1, channels, 1, 1))
+            
+            # eps must be tensor for addition
+            eps = ops.constant(self.vae.config.batch_norm_eps, dtype=dtype, device=device)
+            std = ops.sqrt(ops.add(var_reshaped, eps))
+            
+            latents = ops.add(ops.mul(latents, std), mean_reshaped)
+            
+            # 3. Unpatchify
+            # (B, C, H, W) -> (B, C//4, H*2, W*2)
+            latents = ops.reshape(latents, (batch_size, channels // 4, 2, 2, height, width))
+            latents = ops.permute(latents, (0, 1, 4, 2, 5, 3))
+            latents = ops.reshape(latents, (batch_size, channels // 4, height * 2, width * 2))
+            
+            graph.output(latents)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._vae_prep_models[key] = model
+        return model
+
+        self._vae_prep_models[key] = model
+        return model
+
+    def _ensure_pack_model(self, batch_size, channels, height, width, device, dtype):
+        """Compile pack graph: (B, C, H, W) -> (B, H*W, C)."""
+        key = f"{batch_size}_{channels}_{height}_{width}_{device}_{dtype}"
+        if key in self._pack_models:
+            return self._pack_models[key]
+
+        input_type = TensorType(dtype, shape=[batch_size, channels, height, width], device=device)
+        with Graph("pack", input_types=[input_type]) as graph:
+            latents = graph.inputs[0]
+            # Reshape: (B, C, H*W)
+            latents = ops.reshape(latents, (batch_size, channels, height * width))
+            # Permute: (B, H*W, C)
+            latents = ops.permute(latents, (0, 2, 1))
+            graph.output(latents)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._pack_models[key] = model
+        return model
+
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         inputs = Flux2ModelInputs.from_context(context)
         
@@ -657,26 +757,40 @@ class Flux2Pipeline(DiffusionPipeline):
             # For latent output, return the first image in batch
             return latents[0] if latents.shape[0].dim > 1 else latents
 
-        # Unpack latents using position IDs (Flux2 specific)
-        latents_unpacked = self._unpack_latents_with_ids(latents, latent_image_ids)
+        # Use fused graph for Unpack + BN + Unpatchify
+        # This avoids all per-call eager overhead (scatter_nd, reshape, sqrt, etc)
 
-        # Apply BatchNorm inverse transform (Flux2 specific)
-        # Flux2 uses BatchNorm statistics instead of scaling_factor/shift_factor
+        # Dimensions for Unpack: (H/16, W/16) from original inputs (patchify=2, vae=8)
+        h_latent = height // 16
+        w_latent = width // 16
+
+        # Shapes from input tensor
+        batch_size = latents.shape[0].dim
+        seq_len = latents.shape[1].dim
+        num_channels = latents.shape[2].dim
+        # Workaround for symbolic/lazy tensors: force eager evaluation
+        # By adding 0.0, we force execution and get a fresh Eager Tensor
         bn_mean = self.vae.bn.running_mean
         bn_var = self.vae.bn.running_var
 
-        num_channels = bn_mean.shape[0].dim
-        bn_mean = F.reshape(bn_mean, (1, num_channels, 1, 1))
-        bn_var = F.reshape(bn_var, (1, num_channels, 1, 1))
-        bn_std = F.sqrt(bn_var + self.vae.config.batch_norm_eps)
+        zero = Tensor.zeros([1], dtype=latents.dtype, device=latents.device)
+        bn_mean = bn_mean + zero
+        bn_var = bn_var + zero
 
-        latents_unpacked = latents_unpacked * bn_std + bn_mean
+        # Compile/Cache fused graph
+        model = self._ensure_vae_prep_model(
+             batch_size, seq_len, num_channels, h_latent, w_latent, 
+             latents.device, latents.dtype
+        )
 
-        # Unpatchify latents: (B, C, H, W) -> (B, C//4, H*2, W*2)
-        latents_unpacked = self._unpatchify_latents(latents_unpacked)
+        # Execute fused graph
+        # Returns latents_unpacked as DriverTensor
+        latents_unpacked_drv = model.execute(
+             latents.driver_tensor, bn_mean.driver_tensor, bn_var.driver_tensor
+        )[0]
 
         # VAE decode
-        image = self.vae.decode(latents_unpacked.driver_tensor)
+        image = self.vae.decode(latents_unpacked_drv)
 
         # Convert to Tensor if decode returns driver.Tensor
         if not isinstance(image, Tensor):
@@ -980,15 +1094,18 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return image_latent_ids
 
-    @staticmethod
-    def _pack_latents(latents: Tensor) -> Tensor:
+    def _pack_latents(self, latents: Tensor) -> Tensor:
         batch_size = latents.shape[0].dim
         num_channels = latents.shape[1].dim
         height = latents.shape[2].dim
         width = latents.shape[3].dim
-        latents = F.reshape(latents, (batch_size, num_channels, height * width))
-        latents = F.permute(latents, (0, 2, 1))
-        return latents
+        device = latents.device
+        dtype = latents.dtype
+
+        # Use compiled graph
+        model = self._ensure_pack_model(batch_size, num_channels, height, width, device, dtype)
+        latents_drv = model.execute(latents.driver_tensor)[0]
+        return Tensor.from_dlpack(latents_drv)
 
     @staticmethod
     def _patchify_latents(latents: Tensor) -> Tensor:
@@ -1009,43 +1126,7 @@ class Flux2Pipeline(DiffusionPipeline):
         )
         return latents
 
-    @staticmethod
-    def _unpack_latents_with_ids(x: Tensor, x_ids: Tensor) -> Tensor:
-        batch_size = x.shape[0].dim
-        seq_len = x.shape[1].dim
-        ch = x.shape[2].dim
 
-        # Get h_ids and w_ids from position tensor (columns 1 and 2)
-        h_ids = x_ids[:, :, 1].cast(DType.int64)  # [B, seq_len]
-        w_ids = x_ids[:, :, 2].cast(DType.int64)  # [B, seq_len]
-
-        # Calculate H and W from max indices + 1
-        h = int(h_ids.max().item()) + 1
-        w = int(w_ids.max().item()) + 1
-
-        flat_ids = h_ids * w + w_ids
-
-        # Create output tensor and scatter data into place
-        x_list = []
-        for b in range(batch_size):
-            data_b = x[b]  # [seq_len, C]
-            flat_ids_b = flat_ids[b]  # [seq_len]
-
-            # Initialize output with zeros
-            out = Tensor.zeros([h * w, ch], dtype=x.dtype, device=x.device)
-
-            # Scatter: out[flat_ids[i], :] = data[i, :] for each i
-            indices = F.reshape(flat_ids_b, [seq_len, 1]).cast(DType.int64)
-            out = F.scatter_nd(out, data_b, indices)
-
-            # Reshape from (H * W, C) to (C, H, W)
-            out = F.reshape(out, [h, w, ch])
-            out = F.permute(out, (2, 0, 1))  # [C, H, W]
-            x_list.append(out)
-
-        # Stack batches
-        result = F.stack(x_list, axis=0)  # [B, C, H, W]
-        return result
 
     @staticmethod
     def retrieve_latents(
@@ -1106,51 +1187,20 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return image_latents
 
-    @staticmethod
-    def _patchify_latents(latents: Tensor) -> Tensor:
+    def _patchify_latents(self, latents: Tensor) -> Tensor:
         batch_size = latents.shape[0].dim
         num_channels_latents = latents.shape[1].dim
         height = latents.shape[2].dim
         width = latents.shape[3].dim
+        device = latents.device
+        dtype = latents.dtype
 
-        # Reshape: (B, C, H//2, 2, W//2, 2)
-        # Split spatial dimensions into patch dimensions
-        latents = F.reshape(
-            latents,
-            (batch_size, num_channels_latents, height // 2, 2, width // 2, 2),
-        )
-        # Permute: (0, 1, 3, 5, 2, 4)
-        # Rearrange: (B, C, H//2, 2, W//2, 2) -> (B, C, 2, 2, H//2, W//2)
-        # This groups the 2x2 patch elements together
-        latents = F.permute(latents, (0, 1, 3, 5, 2, 4))
-        # Reshape: (B, C*4, H//2, W//2)
-        # Flatten the 2x2 patch into channel dimension
-        latents = F.reshape(
-            latents,
-            (batch_size, num_channels_latents * 4, height // 2, width // 2),
-        )
-        return latents
-
-    @staticmethod
-    def _unpatchify_latents(latents: Tensor) -> Tensor:
-        batch_size = latents.shape[0].dim
-        num_channels_latents = latents.shape[1].dim
-        height = latents.shape[2].dim
-        width = latents.shape[3].dim
-
-        latents = F.reshape(
-            latents,
-            (batch_size, num_channels_latents // 4, 2, 2, height, width),
-        )
-        # Reverse the patchify permute: (0, 1, 3, 5, 2, 4) -> (0, 1, 4, 2, 5, 3)
-        # From (B, C//4, 2, 2, H, W) to (B, C//4, H, 2, W, 2)
-        latents = F.permute(latents, (0, 1, 4, 2, 5, 3))
-        # Reshape to (B, C//4, H*2, W*2)
-        latents = F.reshape(
-            latents,
-            (batch_size, num_channels_latents // 4, height * 2, width * 2),
-        )
-        return latents
+        # Use compiled graph to avoid per-call eager compilation
+        model = self._ensure_patchify_model(batch_size, num_channels_latents, height, width, device, dtype)
+        # Execute compiled model
+        latents_drv = model.execute(latents.driver_tensor)[0]
+        # Convert back to Tensor
+        return Tensor.from_dlpack(latents_drv)
 
     def prepare_latents(
         self,
