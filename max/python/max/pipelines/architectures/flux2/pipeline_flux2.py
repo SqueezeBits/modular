@@ -21,7 +21,7 @@ from max import functional as F
 from max import random
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.interfaces import PixelGenerationOutput, TokenBuffer
+from max.interfaces import TokenBuffer
 from max.pipelines import PixelContext
 from max.pipelines.lib.diffusion_schedulers import (
     FlowMatchEulerDiscreteScheduler,
@@ -78,9 +78,9 @@ def format_input(
             for prompt in cleaned_txt
         ]
     else:
-        assert len(images) == len(
-            prompts
-        ), "Number of images must match number of prompts"
+        assert len(images) == len(prompts), (
+            "Number of images must match number of prompts"
+        )
         messages = [
             [
                 {
@@ -91,7 +91,7 @@ def format_input(
             for _ in cleaned_txt
         ]
 
-        for i, (el, img_list) in enumerate(zip(messages, images)):
+        for i, (el, img_list) in enumerate(zip(messages, images, strict=False)):
             # optionally add the images per batch element.
             if img_list is not None:
                 el.append(
@@ -220,17 +220,7 @@ class Flux2Pipeline(DiffusionPipeline):
         if hidden_states_layers is None:
             hidden_states_layers = [10, 20, 30]
 
-        # unsqueeze
-        if tokens.array.ndim == 1:
-            tokens.array = np.expand_dims(tokens.array, axis=0)
-
-        # Convert to numpy array (not Tensor) for text_encoder
-        # Mistral3TextEncoderModel expects numpy array, not Tensor
-        text_input_ids = tokens.array.astype(np.int64)
-
-        # Encode with Mistral3 text encoder
-        # Mistral3TextEncoderModel returns tuple of hidden states (all layers)
-        hidden_states_tuple = self.text_encoder(text_input_ids)
+        hidden_states_tuple = self.text_encoder(tokens)
 
         if not isinstance(hidden_states_tuple, tuple):
             raise ValueError(
@@ -337,7 +327,9 @@ class Flux2Pipeline(DiffusionPipeline):
             return latents[0] if latents.shape[0].dim > 1 else latents
 
         # Unpack latents using position IDs (Flux2 specific)
-        latents_unpacked = self._unpack_latents_with_ids(latents, latent_image_ids)
+        latents_unpacked = self._unpack_latents_with_ids(
+            latents, latent_image_ids
+        )
 
         # Apply BatchNorm inverse transform (Flux2 specific)
         # Flux2 uses BatchNorm statistics instead of scaling_factor/shift_factor
@@ -434,7 +426,7 @@ class Flux2Pipeline(DiffusionPipeline):
             # Filter to keep only real tokens (where mask == 1)
             real_token_ids = [
                 token_id
-                for token_id, mask in zip(input_ids, attention_mask)
+                for token_id, mask in zip(input_ids, attention_mask, strict=False)
                 if mask == 1
             ]
             text_input_ids = np.array([real_token_ids], dtype=np.int64)
@@ -522,7 +514,9 @@ class Flux2Pipeline(DiffusionPipeline):
 
             # Ensure correct device and dtype
             prompt_embeds = prompt_embeds.to(device).cast(
-                prompt_embeds.dtype if hasattr(prompt_embeds, "dtype") else DType.bfloat16
+                prompt_embeds.dtype
+                if hasattr(prompt_embeds, "dtype")
+                else DType.bfloat16
             )
 
         bs_embed, seq_len, _ = prompt_embeds.shape
@@ -539,7 +533,7 @@ class Flux2Pipeline(DiffusionPipeline):
         batch_size_final = bs_embed.dim * num_images_per_prompt
         text_ids = self._prepare_text_ids(
             batch_size=batch_size_final,
-            seq_len=seq_len.dim if hasattr(seq_len, 'dim') else seq_len,
+            seq_len=seq_len.dim if hasattr(seq_len, "dim") else seq_len,
             device=device,
         )
 
@@ -968,10 +962,9 @@ class Flux2Pipeline(DiffusionPipeline):
             dtype=np.float32,
         )
         self.scheduler.set_timesteps(sigmas=base_sigmas, mu=mu)
-        sigmas = (
-            Tensor.from_dlpack(np.ascontiguousarray(self.scheduler.sigmas))
-            .to(self.transformer.devices[0])
-        )
+        sigmas = Tensor.from_dlpack(
+            np.ascontiguousarray(self.scheduler.sigmas)
+        ).to(self.transformer.devices[0])
         batch_size = prompt_embeds.shape[0].dim
 
         timesteps: np.ndarray = self.scheduler.timesteps

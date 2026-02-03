@@ -16,39 +16,201 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-from max.driver import Buffer, Device, DeviceSpec
+from max.driver import Buffer, Device
 from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, TensorType
 from max.graph.weights import (
     SafetensorWeights,
-    WeightData,
     Weights,
-    WeightsAdapter,
-    WeightsFormat,
 )
-from max.interfaces import RequestID, TokenBuffer
-from max.kv_cache import PagedKVCacheManager, load_kv_manager
-from max.nn.legacy.kv_cache import KVCacheParams, PagedCacheValues
+from max.interfaces import TokenBuffer
+from max.nn.legacy.kv_cache import (
+    KVCacheParams,
+    PagedCacheValues,
+    RaggedKVCacheInputs,
+)
 from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
-from max.pipelines.core import TextContext
 from max.pipelines.lib import (
     CompilationTimer,
-    PipelineConfig,
     SupportedEncoding,
 )
 from max.pipelines.lib.interfaces.component_model import ComponentModel
-from transformers import AutoConfig
 
 from ..mistral.mistral import Mistral
 from ..mistral.model_config import MistralConfig
-from .arch import mistral3_arch
+from .weight_adapters import convert_safetensor_state_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _ceildiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+class DummyKVManager:
+    """
+    Provides dummy KV-cache inputs required by the compiled graph.
+
+    This class is NOT coupled to KVCacheParams. It derives everything from
+    stable MistralConfig fields (plus a few explicit knobs like page_size).
+
+    Assumed graph signature:
+      - blocks       : bfloat16, (total_num_pages, 2, num_layers, page_size, n_kv_heads, head_dim) on GPU
+      - cache_lengths: uint32,   (batch_size,) on GPU
+      - lookup_table : uint32,   (batch_size, lookup_table_width) on GPU
+      - max_lengths  : uint32,   (steps_remaining, 2) on CPU
+    """
+
+    def __init__(
+        self,
+        *,
+        total_num_pages: int,
+        page_size: int,
+        num_layers: int,
+        n_kv_heads: int,
+        head_dim: int,
+        device: Device,
+        lookup_table_width: int = 4,
+    ) -> None:
+        self.total_num_pages = int(total_num_pages)
+        self.page_size = int(page_size)
+        self.num_layers = int(num_layers)
+        self.n_kv_heads = int(n_kv_heads)
+        self.head_dim = int(head_dim)
+        self.device = device
+        self.lookup_table_width = int(lookup_table_width)
+
+    @classmethod
+    def from_config(
+        cls,
+        mistral_config: MistralConfig,
+        *,
+        device: Device | None = None,
+        page_size: int = 128,
+        lookup_table_width: int = 4,
+    ) -> DummyKVManager:
+        """
+        Build DummyKVManager from MistralConfig without using kv_params.
+
+        Derivations:
+          - num_layers      = mistral_config.num_hidden_layers
+          - n_kv_heads      = mistral_config.num_key_value_heads
+          - head_dim        = mistral_config.head_dim
+          - total_num_pages = ceil(mistral_config.max_seq_len / page_size)
+
+        """
+        if device is None:
+            device = mistral_config.devices[0]
+
+        max_seq_len = int(mistral_config.max_seq_len)
+        if max_seq_len <= 0:
+            raise ValueError(
+                f"mistral_config.max_seq_len must be > 0, got {max_seq_len}"
+            )
+
+        total_num_pages = _ceildiv(max_seq_len, int(page_size))
+
+        return cls(
+            total_num_pages=total_num_pages,
+            page_size=int(page_size),
+            num_layers=int(mistral_config.num_hidden_layers),
+            n_kv_heads=int(mistral_config.num_key_value_heads),
+            head_dim=int(mistral_config.head_dim),
+            device=device,
+            lookup_table_width=int(lookup_table_width),
+        )
+
+    def create_dummy_inputs(
+        self, input_row_offsets: Buffer, num_steps: int = 1
+    ) -> RaggedKVCacheInputs:
+        """
+        Create a dummy RaggedKVCacheInputs object for the given ragged batch.
+
+        Args:
+            input_row_offsets: uint32 buffer of shape (B+1,) on GPU.
+            num_steps: Number of decoding steps to account for (defaults to 1).
+
+        Returns:
+            RaggedKVCacheInputs that can be splatted into model.execute(..., *inputs).
+
+        Raises:
+            ValueError: If required_pages exceeds the fixed lookup_table width (4).
+        """
+        # Derive batch size and per-row lengths from input_row_offsets.
+        # NOTE: This assumes input_row_offsets.to_numpy() works for a GPU buffer in your environment.
+        offs = input_row_offsets.to_numpy()  # shape (B+1,)
+        batch_size = int(offs.shape[0] - 1)
+
+        row_lens = [int(offs[i + 1] - offs[i]) for i in range(batch_size)]
+        max_seq_len = max(row_lens) + int(num_steps) - 1
+        required_pages = _ceildiv(max_seq_len, self.page_size)
+
+        # Your compiled graph has lookup_table width fixed to 4.
+        if required_pages > 4:
+            raise ValueError(
+                f"required_pages={required_pages} > 4, but lookup_table is fixed to (B,4) in this graph. "
+                f"max_seq_len={max_seq_len}, page_size={self.page_size}"
+            )
+
+        # Allocate device-side buffers.
+        blocks = Buffer(
+            DType.bfloat16,
+            (
+                self.total_num_pages,
+                2,
+                self.num_layers,
+                self.page_size,
+                self.n_kv_heads,
+                self.head_dim,
+            ),
+            self.device,
+        )
+        cache_lengths = Buffer(DType.uint32, (batch_size,), self.device)
+        lookup_table = Buffer(DType.uint32, (batch_size, 4), self.device)
+
+        # max_lengths is expected on CPU for your graph (Buffer(...) defaults to CPU in your setup).
+        max_lengths = Buffer(DType.uint32, (1, 2))
+
+        # Allocate CPU staging buffers for initializing/copying metadata.
+        cache_lengths_host = Buffer(DType.uint32, (batch_size,))
+        lookup_table_host = Buffer(DType.uint32, (batch_size, 4))
+
+        # Initialize cache_lengths = 0 (no cached tokens).
+        cache_np = cache_lengths_host.to_numpy()
+        cache_np.fill(0)
+
+        # Initialize lookup_table with sentinel, then fill required pages with [0..required_pages-1].
+        lut_np = lookup_table_host.to_numpy()
+        lut_np.fill(
+            np.uint32(self.total_num_pages)
+        )  # sentinel = invalid page index
+        for b in range(batch_size):
+            for p in range(required_pages):
+                lut_np[b, p] = np.uint32(p)
+
+        # Initialize max_lengths conservatively to the maximum prompt length in the batch.
+        # (These values are often used for bounds checks / slice limits.)
+        ml_np = max_lengths.to_numpy()
+        ml_np[0, 0] = np.uint32(max(row_lens))  # max_prompt_len
+        ml_np[0, 1] = np.uint32(max(row_lens))  # max_cached_len (prefill-style)
+
+        # Copy CPU metadata -> GPU buffers.
+        cache_lengths.inplace_copy_from(cache_lengths_host)
+        lookup_table.inplace_copy_from(lookup_table_host)
+
+        return RaggedKVCacheInputs(
+            blocks=blocks,
+            cache_lengths=cache_lengths,
+            lookup_table=lookup_table,
+            max_lengths=max_lengths,
+            kv_scales=None,
+        )
 
 
 class Mistral3TextEncoderModel(ComponentModel):
@@ -81,19 +243,10 @@ class Mistral3TextEncoderModel(ComponentModel):
         """
         super().__init__(config, encoding, devices, weights)
 
-        # Extract model path from config
-        self._text_encoder_path = config.get("text_encoder_path") or config.get(
-            "model_path"
-        )
-        if not self._text_encoder_path:
-            raise ValueError(
-                "model_path or text_encoder_path must be provided in config"
-            )
-
         # Lazy initialization attributes (set in load_model)
         self._model: Model | None = None
         self._session: InferenceSession | None = None
-        self._kv_manager: PagedKVCacheManager | None = None
+        self._kv_manager: DummyKVManager | None = None
         self._config = config
 
         # Load model during initialization
@@ -111,61 +264,43 @@ class Mistral3TextEncoderModel(ComponentModel):
         """
         self._session = InferenceSession(devices=self.devices)
 
-        device_specs = [
-            DeviceSpec.cpu(id=d.id) if d.label == "cpu"
-            else DeviceSpec.accelerator(id=d.id) if d.label == "gpu"
-            else DeviceSpec(id=d.id, device_type=d.label)
-            for d in self.devices
-        ]
-        self._pipeline_config = PipelineConfig(
-            model_path=self._text_encoder_path,
+        text_config = self._config["text_config"]
+        dtype = getattr(DType, self._config["dtype"])
+
+        mistral_config = MistralConfig(
+            hidden_size=int(text_config["hidden_size"]),
+            num_attention_heads=int(text_config["num_attention_heads"]),
+            num_key_value_heads=int(text_config["num_key_value_heads"]),
+            num_hidden_layers=int(text_config["num_hidden_layers"]),
+            head_dim=int(text_config["head_dim"]),
+            vocab_size=int(text_config["vocab_size"]),
+            rope_theta=float(text_config.get("rope_theta", 10000.0)),
+            rms_norm_eps=float(text_config.get("rms_norm_eps", 1e-5)),
+            feed_forward_length=int(text_config.get("intermediate_size", 0)),
+            dtype=dtype,
+            max_seq_len=int(text_config.get("max_position_embeddings", 0)),
+            kv_params=KVCacheParams(
+                dtype=dtype,
+                n_kv_heads=int(text_config["num_key_value_heads"]),
+                head_dim=int(text_config["head_dim"]),
+                num_layers=int(text_config["num_hidden_layers"]),
+                devices=[DeviceRef.from_device(d) for d in self.devices],
+            ),
+            attention_multiplier=math.sqrt(1 / text_config["head_dim"]),
+            devices=list(self.devices),
+            return_logits=ReturnLogits.LAST_TOKEN,
             return_hidden_states=ReturnHiddenStates.ALL_LAYERS,
-            device_specs=device_specs,
-        )
-        self._huggingface_config = AutoConfig.from_pretrained(
-            self._text_encoder_path
-        )
-        text_config = self._huggingface_config.text_config
-
-        # TODO: initialize KVCacheParams and kv_manager properly without hardcoded values.
-        self._kv_params = KVCacheParams(
-            dtype=DType.bfloat16,
-            n_kv_heads=self._config["text_config"]["num_key_value_heads"],
-            head_dim=self._config["text_config"]["head_dim"],
-            num_layers=self._config["text_config"]["num_hidden_layers"],
-            devices=[DeviceRef.from_device(d) for d in self.devices],
-        )
-        self._kv_manager = load_kv_manager(
-            params=self._kv_params,
-            max_batch_size=512,
-            max_seq_len=131072,
-            session=self._session,
-            available_cache_memory=37769707520,
         )
 
-        self._model = self._build_and_load_model(text_config)
+        self._kv_manager = DummyKVManager.from_config(mistral_config)
+
+        self._model = self._build_and_load_model(mistral_config)
 
         return self._model
 
-    def _get_state_dict(
-        self, adapter: WeightsAdapter | None
-    ) -> dict[str, WeightData]:
-        """Get the state dict from weights, optionally applying adapter."""
-        if adapter:
-            state_dict = adapter(
-                dict(self.weights.items()),
-                huggingface_config=self._huggingface_config.text_config,
-                pipeline_config=self._pipeline_config,
-            )
-        else:
-            state_dict = {
-                key: value.data() for key, value in self.weights.items()
-            }
-        return state_dict
-
     def _build_and_load_model(
         self,
-        text_config: AutoConfig,
+        mistral_config: MistralConfig,
     ) -> Model:
         """Build and load the Mistral model graph.
 
@@ -181,23 +316,9 @@ class Mistral3TextEncoderModel(ComponentModel):
                 "only safetensors weights are currently supported."
             )
 
-        adapter = mistral3_arch.weight_adapters.get(
-            WeightsFormat.safetensors, None
-        )
-
-        # Get state dict
-        state_dict = self._get_state_dict(adapter)
-
-        # Initialize model config
-        mistral_config = MistralConfig.initialize_from_config(
-            self._pipeline_config, text_config
-        )
-        mistral_config.return_logits = ReturnLogits.LAST_TOKEN
-        mistral_config.return_hidden_states = ReturnHiddenStates.ALL_LAYERS
+        state_dict = convert_safetensor_state_dict(dict(self.weights.items()))
 
         # Build graph inputs
-        from max.dtype import DType
-
         device_ref = DeviceRef.from_device(self.devices[0])
         tokens_type = TensorType(
             DType.int64, shape=["total_seq_len"], device=device_ref
@@ -210,7 +331,7 @@ class Mistral3TextEncoderModel(ComponentModel):
         )
 
         # Get KV cache input types
-        kv_inputs = self._kv_params.get_symbolic_inputs()
+        kv_inputs = mistral_config.kv_params.get_symbolic_inputs()
 
         graph_inputs = (
             tokens_type,
@@ -248,14 +369,16 @@ class Mistral3TextEncoderModel(ComponentModel):
             graph.output(*outputs)
 
         timer.mark_build_complete()
-        model = self._session.load(graph, weights_registry=nn_model.state_dict())
+        model = self._session.load(
+            graph, weights_registry=nn_model.state_dict()
+        )
         timer.done()
 
         return model
 
     def __call__(
         self,
-        input_ids: np.ndarray,
+        tokens: TokenBuffer,
         attention_mask: np.ndarray | None = None,
         position_ids: np.ndarray | None = None,
     ) -> tuple[Buffer, ...]:
@@ -272,79 +395,29 @@ class Mistral3TextEncoderModel(ComponentModel):
         Raises:
             RuntimeError: If model is not loaded.
         """
-        if self._model is None or self._kv_manager is None:
-            raise RuntimeError("Model not loaded. Call load_model() first.")
+        input_row_offsets = Buffer.from_numpy(
+            np.cumsum(
+                [0] + [tokens.active_length],
+                dtype=np.uint32,
+            )
+        ).to(self.devices[0])
 
-        # Ensure input is a numpy array with correct dtype, flattened to 1D
-        arr = np.asarray(input_ids, dtype=np.int64).ravel()
+        next_tokens_batch = Buffer.from_numpy(tokens.active).to(self.devices[0])
 
-        # Create TextContext directly without using tokenizer
-        request_id = RequestID()
-        token_buffer = TokenBuffer(arr)
-        context = TextContext(
-            request_id=request_id,
-            max_length=131072,
-            tokens=token_buffer,
-            eos_token_ids=set(),
-            model_name=self._text_encoder_path or "",
+        return_n_logits = Buffer.from_numpy(np.array([1], dtype=np.int64))
+
+        dummy_inputs = self._kv_manager.create_dummy_inputs(input_row_offsets)
+
+        # Execute the model
+        model_outputs = self._model.execute(
+            next_tokens_batch,
+            input_row_offsets,
+            return_n_logits,
+            *dummy_inputs,
         )
 
-        replica_idx = 0
-        num_steps = 1
-        try:
-            # Claim and allocate KV cache directly
-            self._kv_manager.claim(request_id, replica_idx=replica_idx)
-            self._kv_manager.alloc(
-                context, replica_idx=replica_idx, num_steps=num_steps
-            )
-
-            # Get KV cache runtime inputs directly
-            kv_cache_inputs_list = self._kv_manager.get_runtime_inputs(
-                [[context]], num_steps=num_steps
-            )
-            kv_cache_inputs = kv_cache_inputs_list[0]
-
-            # Prepare model inputs directly
-            input_row_offsets = Buffer.from_numpy(
-                np.cumsum(
-                    [0] + [context.tokens.active_length],
-                    dtype=np.uint32,
-                )
-            ).to(self.devices[0])
-
-            next_tokens_batch = Buffer.from_numpy(
-                context.tokens.active
-            ).to(self.devices[0])
-
-            return_n_logits = Buffer.from_numpy(
-                np.array([1], dtype=np.int64)
-            )
-
-            # Execute the model
-            model_outputs = self._model.execute(
-                next_tokens_batch,
-                input_row_offsets,
-                return_n_logits,
-                *kv_cache_inputs,
-            )
-
-            # First output is logits, rest are hidden states
-            if len(model_outputs) <= 1:
-                logger.warning(
-                    "Model did not return hidden states; "
-                    "graph may not be compiled with return_hidden_states=ALL_LAYERS"
-                )
-                raise RuntimeError(
-                    "Model did not return hidden states. "
-                    "Ensure the model graph was compiled with "
-                    "return_hidden_states=ALL_LAYERS."
-                )
-
-            # Return hidden states (skip the first output which is logits)
-            hidden_states = tuple(model_outputs[1:])
-            return hidden_states
-        finally:
-            self._kv_manager.release(request_id, replica_idx=replica_idx)
+        hidden_states = tuple(model_outputs[1:])
+        return hidden_states
 
     @property
     def session(self) -> InferenceSession:
