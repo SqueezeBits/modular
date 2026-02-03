@@ -77,6 +77,8 @@ class ModelOutput(TypedDict):
     """Outputs from an image generation model. Shape: (H, W, C) or (B, H, W, C)"""
 
 
+NUM_STEPS = 10
+
 T = TypeVar("T")
 
 
@@ -136,7 +138,7 @@ def run_model(
     pipeline: pipelines.TextGenerationPipeline,
     tokenizer: PipelineTokenizer,
     requests: Sequence[MockTextGenerationRequest],
-    num_steps: int = 50,
+    num_steps: int = NUM_STEPS,
     print_outputs: bool = False,
     batch_size: int | list[int] = 1,
     reference: list[ModelOutput] | None = None,

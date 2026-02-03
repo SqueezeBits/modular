@@ -281,6 +281,7 @@ def run_image_generation(
     pipeline: FluxPipeline,  # DiffusionPipeline from diffusers
     device: torch.device,
     requests: list[MockPixelGenerationRequest],
+    num_steps: int,
     print_outputs: bool = False,
 ) -> list[dict]:
     """Run image generation using a diffusers pipeline.
@@ -298,13 +299,15 @@ def run_image_generation(
 
     results = []
 
+    pipeline.to(device)
+
     for mock_request in requests:
         prompt = mock_request.prompt
         if print_outputs:
             print(f"Generating image for prompt: {prompt}")
 
         # Use parameters from mock_request, with num_steps override if different
-        inference_steps = mock_request.num_inference_steps
+        inference_steps = num_steps if num_steps is not None else mock_request.num_inference_steps
         height = mock_request.height if mock_request.height is not None else 1024
         width = mock_request.width if mock_request.width is not None else 1024
         guidance_scale = mock_request.guidance_scale

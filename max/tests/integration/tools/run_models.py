@@ -38,6 +38,7 @@ from test_common import (
     torch_utils,
     vllm_utils,
 )
+from max.pipelines.lib.pipeline_variants.pixel_generation import PixelGenerationPipeline
 from test_common.evaluate import ModelOutput
 from typing_extensions import ParamSpec
 
@@ -236,9 +237,6 @@ def run_max_model(
             batch_size=evaluation_batch_size,
         )
     elif task == PipelineTask.PIXEL_GENERATION:
-        from max.pipelines.lib.pipeline_variants.pixel_generation import (
-            PixelGenerationPipeline,
-        )
 
         assert isinstance(
             max_pipeline_and_tokenizer.pipeline,
