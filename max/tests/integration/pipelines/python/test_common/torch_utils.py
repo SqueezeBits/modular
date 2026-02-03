@@ -296,7 +296,6 @@ def run_image_generation(
     Returns:
         List of dicts with prompt and generated images
     """
-    import numpy as np
 
     results = []
 
