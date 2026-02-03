@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -16,7 +16,6 @@ These are Mojo built-ins, so you don't need to import them.
 """
 
 from collections.string.string_slice import _unsafe_strlen
-from format._utils import FormatStruct
 from memory import (
     ArcPointer,
     OwnedPointer,
@@ -32,7 +31,7 @@ from sys.info import size_of, align_of
 # ===-----------------------------------------------------------------------===#
 
 
-struct StackTrace(Copyable, Movable, Stringable, Writable):
+struct StackTrace(Copyable, Movable, Stringable):
     """Holds a stack trace captured at a specific location.
 
     A `StackTrace` instance always contains a valid stack trace. Use the
@@ -127,24 +126,6 @@ struct StackTrace(Copyable, Movable, Stringable, Writable):
             A String of the stack trace.
         """
         return String(unsafe_from_utf8_ptr=self._data.unsafe_ptr())
-
-    fn write_to(self, mut writer: Some[Writer]):
-        """Writes the StackTrace to the provided Writer.
-
-        Args:
-            writer: The object to write to.
-        """
-        writer.write_string(
-            StringSlice(unsafe_from_utf8_ptr=self._data.unsafe_ptr())
-        )
-
-    fn write_repr_to(self, mut writer: Some[Writer]):
-        """Writes the StackTrace to the provided Writer in repr format.
-
-        Args:
-            writer: The object to write to.
-        """
-        FormatStruct(writer, "StackTrace").fields(self)
 
 
 # ===-----------------------------------------------------------------------===#

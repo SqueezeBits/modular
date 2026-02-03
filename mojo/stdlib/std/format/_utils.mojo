@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -87,8 +87,8 @@ fn write_sequence_to[
     W: Writer, ElementFn: fn[T: Writer](mut T) raises StopIteration capturing
 ](
     mut writer: W,
-    start: StaticString = "[",
-    end: StaticString = "]",
+    open: StaticString = "[",
+    close: StaticString = "]",
     sep: StaticString = ", ",
 ):
     """Writes a sequence of elements to a writer using a callback function.
@@ -109,11 +109,11 @@ fn write_sequence_to[
 
     Args:
         writer: The writer to write to.
-        start: The starting delimiter (default: `"["`).
-        end: The ending delimiter (default: `"]"`).
+        open: The opening delimiter (default: `"["`).
+        close: The closing delimiter (default: `"]"`).
         sep: The separator between elements (default: `", "`).
     """
-    writer.write_string(start)
+    writer.write_string(open)
 
     var sequence_writer = _SequenceWriter(writer, sep)
 
@@ -123,7 +123,7 @@ fn write_sequence_to[
             sequence_writer.next_element()
         except:
             break
-    writer.write_string(end)
+    writer.write_string(close)
 
 
 @always_inline
@@ -132,8 +132,8 @@ fn write_sequence_to[
 ](
     mut writer: Some[Writer],
     *args: *Ts,
-    start: StaticString,
-    end: StaticString,
+    open: StaticString,
+    close: StaticString,
     sep: StaticString = ", ",
 ):
     """Writes a sequence of writable values to a writer with delimiters.
@@ -147,11 +147,48 @@ fn write_sequence_to[
     Args:
         writer: The writer to write to.
         args: The variadic list of values to write.
-        start: The starting delimiter.
-        end: The ending delimiter.
+        open: The opening delimiter.
+        close: The closing delimiter.
         sep: The separator between items (default: `", "`).
     """
-    args._write_to(writer, start=start, end=end, sep=sep)
+    write_sequence_to(writer, pack=args, open=open, close=close, sep=sep)
+
+
+@always_inline
+fn write_sequence_to[
+    *Ts: Writable,
+](
+    mut writer: Some[Writer],
+    pack: VariadicPack[_, Writable, *Ts],
+    open: StaticString,
+    close: StaticString,
+    sep: StaticString = ", ",
+):
+    """Writes a sequence of writable values from a pack to a writer with delimiters.
+
+    This function formats a variadic pack of writable values as a delimited
+    sequence, writing each element separated by the specified separator and
+    enclosed by opening and closing delimiters.
+
+    Parameters:
+        Ts: Types of the values in the pack. Must conform to `Writable`.
+
+    Args:
+        writer: The writer to write to.
+        pack: The variadic pack of values to write.
+        open: The opening delimiter.
+        close: The closing delimiter.
+        sep: The separator between items (default: `", "`).
+    """
+
+    @parameter
+    fn elements[i: Int](mut writer: Some[Writer]):
+        pack[i].write_to(writer)
+
+    write_sequence_to[
+        size = type_of(pack).__len__(),
+        ElementFn=elements,
+    ](writer, open, close, sep)
 
 
 # TODO (MOCO-2367): Use unified closures once they correctly capture parameters.
@@ -335,7 +372,7 @@ struct FormatStruct[T: Writer, o: MutOrigin](Movable):
         Returns:
             A reference to this `FormatStruct` instance for method chaining.
         """
-        args._write_to(self._writer[], start="[", end="]")
+        write_sequence_to(self._writer[], args, open="[", close="]")
         return self
 
     @always_inline
@@ -352,7 +389,7 @@ struct FormatStruct[T: Writer, o: MutOrigin](Movable):
         Args:
             args: The field values to write.
         """
-        args._write_to(self._writer[], start="(", end=")")
+        write_sequence_to(self._writer[], args, open="(", close=")")
 
     # TODO (MOCO-2367): Use unified closures once they correctly capture parameters.
     @always_inline

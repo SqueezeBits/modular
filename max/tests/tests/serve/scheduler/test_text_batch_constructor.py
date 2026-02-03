@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -212,7 +212,12 @@ def test_text_batch_constructor__batch_construction_without_chunked_prefill_no_p
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 0
 
     for request_id, response in responses.items():
         if response.is_done:
@@ -233,7 +238,12 @@ def test_text_batch_constructor__batch_construction_without_chunked_prefill_no_p
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 0
 
     assert len(batch_constructor.replicas[0].ce_reqs) == 0
     assert len(batch_constructor.replicas[0].tg_reqs) == 4
@@ -364,7 +374,13 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_pre
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 1
+    assert chunked_request_ids[0] == inputs.batches[0][-1].request_id
 
     # There should now be 3 requests in TG, and 7 in CE
     assert len(batch_constructor.replicas[0].tg_reqs) == 3
@@ -383,7 +399,12 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_pre
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 0
 
     assert len(batch_constructor.replicas[0].ce_reqs) == 3
     assert len(batch_constructor.replicas[0].tg_reqs) == 5
@@ -408,7 +429,12 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_pre
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 0
 
     assert len(batch_constructor.replicas[0].ce_reqs) == 3
     assert len(batch_constructor.replicas[0].tg_reqs) == 5
@@ -493,7 +519,13 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_inf
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 1
+    assert chunked_request_ids[0] == inputs.batches[0][-1].request_id
 
     # There should now be 3 requests in TG, and 7 in CE
     assert len(batch_constructor.replicas[0].tg_reqs) == 3
@@ -512,7 +544,12 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_inf
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 1
 
 
 def test_text_batch_constructor__batch_construction_without_chunked_prefill_and_inflight_batching(
@@ -558,7 +595,12 @@ def test_text_batch_constructor__batch_construction_without_chunked_prefill_and_
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 0
 
     assert len(batch_constructor.replicas[0].ce_reqs) == 4
     assert len(batch_constructor.replicas[0].tg_reqs) == 4
@@ -578,7 +620,12 @@ def test_text_batch_constructor__batch_construction_without_chunked_prefill_and_
         for context in batch:
             context.update(0)
 
-    batch_constructor.advance_requests(inputs)
+    chunked_request_ids = (
+        batch_constructor.advance_requests_and_collect_invalid_ids(
+            inputs.batches
+        )
+    )
+    assert len(chunked_request_ids) == 0
 
     assert len(batch_constructor.replicas[0].ce_reqs) == 1
 

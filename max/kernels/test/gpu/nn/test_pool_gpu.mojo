@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -11,15 +11,17 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from gpu.host import DeviceContext, HostBuffer
+from memory import LegacyUnsafePointer
+
+comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from gpu.host import DeviceContext
+from layout import UNKNOWN_VALUE, Layout, LayoutTensor, RuntimeLayout
 from layout._fillers import arange
-from layout._layout import row_major
-from layout._tile_tensor import TileTensor
 from nn.pool import (
     PoolMethod,
-    avg_pool,
+    avg_pool_cpu,
     avg_pool_gpu,
-    max_pool,
+    max_pool_cpu,
     max_pool_gpu,
 )
 from testing import assert_almost_equal
@@ -71,6 +73,21 @@ fn test_avg_pool_2d(ctx: DeviceContext) raises:
     pool(PoolMethod.AVG, ctx)
 
 
+fn test_maxpool_2d_ceil(ctx: DeviceContext) raises:
+    print("== test_max_pool_2d_ceil")
+    pool_ceil_test(PoolMethod.MAX, ctx)
+
+
+fn test_average_pool_2d_ceil_excludeBound(ctx: DeviceContext) raises:
+    print("== test_average_pool_2d_ceil_excludeBound")
+    pool_ceil_test(PoolMethod.AVG, ctx)
+
+
+fn test_average_pool_2d_ceil_includeBound(ctx: DeviceContext) raises:
+    print("== test_average_pool_2d_ceil_includeBound")
+    pool_ceil_test[True, True](PoolMethod.AVG, ctx)
+
+
 fn test_maxpool_2d_ceil_gpu(ctx: DeviceContext) raises:
     print("== test_max_pool_2d_ceil_gpu")
     pool_ceil_test(PoolMethod.MAX, ctx)
@@ -89,65 +106,82 @@ fn test_average_pool_2d_ceil_includeBound_gpu(ctx: DeviceContext) raises:
 fn pool[
     count_boundary: Bool = False
 ](pool_method: PoolMethod, ctx: DeviceContext) raises:
-    comptime in_layout = row_major[2, 5, 7, 2]()
-    comptime out_layout = row_major[2, 2, 2, 2]()
-    comptime in_size = in_layout.size()
-    comptime out_size = out_layout.size()
+    comptime in_layout = Layout.row_major(2, 5, 7, 2)
+    comptime out_layout = Layout.row_major(2, 2, 2, 2)
 
-    # Create host buffers
-    var in_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](in_size)
-    var out_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    var ref_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    ctx.synchronize()
-
-    # Create TileTensors from host buffers
-    var input_tensor = TileTensor(in_host_buffer, in_layout)
-    var output_tensor = TileTensor(out_host_buffer, out_layout)
-    var h_output_ref = TileTensor(ref_host_buffer, out_layout)
-
+    var in_heap = List[Float32](capacity=comptime (in_layout.size()))
+    var input_tensor = LayoutTensor[DType.float32, in_layout](in_heap)
     arange(input_tensor)
-    for i in range(out_size):
-        out_host_buffer[i] = 0
-        ref_host_buffer[i] = 0
 
-    # Create parameter tensors
-    var paddings_stack = InlineArray[Scalar[DType.int32], 4](uninitialized=True)
-    var paddings_tensor = TileTensor(paddings_stack, row_major[4]())
-    paddings_tensor[0] = 0
-    paddings_tensor[1] = 0
-    paddings_tensor[2] = 0
-    paddings_tensor[3] = 0
+    var out_heap = List[Float32](capacity=comptime (out_layout.size()))
+    var output_tensor = LayoutTensor[DType.float32, out_layout](out_heap).fill(
+        0
+    )
 
-    var filter_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var filter_tensor = TileTensor(filter_stack, row_major[2]())
-    filter_tensor[0] = 3
-    filter_tensor[1] = 2
+    var h_output_ref_ptr = UnsafePointer[Float32].alloc(
+        comptime (out_layout.size())
+    )
+    var h_output_ref = LayoutTensor[DType.float32, Layout.row_major[4]()](
+        h_output_ref_ptr,
+        RuntimeLayout[
+            Layout.row_major[4](), element_type = output_tensor.layout_int_type
+        ].row_major(
+            IndexList[4, element_type = output_tensor.layout_int_type](
+                2, 2, 2, 2
+            )
+        ),
+    ).fill(0)
 
-    var stride_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var stride_tensor = TileTensor(stride_stack, row_major[2]())
-    stride_tensor[0] = 2
-    stride_tensor[1] = 3
+    var paddings: List[Int32] = [0, 0, 0, 0]
+    var filter: List[Int32] = [3, 2]
+    var stride: List[Int32] = [2, 3]
+    var dilation: List[Int32] = [1, 1]
 
-    var dilation_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var dilation_tensor = TileTensor(dilation_stack, row_major[2]())
-    dilation_tensor[0] = 1
-    dilation_tensor[1] = 1
-
-    # Create device buffers
-    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](in_size)
-    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](out_size)
-
-    # Create device TileTensors
-    var d_input = TileTensor(d_input_buffer.unsafe_ptr(), in_layout)
-    var d_output = TileTensor(d_output_buffer.unsafe_ptr(), out_layout)
+    var paddings_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        paddings,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE), element_type = DType.int32
+        ].row_major(IndexList[1, element_type = DType.int32](4)),
+    )
+    var filter_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        filter,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE), element_type = DType.int32
+        ].row_major(IndexList[1, element_type = DType.int32](2)),
+    )
+    var stride_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        stride,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE), element_type = DType.int32
+        ].row_major(IndexList[1, element_type = DType.int32](2)),
+    )
+    var dilation_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        dilation,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE), element_type = DType.int32
+        ].row_major(IndexList[1, element_type = DType.int32](2)),
+    )
 
     # Copy data to device
-    ctx.enqueue_copy(d_input_buffer, in_host_buffer)
-    ctx.enqueue_copy(d_output_buffer, out_host_buffer)
+    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (in_layout.size())
+    )
+    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (out_layout.size())
+    )
+    var d_input = LayoutTensor[DType.float32, in_layout](d_input_buffer)
+    var d_output = LayoutTensor[DType.float32, out_layout](d_output_buffer)
+
+    ctx.enqueue_copy(d_input_buffer, input_tensor.ptr)
+    ctx.enqueue_copy(d_output_buffer, output_tensor.ptr)
 
     if pool_method == PoolMethod.MAX:
         max_pool_gpu[int_type = DType.int32](
@@ -159,7 +193,7 @@ fn pool[
             paddings_tensor,
             d_output,
         )
-        max_pool[int_type = DType.int32](
+        max_pool_cpu[int_type = DType.int32](
             input_tensor,
             filter_tensor,
             stride_tensor,
@@ -177,7 +211,7 @@ fn pool[
             paddings_tensor,
             d_output,
         )
-        avg_pool[int_type = DType.int32, count_boundary=count_boundary](
+        avg_pool_cpu[int_type = DType.int32, count_boundary=count_boundary](
             input_tensor,
             filter_tensor,
             stride_tensor,
@@ -187,75 +221,106 @@ fn pool[
         )
 
     # Copy data back to host
-    ctx.enqueue_copy(out_host_buffer, d_output_buffer)
+    ctx.enqueue_copy(output_tensor.ptr, d_output_buffer)
     ctx.synchronize()
 
     # Ensure the GPU and CPU results are the same
     assert_allclose(h_output_ref, output_tensor)
+
+    h_output_ref_ptr.free()
 
 
 fn pool_ceil_test[
     count_boundary: Bool = False, ceil_mode: Bool = True
 ](pool_method: PoolMethod, ctx: DeviceContext) raises:
-    comptime in_layout = row_major[1, 4, 4, 1]()
-    comptime out_layout = row_major[1, 2, 2, 1]()
-    comptime in_size = in_layout.size()
-    comptime out_size = out_layout.size()
+    comptime in_layout = Layout.row_major(1, 4, 4, 1)
+    comptime out_layout = Layout.row_major(1, 2, 2, 1)
 
-    # Create host buffers
-    var in_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](in_size)
-    var out_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    var ref_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    ctx.synchronize()
-
-    # Create TileTensors from host buffers
-    var input_tensor = TileTensor(in_host_buffer, in_layout)
-    var output_tensor = TileTensor(out_host_buffer, out_layout)
-    var h_output_ref = TileTensor(ref_host_buffer, out_layout)
-
+    var in_heap = List[Float32](capacity=comptime (in_layout.size()))
+    var input_tensor = LayoutTensor[DType.float32, in_layout](in_heap)
     arange(input_tensor)
-    for i in range(out_size):
-        out_host_buffer[i] = 0
-        ref_host_buffer[i] = 0
 
-    # Create parameter tensors
-    var paddings_stack = InlineArray[Scalar[DType.int32], 4](uninitialized=True)
-    var paddings_tensor = TileTensor(paddings_stack, row_major[4]())
-    paddings_tensor[0] = 0
-    paddings_tensor[1] = 0
-    paddings_tensor[2] = 0
-    paddings_tensor[3] = 0
+    var out_heap = List[Float32](capacity=comptime (out_layout.size()))
+    var output_tensor = LayoutTensor[DType.float32, out_layout](out_heap).fill(
+        0
+    )
 
-    var filter_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var filter_tensor = TileTensor(filter_stack, row_major[2]())
-    filter_tensor[0] = 3
-    filter_tensor[1] = 3
+    var h_output_ref_ptr = UnsafePointer[Float32].alloc(
+        comptime (out_layout.size())
+    )
+    var h_output_ref = LayoutTensor[DType.float32, out_layout](
+        h_output_ref_ptr,
+        RuntimeLayout[
+            out_layout, element_type = output_tensor.layout_int_type
+        ].row_major(
+            IndexList[4, element_type = output_tensor.layout_int_type](
+                1, 2, 2, 1
+            )
+        ),
+    ).fill(0)
 
-    var stride_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var stride_tensor = TileTensor(stride_stack, row_major[2]())
-    stride_tensor[0] = 2
-    stride_tensor[1] = 2
+    var paddings: List[Int32] = [0, 0, 0, 0]
+    var filter: List[Int32] = [3, 3]
+    var stride: List[Int32] = [2, 2]
+    var dilation: List[Int32] = [1, 1]
 
-    var dilation_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var dilation_tensor = TileTensor(dilation_stack, row_major[2]())
-    dilation_tensor[0] = 1
-    dilation_tensor[1] = 1
-
-    # Create device buffers
-    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](in_size)
-    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](out_size)
-
-    # Create device TileTensors
-    var d_input = TileTensor(d_input_buffer.unsafe_ptr(), in_layout)
-    var d_output = TileTensor(d_output_buffer.unsafe_ptr(), out_layout)
+    var paddings_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        paddings,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](4)
+        ),
+    )
+    var filter_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        filter,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
+    var stride_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        stride,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
+    var dilation_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        dilation,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
 
     # Copy data to device
-    ctx.enqueue_copy(d_input_buffer, in_host_buffer)
-    ctx.enqueue_copy(d_output_buffer, out_host_buffer)
+    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (in_layout.size())
+    )
+    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (out_layout.size())
+    )
+    var d_input = LayoutTensor[DType.float32, in_layout](d_input_buffer)
+    var d_output = LayoutTensor[DType.float32, out_layout](d_output_buffer)
+
+    ctx.enqueue_copy(d_input_buffer, input_tensor.ptr)
+    ctx.enqueue_copy(d_output_buffer, output_tensor.ptr)
 
     if pool_method == PoolMethod.MAX:
         max_pool_gpu[int_type = DType.int32](
@@ -268,7 +333,7 @@ fn pool_ceil_test[
             d_output,
             ceil_mode,
         )
-        max_pool[int_type = DType.int32](
+        max_pool_cpu[int_type = DType.int32](
             input_tensor,
             filter_tensor,
             stride_tensor,
@@ -288,7 +353,7 @@ fn pool_ceil_test[
             d_output,
             ceil_mode,
         )
-        avg_pool[int_type = DType.int32, count_boundary=count_boundary](
+        avg_pool_cpu[int_type = DType.int32, count_boundary=count_boundary](
             input_tensor,
             filter_tensor,
             stride_tensor,
@@ -299,11 +364,13 @@ fn pool_ceil_test[
         )
 
     # Copy data back to host
-    ctx.enqueue_copy(out_host_buffer, d_output_buffer)
+    ctx.enqueue_copy(output_tensor.ptr, d_output_buffer)
     ctx.synchronize()
 
     # Ensure the GPU and CPU results are the same
     assert_allclose(h_output_ref, output_tensor)
+
+    h_output_ref_ptr.free()
 
 
 fn test_avg_pool_2d_with_padding_gpu[
@@ -311,65 +378,94 @@ fn test_avg_pool_2d_with_padding_gpu[
 ](ctx: DeviceContext) raises:
     print("== test_avg_pool_2d_with_padding_gpu:", count_boundary)
 
-    comptime in_layout = row_major[1, 7, 7, 1]()
-    comptime out_layout = row_major[1, 7, 7, 1]()
-    comptime in_size = in_layout.size()
-    comptime out_size = out_layout.size()
+    comptime in_layout = Layout.row_major(1, 7, 7, 1)
+    comptime out_layout = Layout.row_major(1, 7, 7, 1)
 
-    # Create host buffers
-    var in_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](in_size)
-    var out_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    var ref_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    ctx.synchronize()
-
-    # Create TileTensors from host buffers
-    var input_tensor = TileTensor(in_host_buffer, in_layout)
-    var output_tensor = TileTensor(out_host_buffer, out_layout)
-    var h_output_ref = TileTensor(ref_host_buffer, out_layout)
-
+    var in_heap = List[Float32](capacity=comptime (in_layout.size()))
+    var input_tensor = LayoutTensor[DType.float32, in_layout](in_heap)
     arange(input_tensor)
-    for i in range(out_size):
-        out_host_buffer[i] = 0
-        ref_host_buffer[i] = 0
 
-    # Create parameter tensors
-    var paddings_stack = InlineArray[Scalar[DType.int32], 4](uninitialized=True)
-    var paddings_tensor = TileTensor(paddings_stack, row_major[4]())
-    paddings_tensor[0] = 1
-    paddings_tensor[1] = 1
-    paddings_tensor[2] = 1
-    paddings_tensor[3] = 1
+    var out_heap = List[Float32](capacity=comptime (out_layout.size()))
+    var output_tensor = LayoutTensor[DType.float32, out_layout](out_heap).fill(
+        0
+    )
 
-    var filter_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var filter_tensor = TileTensor(filter_stack, row_major[2]())
-    filter_tensor[0] = 3
-    filter_tensor[1] = 3
+    var h_output_ref_ptr = UnsafePointer[Float32].alloc(
+        comptime (out_layout.size())
+    )
+    var h_output_ref = LayoutTensor[DType.float32, out_layout](
+        h_output_ref_ptr,
+        RuntimeLayout[
+            out_layout, element_type = output_tensor.layout_int_type
+        ].row_major(
+            IndexList[4, element_type = output_tensor.layout_int_type](
+                1, 7, 7, 1
+            )
+        ),
+    ).fill(0)
 
-    var stride_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var stride_tensor = TileTensor(stride_stack, row_major[2]())
-    stride_tensor[0] = 1
-    stride_tensor[1] = 1
+    var paddings: List[Int32] = [1, 1, 1, 1]
+    var filter: List[Int32] = [3, 3]
+    var stride: List[Int32] = [1, 1]
+    var dilation: List[Int32] = [1, 1]
 
-    var dilation_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var dilation_tensor = TileTensor(dilation_stack, row_major[2]())
-    dilation_tensor[0] = 1
-    dilation_tensor[1] = 1
-
-    # Create device buffers
-    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](in_size)
-    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](out_size)
-
-    # Create device TileTensors
-    var d_input = TileTensor(d_input_buffer.unsafe_ptr(), in_layout)
-    var d_output = TileTensor(d_output_buffer.unsafe_ptr(), out_layout)
+    var paddings_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        paddings,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](4)
+        ),
+    )
+    var filter_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        filter,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
+    var stride_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        stride,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
+    var dilation_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        dilation,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
 
     # Copy data to device
-    ctx.enqueue_copy(d_input_buffer, in_host_buffer)
-    ctx.enqueue_copy(d_output_buffer, out_host_buffer)
+    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (in_layout.size())
+    )
+    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (in_layout.size())
+    )
+    var d_input = LayoutTensor[DType.float32, in_layout](d_input_buffer)
+    var d_output = LayoutTensor[DType.float32, out_layout](d_output_buffer)
+
+    ctx.enqueue_copy(d_input_buffer, input_tensor.ptr)
+    ctx.enqueue_copy(d_output_buffer, output_tensor.ptr)
 
     avg_pool_gpu[int_type = DType.int32, count_boundary=count_boundary](
         ctx,
@@ -380,7 +476,7 @@ fn test_avg_pool_2d_with_padding_gpu[
         paddings_tensor,
         d_output,
     )
-    avg_pool[int_type = DType.int32, count_boundary=count_boundary](
+    avg_pool_cpu[int_type = DType.int32, count_boundary=count_boundary](
         input_tensor,
         filter_tensor,
         stride_tensor,
@@ -390,75 +486,107 @@ fn test_avg_pool_2d_with_padding_gpu[
     )
 
     # Copy data back to host
-    ctx.enqueue_copy(out_host_buffer, d_output_buffer)
+    ctx.enqueue_copy(output_tensor.ptr, d_output_buffer)
     ctx.synchronize()
 
     # Ensure the GPU and CPU results are the same
     assert_allclose(h_output_ref, output_tensor)
 
+    h_output_ref_ptr.free()
+
 
 fn test_max_pool_pad_dilation_2d_gpu(ctx: DeviceContext) raises:
     print("== test_max_pool_pad_dilation_2d_gpu")
 
-    comptime in_layout = row_major[1, 4, 4, 1]()
-    comptime out_layout = row_major[1, 1, 3, 1]()
-    comptime in_size = in_layout.size()
-    comptime out_size = out_layout.size()
+    comptime in_layout = Layout.row_major(1, 4, 4, 1)
+    comptime out_layout = Layout.row_major(1, 1, 3, 1)
 
-    # Create host buffers
-    var in_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](in_size)
-    var out_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    var ref_host_buffer = ctx.enqueue_create_host_buffer[DType.float32](
-        out_size
-    )
-    ctx.synchronize()
-
-    # Create TileTensors from host buffers
-    var input_tensor = TileTensor(in_host_buffer, in_layout)
-    var output_tensor = TileTensor(out_host_buffer, out_layout)
-    var h_output_ref = TileTensor(ref_host_buffer, out_layout)
-
+    var in_heap = List[Float32](capacity=comptime (in_layout.size()))
+    var input_tensor = LayoutTensor[DType.float32, in_layout](in_heap)
     arange(input_tensor)
-    for i in range(out_size):
-        out_host_buffer[i] = 0
-        ref_host_buffer[i] = 0
 
-    # Create parameter tensors
-    var paddings_stack = InlineArray[Scalar[DType.int32], 4](uninitialized=True)
-    var paddings_tensor = TileTensor(paddings_stack, row_major[4]())
-    paddings_tensor[0] = 0
-    paddings_tensor[1] = 0
-    paddings_tensor[2] = 2
-    paddings_tensor[3] = 0
+    var out_heap = List[Float32](capacity=comptime (out_layout.size()))
+    var output_tensor = LayoutTensor[DType.float32, out_layout](out_heap).fill(
+        0
+    )
 
-    var filter_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var filter_tensor = TileTensor(filter_stack, row_major[2]())
-    filter_tensor[0] = 2
-    filter_tensor[1] = 2
+    var h_output_ref_ptr = UnsafePointer[Float32].alloc(
+        comptime (out_layout.size())
+    )
+    var h_output_ref = LayoutTensor[DType.float32, out_layout](
+        h_output_ref_ptr,
+        RuntimeLayout[
+            out_layout,
+            element_type = output_tensor.layout_int_type,
+        ].row_major(
+            IndexList[4, element_type = output_tensor.layout_int_type](
+                1, 1, 3, 1
+            )
+        ),
+    ).fill(0)
 
-    var stride_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var stride_tensor = TileTensor(stride_stack, row_major[2]())
-    stride_tensor[0] = 1
-    stride_tensor[1] = 1
+    var paddings: List[Int32] = [0, 0, 2, 0]
+    var filter: List[Int32] = [2, 2]
+    var stride: List[Int32] = [1, 1]
+    var dilation: List[Int32] = [3, 3]
 
-    var dilation_stack = InlineArray[Scalar[DType.int32], 2](uninitialized=True)
-    var dilation_tensor = TileTensor(dilation_stack, row_major[2]())
-    dilation_tensor[0] = 3
-    dilation_tensor[1] = 3
-
-    # Create device buffers
-    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](in_size)
-    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](out_size)
-
-    # Create device TileTensors
-    var d_input = TileTensor(d_input_buffer.unsafe_ptr(), in_layout)
-    var d_output = TileTensor(d_output_buffer.unsafe_ptr(), out_layout)
+    var paddings_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        paddings,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](4)
+        ),
+    )
+    var filter_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        filter,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
+    var stride_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        stride,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
+    var dilation_tensor = LayoutTensor[
+        DType.int32, Layout.row_major(UNKNOWN_VALUE)
+    ](
+        dilation,
+        RuntimeLayout[
+            Layout.row_major(UNKNOWN_VALUE),
+            element_type = input_tensor.layout_int_type,
+        ].row_major(
+            IndexList[1, element_type = input_tensor.layout_int_type](2)
+        ),
+    )
 
     # Copy data to device
-    ctx.enqueue_copy(d_input_buffer, in_host_buffer)
-    ctx.enqueue_copy(d_output_buffer, out_host_buffer)
+    var d_input_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (in_layout.size())
+    )
+    var d_output_buffer = ctx.enqueue_create_buffer[DType.float32](
+        comptime (in_layout.size())
+    )
+    var d_input = LayoutTensor[DType.float32, in_layout](d_input_buffer)
+    var d_output = LayoutTensor[DType.float32, out_layout](d_output_buffer)
+
+    ctx.enqueue_copy(d_input_buffer, input_tensor.ptr)
+    ctx.enqueue_copy(d_output_buffer, output_tensor.ptr)
 
     max_pool_gpu[int_type = DType.int32](
         ctx,
@@ -469,7 +597,7 @@ fn test_max_pool_pad_dilation_2d_gpu(ctx: DeviceContext) raises:
         paddings_tensor,
         d_output,
     )
-    max_pool[int_type = DType.int32](
+    max_pool_cpu[int_type = DType.int32](
         input_tensor,
         filter_tensor,
         stride_tensor,
@@ -479,21 +607,23 @@ fn test_max_pool_pad_dilation_2d_gpu(ctx: DeviceContext) raises:
     )
 
     # Copy data back to host
-    ctx.enqueue_copy(out_host_buffer, d_output_buffer)
+    ctx.enqueue_copy(output_tensor.ptr, d_output_buffer)
     ctx.synchronize()
 
     # Ensure the GPU and CPU results are the same
     assert_allclose(h_output_ref, output_tensor)
 
+    h_output_ref_ptr.free()
+
 
 fn assert_allclose[
     dtype: DType,
 ](
-    h_output_ref: TileTensor[dtype, ...],
-    h_output_gpu: TileTensor[dtype, ...],
+    h_output_ref: LayoutTensor[dtype, ...],
+    h_output_gpu: LayoutTensor[dtype, ...],
 ) raises:
     try:
-        for i in range(h_output_ref.layout.size()):
+        for i in range(h_output_ref.size()):
             assert_almost_equal(h_output_ref.ptr[i], h_output_gpu.ptr[i])
     except e:
         print(e)

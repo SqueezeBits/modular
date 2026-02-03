@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -72,7 +72,9 @@ fn _matmul_allreduce[
     @parameter
     for i in range(ngpus):
         allreduce[ngpus=ngpus, output_lambda = outputs_lambda[input_index=i]](
-            c_temp_buffers[i],
+            rebind[InlineArray[NDBuffer[out_dtype, 2, MutAnyOrigin], ngpus]](
+                c_temp_buffers
+            ),
             output_buffers[i],
             rank_sigs,
             ctxs[i],
@@ -203,7 +205,9 @@ fn _matmul_allreduce_split_m[
                 output_lambda = outputs_lambda_wrapper[input_index=i],
                 pdl_level = PDLLevel.OVERLAP_AT_BEGINNING if overlap_with_dpl else PDLLevel(),
             ](
-                C_parts[i],
+                rebind[
+                    InlineArray[NDBuffer[out_dtype, 2, MutAnyOrigin], ngpus]
+                ](C_parts),
                 Out_parts[i],
                 rank_sigs,
                 ctxs[i],
@@ -333,7 +337,9 @@ fn _matmul_allreduce_split_n[
                 output_lambda = outputs_lambda_wrapper[input_index=i],
                 pdl_level = PDLLevel.OVERLAP_AT_BEGINNING if overlap_with_dpl else PDLLevel(),
             ](
-                C_parts[i],
+                rebind[
+                    InlineArray[NDBuffer[out_dtype, 2, MutAnyOrigin], ngpus]
+                ](C_parts),
                 Out_parts[i],
                 rank_sigs,
                 ctxs[i],

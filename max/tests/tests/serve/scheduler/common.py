@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -228,9 +228,7 @@ class FakeTokenGeneratorPipeline(
                 if context.is_done:
                     break
 
-            output = context.to_generation_output()
-            if output.tokens:
-                responses[req_id] = output
+            responses[req_id] = context.to_generation_output()
 
         # Step the kv cache manager
         self.kv_manager.step(inputs.batches)

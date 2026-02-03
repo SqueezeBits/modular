@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -210,8 +210,7 @@ fn test_dynamic_mxfp8_quant[
                         if left > right:
                             mismatch_count += 1
 
-                mismatch_rate = Float64(mismatch_count) / Float64(m * n)
-                if (1 - mismatch_rate) < 0.999:
+                if (1 - (mismatch_count / (m * n))) < 0.999:
                     raise Error("Too many mismatches!")
                 print(
                     "M = ",
@@ -225,7 +224,7 @@ fn test_dynamic_mxfp8_quant[
                     "scales_dtype = ",
                     scales_dtype,
                     "mismatch percentage = ",
-                    mismatch_rate * 100.0,
+                    mismatch_count / (m * n) * 100.0,
                     "%",
                 )
 

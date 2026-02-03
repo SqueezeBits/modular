@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -477,15 +477,37 @@ struct String(
         """
         comptime length = args.__len__()
         var total_bytes = _TotalWritableBytes()
-        args._write_to(total_bytes, end=end, sep=sep)
+
+        @parameter
+        for i in range(length):
+            args[i].write_to(total_bytes)
+
+            @parameter
+            if i < length - 1:
+                sep.write_to(total_bytes)
+        end.write_to(total_bytes)
+
+        if total_bytes.size == 0:
+            return String()
+
+        @parameter
+        fn _write[W: Writer](mut writer: W):
+            @parameter
+            for i in range(args.__len__()):
+                args[i].write_to(writer)
+
+                @parameter
+                if i < length - 1:
+                    sep.write_to(writer)
+            end.write_to(writer)
 
         if total_bytes.size <= Self.INLINE_CAPACITY:
             self = String()
-            args._write_to(self, end=end, sep=sep)
+            _write(self)
         else:
             self = String(capacity=total_bytes.size)
             var buffer = _WriteBufferStack[STACK_BUFFER_BYTES](self)
-            args._write_to(buffer, end=end, sep=sep)
+            _write(buffer)
             buffer.flush()
 
     # TODO(MOCO-1791): Default arguments and param inference aren't powerful
@@ -525,15 +547,37 @@ struct String(
         """
         comptime length = args.__len__()
         var total_bytes = _TotalWritableBytes()
-        args._write_to(total_bytes, end=end, sep=sep)
+
+        @parameter
+        for i in range(length):
+            args[i].write_to(total_bytes)
+
+            @parameter
+            if i < length - 1:
+                sep.write_to(total_bytes)
+        end.write_to(total_bytes)
+
+        if total_bytes.size == 0:
+            return String()
+
+        @parameter
+        fn _write[W: Writer](mut writer: W):
+            @parameter
+            for i in range(length):
+                args[i].write_to(writer)
+
+                @parameter
+                if i < length - 1:
+                    sep.write_to(writer)
+            end.write_to(writer)
 
         if total_bytes.size <= Self.INLINE_CAPACITY:
             self = String()
-            args._write_to(self, end=end, sep=sep)
+            _write(self)
         else:
             self = String(capacity=total_bytes.size)
             var buffer = _WriteBufferStack[STACK_BUFFER_BYTES](self)
-            args._write_to(buffer, end=end, sep=sep)
+            _write(buffer)
             buffer.flush()
 
     @staticmethod
@@ -555,16 +599,38 @@ struct String(
         """
         comptime length = args.__len__()
         var total_bytes = _TotalWritableBytes()
-        args._write_to(total_bytes, end=end, sep=sep)
+
+        @parameter
+        for i in range(length):
+            args[i].write_to(total_bytes)
+
+            @parameter
+            if i < length - 1:
+                sep.write_to(total_bytes)
+        end.write_to(total_bytes)
+
+        if total_bytes.size == 0:
+            return String()
+
+        @parameter
+        fn _write[W: Writer](mut writer: W):
+            @parameter
+            for i in range(length):
+                args[i].write_to(writer)
+
+                @parameter
+                if i < length - 1:
+                    sep.write_to(writer)
+            end.write_to(writer)
 
         if total_bytes.size <= Self.INLINE_CAPACITY:
             var result = String()
-            args._write_to(result, end=end, sep=sep)
+            _write(result)
             return result^
         else:
             var result = String(capacity=total_bytes.size)
             var buffer = _WriteBufferStack[STACK_BUFFER_BYTES](result)
-            args._write_to(buffer, end=end, sep=sep)
+            _write(buffer)
             buffer.flush()
             return result^
 
@@ -580,14 +646,23 @@ struct String(
         comptime length = args.__len__()
         var total_bytes = _TotalWritableBytes()
         total_bytes.size += self.byte_length()
-        args._write_to(total_bytes, sep="")
+
+        @parameter
+        for i in range(length):
+            args[i].write_to(total_bytes)
+
+        @parameter
+        fn _write[W: Writer](mut writer: W):
+            @parameter
+            for i in range(length):
+                args[i].write_to(writer)
 
         if total_bytes.size <= Self.INLINE_CAPACITY:
-            args._write_to(self, sep="")
+            _write(self)
         else:
             self.reserve(total_bytes.size)
             var buffer = _WriteBufferStack[STACK_BUFFER_BYTES](self)
-            args._write_to(buffer, sep="")
+            _write(buffer)
             buffer.flush()
 
     fn write[T: Writable](mut self, value: T):
@@ -1863,7 +1938,7 @@ struct String(
         """
         return StringSlice(self) * n
 
-    fn format[*Ts: Writable](self, *args: *Ts) raises -> String:
+    fn format[*Ts: AnyType](self, *args: *Ts) raises -> String:
         """Produce a formatted string using the current string as a template.
 
         The template, or "format string" can contain literal text and/or
@@ -1878,7 +1953,8 @@ struct String(
             args: The substitution values.
 
         Parameters:
-            Ts: The types of substitution values that implement `Writable`.
+            Ts: The types of substitution values that implement `Representable &
+                Stringable` or `Writable`.
 
         Returns:
             The template with the given values substituted.

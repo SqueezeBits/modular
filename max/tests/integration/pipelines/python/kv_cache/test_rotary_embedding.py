@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -374,10 +374,7 @@ def test_rope(
         )
 
 
-@pytest.mark.parametrize("use_position_ids", [False, True])
-def test_kv_cache_ragged_rope(
-    session: InferenceSession, use_position_ids: bool
-) -> None:
+def test_kv_cache_ragged_rope(session: InferenceSession) -> None:
     # These imports are deferred to avoid Mojo module import race conditions
     # when running with pytest-xdist parallel workers.
     from max.kv_cache import PagedKVCacheManager
@@ -390,11 +387,10 @@ def test_kv_cache_ragged_rope(
     from test_common.context_utils import create_text_context
 
     num_q_heads = 32
-    head_dim = 128
     kv_params = KVCacheParams(
         dtype=DType.float32,
         n_kv_heads=8,
-        head_dim=head_dim,
+        head_dim=128,
         num_layers=1,
         cache_strategy=KVCacheStrategy.PAGED,
         page_size=128,
@@ -403,29 +399,20 @@ def test_kv_cache_ragged_rope(
     prompt_lens = [10, 30]
     batch_size = len(prompt_lens)
     total_seq_len = sum(prompt_lens)
-
     input_type = TensorType(
         DType.float32,
-        ["total_seq_len", num_q_heads, head_dim],
+        ["total_seq_len", num_q_heads, kv_params.head_dim],
         device=DeviceRef.CPU(),
     )
     input_row_offsets_type = TensorType(
         DType.uint32, ["input_row_offsets_len"], device=DeviceRef.CPU()
     )
+
     freqs_cis_type = TensorType(
-        DType.float32,
-        [MAX_SEQ_LEN, head_dim],
+        input_type.dtype,
+        [MAX_SEQ_LEN, kv_params.head_dim],
         device=DeviceRef.CPU(),
     )
-
-    num_sections = 3
-    position_ids_type = None
-    if use_position_ids:
-        position_ids_type = TensorType(
-            DType.uint32,
-            [num_sections, "total_seq_len"],
-            device=DeviceRef.CPU(),
-        )
 
     kv_manager = PagedKVCacheManager(
         kv_params,
@@ -436,39 +423,34 @@ def test_kv_cache_ragged_rope(
         kv_params.get_symbolic_inputs()[0]
     )
 
-    mrope_section = [16, 24, 24]
-
     def construct() -> Graph:
-        input_types = [
-            input_type,
-            input_row_offsets_type,
-            freqs_cis_type,
-            blocks_type,
-            cache_lengths_type,
-            lookup_table_type,
-            is_cache_empty_type,
-        ]
-
-        if use_position_ids:
-            input_types.insert(3, position_ids_type)
-
-        graph_name = (
-            "call_ragged_qk_rope_with_position_ids"
-            if use_position_ids
-            else "call_ragged_qk_rope"
-        )
-
-        with Graph(graph_name, input_types=input_types) as g:
-            inp = g.inputs[0]
-            input_row_offsets = g.inputs[1]
-            freqs_cis = g.inputs[2]
-
-            kv_start = 4 if use_position_ids else 3
-            blocks, cache_lengths, lookup_table, is_cache_empty = g.inputs[
-                kv_start:
-            ]
-
-            layer_idx = ops.constant(0, DType.uint32, DeviceRef.CPU())
+        with Graph(
+            "call_ragged_qk_rope",
+            input_types=[
+                input_type,
+                input_row_offsets_type,
+                freqs_cis_type,
+                blocks_type,
+                cache_lengths_type,
+                lookup_table_type,
+                is_cache_empty_type,
+            ],
+        ) as g:
+            assert g.inputs
+            (
+                input,
+                input_row_offsets,
+                freqs_cis,
+                blocks,
+                cache_lengths,
+                lookup_table,
+                is_cache_empty,
+            ) = g.inputs
+            layer_idx = ops.constant(
+                0,
+                DType.uint32,
+                DeviceRef.CPU(),
+            )
 
             kv_collection = PagedCacheValues(
                 blocks.buffer,
@@ -476,18 +458,13 @@ def test_kv_cache_ragged_rope(
                 lookup_table.tensor,
                 is_cache_empty.tensor,
             )
-
-            position_ids = g.inputs[3].tensor if use_position_ids else None
-
             result = fused_qk_ragged_rope(
                 kv_params,
-                inp.tensor,
+                input.tensor,
                 input_row_offsets.tensor,
                 kv_collection,
                 freqs_cis.tensor,
                 layer_idx,
-                position_ids=position_ids,
-                mrope_section=mrope_section if use_position_ids else None,
             )
             g.output(result)
         return g
@@ -513,26 +490,9 @@ def test_kv_cache_ragged_rope(
         input_row_offsets[i] = running_sum
         running_sum += prompt_lens[i]
     input_row_offsets[batch_size] = running_sum
-
     blocks, cache_lengths, lookup_table_tensor, is_cache_empty_buf = (
         kv_manager.get_runtime_inputs([batch])[0]
     )
-
-    # Build provided_inputs with correct indices based on use_position_ids
-    offset = 1 if use_position_ids else 0
-    provided_inputs = {
-        1: input_row_offsets,
-        3 + offset: blocks,
-        4 + offset: cache_lengths,
-        5 + offset: lookup_table_tensor,
-        6 + offset: is_cache_empty_buf,
-    }
-
-    if use_position_ids:
-        position_ids_data = np.tile(
-            np.arange(total_seq_len, dtype=np.uint32), (num_sections, 1)
-        )
-        provided_inputs[3] = Buffer.from_numpy(position_ids_data)
 
     @modular_graph_test(
         session,
@@ -541,7 +501,13 @@ def test_kv_cache_ragged_rope(
             "total_seq_len": total_seq_len,
             "input_row_offsets_len": len(prompt_lens) + 1,
         },
-        provided_inputs=provided_inputs,
+        provided_inputs={
+            1: input_row_offsets,
+            3: blocks,
+            4: cache_lengths,
+            5: lookup_table_tensor,
+            6: is_cache_empty_buf,
+        },
     )
     @settings(max_examples=10)
     def test_runs_without_nan(
@@ -549,9 +515,10 @@ def test_kv_cache_ragged_rope(
         inputs: Sequence[Buffer],
         torch_inputs: Sequence[torch.Tensor],
     ) -> None:
-        result = execute(list(inputs)).to_numpy()
-        assert not np.any(np.isnan(result))
-        assert not np.any(np.isinf(result))
+        inputs = list(inputs)
+        result = execute(inputs).to_numpy()
+        assert np.any(result != np.nan)
+        assert np.any(result != np.inf)
 
 
 def torch_longrope_freqs_cis(

@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -20,7 +20,7 @@ from python import ConvertibleToPython
 """
 
 
-trait ConvertibleToPython(ImplicitlyDestructible):
+trait ConvertibleToPython:
     """A trait that indicates a type can be converted to a PythonObject, and
     that specifies the behavior with a `to_python_object` method."""
 
@@ -36,7 +36,7 @@ trait ConvertibleToPython(ImplicitlyDestructible):
         ...
 
 
-trait ConvertibleFromPython(Copyable, ImplicitlyDestructible):
+trait ConvertibleFromPython(Copyable):
     """Denotes a type that can attempt construction from a read-only Python
     object.
     """

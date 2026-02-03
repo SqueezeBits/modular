@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -47,7 +47,6 @@ from shmem.ep_comm import (
     fused_silu_kernel,
     fused_silu_fp8_kernel,
     router_weights_wrapper_type,
-    input_scales_wrapper_type,
 )
 
 
@@ -107,7 +106,6 @@ fn ep_dispatch_async_kernel_api[
     n_gpus_per_node: Int,
     n_nodes: Int,
     target: StaticString,
-    input_scales_wrapper: Optional[input_scales_wrapper_type] = None,
     use_shmem: Bool = True,
 ](
     atomic_counters: LayoutTensor[DType.int32, ...],
@@ -132,7 +130,6 @@ fn ep_dispatch_async_kernel_api[
         n_gpus_per_node: GPUs per physical node.
         n_nodes: Number of physical nodes.
         target: Target.
-        input_scales_wrapper: The wrapper for the input scales.
         use_shmem: Whether to enable SHMEM communication.
 
     Arguments:
@@ -176,7 +173,6 @@ fn ep_dispatch_async_kernel_api[
         max_token_per_rank,
         n_gpus_per_node,
         token_fmt_type,
-        input_scales_wrapper=input_scales_wrapper,
         use_shmem=use_shmem,
     ]
 
@@ -256,7 +252,6 @@ fn ep_dispatch_wait_kernel_api[
     n_nodes: Int,
     target: StaticString,
     fused_shared_expert: Bool = False,
-    input_scales_wrapper: Optional[input_scales_wrapper_type] = None,
 ](
     token_handler: token_fmt_type,
     row_offsets: LayoutTensor[DType.uint32, ...],
@@ -286,7 +281,6 @@ fn ep_dispatch_wait_kernel_api[
         target: Target.
         fused_shared_expert: Whether to pack shared expert inputs with routed
             experts' inputs.
-        input_scales_wrapper: The wrapper for the input scales.
 
     Arguments:
         token_handler: Token handler. Wrapper for the output token tensor.
@@ -329,7 +323,6 @@ fn ep_dispatch_wait_kernel_api[
         token_fmt_type,
         fused_shared_expert=fused_shared_expert,
         expert_m_padding=expert_m_padding,
-        input_scales_wrapper=input_scales_wrapper,
     ]
 
     @always_inline
@@ -394,7 +387,6 @@ fn ep_fused_dispatch_kernel_api[
     n_nodes: Int,
     fused_shared_expert: Bool,
     target: StaticString,
-    input_scales_wrapper: Optional[input_scales_wrapper_type] = None,
     use_shmem: Bool = True,
 ](
     token_handler: token_fmt_type,
@@ -427,7 +419,6 @@ fn ep_fused_dispatch_kernel_api[
         fused_shared_expert: Whether to pack shared expert inputs with
             routed experts' inputs.
         target: Target.
-        input_scales_wrapper: The wrapper for the input scales.
         use_shmem: Whether to enable SHMEM communication.
 
     Arguments:
@@ -484,7 +475,6 @@ fn ep_fused_dispatch_kernel_api[
         token_fmt_type,
         expert_m_padding=expert_m_padding,
         fused_shared_expert=fused_shared_expert,
-        input_scales_wrapper=input_scales_wrapper,
         use_shmem=use_shmem,
     ]
 

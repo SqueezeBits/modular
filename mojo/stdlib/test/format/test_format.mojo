@@ -146,7 +146,7 @@ def test_write_sequence_to_custom_delimiters():
         index += 1
 
     write_sequence_to[ElementFn=write_items](
-        output, start="{", end="}", sep="; "
+        output, open="{", close="}", sep="; "
     )
     assert_equal(output, "{item0; item1; item2}")
 

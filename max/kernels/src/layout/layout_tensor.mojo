@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -329,10 +329,10 @@ struct LayoutTensor[
                 Variadic.types[
                     T=AnyType,
                     Self,
-                    Self.OriginCastType[MutAnyOrigin],
-                    Self.OriginCastType[MutExternalOrigin],
-                    Self.OriginCastType[ImmutAnyOrigin],
-                    Self.OriginCastType[ImmutExternalOrigin],
+                    Self.OriginCastType[True, MutAnyOrigin],
+                    Self.OriginCastType[True, MutExternalOrigin],
+                    Self.OriginCastType[False, ImmutAnyOrigin],
+                    Self.OriginCastType[False, ImmutExternalOrigin],
                 ],
             ]
         else:
@@ -341,8 +341,8 @@ struct LayoutTensor[
                 Variadic.types[
                     T=AnyType,
                     Self,
-                    Self.OriginCastType[ImmutAnyOrigin],
-                    Self.OriginCastType[ImmutExternalOrigin],
+                    Self.OriginCastType[False, ImmutAnyOrigin],
+                    Self.OriginCastType[False, ImmutExternalOrigin],
                 ],
             ]
 
@@ -927,7 +927,6 @@ struct LayoutTensor[
 
     comptime OriginCastType[
         mut: Bool,
-        //,
         origin: Origin[mut=mut],
     ] = LayoutTensor[
         Self.dtype,
@@ -947,14 +946,14 @@ struct LayoutTensor[
         origin: The origin for the result tensor.
     """
 
-    comptime MutableAnyType = Self.OriginCastType[MutAnyOrigin]
+    comptime MutableAnyType = Self.OriginCastType[True, MutAnyOrigin]
     """Mutable LayoutTensor type with MutAnyOrigin."""
-    comptime _AsMut = Self.OriginCastType[mut=True, _]
+    comptime _AsMut = Self.OriginCastType[True, _]
 
     @always_inline("nodebug")
     fn as_any_origin(
         self: Self._AsMut,
-    ) -> type_of(self).OriginCastType[MutAnyOrigin]:
+    ) -> type_of(self).OriginCastType[True, MutAnyOrigin]:
         """Casts the origin of the mutable `LayoutTensor` to `MutAnyOrigin`.
 
         Returns:
@@ -977,7 +976,7 @@ struct LayoutTensor[
     @always_inline("nodebug")
     fn as_any_origin(
         self: LayoutTensor[mut=False, ...],
-    ) -> type_of(self).OriginCastType[ImmutAnyOrigin]:
+    ) -> type_of(self).OriginCastType[False, ImmutAnyOrigin]:
         """Casts the origin of the immutable `LayoutTensor` to `ImmutAnyOrigin`.
 
         Returns:
@@ -997,7 +996,7 @@ struct LayoutTensor[
     @doc_private
     fn as_any_origin(
         self: LayoutTensor[...],
-    ) -> type_of(self).OriginCastType[ImmutAnyOrigin]:
+    ) -> type_of(self).OriginCastType[False, ImmutAnyOrigin]:
         constrained[
             False,
             (
@@ -1049,7 +1048,7 @@ struct LayoutTensor[
     @always_inline
     fn get_immutable(
         self,
-    ) -> Self.OriginCastType[ImmutOrigin(Self.origin)]:
+    ) -> Self.OriginCastType[False, ImmutOrigin(Self.origin)]:
         """
         Return an immutable version of this tensor.
 
@@ -1296,7 +1295,7 @@ struct LayoutTensor[
     @always_inline
     fn __add__(
         self, other: Scalar[Self.dtype]
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Add a scalar value to each element of the tensor.
 
         Performs an elementwise addition operation, adding the scalar value to
@@ -1356,7 +1355,7 @@ struct LayoutTensor[
             element_layout = Self.element_layout,
             ...,
         ],
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Add another tensor to this tensor elementwise.
 
         Performs an elementwise addition between this tensor and another tensor.
@@ -1438,7 +1437,7 @@ struct LayoutTensor[
     @always_inline
     fn __mul__(
         self, other: Scalar[Self.dtype]
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Multiply each element of the tensor by a scalar value.
 
         Performs an elementwise multiplication operation, multiplying each
@@ -1477,7 +1476,7 @@ struct LayoutTensor[
             element_layout = Self.element_layout,
             ...,
         ],
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Multiply this tensor with another tensor elementwise.
 
         Performs an elementwise multiplication (Hadamard product) between this tensor
@@ -1587,7 +1586,7 @@ struct LayoutTensor[
     @always_inline
     fn __sub__(
         self, other: Scalar[Self.dtype]
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Subtract a scalar value from each element of the tensor.
 
         Performs an elementwise subtraction operation, subtracting the scalar
@@ -1626,7 +1625,7 @@ struct LayoutTensor[
             element_layout = Self.element_layout,
             ...,
         ],
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Subtract another tensor from this tensor elementwise.
 
         Performs an elementwise subtraction between this tensor and another
@@ -1729,7 +1728,7 @@ struct LayoutTensor[
     @always_inline
     fn __truediv__(
         self, other: Scalar[Self.dtype]
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Divide each element of the tensor by a scalar value.
 
         Performs an elementwise division operation, dividing each element in the
@@ -1774,7 +1773,7 @@ struct LayoutTensor[
             element_layout = Self.element_layout,
             ...,
         ],
-    ) -> Self.OriginCastType[MutAnyOrigin]:
+    ) -> Self.OriginCastType[True, MutAnyOrigin]:
         """Divide this tensor by another tensor elementwise.
 
         Performs an elementwise division between this tensor and another tensor.

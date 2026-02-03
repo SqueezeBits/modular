@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -933,7 +933,6 @@ struct TileTensor[
 
     comptime OriginCastType[
         mut: Bool,
-        //,
         origin: Origin[mut=mut],
     ] = TileTensor[
         shape_types = Self.shape_types,
@@ -950,12 +949,12 @@ struct TileTensor[
         origin: The origin for the result tensor.
     """
 
-    comptime _AsMut = Self.OriginCastType[mut=True, _]
+    comptime _AsMut = Self.OriginCastType[True, _]
 
     @always_inline("nodebug")
     fn as_any_origin(
         self: Self._AsMut,
-    ) -> type_of(self).OriginCastType[MutAnyOrigin]:
+    ) -> type_of(self).OriginCastType[True, MutAnyOrigin]:
         """Casts the origin of the mutable `LayoutTensor` to `MutAnyOrigin`.
 
         Returns:
@@ -974,7 +973,7 @@ struct TileTensor[
     @always_inline
     fn as_immut(
         self,
-    ) -> Self.OriginCastType[ImmutOrigin(Self.origin)]:
+    ) -> Self.OriginCastType[False, ImmutOrigin(Self.origin)]:
         """
         Return an immutable version of this tensor.
 
