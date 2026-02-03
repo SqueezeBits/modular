@@ -33,6 +33,7 @@ from transformers import AutoTokenizer
 from .diffusion_schedulers import SchedulerFactory
 
 if TYPE_CHECKING:
+    import PIL.Image
     from max.pipelines.lib.config import PipelineConfig
 
 logger = logging.getLogger("max.pipelines")
@@ -194,6 +195,36 @@ class PixelGenerationTokenizer(
         #     self._scheduler.config, "use_flow_sigmas", False
         # )
 
+    @staticmethod
+    def _compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+        """Compute empirical mu for Flux2 timestep scheduling.
+
+        Taken from:
+        https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/sampling.py#L251
+
+        Args:
+            image_seq_len: Length of image sequence (H*W after packing).
+            num_steps: Number of inference steps.
+
+        Returns:
+            Empirical mu value for scheduler.
+        """
+        a1, b1 = 8.73809524e-05, 1.89833333
+        a2, b2 = 0.00016927, 0.45666666
+
+        if image_seq_len > 4300:
+            mu = a2 * image_seq_len + b2
+            return float(mu)
+
+        m_200 = a2 * image_seq_len + b2
+        m_10 = a1 * image_seq_len + b1
+
+        a = (m_200 - m_10) / 190.0
+        b = m_200 - 200.0 * a
+        mu = a * num_steps + b
+
+        return float(mu)
+
     def _calculate_shift(
         self,
         image_seq_len: int,
@@ -202,10 +233,46 @@ class PixelGenerationTokenizer(
         base_shift: float = 0.5,
         max_shift: float = 1.15,
     ) -> float:
+        """Calculate shift for Flux1 timestep scheduling using linear interpolation."""
         m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
         b = base_shift - m * base_seq_len
         mu = image_seq_len * m + b
         return mu
+
+    def _calculate_mu(
+        self,
+        image_seq_len: int,
+        num_inference_steps: int,
+    ) -> float:
+        """Calculate mu for timestep scheduling, automatically selecting Flux1 or Flux2 method.
+
+        Args:
+            image_seq_len: Length of image sequence (H*W after packing).
+            num_inference_steps: Number of inference steps.
+
+        Returns:
+            Mu value for scheduler.
+        """
+        # Check if this is Flux2 pipeline
+        is_flux2 = self._pipeline_class_name == "Flux2Pipeline" or (
+            self._pipeline_class_name
+            and "flux2" in self._pipeline_class_name.lower()
+        )
+
+        if is_flux2:
+            # Use Flux2 empirical mu calculation
+            return self._compute_empirical_mu(
+                image_seq_len, num_inference_steps
+            )
+        else:
+            # Use Flux1 linear interpolation (default)
+            return self._calculate_shift(
+                image_seq_len,
+                self._base_image_seq_len,
+                self._max_image_seq_len,
+                self._base_shift,
+                self._max_shift,
+            )
 
     @staticmethod
     def _prepare_latent_image_ids(
@@ -229,6 +296,59 @@ class PixelGenerationTokenizer(
     ) -> npt.NDArray[np.float32]:
         rng = np.random.RandomState(seed)
         return rng.standard_normal(shape).astype(np.float32)
+
+    def _preprocess_input_image(
+        self,
+        image: PIL.Image.Image,
+        target_height: int | None = None,
+        target_width: int | None = None,
+    ) -> PIL.Image.Image:
+        """Preprocess input image for image-to-image generation.
+
+        This method preprocesses images for condition-based image-to-image generation.
+        Matching diffusers behavior: resizes large images, ensures dimensions are multiples
+        of vae_scale_factor * 2, and optionally resizes to target dimensions.
+
+        Note: This is a simplified version compared to pipeline_flux2.py which uses
+        image_processor.preprocess. This tokenizer-level preprocessing is sufficient
+        for the Max framework's condition-based approach.
+
+        Args:
+            image: PIL Image to preprocess.
+            target_height: Target height for the image. If None, uses image's height.
+            target_width: Target width for the image. If None, uses image's width.
+
+        Returns:
+            Preprocessed PIL Image with adjusted dimensions.
+        """
+        import PIL.Image
+
+        image_width, image_height = image.size
+        multiple_of = self._vae_scale_factor * 2
+
+        if image_width * image_height > 1024 * 1024:
+            scale = (1024 * 1024 / (image_width * image_height)) ** 0.5
+            new_width = int(image_width * scale)
+            new_height = int(image_height * scale)
+            image = image.resize(
+                (new_width, new_height), PIL.Image.Resampling.LANCZOS
+            )
+            image_width, image_height = image.size
+
+        image_width = (image_width // multiple_of) * multiple_of
+        image_height = (image_height // multiple_of) * multiple_of
+
+        if target_height is not None:
+            image_height = (target_height // multiple_of) * multiple_of
+        if target_width is not None:
+            image_width = (target_width // multiple_of) * multiple_of
+
+        if image.size != (image_width, image_height):
+            image = image.resize(
+                (image_width, image_height), PIL.Image.Resampling.LANCZOS
+            )
+
+        return image
 
     def _prepare_latents(
         self,
@@ -293,6 +413,7 @@ class PixelGenerationTokenizer(
         negative_prompt: str | None = None,
         negative_prompt_2: str | None = None,
         do_true_cfg: bool = False,
+        images: list[PIL.Image.Image] | None = None,
     ) -> tuple[
         npt.NDArray[np.int64],
         npt.NDArray[np.bool_],
@@ -302,11 +423,19 @@ class PixelGenerationTokenizer(
     ]:
         """Tokenize prompt(s) with encoder model(s).
 
+        Args:
+            prompt: Primary prompt to tokenize.
+            prompt_2: Secondary prompt (optional).
+            negative_prompt: Negative prompt (optional).
+            negative_prompt_2: Secondary negative prompt (optional).
+            do_true_cfg: Whether to use true classifier-free guidance.
+            images: Optional list of images for image-to-image generation (Flux2 only).
+
         Returns:
             Tuple of (token_ids, attn_mask, token_ids_2, negative_token_ids, negative_token_ids_2).
             token_ids_2 and negative_token_ids_2 are None if no secondary tokenizer is configured.
         """
-        token_ids, attn_mask = await self.encode(prompt)
+        token_ids, attn_mask = await self.encode(prompt, images=images)
 
         token_ids_2: npt.NDArray[np.int64] | None = None
         if self.delegate_2 is not None:
@@ -349,9 +478,8 @@ class PixelGenerationTokenizer(
         add_special_tokens: bool = True,
         *,
         use_secondary: bool = False,
+        images: list[PIL.Image.Image] | None = None,
     ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.bool_]]:
-        """Transform the provided prompt into a token array."""
-
         delegate = self.delegate_2 if use_secondary else self.delegate
         max_sequence_length = (
             self.secondary_max_length if use_secondary else self.max_length
@@ -370,25 +498,25 @@ class PixelGenerationTokenizer(
 
         def _encode_fn(prompt_str: str) -> Any:
             assert delegate is not None
-            
+
             # For Flux2, use apply_chat_template with format_input
             if is_flux2 and not use_secondary:
                 # Import here to avoid circular dependencies
-                from max.pipelines.architectures.flux2.system_messages import (
-                    SYSTEM_MESSAGE,
-                )
                 from max.pipelines.architectures.flux2.pipeline_flux2 import (
                     format_input,
                 )
-                
-                # Format prompt using Flux2 chat template
-                messages_batch = format_input(
-                    prompts=[prompt_str], system_message=SYSTEM_MESSAGE
+                from max.pipelines.architectures.flux2.system_messages import (
+                    SYSTEM_MESSAGE,
                 )
-                
-                # Use apply_chat_template for Flux2
+
+                messages_batch = format_input(
+                    prompts=[prompt_str],
+                    system_message=SYSTEM_MESSAGE,
+                    images=None,
+                )
+
                 return delegate.apply_chat_template(
-                    messages_batch[0],  # format_input returns list of conversations
+                    messages_batch[0],
                     add_generation_prompt=False,
                     tokenize=True,
                     return_dict=True,
@@ -399,7 +527,6 @@ class PixelGenerationTokenizer(
                     return_overflowing_tokens=False,
                 )
             else:
-                # Standard tokenization for other pipelines
                 return delegate(
                     prompt_str,
                     padding="max_length",
@@ -419,13 +546,13 @@ class PixelGenerationTokenizer(
             attention_mask = tokenizer_output.get("attention_mask", None)
             if attention_mask is None:
                 attention_mask = [1] * len(input_ids)
-            
+
             # Extract real tokens only (using attention mask) for Flux2
             if is_flux2 and not use_secondary:
                 # Filter to keep only real tokens (where mask == 1)
                 real_token_ids = [
                     token_id
-                    for token_id, mask in zip(input_ids[0], attention_mask[0])
+                    for token_id, mask in zip(input_ids[0], attention_mask[0], strict=False)
                     if mask == 1
                 ]
                 input_ids = [real_token_ids]
@@ -435,18 +562,13 @@ class PixelGenerationTokenizer(
             input_ids = tokenizer_output.input_ids
             attention_mask = tokenizer_output.attention_mask
 
-        if (
-            max_sequence_length
-            and len(input_ids) > max_sequence_length
-        ):
+        if max_sequence_length and len(input_ids) > max_sequence_length:
             raise ValueError(
                 f"Input string is larger than tokenizer's max length ({len(input_ids)} > {max_sequence_length})."
             )
 
         encoded_prompt = np.array(input_ids)
-        attention_mask_array = np.array(attention_mask).astype(
-            np.bool_
-        )
+        attention_mask_array = np.array(attention_mask).astype(np.bool_)
 
         return encoded_prompt, attention_mask_array
 
@@ -468,7 +590,9 @@ class PixelGenerationTokenizer(
         return pixel_data
 
     async def new_context(
-        self, request: PixelGenerationRequest
+        self,
+        request: PixelGenerationRequest,
+        input_image: PIL.Image.Image | None = None,
     ) -> PixelContext:
         """Create a new PixelContext object, leveraging necessary information from PixelGenerationRequest."""
         if request.guidance_scale < 1.0 or request.true_cfg_scale < 1.0:
@@ -490,6 +614,11 @@ class PixelGenerationTokenizer(
         )
 
         # 1. Tokenize prompts
+        # Convert input_image to list format for _generate_tokens_ids
+        images_for_tokenization = None
+        if input_image is not None:
+            images_for_tokenization = [input_image]
+
         (
             token_ids,
             attn_mask,
@@ -502,6 +631,7 @@ class PixelGenerationTokenizer(
             request.negative_prompt,
             request.secondary_negative_prompt,
             do_true_cfg,
+            images=images_for_tokenization,
         )
 
         token_buffer = TokenBuffer(
@@ -523,6 +653,22 @@ class PixelGenerationTokenizer(
                 array=negative_token_ids_2.astype(np.int64, copy=False),
             )
 
+        # 2. Preprocess input image if provided
+        preprocessed_image = None
+        if input_image is not None:
+            # Resolve target dimensions first (will be adjusted during preprocessing)
+            target_height = (
+                request.height
+                or self._default_sample_size * self._vae_scale_factor
+            )
+            target_width = (
+                request.width
+                or self._default_sample_size * self._vae_scale_factor
+            )
+            preprocessed_image = self._preprocess_input_image(
+                input_image, target_height, target_width
+            )
+
         # 3. Resolve image dimensions using cached static values
         height = (
             request.height or self._default_sample_size * self._vae_scale_factor
@@ -531,17 +677,19 @@ class PixelGenerationTokenizer(
             request.width or self._default_sample_size * self._vae_scale_factor
         )
 
+        # If we have a preprocessed image, use its dimensions if height/width not specified
+        if preprocessed_image is not None:
+            if request.height is None:
+                height = preprocessed_image.size[1]
+            if request.width is None:
+                width = preprocessed_image.size[0]
+
         latent_height = 2 * (int(height) // (self._vae_scale_factor * 2))
         latent_width = 2 * (int(width) // (self._vae_scale_factor * 2))
         image_seq_len = (latent_height // 2) * (latent_width // 2)
 
-        mu = self._calculate_shift(
-            image_seq_len,
-            self._base_image_seq_len,
-            self._max_image_seq_len,
-            self._base_shift,
-            self._max_shift,
-        )
+        # Calculate mu using appropriate method for Flux1 or Flux2
+        mu = self._calculate_mu(image_seq_len, request.num_inference_steps)
 
         sigmas: npt.NDArray[np.float32] | None = (
             None
@@ -601,6 +749,7 @@ class PixelGenerationTokenizer(
             true_cfg_scale=request.true_cfg_scale,
             num_warmup_steps=0,
             model_name=request.model_name,
+            input_image=preprocessed_image,
         )
 
         for validator in self._context_validators:
