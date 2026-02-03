@@ -30,7 +30,7 @@ from .layers.normalizations import (
     AdaLayerNormContinuous,
     WeightedLayerNorm,
 )
-
+from .model import Flux2Config
 
 class Flux2TimestepGuidanceEmbeddings(Module):
     """Combined timestep and guidance scale embeddings for Flux2."""
