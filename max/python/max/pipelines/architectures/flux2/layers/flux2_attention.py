@@ -13,21 +13,20 @@
 
 """Flux2 attention and feedforward layers."""
 
-from typing import Optional, Tuple
-
 from max import functional as F
 from max.dtype import DType
 from max.nn import Linear, Module, module_dataclass
 from max.nn.legacy.attention.mask_config import MHAMaskVariant
 from max.nn.legacy.kernels import flash_attention_gpu
-from max.tensor import Tensor
 from max.nn.sequential import ModuleList
+from max.tensor import Tensor
+
 from .embeddings import apply_rotary_emb, get_1d_rotary_pos_embed
 from .normalizations import WeightedRMSNorm
 
 
 @module_dataclass
-class Flux2SwiGLU(Module):
+class Flux2SwiGLU(Module[[Tensor], Tensor]):
     """SwiGLU activation function for Flux2 feedforward blocks."""
 
     def __call__(self, x: Tensor) -> Tensor:
@@ -43,7 +42,7 @@ class Flux2SwiGLU(Module):
         return F.silu(x1) * x2
 
 
-class Flux2FeedForward(Module):
+class Flux2FeedForward(Module[[Tensor], Tensor]):
     """Feedforward network with SwiGLU activation for Flux2."""
 
     linear_in: Linear
@@ -53,9 +52,9 @@ class Flux2FeedForward(Module):
     def __init__(
         self,
         dim: int,
-        dim_out: Optional[int] = None,
+        dim_out: int | None = None,
         mult: float = 3.0,
-        inner_dim: Optional[int] = None,
+        inner_dim: int | None = None,
         bias: bool = False,
     ):
         """Initialize Flux2FeedForward.
@@ -91,13 +90,13 @@ class Flux2FeedForward(Module):
         return x
 
 
-class Flux2PosEmbed(Module):
+class Flux2PosEmbed(Module[[Tensor], tuple[Tensor, Tensor]]):
     """Flux2 positional embedding with per-axis RoPE dimensions."""
 
     theta: int
-    axes_dim: Tuple[int, ...]
+    axes_dim: tuple[int, ...]
 
-    def __init__(self, theta: int, axes_dim: Tuple[int, ...]):
+    def __init__(self, theta: int, axes_dim: tuple[int, ...]):
         """Initialize Flux2PosEmbed.
 
         Args:
@@ -107,7 +106,7 @@ class Flux2PosEmbed(Module):
         self.theta = theta
         self.axes_dim = tuple(axes_dim)
 
-    def __call__(self, ids: Tensor) -> Tuple[Tensor, Tensor]:
+    def __call__(self, ids: Tensor) -> tuple[Tensor, Tensor]:
         """Compute rotary position embeddings.
 
         Args:
@@ -142,7 +141,7 @@ class Flux2PosEmbed(Module):
         return freqs_cos, freqs_sin
 
 
-class Flux2Attention(Module):
+class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
     """Dual-stream attention with QK normalization and optional RoPE for Flux2.
 
     Supports both single-stream (self-attention) and dual-stream modes
@@ -156,11 +155,11 @@ class Flux2Attention(Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         bias: bool = False,
-        added_kv_proj_dim: Optional[int] = None,
-        added_proj_bias: Optional[bool] = True,
+        added_kv_proj_dim: int | None = None,
+        added_proj_bias: bool | None = True,
         out_bias: bool = True,
         eps: float = 1e-5,
-        out_dim: Optional[int] = None,
+        out_dim: int | None = None,
         elementwise_affine: bool = True,
     ):
         """Initialize Flux2Attention.
@@ -206,6 +205,12 @@ class Flux2Attention(Module):
         self.to_out.append(Linear(self.inner_dim, out_dim, bias=out_bias))
 
         # Optional: encoder projections
+        self.norm_added_q: WeightedRMSNorm | None
+        self.norm_added_k: WeightedRMSNorm | None
+        self.add_q_proj: Linear | None
+        self.add_k_proj: Linear | None
+        self.add_v_proj: Linear | None
+        self.to_add_out: Linear | None
         if added_kv_proj_dim is not None:
             self.norm_added_q = WeightedRMSNorm(
                 normalized_shape=dim_head,
@@ -218,17 +223,21 @@ class Flux2Attention(Module):
                 elementwise_affine=elementwise_affine,
             )
             self.add_q_proj = Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias if added_proj_bias is not None else False,
             )
             self.add_k_proj = Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias if added_proj_bias is not None else False,
             )
             self.add_v_proj = Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias if added_proj_bias is not None else False,
             )
-            self.to_add_out = Linear(
-                self.inner_dim, query_dim, bias=out_bias
-            )
+            self.to_add_out = Linear(self.inner_dim, query_dim, bias=out_bias)
         else:
             self.norm_added_q = None
             self.norm_added_k = None
@@ -240,10 +249,10 @@ class Flux2Attention(Module):
     def __call__(
         self,
         hidden_states: Tensor,
-        encoder_hidden_states: Optional[Tensor] = None,
+        encoder_hidden_states: Tensor | None = None,
         # attention_mask: Optional[Tensor] = None,
-        image_rotary_emb: Optional[Tuple[Tensor, Tensor]] = None,
-    ) -> Tensor | Tuple[Tensor, Tensor]:
+        image_rotary_emb: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Apply dual-stream attention.
 
         Args:
@@ -281,6 +290,12 @@ class Flux2Attention(Module):
             encoder_hidden_states is not None
             and self.added_kv_proj_dim is not None
         ):
+            if (
+                self.add_q_proj is None
+                or self.add_k_proj is None
+                or self.add_v_proj is None
+            ):
+                raise ValueError("Encoder projections not initialized")
             encoder_query = self.add_q_proj(encoder_hidden_states)
             encoder_key = self.add_k_proj(encoder_hidden_states)
             encoder_value = self.add_v_proj(encoder_hidden_states)
@@ -300,6 +315,8 @@ class Flux2Attention(Module):
             )
 
             # Apply normalization
+            if self.norm_added_q is None or self.norm_added_k is None:
+                raise ValueError("Encoder normalizations not initialized")
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
@@ -332,13 +349,16 @@ class Flux2Attention(Module):
 
         # Scaled dot-product attention
         scale = 1.0 / (self.head_dim**0.5)
-        hidden_states = flash_attention_gpu(
-            query,
-            key,
-            value,
+        from max.tensor import Tensor as TensorType
+
+        hidden_states_tv = flash_attention_gpu(
+            query.__tensorvalue__(),
+            key.__tensorvalue__(),
+            value.__tensorvalue__(),
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=scale,
         )
+        hidden_states = TensorType.from_graph_value(hidden_states_tv)
 
         # hidden_states = F.flatten(hidden_states, 2, 3)
         # Reshape from [B, S, num_heads, head_dim] to [B, S, num_heads * head_dim]
@@ -358,6 +378,8 @@ class Flux2Attention(Module):
 
             # Project outputs
             hidden_out = self.to_out[0](hidden_out)
+            if self.to_add_out is None:
+                raise ValueError("Encoder output projection not initialized")
             encoder_out = self.to_add_out(encoder_out)
 
             return hidden_out, encoder_out
@@ -367,7 +389,7 @@ class Flux2Attention(Module):
             return hidden_states
 
 
-class Flux2ParallelSelfAttention(Module):
+class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
     """Parallel self-attention with fused QKV and MLP projections for Flux2.
 
     Computes attention and MLP in parallel with shared input projection
@@ -383,7 +405,7 @@ class Flux2ParallelSelfAttention(Module):
         bias: bool = False,
         out_bias: bool = True,
         eps: float = 1e-5,
-        out_dim: Optional[int] = None,
+        out_dim: int | None = None,
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
@@ -438,8 +460,8 @@ class Flux2ParallelSelfAttention(Module):
     def __call__(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        image_rotary_emb: Optional[Tuple[Tensor, Tensor]] = None,
+        attention_mask: Tensor | None = None,
+        image_rotary_emb: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         """Apply parallel self-attention and MLP.
 
@@ -500,13 +522,16 @@ class Flux2ParallelSelfAttention(Module):
             key = key.cast(original_dtype)
 
         # Attention computation
-        hidden_states = flash_attention_gpu(
-            query,
-            key,
-            value,
+        hidden_states_tv = flash_attention_gpu(
+            query.__tensorvalue__(),
+            key.__tensorvalue__(),
+            value.__tensorvalue__(),
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=1.0 / (self.head_dim**0.5),
         )
+        from max.tensor import Tensor as TensorType
+
+        hidden_states = TensorType.from_graph_value(hidden_states_tv)
         # hidden_states = F.flatten(hidden_states, 2, 3)
         # Reshape from [B, S, num_heads, head_dim] to [B, S, num_heads * head_dim]
         batch_size = hidden_states.shape[0]
@@ -517,7 +542,7 @@ class Flux2ParallelSelfAttention(Module):
         hidden_states = hidden_states.cast(query.dtype)
 
         # Process MLP stream
-        mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
+        mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)  # type: ignore[arg-type]
 
         # Concatenate attention and MLP outputs
         hidden_states = F.concat([hidden_states, mlp_hidden_states], axis=-1)

@@ -14,7 +14,7 @@
 """Embedding layers for Flux2."""
 
 import math
-from typing import Optional, Tuple
+from collections.abc import Callable
 
 from max import functional as F
 from max.dtype import DType
@@ -64,7 +64,7 @@ def get_timestep_embedding(
 
 def apply_rotary_emb(
     x: Tensor,
-    freqs_cis: Tuple[Tensor, Tensor],
+    freqs_cis: tuple[Tensor, Tensor],
     use_real: bool = True,
     use_real_unbind_dim: int = -1,
     sequence_dim: int = 2,
@@ -164,7 +164,7 @@ def get_1d_rotary_pos_embed(
     theta: float = 10000.0,
     use_real: bool = True,
     repeat_interleave_real: bool = True,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
     Args:
@@ -191,8 +191,9 @@ def get_1d_rotary_pos_embed(
         )
 
     # Create frequency bands: [dim/2]
+    device = pos.device if isinstance(pos, Tensor) else None
     freq_exponent = (
-        F.arange(0, dim, 2, dtype=DType.float32, device=pos.device) / dim
+        F.arange(0, dim, 2, dtype=DType.float32, device=device) / dim
     )
     freq = 1.0 / (theta**freq_exponent)
 
@@ -222,7 +223,7 @@ def get_1d_rotary_pos_embed(
     return freqs_cos, freqs_sin
 
 
-class Timesteps(Module):
+class Timesteps(Module[[Tensor], Tensor]):
     """Timestep embeddings module."""
 
     def __init__(
@@ -264,7 +265,7 @@ class Timesteps(Module):
         return t_emb
 
 
-class TimestepEmbedding(Module):
+class TimestepEmbedding(Module[[Tensor], Tensor]):
     """MLP for processing timestep embeddings."""
 
     def __init__(
@@ -272,9 +273,9 @@ class TimestepEmbedding(Module):
         in_channels: int,
         time_embed_dim: int,
         act_fn: str = "silu",
-        out_dim: Optional[int] = None,
+        out_dim: int | None = None,
         post_act_fn: str | None = None,
-        cond_proj_dim: Optional[int] = None,
+        cond_proj_dim: int | None = None,
         sample_proj_bias: bool = True,
     ):
         """Initialize TimestepEmbedding MLP.
@@ -292,12 +293,13 @@ class TimestepEmbedding(Module):
             in_channels, time_embed_dim, bias=sample_proj_bias
         )
 
+        self.cond_proj: Linear | None
         if cond_proj_dim is not None:
             self.cond_proj = Linear(cond_proj_dim, in_channels, bias=False)
         else:
             self.cond_proj = None
 
-        self.act = ACT2FN[act_fn]
+        self.act: Callable[[Tensor], Tensor] = ACT2FN[act_fn]  # type: ignore[assignment]
 
         if out_dim is not None:
             time_embed_dim_out = out_dim
@@ -308,8 +310,9 @@ class TimestepEmbedding(Module):
             time_embed_dim, time_embed_dim_out, bias=sample_proj_bias
         )
 
+        self.post_act: Callable[[Tensor], Tensor] | None
         if post_act_fn is not None:
-            self.post_act = ACT2FN[post_act_fn]
+            self.post_act = ACT2FN[post_act_fn]  # type: ignore[assignment]
         else:
             self.post_act = None
 

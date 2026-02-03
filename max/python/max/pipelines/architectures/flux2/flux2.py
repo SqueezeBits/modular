@@ -11,11 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from typing import Optional, Tuple
 
 from max import functional as F
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType
+from max.graph import TensorType
 from max.nn import Linear, Module
 from max.nn.sequential import ModuleList
 from max.tensor import Tensor
@@ -34,7 +33,7 @@ from .layers.normalizations import (
 from .model_config import Flux2Config
 
 
-class Flux2TimestepGuidanceEmbeddings(Module):
+class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
     """Combined timestep and guidance scale embeddings for Flux2."""
 
     def __init__(
@@ -94,7 +93,9 @@ class Flux2TimestepGuidanceEmbeddings(Module):
         return time_guidance_emb
 
 
-class Flux2Modulation(Module):
+class Flux2Modulation(
+    Module[[Tensor], tuple[tuple[Tensor, Tensor, Tensor], ...]]
+):
     """Generates adaptive normalization parameters (shift, scale, gate) from timestep embeddings."""
 
     def __init__(
@@ -115,7 +116,7 @@ class Flux2Modulation(Module):
 
     def __call__(
         self, temb: Tensor
-    ) -> Tuple[Tuple[Tensor, Tensor, Tensor], ...]:
+    ) -> tuple[tuple[Tensor, Tensor, Tensor], ...]:
         """Generate modulation parameters from timestep embedding.
 
         Args:
@@ -147,7 +148,7 @@ class Flux2Modulation(Module):
         return result
 
 
-class Flux2TransformerBlock(Module):
+class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
     """Dual-stream transformer block processing image and text separately with adaptive modulation."""
 
     def __init__(
@@ -211,14 +212,14 @@ class Flux2TransformerBlock(Module):
         self,
         hidden_states: Tensor,
         encoder_hidden_states: Tensor,
-        temb_mod_params_img: Tuple[
-            Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]
+        temb_mod_params_img: tuple[
+            tuple[Tensor, Tensor, Tensor], tuple[Tensor, Tensor, Tensor]
         ],
-        temb_mod_params_txt: Tuple[
-            Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]
+        temb_mod_params_txt: tuple[
+            tuple[Tensor, Tensor, Tensor], tuple[Tensor, Tensor, Tensor]
         ],
-        image_rotary_emb: Optional[Tuple[Tensor, Tensor]] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        image_rotary_emb: tuple[Tensor, Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Forward pass for dual-stream transformer block.
 
         Args:
@@ -251,11 +252,15 @@ class Flux2TransformerBlock(Module):
         ) * norm_encoder_hidden_states + c_shift_msa
 
         # === Dual-stream attention ===
-        attn_output, context_attn_output = self.attn(
+        attn_result = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
         )
+        if isinstance(attn_result, tuple):
+            attn_output, context_attn_output = attn_result
+        else:
+            raise ValueError("Expected tuple from dual-stream attention")
 
         # === Image stream - Apply gate and residual ===
         attn_output = gate_msa * attn_output
@@ -285,12 +290,14 @@ class Flux2TransformerBlock(Module):
 
         # === FP16 clipping for text stream ===
         if encoder_hidden_states.dtype == DType.float16:
-            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+            encoder_hidden_states = encoder_hidden_states.clip(
+                min=-65504, max=65504
+            )
 
         return encoder_hidden_states, hidden_states
 
 
-class Flux2SingleTransformerBlock(Module):
+class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
     """Single-stream transformer block with parallel attention and MLP for concatenated tokens."""
 
     def __init__(
@@ -333,12 +340,12 @@ class Flux2SingleTransformerBlock(Module):
     def __call__(
         self,
         hidden_states: Tensor,
-        encoder_hidden_states: Optional[Tensor] = None,
-        temb_mod_params: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
-        image_rotary_emb: Optional[Tuple[Tensor, Tensor]] = None,
+        encoder_hidden_states: Tensor | None = None,
+        temb_mod_params: tuple[Tensor, Tensor, Tensor] | None = None,
+        image_rotary_emb: tuple[Tensor, Tensor] | None = None,
         split_hidden_states: bool = False,
-        text_seq_len: Optional[int] = None,
-    ) -> Tensor | Tuple[Tensor, Tensor]:
+        text_seq_len: int | None = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Forward pass for single-stream transformer block.
 
         Args:
@@ -355,12 +362,21 @@ class Flux2SingleTransformerBlock(Module):
         """
         # Concatenate text and image if separate encoder_hidden_states provided
         if encoder_hidden_states is not None:
-            text_seq_len = encoder_hidden_states.shape[1]
+            from max.graph import StaticDim
+
+            text_seq_len_dim = encoder_hidden_states.shape[1]
+            if isinstance(text_seq_len_dim, StaticDim):
+                text_seq_len = text_seq_len_dim.dim
+            else:
+                # For symbolic dims, we'll need to handle at runtime
+                text_seq_len = None
             hidden_states = F.concat(
                 [encoder_hidden_states, hidden_states], axis=1
             )
 
         # Unpack modulation parameters
+        if temb_mod_params is None:
+            raise ValueError("temb_mod_params cannot be None")
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
         # Normalize and modulate
@@ -378,7 +394,7 @@ class Flux2SingleTransformerBlock(Module):
 
         # FP16 clipping
         if hidden_states.dtype == DType.float16:
-            hidden_states = hidden_states.clip(-65504, 65504)
+            hidden_states = hidden_states.clip(min=-65504, max=65504)
 
         # Optionally split back to text and image
         if split_hidden_states:
@@ -389,12 +405,12 @@ class Flux2SingleTransformerBlock(Module):
             return hidden_states
 
 
-class Flux2Transformer2DModel(Module):
+class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
     """Complete Flux2 transformer with dual-stream and single-stream blocks for text-to-image generation."""
 
     def __init__(
         self,
-        config,
+        config: Flux2Config,
     ):
         """Initialize Flux2Transformer2DModel.
 
@@ -455,7 +471,7 @@ class Flux2Transformer2DModel(Module):
         )
 
         # 5. Dual-stream transformer blocks
-        self.transformer_blocks = ModuleList(
+        self.transformer_blocks: ModuleList[Flux2TransformerBlock] = ModuleList(
             [
                 Flux2TransformerBlock(
                     dim=self.inner_dim,
@@ -470,7 +486,9 @@ class Flux2Transformer2DModel(Module):
         )
 
         # 6. Single-stream transformer blocks
-        self.single_transformer_blocks = ModuleList(
+        self.single_transformer_blocks: ModuleList[
+            Flux2SingleTransformerBlock
+        ] = ModuleList(
             [
                 Flux2SingleTransformerBlock(
                     dim=self.inner_dim,
@@ -527,10 +545,14 @@ class Flux2Transformer2DModel(Module):
             self.max_dtype, shape=["batch_size"], device=self.max_device
         )
         img_ids_type = TensorType(
-            DType.int64, shape=["batch_size", "image_seq_len", 4], device=self.max_device
+            DType.int64,
+            shape=["batch_size", "image_seq_len", 4],
+            device=self.max_device,
         )
         txt_ids_type = TensorType(
-            DType.int64, shape=["batch_size", "text_seq_len", 4], device=self.max_device
+            DType.int64,
+            shape=["batch_size", "text_seq_len", 4],
+            device=self.max_device,
         )
         guidance_type = TensorType(
             self.max_dtype, shape=["batch_size"], device=self.max_device
@@ -578,10 +600,14 @@ class Flux2Transformer2DModel(Module):
             self.max_dtype, shape=[batch_size], device=self.max_device
         )
         img_ids_type = TensorType(
-            DType.int64, shape=[batch_size, image_seq_len, 4], device=self.max_device
+            DType.int64,
+            shape=[batch_size, image_seq_len, 4],
+            device=self.max_device,
         )
         txt_ids_type = TensorType(
-            DType.int64, shape=[batch_size, text_seq_len, 4], device=self.max_device
+            DType.int64,
+            shape=[batch_size, text_seq_len, 4],
+            device=self.max_device,
         )
         guidance_type = TensorType(
             self.max_dtype, shape=[batch_size], device=self.max_device
@@ -634,9 +660,17 @@ class Flux2Transformer2DModel(Module):
         temb = self.time_guidance_embed(timestep, guidance)
 
         # Generate modulation parameters
-        double_stream_mod_img = self.double_stream_modulation_img(temb)
-        double_stream_mod_txt = self.double_stream_modulation_txt(temb)
-        single_stream_mod = self.single_stream_modulation(temb)[0]
+        double_stream_mod_img_tuple = self.double_stream_modulation_img(temb)
+        double_stream_mod_txt_tuple = self.double_stream_modulation_txt(temb)
+        single_stream_mod_tuple = self.single_stream_modulation(temb)
+        # Cast to expected types (modulation returns variadic tuple, but we need fixed-length)
+        double_stream_mod_img: tuple[
+            tuple[Tensor, Tensor, Tensor], tuple[Tensor, Tensor, Tensor]
+        ] = (double_stream_mod_img_tuple[0], double_stream_mod_img_tuple[1])
+        double_stream_mod_txt: tuple[
+            tuple[Tensor, Tensor, Tensor], tuple[Tensor, Tensor, Tensor]
+        ] = (double_stream_mod_txt_tuple[0], double_stream_mod_txt_tuple[1])
+        single_stream_mod = single_stream_mod_tuple[0]
 
         # 2. Input projection
         hidden_states = self.x_embedder(hidden_states)
@@ -661,8 +695,11 @@ class Flux2Transformer2DModel(Module):
         hidden_states = F.concat([encoder_hidden_states, hidden_states], axis=1)
 
         # 6. Single-stream transformer blocks
-        for block in self.single_transformer_blocks:
-            hidden_states = block(
+        for i in range(len(self.single_transformer_blocks)):
+            single_block: Flux2SingleTransformerBlock = (
+                self.single_transformer_blocks[i]
+            )
+            hidden_states = single_block(  # type: ignore[assignment]
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
