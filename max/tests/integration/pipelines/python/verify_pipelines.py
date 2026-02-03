@@ -685,7 +685,7 @@ def run_pixel_generation_verification(
         eval_metrics.append("lpips")
     if not eval_metrics:
         raise ValueError(
-            "Please provide absolute, relative, SSIM, LPIPS, or FID thresholds."
+            "Please provide absolute, relative, SSIM or LPIPS thresholds."
             " Otherwise no metrics will be computed."
         )
 
@@ -822,7 +822,7 @@ def _make_pixel_generation_pipeline_runner(
     """Create a pixel generation pipeline verification runner.
 
     This factory function creates a verification runner for image generation pipelines
-    that supports multiple image quality metrics (SSIM, LPIPS, FID) alongside MAE/RMSE.
+    that supports multiple image quality metrics (SSIM, LPIPS).
 
     Args:
         pipeline: Pipeline identifier (e.g., "black-forest-labs/FLUX.1-dev")
@@ -1538,14 +1538,15 @@ PIPELINES = {
             kl_div_threshold=7.1e-01,
         ),
     ),
+    # ========== Pixel Generation Pipelines ==========
     "black-forest-labs/FLUX.1-dev-bfloat16": PipelineDef(
         compatible_with=[DeviceKind.GPU],
         tags=["nvidia-only", "big", "image-generation"],
         run=_make_pixel_generation_pipeline_runner(
             pipeline="black-forest-labs/FLUX.1-dev",
             encoding="bfloat16",
-            ssim_threshold=0.6,
-            lpips_threshold=0.50,  # Increased to accommodate diffusion model variance (max observed: 0.467)
+            ssim_threshold=0.60,
+            lpips_threshold=0.35,
         ),
     ),
 }

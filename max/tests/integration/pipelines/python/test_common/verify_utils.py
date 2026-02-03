@@ -667,37 +667,50 @@ class KLDivergenceValidator(DistanceValidatorBase):
         return result
 
 
-class LPIPSValidator(DistanceValidatorBase):
+class LPIPSValidator(ValidatorBase):
     """Validator to check Learned Perceptual Image Patch Similarity (LPIPS).
 
     LPIPS uses deep features from pre-trained networks to measure perceptual similarity.
-    Lower LPIPS = more similar images (range: [0, ∞), typically 0-1 for similar images).
+    Lower LPIPS = more similar images (range: [0, ∞), typically 0-1). Pass when lpips <= threshold.
     """
 
     def __init__(self, lpips_threshold: float, **kwargs) -> None:
-        super().__init__(lpips_threshold, **kwargs)
+        super().__init__(**kwargs)
+        self._lpips_threshold = lpips_threshold
 
     @staticmethod
     def short_name() -> str:
         return "lpips"
 
     @staticmethod
+    def _column_names() -> list[str]:
+        return ["lpips"]
+
+    @staticmethod
+    def _indices_to_sort_by() -> list[int]:
+        return [0]
+
+    @staticmethod
     def _pretty_names() -> list[str]:
-        return ["LPIPS Distance"]
+        return ["LPIPS"]
 
     def threshold_str(self) -> str:
-        return f"lpips={self._threshold}"
+        return f"lpips<={self._lpips_threshold}"
 
-    def _compute_distance(
-        self, target: numpy.typing.NDArray, reference: numpy.typing.NDArray
-    ) -> numpy.typing.NDArray:
-        """Compute LPIPS distance between images (uses shared compute_lpips)."""
-        if target.ndim < 3 or reference.ndim < 3:
-            raise ValueError(
-                f"LPIPS requires 3D (H, W, C) or 4D (B, H, W, C) images, "
-                f"got shapes: target={target.shape}, reference={reference.shape}"
-            )
-        return compute_lpips(target, reference)
+    def _print_suggested_tolerances(
+        self,
+        targets: list[numpy.typing.NDArray],
+        references: list[numpy.typing.NDArray],
+        metrics: list[list[numpy.typing.NDArray]],
+    ) -> None:
+        assert len(metrics) == 1
+        max_lpips = np.array(metrics[0]).max()
+        if math.isfinite(max_lpips):
+            base = math.pow(10, math.floor(math.log10(max_lpips)) - 1)
+            max_lpips = math.ceil(max_lpips / base) * base
+        CONSOLE.print(
+            f"Suggested {self._pretty_names()[0]} threshold: {max_lpips:.1e}\n"
+        )
 
     def validate(
         self,
@@ -705,46 +718,44 @@ class LPIPSValidator(DistanceValidatorBase):
         reference: numpy.typing.NDArray,
         **kwargs,
     ) -> ValidationResultCollection:
-        """Validate LPIPS distance for images."""
-        distance = self._compute_distance(target, reference)
-        max_distance = distance.max()
+        """Validate LPIPS: lower is better, pass when max(lpips) <= threshold."""
+        if target.ndim < 3 or reference.ndim < 3:
+            raise ValueError(
+                f"LPIPS requires 3D (H, W, C) or 4D (B, H, W, C) images, "
+                f"got shapes: target={target.shape}, reference={reference.shape}"
+            )
+        lpips_values = compute_lpips(target, reference)
+        max_lpips = float(np.max(lpips_values))
 
-        # Check if all images pass
-        if max_distance <= self._threshold:
+        if max_lpips <= self._lpips_threshold:
             return ValidationResultCollection(
                 ValidationResult(self.short_name(), True)
             )
 
-        # For images, we report the entire image arrays in the error
         err_msg = (
-            f"LPIPS check failed: {max_distance:.6f} > {self._threshold:.6f}"
+            f"LPIPS check failed: {max_lpips:.6f} > {self._lpips_threshold:.6f}"
         )
-
         result = ValidationResult(
             self.short_name(),
             False,
             err_msg,
             target,
             reference,
-            np.array([[0]]),  # Dummy index for whole-image comparison
-            [distance],
+            np.array([[0]]),
+            [lpips_values],
         )
-
         return ValidationResultCollection(result)
 
 
-class SSIMValidator(DistanceValidatorBase):
+class SSIMValidator(ValidatorBase):
     """Validator to check Structural Similarity Index (SSIM) for images.
 
-    SSIM measures perceptual similarity between images (range: [-1, 1], 1 = identical).
-    This validator converts SSIM to a distance metric (1 - SSIM) for validation.
+    SSIM measures perceptual similarity (range: [-1, 1], 1 = identical).
+    Higher SSIM is better; no distance conversion.
     """
 
     def __init__(self, ssim_threshold: float, **kwargs) -> None:
-        # Convert SSIM threshold to distance threshold (1.0 - ssim_threshold)
-        # E.g., ssim_threshold=0.95 means we want distance <= 0.05
-        distance_threshold = 1.0 - ssim_threshold
-        super().__init__(distance_threshold, **kwargs)
+        super().__init__(**kwargs)
         self._ssim_threshold = ssim_threshold
 
     @staticmethod
@@ -752,23 +763,32 @@ class SSIMValidator(DistanceValidatorBase):
         return "ssim"
 
     @staticmethod
+    def _column_names() -> list[str]:
+        return ["ssim"]
+
+    @staticmethod
+    def _indices_to_sort_by() -> list[int]:
+        return [0]
+
+    @staticmethod
     def _pretty_names() -> list[str]:
-        return ["SSIM Dissimilarity"]
+        return ["SSIM"]
 
     def threshold_str(self) -> str:
-        return f"ssim={self._ssim_threshold}"
+        return f"ssim>={self._ssim_threshold}"
 
-    def _compute_distance(
-        self, target: numpy.typing.NDArray, reference: numpy.typing.NDArray
-    ) -> numpy.typing.NDArray:
-        """Compute SSIM dissimilarity (1 - SSIM) between images (uses shared compute_ssim)."""
-        if target.ndim < 3 or reference.ndim < 3:
-            raise ValueError(
-                f"SSIM requires 3D (H, W, C) or 4D (B, H, W, C) images, "
-                f"got shapes: target={target.shape}, reference={reference.shape}"
+    def _print_suggested_tolerances(
+        self,
+        targets: list[numpy.typing.NDArray],
+        references: list[numpy.typing.NDArray],
+        metrics: list[list[numpy.typing.NDArray]],
+    ) -> None:
+        assert len(metrics) == 1
+        min_ssim = np.array(metrics[0]).min()
+        if math.isfinite(min_ssim):
+            CONSOLE.print(
+                f"Suggested {self._pretty_names()[0]} threshold: {min_ssim:.2e}\n"
             )
-        ssim_score = compute_ssim(target, reference)
-        return np.array([1.0 - ssim_score])
 
     def validate(
         self,
@@ -776,39 +796,31 @@ class SSIMValidator(DistanceValidatorBase):
         reference: numpy.typing.NDArray,
         **kwargs,
     ) -> ValidationResultCollection:
-        """Validate SSIM similarity for images.
+        """Validate SSIM: higher is better, pass when ssim >= threshold."""
+        if target.ndim < 3 or reference.ndim < 3:
+            raise ValueError(
+                f"SSIM requires 3D (H, W, C) or 4D (B, H, W, C) images, "
+                f"got shapes: target={target.shape}, reference={reference.shape}"
+            )
+        ssim_score = compute_ssim(target, reference)
 
-        Overrides base class to handle whole-image comparison properly.
-        """
-        distance = self._compute_distance(target, reference)
-        max_distance = distance.max()
-
-        # Check if all images pass
-        if max_distance <= self._threshold:
+        if ssim_score >= self._ssim_threshold:
             return ValidationResultCollection(
                 ValidationResult(self.short_name(), True)
             )
 
-        # Compute SSIM score for reporting (convert back from dissimilarity)
-        ssim_score = 1.0 - max_distance
-
-        # For images, we compare the whole image, not individual pixels
-        # So we report the entire image arrays in the error
         err_msg = (
             f"SSIM check failed: {ssim_score:.6f} < {self._ssim_threshold:.6f}"
-            f" (dissimilarity: {max_distance:.6f} > {self._threshold:.6f})"
         )
-
         result = ValidationResult(
             self.short_name(),
             False,
             err_msg,
             target,
             reference,
-            np.array([[0]]),  # Dummy index since we're comparing whole images
-            [distance],
+            np.array([[0]]),
+            [np.array([ssim_score])],
         )
-
         return ValidationResultCollection(result)
 
 

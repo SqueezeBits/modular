@@ -185,6 +185,7 @@ def main(
     cos_dist_threshold: float,
     kl_div_threshold: float,
     ssim_threshold: float,
+    lpips_threshold: float,
     diff_count: int,
     print_suggested_tolerances: bool,
 ) -> None:
@@ -203,6 +204,7 @@ def main(
         cos_dist_threshold=cos_dist_threshold,
         kl_div_threshold=kl_div_threshold,
         ssim_threshold=ssim_threshold,
+        lpips_threshold=lpips_threshold,
         diff_count=diff_count,
         print_suggested_tolerances=print_suggested_tolerances,
     )
