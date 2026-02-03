@@ -186,6 +186,26 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     print(f"Generating image for prompt: '{args.prompt}'")
 
+    # Warmup
+    print("Running warmup...")
+    warmup_request = PixelGenerationRequest(
+        request_id=RequestID(),
+        model_name=args.model,
+        prompt="test",
+        negative_prompt=None,
+        height=args.height,
+        width=args.width,
+        num_inference_steps=3,
+        guidance_scale=args.guidance_scale,
+        seed=42,
+    )
+    warmup_context = await tokenizer.new_context(warmup_request)
+    warmup_inputs = PixelGenerationInputs[PixelContext](
+        batch={warmup_context.request_id: warmup_context}
+    )
+    pipeline.execute(warmup_inputs)
+    print("Warmup complete!")
+
     # Step 4: Create a PixelGenerationRequest
     request = PixelGenerationRequest(
         request_id=RequestID(),
