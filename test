@@ -1,0 +1,17 @@
+#!/bin/bash
+
+CACHE_DIR="/tmp/bazel-cache-$(whoami)"
+OUTPUT_BASE="/tmp/bazel-output-$(whoami)"
+
+mkdir -p "$CACHE_DIR" "$OUTPUT_BASE"
+
+# Get the first argument (bazel command like build, test, run, etc.)
+CMD="$1"
+shift
+
+exec ./bazelw \
+    --output_base="$OUTPUT_BASE" \
+    "$CMD" \
+    --repository_cache="$CACHE_DIR/repository" \
+    --disk_cache="$CACHE_DIR/disk" \
+    "$@"
