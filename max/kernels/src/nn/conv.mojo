@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import Optional, Dict
+from collections import Optional, Dict, List
 from math import align_down, ceildiv
 from memory import LegacyUnsafePointer
 
@@ -21,8 +21,10 @@ comptime OpaquePointer = LegacyUnsafePointer[
 ]
 
 from os import abort
-from sys.ffi import _get_global_or_null, external_call
+from sys.ffi import _get_global_or_null, external_call, _find_dylib, OwnedDLHandle, _Global
+from sys.ffi import _get_dylib_function as _ffi_get_dylib_function
 from sys.info import align_of, simd_width_of
+from pathlib import Path
 
 from _cudnn.cnn_infer import (
     cudnnConvolutionForward,
@@ -34,6 +36,8 @@ from _cudnn.cnn_infer import (
     cudnnSetConvolution2dDescriptor,
     cudnnSetConvolutionGroupCount,
     cudnnSetConvolutionMathType,
+    cudnnGetConvolutionForwardAlgorithm_v7,
+    cudnnConvolutionFwdAlgoPerf_t,
 )
 from _cudnn.infer import (
     cudnnContext,
@@ -3189,6 +3193,28 @@ fn check_cudnn_error(stat: cudnnStatus_t):
         print(stat)
 
 
+
+
+
+fn get_cudnn_dtype[dtype: DType]() raises -> cudnnDataType_t:
+    """Map Mojo DType to cuDNN data type.
+
+    Support only floating point dtypes for now.
+    """
+
+    @parameter
+    if dtype == DType.float32:
+        return cudnnDataType_t.CUDNN_DATA_FLOAT
+    elif dtype == DType.float16:
+        return cudnnDataType_t.CUDNN_DATA_HALF
+    elif dtype == DType.bfloat16:
+        return cudnnDataType_t.CUDNN_DATA_BFLOAT16
+    else:
+        raise Error("unsupported dtype", dtype, "for cuDNN")
+
+
+
+
 @register_passable
 struct CuDNNConvMeta(ImplicitlyCopyable):
     var ptr_handle: UnsafePointer[cudnnContext]
@@ -3284,21 +3310,151 @@ fn _get_cudnn_meta(ctx: DeviceContext) raises -> UnsafePointer[CuDNNConvMeta]:
     return ptr_meta
 
 
-fn get_cudnn_dtype[dtype: DType]() raises -> cudnnDataType_t:
-    """Map Mojo DType to cuDNN data type.
+# --- LibCudaRT FFI ---
+fn _init_libcudart() -> OwnedDLHandle:
+    var paths = List[Path]()
+    paths.append(Path("libcudart.so"))
+    paths.append(Path("libcudart.so.12"))
+    paths.append(Path("libcudart.so.11.0"))
+    paths.append(Path("/usr/local/cuda/lib64/libcudart.so"))
+    return _find_dylib[abort_on_failure=False](paths)
 
-    Support only floating point dtypes for now.
-    """
+comptime LIBCUDART_HANDLE = _Global[
+    "LIBCUDART_HANDLE_V7", _init_libcudart
+]
 
-    @parameter
-    if dtype == DType.float32:
-        return cudnnDataType_t.CUDNN_DATA_FLOAT
-    elif dtype == DType.float16:
-        return cudnnDataType_t.CUDNN_DATA_HALF
-    elif dtype == DType.bfloat16:
-        return cudnnDataType_t.CUDNN_DATA_BFLOAT16
-    else:
-        raise Error("unsupported dtype", dtype, "for cuDNN")
+fn cudaMalloc(devPtr: UnsafePointer[OpaquePointer], size: Int) raises -> Int32:
+    return _ffi_get_dylib_function[
+        LIBCUDART_HANDLE(),
+        "cudaMalloc",
+        fn(UnsafePointer[OpaquePointer], Int) -> Int32
+    ]()(devPtr, size)
+
+fn cudaFree(devPtr: OpaquePointer) raises -> Int32:
+    return _ffi_get_dylib_function[
+        LIBCUDART_HANDLE(),
+        "cudaFree",
+        fn(OpaquePointer) -> Int32
+    ]()(devPtr)
+
+@always_inline
+fn check_cuda_error(ret: Int32):
+    if ret != 0:
+        print("CUDA Error:", ret)
+
+@register_passable
+struct CachedCuDNNMetaNHWCFull(ImplicitlyCopyable):
+    var ptr_handle: UnsafePointer[cudnnContext]
+    var ptr_input_desc: UnsafePointer[cudnnTensorStruct]
+    var ptr_filter_desc: UnsafePointer[cudnnFilterStruct]
+    var ptr_conv_desc: UnsafePointer[cudnnConvolutionStruct]
+    var ptr_output_desc: UnsafePointer[cudnnTensorStruct]
+    
+    # Workspace Cache
+    var workspace_ptr: OpaquePointer
+    var workspace_capacity: Int
+    var workspace_size: Int  # Cache the workspace size too!
+    
+    # Algo Cache
+    var best_algo: cudnnConvolutionFwdAlgo_t
+    
+    # Cache key fields
+    var is_set: Bool
+    var in_n: Int
+    var in_h: Int
+    var in_w: Int
+    var in_c: Int
+    
+    var filt_k: Int
+    var filt_c: Int
+    var filt_r: Int
+    var filt_s: Int
+    
+    var out_n: Int
+    var out_h: Int
+    var out_w: Int
+    var out_c: Int
+    
+    var pad_h: Int
+    var pad_w: Int
+    var stride_h: Int
+    var stride_w: Int
+    var dil_h: Int
+    var dil_w: Int
+
+    fn __init__(out self) raises:
+        self.ptr_handle = UnsafePointer[cudnnContext]()
+        check_cudnn_error(cudnnCreate(UnsafePointer(to=self.ptr_handle)))
+
+        self.ptr_input_desc = UnsafePointer[cudnnTensorStruct]()
+        check_cudnn_error(
+            cudnnCreateTensorDescriptor(UnsafePointer(to=self.ptr_input_desc))
+        )
+
+        self.ptr_filter_desc = UnsafePointer[cudnnFilterStruct]()
+        check_cudnn_error(
+            cudnnCreateFilterDescriptor(UnsafePointer(to=self.ptr_filter_desc))
+        )
+
+        self.ptr_conv_desc = UnsafePointer[cudnnConvolutionStruct]()
+        check_cudnn_error(
+            cudnnCreateConvolutionDescriptor(
+                UnsafePointer(to=self.ptr_conv_desc)
+            )
+        )
+
+        self.ptr_output_desc = UnsafePointer[cudnnTensorStruct]()
+        check_cudnn_error(
+            cudnnCreateTensorDescriptor(UnsafePointer(to=self.ptr_output_desc))
+        )
+        
+        self.workspace_ptr = OpaquePointer()
+        self.workspace_capacity = 0
+        self.workspace_size = 0
+        self.best_algo = cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+        
+        self.is_set = False
+        self.in_n = 0
+        self.in_h = 0
+        self.in_w = 0
+        self.in_c = 0
+        self.filt_k = 0
+        self.filt_c = 0
+        self.filt_r = 0
+        self.filt_s = 0
+        self.out_n = 0
+        self.out_h = 0
+        self.out_w = 0
+        self.out_c = 0
+        self.pad_h = 0
+        self.pad_w = 0
+        self.stride_h = 0
+        self.stride_w = 0
+        self.dil_h = 0
+        self.dil_w = 0
+
+fn _get_cached_cudnn_meta_nhwc_full(ctx: DeviceContext) raises -> UnsafePointer[CachedCuDNNMetaNHWCFull]:
+    var cache_key = "CUDA_CUDNN_CACHED_META_NHWC_FULL_" + String(ctx.id())
+
+    if ptr_meta := _get_global_or_null(cache_key).bitcast[CachedCuDNNMetaNHWCFull]():
+        check_cudnn_error(
+            cudnnSetStream(ptr_meta[].ptr_handle, CUDA(ctx.stream()))
+        )
+        return ptr_meta
+
+    var new_ptr_meta = UnsafePointer[CachedCuDNNMetaNHWCFull].alloc(1)
+    new_ptr_meta.init_pointee_move(CachedCuDNNMetaNHWCFull())
+
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(cache_key),
+        new_ptr_meta.bitcast[NoneType](),
+    )
+    
+    check_cudnn_error(
+        cudnnSetStream(new_ptr_meta[].ptr_handle, CUDA(ctx.stream()))
+    )
+    
+    return new_ptr_meta
 
 
 fn _conv_cudnn[
@@ -3315,113 +3471,195 @@ fn _conv_cudnn[
     num_groups: Int,
     ctx: DeviceContext,
 ) raises:
-    var ptr_meta = _get_cudnn_meta(ctx)
-
-    check_cudnn_error(
-        cudnnSetTensor4dDescriptor(
-            ptr_meta[].ptr_input_desc,
-            cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
-            get_cudnn_dtype[input_type](),
-            input.dim[0](),
-            input.dim[3](),
-            input.dim[1](),
-            input.dim[2](),
+    # Use the optimized cached metadata implementation
+    var meta_ptr = _get_cached_cudnn_meta_nhwc_full(ctx)
+    
+    # Input shape: NHWC
+    var in_n = input.dim[0]()
+    var in_h = input.dim[1]()
+    var in_w = input.dim[2]()
+    var in_c = input.dim[3]()
+    
+    # Filter shape: FCRS (K, C, R, S)
+    var filt_k = filter.dim[0]()
+    var filt_c = filter.dim[1]()
+    var filt_r = filter.dim[2]()
+    var filt_s = filter.dim[3]()
+    
+    # Output shape: NHWC
+    var out_n = output.dim[0]()
+    var out_h = output.dim[1]()
+    var out_w = output.dim[2]()
+    var out_c = output.dim[3]()
+    
+    var pad_h = padding[0]
+    var pad_w = padding[1]
+    var stride_h = stride[0]
+    var stride_w = stride[1]
+    var dil_h = dilation[0]
+    var dil_w = dilation[1]
+    
+    var params_match = meta_ptr[].is_set
+    
+    if params_match:
+        if meta_ptr[].in_n != in_n or meta_ptr[].in_h != in_h or meta_ptr[].in_w != in_w or meta_ptr[].in_c != in_c:
+            params_match = False
+        elif meta_ptr[].filt_k != filt_k or meta_ptr[].filt_c != filt_c or meta_ptr[].filt_r != filt_r or meta_ptr[].filt_s != filt_s:
+            params_match = False
+        elif meta_ptr[].out_n != out_n or meta_ptr[].out_h != out_h or meta_ptr[].out_w != out_w or meta_ptr[].out_c != out_c:
+            params_match = False
+        elif meta_ptr[].pad_h != pad_h or meta_ptr[].pad_w != pad_w:
+            params_match = False
+        elif meta_ptr[].stride_h != stride_h or meta_ptr[].stride_w != stride_w:
+            params_match = False
+        elif meta_ptr[].dil_h != dil_h or meta_ptr[].dil_w != dil_w:
+            params_match = False
+            
+    if not params_match:
+        # Update Input Descriptor (NHWC)
+        check_cudnn_error(
+            cudnnSetTensor4dDescriptor(
+                meta_ptr[].ptr_input_desc,
+                cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
+                get_cudnn_dtype[input_type](),
+                in_n, in_c, in_h, in_w,
+            )
         )
-    )
-
-    check_cudnn_error(
-        cudnnSetFilter4dDescriptor(
-            ptr_meta[].ptr_filter_desc,
-            get_cudnn_dtype[filter_type](),
-            cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,
-            filter.dim[0](),
-            filter.dim[1](),
-            filter.dim[2](),
-            filter.dim[3](),
+        
+        # Update Filter Descriptor (NCHW for filter)
+        check_cudnn_error(
+            cudnnSetFilter4dDescriptor(
+                meta_ptr[].ptr_filter_desc,
+                get_cudnn_dtype[filter_type](),
+                cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,
+                filt_k, filt_c, filt_r, filt_s
+            )
         )
-    )
-
-    check_cudnn_error(
-        cudnnSetConvolution2dDescriptor(
-            ptr_meta[].ptr_conv_desc,
-            padding[0],
-            padding[1],
-            stride[0],
-            stride[1],
-            dilation[0],
-            dilation[1],
-            cudnnConvolutionMode_t.CUDNN_CROSS_CORRELATION,
-            # cuDNN 8+ requires float32 accumulation when the I/O tensors are
-            # bfloat16.
-            # Note that this is correct for float16, bfloat16, and float32 but
-            # would have to be adjusted for other input dtypes, such as int8.
-            cudnnDataType_t.CUDNN_DATA_FLOAT,
+        
+        # Update Conv Descriptor
+        check_cudnn_error(
+            cudnnSetConvolution2dDescriptor(
+                meta_ptr[].ptr_conv_desc,
+                pad_h, pad_w,
+                stride_h, stride_w,
+                dil_h, dil_w,
+                cudnnConvolutionMode_t.CUDNN_CROSS_CORRELATION,
+                cudnnDataType_t.CUDNN_DATA_FLOAT,
+            )
         )
-    )
-
-    check_cudnn_error(
-        cudnnSetConvolutionGroupCount(ptr_meta[].ptr_conv_desc, num_groups)
-    )
-
-    check_cudnn_error(
-        cudnnSetTensor4dDescriptor(
-            ptr_meta[].ptr_output_desc,
-            cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
-            get_cudnn_dtype[output_type](),
-            output.dim[0](),
-            output.dim[3](),
-            output.dim[1](),
-            output.dim[2](),
+        
+        check_cudnn_error(
+            cudnnSetConvolutionMathType(
+                meta_ptr[].ptr_conv_desc,
+                cudnnMathType_t.CUDNN_DEFAULT_MATH,
+            )
         )
-    )
 
-    var alpha = Float32(1.0)
-    var beta = Float32(0.0)
+        check_cudnn_error(
+            cudnnSetConvolutionGroupCount(
+                meta_ptr[].ptr_conv_desc,
+                num_groups
+            )
+        )
+        
+        # Update Output Descriptor (NHWC)
+        check_cudnn_error(
+            cudnnSetTensor4dDescriptor(
+                meta_ptr[].ptr_output_desc,
+                cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
+                get_cudnn_dtype[output_type](),
+                out_n, out_c, out_h, out_w,
+            )
+        )
+        
+        # Algorithm Autotuning
+        # Disabling autotuning for now as it causes thrashing in VAE loop
+        # var requested_algo_count: Int16 = 1
+        # var returned_algo_count: Int16 = 0
+        # var perf_result_ptr = UnsafePointer[cudnnConvolutionFwdAlgoPerf_t].alloc(1)
+        
+        # check_cudnn_error(
+        #     cudnnGetConvolutionForwardAlgorithm_v7(
+        #         meta_ptr[].ptr_handle,
+        #         meta_ptr[].ptr_input_desc,
+        #         meta_ptr[].ptr_filter_desc,
+        #         meta_ptr[].ptr_conv_desc,
+        #         meta_ptr[].ptr_output_desc,
+        #         requested_algo_count,
+        #         UnsafePointer(to=returned_algo_count),
+        #         perf_result_ptr,
+        #     )
+        # )
+        
+        # if returned_algo_count > 0:
+        #     meta_ptr[].best_algo = perf_result_ptr[].algo
+        # else:
+        meta_ptr[].best_algo = cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+        
+        # perf_result_ptr.free()
+        
+        # Query workspace size
+        var ws_size: Int = 0
+        check_cudnn_error(
+            cudnnGetConvolutionForwardWorkspaceSize(
+                meta_ptr[].ptr_handle,
+                meta_ptr[].ptr_input_desc,
+                meta_ptr[].ptr_filter_desc,
+                meta_ptr[].ptr_conv_desc,
+                meta_ptr[].ptr_output_desc,
+                meta_ptr[].best_algo,
+                UnsafePointer(to=ws_size)
+            )
+        )
+        meta_ptr[].workspace_size = ws_size
+        
+        # Allocate workspace
+        if ws_size > 0 and meta_ptr[].workspace_capacity < ws_size:
+            if meta_ptr[].workspace_capacity > 0:
+                var free_ret = cudaFree(meta_ptr[].workspace_ptr)
+                check_cuda_error(free_ret)
+                
+            var new_ptr = OpaquePointer()
+            var alloc_ret = cudaMalloc(UnsafePointer(to=new_ptr), ws_size)
+            check_cuda_error(alloc_ret)
+            
+            meta_ptr[].workspace_ptr = new_ptr
+            meta_ptr[].workspace_capacity = ws_size
+        
+        # Update Cache State
+        meta_ptr[].is_set = True
+        meta_ptr[].in_n = in_n; meta_ptr[].in_h = in_h; meta_ptr[].in_w = in_w; meta_ptr[].in_c = in_c
+        meta_ptr[].filt_k = filt_k; meta_ptr[].filt_c = filt_c; meta_ptr[].filt_r = filt_r; meta_ptr[].filt_s = filt_s
+        meta_ptr[].out_n = out_n; meta_ptr[].out_h = out_h; meta_ptr[].out_w = out_w; meta_ptr[].out_c = out_c
+        meta_ptr[].pad_h = pad_h; meta_ptr[].pad_w = pad_w
+        meta_ptr[].stride_h = stride_h; meta_ptr[].stride_w = stride_w
+        meta_ptr[].dil_h = dil_h; meta_ptr[].dil_w = dil_w
 
-    check_cudnn_error(
-        cudnnSetConvolutionMathType(
-            ptr_meta[].ptr_conv_desc,
-            cudnnMathType_t.CUDNN_DEFAULT_MATH,  # this is the line that enables tf32
-        )
-    )
-    # to disable tf32, run export NVIDIA_TF32_OVERRIDE=0 in the environment
-    algo = (
-        cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
-    )
-    var workspace_size_var = 0
-    var workspace_size_ptr = UnsafePointer(to=workspace_size_var)
-    check_cudnn_error(
-        cudnnGetConvolutionForwardWorkspaceSize(
-            ptr_meta[].ptr_handle,
-            ptr_meta[].ptr_input_desc,
-            ptr_meta[].ptr_filter_desc,
-            ptr_meta[].ptr_conv_desc,
-            ptr_meta[].ptr_output_desc,
-            algo,
-            workspace_size_ptr,
-        )
-    )
-    var workspace_buffer = ctx.enqueue_create_buffer[DType.uint8](
-        workspace_size_var
-    )
+    # Execute
+    var use_workspace_ptr = OpaquePointer()
+    if meta_ptr[].workspace_size > 0:
+        use_workspace_ptr = meta_ptr[].workspace_ptr
+    
+    var alpha: Float32 = 1.0
+    var beta: Float32 = 0.0
+    
     check_cudnn_error(
         cudnnConvolutionForward(
-            ptr_meta[].ptr_handle,
+            meta_ptr[].ptr_handle,
             UnsafePointer(to=alpha).bitcast[NoneType](),
-            ptr_meta[].ptr_input_desc,
+            meta_ptr[].ptr_input_desc,
             rebind[OpaquePointer](input.ptr.bitcast[NoneType]()),
-            ptr_meta[].ptr_filter_desc,
+            meta_ptr[].ptr_filter_desc,
             rebind[OpaquePointer](filter.ptr.bitcast[NoneType]()),
-            ptr_meta[].ptr_conv_desc,
-            algo,
-            workspace_buffer.unsafe_ptr().bitcast[NoneType](),
-            workspace_size_var,
+            meta_ptr[].ptr_conv_desc,
+            meta_ptr[].best_algo,
+            use_workspace_ptr,
+            meta_ptr[].workspace_size,
             UnsafePointer(to=beta).bitcast[NoneType](),
-            ptr_meta[].ptr_output_desc,
+            meta_ptr[].ptr_output_desc,
             rebind[OpaquePointer](output.ptr.bitcast[NoneType]()),
         )
     )
-    _ = workspace_buffer^
 
 
 fn conv_cudnn[
