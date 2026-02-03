@@ -120,20 +120,12 @@ def update_context_and_prepare_responses(
             if context.is_done:
                 break
 
-<<<<<<< HEAD
         output = context.to_generation_output()
         if all_layers_hidden_states is not None:
             output = dataclasses.replace(
                 output, hidden_states=all_layers_hidden_states
             )
         res[context.request_id] = output
-=======
-        # Only add the output if there are tokens to return.
-        # It is possible that there are no generated tokens due to chunked prefill.
-        output = context.to_generation_output()
-        if output.tokens:
-            res[context.request_id] = output
->>>>>>> origin
 
     return res
 
