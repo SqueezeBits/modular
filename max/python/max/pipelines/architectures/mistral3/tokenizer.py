@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2025, Modular Inc. All rights reserved.
+# Copyright (c) 2026, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -19,6 +19,7 @@ import json
 import logging
 
 import huggingface_hub
+from huggingface_hub.errors import EntryNotFoundError
 from max.pipelines.lib import TextTokenizer, try_to_load_from_cache
 from max.pipelines.lib.config import PipelineConfig
 
@@ -44,17 +45,43 @@ class Mistral3Tokenizer(TextTokenizer):
         root_model_path: str | None = None,
         **unused_kwargs,
     ) -> None:
-        super().__init__(
-            model_path=model_path,
-            pipeline_config=pipeline_config,
-            revision=revision,
-            max_length=max_length,
-            max_new_tokens=max_new_tokens,
-            trust_remote_code=trust_remote_code,
-        )
-        
-        # Store root_model_path for chat_template loading
-        self._root_model_path = root_model_path
+        # For Flux2 models, tokenizer is in root_model_path/tokenizer subdirectory
+        if root_model_path:
+            from transformers import AutoTokenizer
+            self.model_path = root_model_path
+            self.delegate = AutoTokenizer.from_pretrained(
+                root_model_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                model_max_length=max_length,
+                subfolder="tokenizer",
+            )
+            self.max_length = max_length or self.delegate.model_max_length
+            self._custom_template_provided = False
+            self._enable_llama_whitespace_fix = False
+            self._llama_whitespace_fix_dummy_token_id = None
+            self._llama_whitespace_fix_dummy_token_len = None
+            eos_token_id = self.delegate.eos_token_id
+            self._default_eos_token_ids = set([eos_token_id] if eos_token_id is not None else [])
+            self._context_validators = []
+            if pipeline_config:
+                huggingface_config = pipeline_config.model.huggingface_config
+                if eos_token_id := getattr(huggingface_config, "eos_token_id", None):
+                    if isinstance(eos_token_id, int):
+                        self._default_eos_token_ids.add(eos_token_id)
+                    elif isinstance(eos_token_id, list):
+                        self._default_eos_token_ids.update(eos_token_id)
+            self._root_model_path = root_model_path
+        else:
+            super().__init__(
+                model_path=model_path,
+                pipeline_config=pipeline_config,
+                revision=revision,
+                max_length=max_length,
+                max_new_tokens=max_new_tokens,
+                trust_remote_code=trust_remote_code,
+            )
+            self._root_model_path = None
 
         self._load_and_set_chat_template(
             revision=revision, pipeline_config=pipeline_config
@@ -65,7 +92,7 @@ class Mistral3Tokenizer(TextTokenizer):
         revision: str | None = None,
         pipeline_config: PipelineConfig | None = None,
     ) -> None:
-        """Load chat template from chat_template.json file and set it on the tokenizer."""
+        """Load chat template from chat_template.json or chat_template.jinja file and set it on the tokenizer."""
 
         if revision is None:
             # Prefer revision from pipeline config when not explicitly provided.
@@ -76,162 +103,101 @@ class Mistral3Tokenizer(TextTokenizer):
             )
         revision = revision or "main"
 
-        # Check if model_path is a local file path or HuggingFace repo ID
-        import os
-        from pathlib import Path
-        
+        # For Flux2 models, chat_template is in root_model_path/tokenizer
+        search_repo = self._root_model_path if self._root_model_path else self.model_path
+        tokenizer_prefix = "tokenizer/" if self._root_model_path else ""
+
+        # Try chat_template.json first, then chat_template.jinja
         template_file_path = None
-        is_jinja_file = False
-        
-        # Try both chat_template.json and chat_template.jinja
-        template_files = [
-            ("chat_template.json", False),
-            ("chat_template.jinja", True),
-        ]
-        
-        # First, try to load from local model_path (text_encoder subdirectory)
-        is_local_path = os.path.exists(self.model_path) or Path(self.model_path).exists()
-        if is_local_path:
-            # For local paths, check files directly
-            for filename, is_jinja in template_files:
-                local_file = Path(self.model_path) / filename
-                if local_file.exists():
-                    template_file_path = str(local_file)
-                    is_jinja_file = is_jinja
-                    logger.info(f"Found {filename} at local path: {template_file_path}")
-                    break
-        
-        # If not found locally and root_model_path is available, try from root model
-        if not template_file_path and self._root_model_path:
-            # For HuggingFace repos, try cache first then download
-            # Try both root directory and text_encoder subdirectory
-            search_paths = [
-                "",  # Root directory
-                "text_encoder/",  # text_encoder subdirectory
-            ]
-            for search_path in search_paths:
-                for filename, is_jinja in template_files:
-                    full_filename = search_path + filename if search_path else filename
-                    try:
-                        cached_path = try_to_load_from_cache(
-                            repo_id=self._root_model_path,
-                            filename=full_filename,
-                            revision=revision,
-                        )
-                        # try_to_load_from_cache returns object() singleton if file not found
-                        if cached_path and isinstance(cached_path, (str, os.PathLike)):
-                            template_file_path = cached_path
-                            is_jinja_file = is_jinja
-                            break
-                    except (ValueError, Exception):
-                        pass
-                if template_file_path:
-                    break
-            
-            # If not in cache, try to download
-            if not template_file_path:
-                for search_path in search_paths:
-                    for filename, is_jinja in template_files:
-                        full_filename = search_path + filename if search_path else filename
-                        try:
-                            template_file_path = huggingface_hub.hf_hub_download(
-                                repo_id=self._root_model_path,
-                                filename=full_filename,
-                                revision=revision,
-                            )
-                            is_jinja_file = is_jinja
-                            logger.info(f"Successfully downloaded {full_filename}")
-                            break
-                        except Exception:
-                            continue
-                    if template_file_path:
-                        break
-        
-        # If still not found, try model_path as HuggingFace repo ID
-        if not template_file_path and not is_local_path:
-            for filename, is_jinja in template_files:
+        for filename_suffix in [".json", ".jinja"]:
+            search_filename = f"{tokenizer_prefix}chat_template{filename_suffix}"
+
+            # Try to load from cache first
+            template_file_path = try_to_load_from_cache(
+                repo_id=search_repo,
+                filename=search_filename,
+                revision=revision,
+            )
+
+            # Check if file was found in cache
+            # try_to_load_from_cache returns object() singleton when file doesn't exist
+            if not template_file_path or not isinstance(template_file_path, str):
+                logger.info(
+                    f"{search_filename} not in cache, attempting to download..."
+                )
                 try:
-                    cached_path = try_to_load_from_cache(
-                        repo_id=self.model_path,
-                        filename=filename,
+                    template_file_path = huggingface_hub.hf_hub_download(
+                        repo_id=search_repo,
+                        filename=search_filename,
                         revision=revision,
                     )
-                    # try_to_load_from_cache returns object() singleton if file not found
-                    if cached_path and isinstance(cached_path, (str, os.PathLike)):
-                        template_file_path = cached_path
-                        is_jinja_file = is_jinja
-                        break
-                except (ValueError, Exception):
-                    pass
-            
-            if not template_file_path:
-                for filename, is_jinja in template_files:
-                    try:
-                        template_file_path = huggingface_hub.hf_hub_download(
-                            repo_id=self.model_path,
-                            filename=filename,
-                            revision=revision,
-                        )
-                        is_jinja_file = is_jinja
-                        logger.info(f"Successfully downloaded {filename}")
-                        break
-                    except Exception as e:
-                        if filename == template_files[-1][0]:  # Last file to try
-                            raise RuntimeError(
-                                f"Failed to download 'chat_template.json' or 'chat_template.jinja' "
-                                f"from model repo '{self.model_path}' at revision '{revision}': {e}"
-                            ) from e
-                        continue
-
-        # If no template file found, use tokenizer's default if available
-        if not template_file_path:
-            if hasattr(self.delegate, "chat_template") and self.delegate.chat_template:
-                logger.info(
-                    f"No chat template file found, using tokenizer's default for {self.model_path}"
-                )
-                return
+                    logger.info(f"Successfully downloaded {search_filename}")
+                    break  # Found the file, exit the loop
+                except EntryNotFoundError:
+                    # File doesn't exist, try next format
+                    logger.debug(
+                        f"{search_filename} not found, trying alternative format..."
+                    )
+                    template_file_path = None
+                    continue
+                except Exception as e:
+                    # Other errors should be raised
+                    raise RuntimeError(
+                        f"Failed to download '{search_filename}' from model repo '{search_repo}' "
+                        f"at revision '{revision}': {e}"
+                    ) from e
             else:
-                raise RuntimeError(
-                    f"Failed to find 'chat_template.json' in model path '{self.model_path}' "
-                    f"or root model path '{self._root_model_path}'"
-                )
+                # Found in cache
+                break
+
+        # If no template file found, use tokenizer's default
+        if not template_file_path:
+            logger.warning(
+                f"Neither chat_template.json nor chat_template.jinja found in {search_repo}. "
+                f"Using tokenizer's default chat template."
+            )
+            return
 
         # Load and set the chat template
         try:
             with open(template_file_path, encoding="utf-8") as f:
-                if is_jinja_file:
-                    chat_template = f.read().strip()
-                else:
-                    content = f.read().strip()
-                    
-                    # Check if file is empty
-                    if not content:
-                        logger.warning(
-                            f"chat_template.json is empty at {template_file_path}, "
-                            "using tokenizer's default if available"
-                        )
-                        if hasattr(self.delegate, "chat_template") and self.delegate.chat_template:
-                            return
-                        else:
-                            raise ValueError(
-                                f"chat_template.json is empty and tokenizer has no default "
-                                f"template at {template_file_path}"
-                            )
-                    
-                    template_data = json.loads(content)
-                    chat_template = template_data.get("chat_template")
+                template_content = f.read()
 
-                    if not chat_template:
-                        raise KeyError(
-                            f"No 'chat_template' key found in {template_file_path} for model {self.model_path}"
-                        )
+            # Try to parse as JSON and extract chat_template if present
+            try:
+                template_data = json.loads(template_content)
+                if isinstance(template_data, dict) and "chat_template" in template_data:
+                    chat_template = template_data["chat_template"]
+                    logger.info(
+                        f"Loaded chat_template from JSON in {template_file_path} "
+                        f"({len(chat_template)} characters)"
+                    )
+                else:
+                    # JSON but no chat_template key, use entire content
+                    chat_template = template_content
+                    logger.info(
+                        f"Loaded chat template from {template_file_path} "
+                        f"({len(template_content)} characters, JSON without chat_template key)"
+                    )
+            except json.JSONDecodeError:
+                # Not valid JSON (e.g., .jinja file), use entire content as template
+                chat_template = template_content
+                logger.info(
+                    f"Loaded chat template from {template_file_path} "
+                    f"({len(template_content)} characters, non-JSON format)"
+                )
+
+            if not chat_template:
+                raise ValueError(
+                    f"Empty chat template loaded from {template_file_path}"
+                )
 
             self.delegate.chat_template = chat_template
             logger.info(
-                f"Loaded custom chat template from {template_file_path}"
+                f"Successfully set chat template on tokenizer from {template_file_path}"
             )
 
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, UnicodeDecodeError) as e:
             raise ValueError(
-                f"Failed to load chat template from {template_file_path}: {e}"
+                f"Failed to read chat template from {template_file_path}: {e}"
             ) from e

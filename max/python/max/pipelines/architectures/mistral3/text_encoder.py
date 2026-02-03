@@ -93,7 +93,7 @@ class Mistral3TextEncoderModel(ComponentModel):
 
         # Text encoder uses single forward pass, so minimal KV cache is sufficient
         self.device_memory_utilization = config.get(
-            "device_memory_utilization", 0.3
+            "device_memory_utilization", 0.5
         )
 
         # Lazy initialization attributes (set in load_model)
@@ -162,8 +162,9 @@ class Mistral3TextEncoderModel(ComponentModel):
             return_hidden_states=ReturnHiddenStates.ALL_LAYERS,
         )
 
+        tokenizer_path = self._root_model_path if self._root_model_path else self._text_encoder_path
         self._tokenizer = Mistral3Tokenizer(
-            model_path=self._text_encoder_path,
+            model_path=tokenizer_path,
             pipeline_config=self._pipeline_config,
             root_model_path=self._root_model_path,
         )
