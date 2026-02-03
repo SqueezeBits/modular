@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+from pathlib import Path
 
 import numpy as np
 from max.driver import DeviceSpec
@@ -96,7 +97,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=3.5,
+        default=4.0,
         help="Guidance scale for classifier-free guidance. Set to 1.0 to disable CFG.",
     )
     parser.add_argument(
@@ -111,6 +112,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="output.png",
         help="Output filename for the generated image.",
     )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Optional input image path for image-to-image generation (Flux2 only).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -124,6 +131,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "num-inference-steps must be a positive integer."
     )
     assert args.guidance_scale > 0.0, "guidance-scale must be positive."
+    
+    # Validate image input
+    if args.image is not None:
+        image_path = Path(args.image)
+        assert image_path.exists(), f"Image file not found: {args.image}"
+        assert image_path.is_file(), f"Image path is not a file: {args.image}"
 
     return args
 
@@ -151,6 +164,30 @@ def save_image(pixel_data: np.ndarray, output_path: str) -> None:
         print(f"Pixel data saved to: {output_path.replace('.png', '.npy')}")
 
 
+def load_and_preprocess_image(image_path: str | None) -> "PIL.Image.Image | None":
+    """Load and preprocess input image for image-to-image generation.
+
+    Args:
+        image_path: Path to the input image file.
+
+    Returns:
+        PIL Image object or None if no image path provided.
+    """
+    if image_path is None:
+        return None
+
+    try:
+        from PIL import Image
+
+        image = Image.open(image_path)
+        # Convert to RGB if necessary
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        return image
+    except Exception as e:
+        raise ValueError(f"Failed to load image from {image_path}: {e}")
+
+
 async def generate_image(args: argparse.Namespace) -> None:
     """Main generation logic.
 
@@ -158,6 +195,11 @@ async def generate_image(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments
     """
     print(f"Loading model: {args.model}")
+
+    # Step 0: Load input image if provided
+    input_image = load_and_preprocess_image(args.image)
+    if input_image is not None:
+        print(f"Loaded input image: {input_image.size[0]}x{input_image.size[1]} pixels")
 
     # Step 1: Initialize pipeline configuration
     # defer_resolve=True prevents automatic model resolution/loading
@@ -181,10 +223,18 @@ async def generate_image(args: argparse.Namespace) -> None:
     # The pipeline executes the diffusion model
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
-        pipeline_model=Flux2Pipeline if is_flux2 else FluxPipeline,
+        pipeline_model=Flux2Pipeline,
     )
 
-    print(f"Generating image for prompt: '{args.prompt}'")
+    if input_image is not None:
+        print(f"Generating image-to-image for prompt: '{args.prompt}'")
+        # Use input image dimensions if height/width not specified
+        if args.height is None:
+            args.height = input_image.size[1]
+        if args.width is None:
+            args.width = input_image.size[0]
+    else:
+        print(f"Generating image for prompt: '{args.prompt}'")
 
     # Step 4: Create a PixelGenerationRequest
     request = PixelGenerationRequest(
@@ -202,15 +252,19 @@ async def generate_image(args: argparse.Namespace) -> None:
     print(
         f"Parameters: steps={args.num_inference_steps}, guidance={args.guidance_scale}"
     )
+    if input_image is not None:
+        print("Image-to-image generation enabled")
 
     # Step 5: Create a PixelContext object from the request
     # The tokenizer handles prompt tokenization, timestep scheduling,
-    # latent initialization, and all other preprocessing
-    context = await tokenizer.new_context(request)
+    # latent initialization, image preprocessing, and all other preprocessing
+    context = await tokenizer.new_context(request, input_image=input_image)
 
     print(
         f"Context created: {context.height}x{context.width}, {context.num_inference_steps} steps"
     )
+    if context.input_image is not None:
+        print("Input image preprocessed and stored in context for image-to-image generation")
 
     # Step 6: Prepare inputs for the pipeline
     # Create a batch with a single context
@@ -239,7 +293,6 @@ async def generate_image(args: argparse.Namespace) -> None:
     pixel_data = output.pixel_data
 
     # Step 10: Save the image
-    # Take the first image if multiple were generated
     if pixel_data.shape[0] > 0:
         save_image(pixel_data[0], args.output)
     else:
