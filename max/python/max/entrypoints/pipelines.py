@@ -454,6 +454,12 @@ def diffusion_group() -> None:
     show_default=True,
     help="Random seed for torch-based latent initialization.",
 )
+@click.option(
+    "--benchmark",
+    is_flag=True,
+    default=False,
+    help="Enable benchmarking: 2 warm-ups + 5 timed runs, report average.",
+)
 def diffusion_generate(
     prompt: str,
     height: int,
@@ -464,15 +470,19 @@ def diffusion_generate(
     output: Path,
     use_torch_randn: bool,
     seed: int,
+    benchmark: bool,
     **config_kwargs: Any,
 ) -> None:
-    """Generate images using a diffusion pipeline."""
+    """
+    Generate images using a diffusion pipeline.
+    Example: ./bazelw run //max/python/max/entrypoints:pipelines_diffusion -- generate --benchmark
+    """
     from max.entrypoints.cli.generate import generate_image
     from max.experimental.realization_context import set_seed
     from max.pipelines import PipelineConfig
 
     set_seed(seed)
-    pipeline_config = PipelineConfig(**config_kwargs)
+    pipeline_config = PipelineConfig(model_path="black-forest-labs/FLUX.1-dev")
     pipeline_config.log_basic_config()
 
     try:
@@ -485,6 +495,7 @@ def diffusion_generate(
             guidance_scale=guidance_scale,
             num_images_per_prompt=num_images_per_prompt,
             output=output,
+            benchmark=benchmark,
         )
     except Exception as exc:
         logger.exception(

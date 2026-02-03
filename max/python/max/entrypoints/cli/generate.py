@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -170,18 +171,57 @@ def generate_image(
     guidance_scale: float,
     num_images_per_prompt: int,
     output: Path,
+    benchmark: bool = False,
 ) -> None:
     from ..diffusion import DiffusionPipeline
 
     pipeline = DiffusionPipeline(pipeline_config)
-    result = pipeline(
-        prompt=prompt,
-        height=height,
-        width=width,
-        num_inference_steps=num_inference_steps,
-        guidance_scale=guidance_scale,
-        num_images_per_prompt=num_images_per_prompt,
-    )
+
+    def run_pipeline() -> Any:
+        return pipeline(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+        )
+
+    if benchmark:
+        num_warmups = 0
+        num_benchmark_runs = 2
+
+        print(f"\n{'='*60}")
+        print("BENCHMARK MODE")
+        print(f"{'='*60}")
+
+        # Warm-up runs
+        print(f"\nRunning {num_warmups} warm-up iterations...")
+        for i in range(num_warmups):
+            print(f"  Warm-up {i + 1}/{num_warmups}...")
+            run_pipeline()
+
+        # Benchmark runs
+        print(f"\nRunning {num_benchmark_runs} benchmark iterations...")
+        times: list[float] = []
+        for i in range(num_benchmark_runs):
+            start = time.perf_counter()
+            result = run_pipeline()
+            elapsed = time.perf_counter() - start
+            times.append(elapsed)
+            print(f"  Run {i + 1}/{num_benchmark_runs}: {elapsed:.4f}s")
+
+        # Report results
+        avg_time = sum(times) / len(times)
+        print(f"\n{'='*60}")
+        print("BENCHMARK RESULTS")
+        print(f"{'='*60}")
+        print(f"  Individual times: {', '.join(f'{t:.4f}s' for t in times)}")
+        print(f"  Average time:     {avg_time:.4f}s")
+        print(f"{'='*60}\n")
+
+    else:
+        result = run_pipeline()
 
     images = result.images
     assert images, "Expected at least one generated image."
