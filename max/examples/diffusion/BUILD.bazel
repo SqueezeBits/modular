@@ -14,6 +14,6 @@ modular_py_binary(
         requirement("numpy"),
         requirement("pillow"),
         requirement("sentencepiece"),
-        requirement("torch"), # for test
+        requirement("torch"),  # for test
     ],
 )

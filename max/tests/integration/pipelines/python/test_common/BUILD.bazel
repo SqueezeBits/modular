@@ -293,6 +293,9 @@ modular_py_library(
         requirement("numpy"),
         requirement("rich"),
         requirement("scipy"),
+        requirement("torch"),
+        requirement("torchmetrics"),  # Unified package for SSIM, LPIPS, and other metrics
+        requirement("torchvision"),  # Required for FID computation
     ],
 )
 

@@ -44,7 +44,7 @@ from run_models import (
 from test_common import (
     numpy_encoder,
 )
-from test_common.evaluate import NUM_STEPS, ModelOutput
+from test_common.evaluate import ModelOutput
 from test_common.github_utils import github_log_group
 
 # This is far from a universal standard, but this is the closest to a standard
@@ -230,7 +230,7 @@ def generate_llm_logits(
         num_steps = 1
     else:
         inputs = pipeline_oracle.inputs
-        num_steps = NUM_STEPS
+        num_steps = 50
 
     evaluation_batch_size: int | list[int]
     if max_batch_size is None:
