@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import time
 
 import numpy as np
 from max.driver import DeviceSpec
@@ -240,7 +241,10 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
+    t0 = time.time()
     outputs = pipeline.execute(inputs)
+    latency = time.time() - t0
+    print(f"Latency: {latency:.4f}s")
 
     # Step 8: Get the output for our request
     output = outputs[context.request_id]
