@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -174,9 +174,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         model_path=args.model,
         pipeline_config=config,
         subfolder="tokenizer",  # Tokenizer is in a subfolder for diffusion models
-        max_length=77,  # Standard max length for CLIP-based encoders
         subfolder_2="tokenizer_2",
-        secondary_max_length=512,  # Standard max length for T5 encoders
     )
 
     # Step 3: Initialize the pipeline
