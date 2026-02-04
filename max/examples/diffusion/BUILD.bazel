@@ -17,3 +17,86 @@ modular_py_binary(
         requirement("torch"),
     ],
 )
+load("//bazel:api.bzl", "modular_py_binary", "requirement")
+
+package(default_visibility = ["//visibility:private"])
+
+modular_py_binary(
+    name = "simple_offline_generation",
+    srcs = ["simple_offline_generation.py"],
+    tags = ["no-pydeps"],  # TODO: Fix and re-enable
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("jinja2"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "benchmark_flux2_vs_torch",
+    srcs = ["benchmark_flux2_vs_torch.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("torch"),
+        requirement("diffusers"),
+    ],
+)
+
+modular_py_binary(
+    name = "benchmark_overhead",
+    srcs = ["benchmark_overhead.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("torch"),
+        requirement("tqdm"),
+    ],
+)
+
+modular_py_binary(
+    name = "benchmark_vae_latency",
+    srcs = ["benchmark_vae_latency.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("torch"),
+        requirement("diffusers"),
+    ],
+)
+
+modular_py_binary(
+    name = "profile_flux2_components",
+    srcs = ["profile_flux2_components.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("torch"),
+        requirement("diffusers"),
+    ],
+)
