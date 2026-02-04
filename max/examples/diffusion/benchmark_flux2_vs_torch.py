@@ -169,4 +169,4 @@ if __name__ == "__main__":
     if args.framework in ["max", "both"]:
         print(f"MAX:       {max_time:.2f} ms")
     if args.framework == "both" and diffusers_time > 0 and max_time > 0:
-        print(f"Speedup:   {diffusers_time / max_time:.2fx}")
+        print(f"Speedup:   {diffusers_time / max_time:.2f}")
