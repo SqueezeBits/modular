@@ -81,3 +81,16 @@ modular_py_binary(
         requirement("diffusers"),
     ],
 )
+
+modular_py_binary(
+    name = "benchmark_scalar_upload",
+    srcs = ["benchmark_scalar_upload.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+    ],
+)

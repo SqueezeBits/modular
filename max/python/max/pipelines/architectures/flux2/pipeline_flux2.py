@@ -19,7 +19,7 @@ import numpy as np
 import PIL.Image
 from max import functional as F
 from max import random
-from max.driver import Accelerator, DeviceSpec
+from max.driver import Accelerator, Buffer as DriverTensor, DeviceSpec
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
@@ -525,37 +525,13 @@ class Flux2Pipeline(DiffusionPipeline):
             Tensor.from_dlpack(self._sigmas_cpu)
             .to(self.transformer.devices[0])
         )
-        batch_size = prompt_embeds.shape[0].dim
-
         timesteps: np.ndarray = self.scheduler.timesteps
         num_timesteps = timesteps.shape[0]
-
-        # Pre-create all timestep tensors on GPU to avoid per-step CPU→GPU transfer
-        timestep_tensors_drv = []
-        for t in timesteps:
-            timestep_np = np.full((batch_size,), t, dtype=np.float32) / 1000.0
-            timestep_tensor = (
-                Tensor.from_dlpack(timestep_np)
-                .to(self.transformer.devices[0])
-                .cast(dtype)
-            )
-            timestep_tensors_drv.append(timestep_tensor.driver_tensor)
-
-        # Pre-create all dt tensors on GPU for compiled scheduler step
-        dt_tensors_drv = []
-        for i in range(num_timesteps):
-            dt_val = float(self._sigmas_cpu[i + 1] - self._sigmas_cpu[i])
-            dt_np = np.array(dt_val, dtype=np.float32)
-            dt_tensor = (
-                Tensor.from_dlpack(dt_np)
-                .to(self.transformer.devices[0])
-                .cast(dtype)
-            )
-            dt_tensors_drv.append(dt_tensor.driver_tensor)
 
         # Compile transformer once before loop
         image_seq_len = latents.shape[1].dim
         text_seq_len = prompt_embeds.shape[1].dim
+        batch_size = latents.shape[0]
         compiled_model = self.transformer._ensure_compiled(
             batch_size=batch_size,
             image_seq_len=image_seq_len,
@@ -563,8 +539,8 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
         # Build scheduler step graph if not already built
+        device = self.transformer.devices[0]
         if self._scheduler_step_model is None:
-            device = self.transformer.devices[0]
             self._build_scheduler_step_graph(dtype, device)
 
         # Pre-convert unchanging tensors to driver_tensor
@@ -579,9 +555,20 @@ class Flux2Pipeline(DiffusionPipeline):
         for i in tqdm(range(num_timesteps), desc="Denoising"):
             self._current_timestep = i
 
-            # Use pre-created tensors (no per-step conversion)
-            timestep_drv = timestep_tensors_drv[i]
-            dt_drv = dt_tensors_drv[i]
+            # Calculate dt in Python (CPU)
+            t = self.scheduler.timesteps[i]
+            dt = self._sigmas_cpu[i + 1] - self._sigmas_cpu[i]
+
+            # Manual float32 -> bfloat16 conversion (truncation) to avoid Tensor.cast overhead
+            # 1. View as uint32, shift right 16 bits to get top 16 bits (bfloat16)
+            # 2. Ensure shape is [1] (1D array of size 1)
+            t_u16 = (np.array(t / 1000.0, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
+            dt_u16 = (np.array(dt, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
+
+            # 3. Create uint16 Buffer -> View as bfloat16
+            timestep_drv = DriverTensor.from_dlpack(t_u16).to(device).view(DType.bfloat16)
+            dt_drv = DriverTensor.from_dlpack(dt_u16).to(device).view(DType.bfloat16, shape=[])
+
 
             # Transformer forward pass
             noise_pred_drv = compiled_model(

@@ -13,7 +13,8 @@ try:
 except ImportError:
     DiffusersFlux2Pipeline = None
 
-from max.driver import DeviceSpec
+from max.driver import DeviceSpec, Accelerator, Buffer as DriverTensor
+from max.dtype import DType
 from max.pipelines import PipelineConfig
 from max.pipelines.architectures.flux2.pipeline_flux2 import Flux2Pipeline, Flux2ModelInputs, Flux2PipelineOutput, FluxMistral3TextEncoder
 from max.tensor import Tensor
@@ -95,28 +96,7 @@ class ProfiledFlux2Pipeline(Flux2Pipeline):
         timesteps: np.ndarray = model_inputs.timesteps
         num_timesteps = timesteps.shape[0]
 
-        # Pre-create all timestep tensors on GPU to avoid per-step CPU→GPU transfer
-        timestep_tensors_drv = []
-        for t in timesteps:
-            timestep_np = np.full((batch_size,), t, dtype=np.float32) / 1000.0
-            timestep_tensor = (
-                Tensor.from_dlpack(timestep_np)
-                .to(self.transformer.devices[0])
-                .cast(dtype)
-            )
-            timestep_tensors_drv.append(timestep_tensor.driver_tensor)
-
-        # Pre-create all dt tensors on GPU for compiled scheduler step
-        dt_tensors_drv = []
-        for i in range(num_timesteps):
-            dt_val = float(self._sigmas_cpu[i + 1] - self._sigmas_cpu[i])
-            dt_np = np.array(dt_val, dtype=np.float32)
-            dt_tensor = (
-                Tensor.from_dlpack(dt_np)
-                .to(self.transformer.devices[0])
-                .cast(dtype)
-            )
-            dt_tensors_drv.append(dt_tensor.driver_tensor)
+        # DriverTensor approach: No pre-creation loops needed here
 
         # Compile
         t0 = time.time()
@@ -144,9 +124,14 @@ class ProfiledFlux2Pipeline(Flux2Pipeline):
             t0_step = time.time()
             self._current_timestep = i
 
-            # Use pre-created timestep tensor (no CPU→GPU transfer per step)
-            timestep_drv = timestep_tensors_drv[i]
-            dt_drv = dt_tensors_drv[i]
+            # Manual float32 -> bfloat16 conversion (truncation) to avoid Tensor.cast overhead
+            t = timesteps[i]
+            dt = self._sigmas_cpu[i + 1] - self._sigmas_cpu[i]
+            t_u16 = (np.array(t / 1000.0, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
+            dt_u16 = (np.array(dt, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
+
+            timestep_drv = DriverTensor.from_dlpack(t_u16).to(self.transformer.devices[0]).view(DType.bfloat16)
+            dt_drv = DriverTensor.from_dlpack(dt_u16).to(self.transformer.devices[0]).view(DType.bfloat16, shape=[])
 
             latents_drv = latents.driver_tensor
 
