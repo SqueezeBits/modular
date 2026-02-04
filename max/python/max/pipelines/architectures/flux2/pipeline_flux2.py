@@ -35,7 +35,7 @@ from max.tensor import Tensor
 from tqdm import tqdm
 
 from ..autoencoders import AutoencoderKLFlux2Model
-from ..mistral3 import Mistral3TextEncoderModel
+from ..mistral3.text_encoder import Mistral3TextEncoderModel
 from ..mistral3.tokenizer import Mistral3Tokenizer
 from .model import Flux2Model
 from .system_messages import SYSTEM_MESSAGE
@@ -213,7 +213,10 @@ class Flux2Pipeline(DiffusionPipeline):
         if max_sequence_length is None:
             max_sequence_length = int(tokens.array.shape[-1])
         
-        hidden_states_tuple = self.text_encoder(tokens)
+        text_input_ids = Tensor.constant(
+            tokens.array, dtype=DType.int64, device=self.text_encoder.devices[0]
+        )
+        hidden_states_tuple = self.text_encoder(text_input_ids)
 
         if not isinstance(hidden_states_tuple, tuple):
             raise ValueError(
