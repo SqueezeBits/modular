@@ -287,17 +287,16 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
                         quant_conv_input_type, weights=quant_conv_state_dict
                     )
 
-        # Convert BatchNorm statistics to Tensor in lazy context
+        # Convert BatchNorm statistics to Tensor (keep eager)
         if bn_mean_data is not None or bn_var_data is not None:
-            with F.lazy():
-                if bn_mean_data is not None:
-                    self.bn_running_mean = Tensor.from_dlpack(bn_mean_data).to(
-                        self.devices[0]
-                    )
-                if bn_var_data is not None:
-                    self.bn_running_var = Tensor.from_dlpack(bn_var_data).to(
-                        self.devices[0]
-                    )
+            if bn_mean_data is not None:
+                self.bn_running_mean = Tensor.from_dlpack(bn_mean_data).to(
+                    self.devices[0]
+                )
+            if bn_var_data is not None:
+                self.bn_running_var = Tensor.from_dlpack(bn_var_data).to(
+                    self.devices[0]
+                )
 
         return self.model
 

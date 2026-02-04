@@ -755,27 +755,22 @@ class Flux2Pipeline(DiffusionPipeline):
         batch_size = latents.shape[0].dim
         seq_len = latents.shape[1].dim
         num_channels = latents.shape[2].dim
-        # Workaround for symbolic/lazy tensors: force eager evaluation
-        # By adding 0.0, we force execution and get a fresh Eager Tensor
+        # BN stats are already eager tensors from load_model()
         bn_mean = self.vae.bn.running_mean
         bn_var = self.vae.bn.running_var
-
-        zero = Tensor.zeros([1], dtype=latents.dtype, device=latents.device)
-        bn_mean = bn_mean + zero
-        bn_var = bn_var + zero
-
+        
         # Compile/Cache fused graph
         model = self._ensure_vae_prep_model(
              batch_size, seq_len, num_channels, h_latent, w_latent, 
              latents.device, latents.dtype
         )
-
+        
         # Execute fused graph
         # Returns latents_unpacked as DriverTensor
         latents_unpacked_drv = model.execute(
              latents.driver_tensor, bn_mean.driver_tensor, bn_var.driver_tensor
         )[0]
-
+        
         # VAE decode
         image = self.vae.decode(latents_unpacked_drv)
 

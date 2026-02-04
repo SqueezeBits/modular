@@ -94,3 +94,17 @@ modular_py_binary(
         requirement("numpy"),
     ],
 )
+
+modular_py_binary(
+    name = "benchmark_vae_prep",
+    srcs = ["benchmark_vae_prep.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("torch"),
+    ],
+)

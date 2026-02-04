@@ -244,7 +244,23 @@ async def profile_flux2(model_path, num_steps=10):
     )
     print(f"Preparation time (Tokenizer + Init): {(time.time() - t0_prepare)*1000:.2f} ms")
     
-    print("Executing pipeline...")
+    # Run a full e2e warmup pass to compile all graphs (incl. VAE)
+    print("Running warmup pass (untimed)...")
+    pipeline.execute(inputs)
+    print("Warmup complete.")
+    
+    # Reset profiling stats for the actual timed run
+    pipeline._pipeline_model.profiling_stats = {
+        "prompt_encoding": [],
+        "compilation": [],
+        "transformer_forward": [],
+        "scheduler_step": [],
+        "denoising_step": [],
+        "vae_decode": [],
+        "total_execute": [],
+    }
+    
+    print("Executing pipeline (timed)...")
     pipeline.execute(inputs)
     
     # Extract stats from the internal model
