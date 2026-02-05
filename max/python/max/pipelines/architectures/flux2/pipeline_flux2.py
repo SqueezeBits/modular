@@ -322,10 +322,12 @@ class Flux2Pipeline(DiffusionPipeline):
         self._pack_models: dict[str, Any] = {}
         self._prompt_embed_models: dict[str, Any] = {}
         self._latent_prep_models: dict[str, Any] = {}
+        self._unsqueeze_models: dict[str, Any] = {}  # For layer tensor unsqueezing
         
         # Cache for invariant tensors (to avoid Tensor.full and Tensor.from_dlpack overhead)
         self._cached_guidance: dict[str, Tensor] = {}
         self._cached_latent_image_ids: dict[str, Tensor] = {}
+        self._cached_text_ids: dict[str, Tensor] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
@@ -530,6 +532,34 @@ class Flux2Pipeline(DiffusionPipeline):
         session = InferenceSession([Accelerator()])
         model = session.load(graph)
         self._prompt_embed_models[key] = model
+        return model
+
+    def _ensure_unsqueeze_model(
+        self,
+        seq_len: int,
+        hidden_dim: int,
+        device: DeviceRef,
+        dtype: DType,
+    ):
+        """Compile unsqueeze graph: (seq_len, hidden_dim) -> (1, seq_len, hidden_dim).
+        
+        This avoids the ~185ms overhead per F.reshape call on eager tensors.
+        """
+        key = f"{seq_len}_{hidden_dim}_{device}_{dtype}"
+        if key in self._unsqueeze_models:
+            return self._unsqueeze_models[key]
+
+        input_type = TensorType(dtype, shape=[seq_len, hidden_dim], device=device)
+        
+        with Graph("unsqueeze_layer", input_types=[input_type]) as graph:
+            tensor_in = graph.inputs[0]
+            # Unsqueeze at batch dimension: (seq_len, hidden_dim) -> (1, seq_len, hidden_dim)
+            result = ops.reshape(tensor_in, [1, seq_len, hidden_dim])
+            graph.output(result)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._unsqueeze_models[key] = model
         return model
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
@@ -786,7 +816,7 @@ class Flux2Pipeline(DiffusionPipeline):
         # Extract specific layers and stack them
         layer_tensors = []
         max_sequence_length = tokens.array.shape[-1]
-        for k in hidden_states_layers:
+        for i, k in enumerate(hidden_states_layers):
             layer_idx = k - 1  # Convert 1-based to 0-based
             if layer_idx >= len(hidden_states_tuple):
                 raise ValueError(
@@ -801,9 +831,12 @@ class Flux2Pipeline(DiffusionPipeline):
                 hs = Tensor.from_dlpack(hs)
 
             # Handle sequence length padding/truncation
-            if hs.rank == 2:
-                real_seq_len = hs.shape[0].dim
-                hidden_dim = hs.shape[1].dim
+            tensor_rank = hs.rank
+            if tensor_rank == 2:
+                # Use driver_tensor.shape for fast shape access (avoids GPU sync)
+                drv_shape = hs.driver_tensor.shape
+                real_seq_len = drv_shape[0]
+                hidden_dim = drv_shape[1]
                 if real_seq_len < max_sequence_length:
                     padding_size = max_sequence_length - real_seq_len
                     padding = Tensor.zeros(
@@ -814,11 +847,21 @@ class Flux2Pipeline(DiffusionPipeline):
                     hs = F.concat([hs, padding], axis=0)
                 elif real_seq_len > max_sequence_length:
                     hs = hs[:max_sequence_length]
-                hs = F.reshape(hs, [1, max_sequence_length, hidden_dim])
-            elif hs.rank == 3:
-                batch_size = hs.shape[0].dim
-                real_seq_len = hs.shape[1].dim
-                hidden_dim = hs.shape[2].dim
+                # Use compiled unsqueeze graph instead of eager F.reshape
+                unsqueeze_model = self._ensure_unsqueeze_model(
+                    seq_len=max_sequence_length,
+                    hidden_dim=hidden_dim,
+                    device=hs.device,
+                    dtype=hs.dtype,
+                )
+                (hs_out,) = unsqueeze_model.execute(hs.driver_tensor)
+                hs = Tensor.from_dlpack(hs_out)
+            elif tensor_rank == 3:
+                # Use driver_tensor.shape for fast shape access (avoids GPU sync)
+                drv_shape = hs.driver_tensor.shape
+                batch_size = drv_shape[0]
+                real_seq_len = drv_shape[1]
+                hidden_dim = drv_shape[2]
                 if real_seq_len < max_sequence_length:
                     padding_size = max_sequence_length - real_seq_len
                     padding = Tensor.zeros(
@@ -862,13 +905,20 @@ class Flux2Pipeline(DiffusionPipeline):
             (bs_embed.dim * num_images_per_prompt, seq_len_dim, -1)
         )
 
-        # Prepare text position IDs (4D for Flux2)
+        # Prepare text position IDs (4D for Flux2) - use cache if available
         batch_size_final = bs_embed.dim * num_images_per_prompt
-        text_ids = self._prepare_text_ids(
-            batch_size=batch_size_final,
-            seq_len=seq_len.dim if hasattr(seq_len, "dim") else seq_len,
-            device=self.text_encoder.devices[0],
-        )
+        seq_len_val = seq_len.dim if hasattr(seq_len, "dim") else seq_len
+        text_ids_key = f"{batch_size_final}_{seq_len_val}_{self.text_encoder.devices[0]}"
+        
+        if text_ids_key in self._cached_text_ids:
+            text_ids = self._cached_text_ids[text_ids_key]
+        else:
+            text_ids = self._prepare_text_ids(
+                batch_size=batch_size_final,
+                seq_len=seq_len_val,
+                device=self.text_encoder.devices[0],
+            )
+            self._cached_text_ids[text_ids_key] = text_ids
 
         return prompt_embeds, text_ids
 
