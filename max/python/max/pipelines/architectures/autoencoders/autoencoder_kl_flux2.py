@@ -40,7 +40,6 @@ class AutoencoderKLFlux2(Module[[Tensor, Tensor | None], Tensor]):
                 structure, normalization settings, BatchNorm parameters, and device/dtype information.
         """
         super().__init__()
-        # Encoder: images -> latents (mean and logvar)
         self.encoder = Encoder(
             in_channels=config.in_channels,
             out_channels=config.latent_channels,
@@ -55,7 +54,6 @@ class AutoencoderKLFlux2(Module[[Tensor, Tensor | None], Tensor]):
             device=config.device,
             dtype=config.dtype,
         )
-        # Decoder: latents -> images
         self.decoder = Decoder(
             in_channels=config.latent_channels,
             out_channels=config.out_channels,
@@ -134,7 +132,15 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
 
         for key, value in self.weights.items():
             if key in ("bn.running_mean", "bn.running_var"):
-                weight_data = value.data().astype(self.config.dtype)
+                weight_data = value.data()
+                target_dtype = self.config.dtype
+                if weight_data.dtype != target_dtype:
+                    if not weight_data.dtype.is_float() or not target_dtype.is_float():
+                        raise TypeError(
+                            "Weight adapter in VAE only casts between float dtypes (e.g. float32 -> bfloat16). "
+                            f"Got {key}: {weight_data.dtype} -> {target_dtype}."
+                        )
+                    weight_data = weight_data.astype(target_dtype)
                 bn_stats[key] = weight_data.data
 
         bn_mean_data = bn_stats.get("bn.running_mean")
