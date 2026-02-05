@@ -19,7 +19,7 @@ import numpy as np
 import PIL.Image
 from max import functional as F
 from max import random
-from max.driver import Accelerator, Buffer as DriverTensor, DeviceSpec
+from max.driver import Accelerator, Buffer as DriverTensor, DeviceSpec, load_devices
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
@@ -200,7 +200,7 @@ class FluxMistral3TextEncoder(Mistral3TextEncoderModel):
         config = config.copy()
         config["max_length"] = 512
         # Set utilization to 0.35 (just enough for 14GB weights) to check passes via overrides
-        config["device_memory_utilization"] = 0.35
+        config["device_memory_utilization"] = 0.20
         super().__init__(config, **kwargs)
 
     def load_model(self) -> Callable[..., Any]:
@@ -217,6 +217,10 @@ class FluxMistral3TextEncoder(Mistral3TextEncoderModel):
         ]
         # Allow overriding max_length from pipeline config
         max_length = self.config.get("max_length", None)
+
+        # Force load devices to ensure correct memory stats are available
+        # This fixes a regression where lazy loading caused the device to report only ~15GB free
+        _ = load_devices(device_specs)
 
         self._pipeline_config = PipelineConfig(
             model_path=self._text_encoder_path,
