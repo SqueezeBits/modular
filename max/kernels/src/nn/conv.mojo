@@ -3551,7 +3551,7 @@ fn _conv_cudnn[
         check_cudnn_error(
             cudnnSetConvolutionMathType(
                 meta_ptr[].ptr_conv_desc,
-                cudnnMathType_t.CUDNN_DEFAULT_MATH,
+                cudnnMathType_t.CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION,
             )
         )
 
