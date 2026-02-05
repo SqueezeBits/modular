@@ -3573,30 +3573,31 @@ fn _conv_cudnn[
         )
         
         # Algorithm Autotuning
-        # Disabling autotuning for now as it causes thrashing in VAE loop
-        # var requested_algo_count: Int16 = 1
-        # var returned_algo_count: Int16 = 0
-        # var perf_result_ptr = UnsafePointer[cudnnConvolutionFwdAlgoPerf_t].alloc(1)
+        var requested_algo_count: Int16 = 1
+        var returned_algo_count: Int16 = 0
+        var perf_result_ptr = UnsafePointer[cudnnConvolutionFwdAlgoPerf_t].alloc(1)
         
-        # check_cudnn_error(
-        #     cudnnGetConvolutionForwardAlgorithm_v7(
-        #         meta_ptr[].ptr_handle,
-        #         meta_ptr[].ptr_input_desc,
-        #         meta_ptr[].ptr_filter_desc,
-        #         meta_ptr[].ptr_conv_desc,
-        #         meta_ptr[].ptr_output_desc,
-        #         requested_algo_count,
-        #         UnsafePointer(to=returned_algo_count),
-        #         perf_result_ptr,
-        #     )
-        # )
+        check_cudnn_error(
+            cudnnGetConvolutionForwardAlgorithm_v7(
+                meta_ptr[].ptr_handle,
+                meta_ptr[].ptr_input_desc,
+                meta_ptr[].ptr_filter_desc,
+                meta_ptr[].ptr_conv_desc,
+                meta_ptr[].ptr_output_desc,
+                requested_algo_count,
+                UnsafePointer(to=returned_algo_count),
+                perf_result_ptr,
+            )
+        )
         
-        # if returned_algo_count > 0:
-        #     meta_ptr[].best_algo = perf_result_ptr[].algo
-        # else:
-        meta_ptr[].best_algo = cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+        if returned_algo_count > 0:
+            meta_ptr[].best_algo = perf_result_ptr[].algo
+            # print("Autotuning success! Algo:", perf_result_ptr[].algo)
+        else:
+            meta_ptr[].best_algo = cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+            # print("Autotuning failed. Using default.")
         
-        # perf_result_ptr.free()
+        perf_result_ptr.free()
         
         # Query workspace size
         var ws_size: Int = 0
