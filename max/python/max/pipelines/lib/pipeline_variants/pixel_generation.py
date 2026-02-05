@@ -88,6 +88,7 @@ class PixelGenerationPipeline(
     def execute(
         self,
         inputs: PixelGenerationInputs[PixelGenerationContextType],
+        output_type: Literal["pil", "latent", "np"] = "pil",
     ) -> PipelineOutputsDict[PixelGenerationOutput]:
         model_inputs, flat_batch = self.prepare_batch(inputs.batch)
         if not flat_batch or model_inputs is None:
@@ -95,7 +96,8 @@ class PixelGenerationPipeline(
 
         try:
             model_outputs = self._pipeline_model.execute(
-                model_inputs=model_inputs
+                model_inputs=model_inputs,
+                output_type=output_type,
             )
         except Exception:
             batch_size = len(flat_batch)
@@ -120,6 +122,25 @@ class PixelGenerationPipeline(
                 f"expected {expected_images}, got {len(image_list)}."
             )
 
+        if output_type == "latent":
+            responses: dict[RequestID, PixelGenerationOutput] = {}
+            for index, (request_id, _context) in enumerate(flat_batch):
+                 offset = index * num_images_per_prompt
+                 latents = image_list[offset : offset + num_images_per_prompt]
+                 
+                 # If single latent, unpack from list
+                 if len(latents) == 1:
+                     latents = latents[0]
+                 
+                 # Hack: Wrap in PixelGenerationOutput even if not strictly pixels
+                 responses[request_id] = PixelGenerationOutput(
+                    request_id=request_id,
+                    final_status=GenerationStatus.END_OF_SEQUENCE,
+                    pixel_data=latents,
+                 )
+            return responses
+
+        # Standard pixel path
         responses: dict[RequestID, PixelGenerationOutput] = {}
         for index, (request_id, _context) in enumerate(flat_batch):
             offset = index * num_images_per_prompt

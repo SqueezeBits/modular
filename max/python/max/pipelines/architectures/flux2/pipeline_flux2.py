@@ -745,8 +745,15 @@ class Flux2Pipeline(DiffusionPipeline):
         output_type: Literal["np", "latent", "pil"] = "np",
     ) -> PIL.Image.Image | np.ndarray | Tensor:
         if output_type == "latent":
-            # For latent output, return the first image in batch
-            return latents[0] if latents.shape[0].dim > 1 else latents
+            # Unpack latents (B, Seq, C) -> (B, C, H, W)
+            # This makes them usable for downstream tasks
+            latents_unpacked = self._unpack_latents(
+                latents, height, width, latents.device, latents.dtype
+            )
+            # Return as Tensor (or numpy if requested? usually latent implies Tensor for chained pipelines)
+            # But the pipeline signature says 'np' or 'pil' mainly.
+            # If 'latent', we return the Tensor.
+            return latents_unpacked[0] if latents_unpacked.shape[0].dim > 1 else latents_unpacked
 
         # Use fused graph for Unpack + BN + Unpatchify
         # This avoids all per-call eager overhead (scatter_nd, reshape, sqrt, etc)
@@ -789,6 +796,48 @@ class Flux2Pipeline(DiffusionPipeline):
             image = self._to_hwc(image)
 
         return image
+
+    def _unpack_models(self) -> dict[str, Any]:
+        """Lazy init of unpack models cache."""
+        if not hasattr(self, "_unpack_models_cache"):
+            self._unpack_models_cache = {}
+        return self._unpack_models_cache
+
+    def _unpack_latents(
+        self,
+        latents: Tensor,
+        height: int,
+        width: int,
+        device: DeviceRef,
+        dtype: DType,
+    ) -> Tensor:
+        """Unpack latents from (B, H*W, C) to (B, C, H, W)."""
+        # Flux2 VAE compression is 8, and patch size is 2 => factor 16
+        h_latent = height // 16
+        w_latent = width // 16
+        
+        batch_size = latents.shape[0].dim
+        channels = latents.shape[2].dim
+
+        key = f"{batch_size}_{channels}_{h_latent}_{w_latent}_{device}_{dtype}"
+        cache = self._unpack_models()
+        
+        if key not in cache:
+            # Build graph
+            input_type = TensorType(dtype, shape=[batch_size, h_latent * w_latent, channels], device=device)
+            with Graph("unpack_latents", input_types=[input_type]) as graph:
+                l_in = graph.inputs[0]
+                # Permute: (B, H*W, C) -> (B, C, H*W)
+                l = ops.permute(l_in, (0, 2, 1))
+                # Reshape: (B, C, H, W)
+                l = ops.reshape(l, (batch_size, channels, h_latent, w_latent))
+                graph.output(l)
+            
+            session = InferenceSession([Accelerator()])
+            cache[key] = session.load(graph)
+            
+        model = cache[key]
+        return Tensor.from_dlpack(model.execute(latents.driver_tensor)[0])
 
     @staticmethod
     def _to_hwc(image: np.ndarray) -> np.ndarray:
