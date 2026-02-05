@@ -320,6 +320,12 @@ class Flux2Pipeline(DiffusionPipeline):
         self._patchify_models: dict[str, Any] = {}
         self._vae_prep_models: dict[str, Any] = {}
         self._pack_models: dict[str, Any] = {}
+        self._prompt_embed_models: dict[str, Any] = {}
+        self._latent_prep_models: dict[str, Any] = {}
+        
+        # Cache for invariant tensors (to avoid Tensor.full and Tensor.from_dlpack overhead)
+        self._cached_guidance: dict[str, Tensor] = {}
+        self._cached_latent_image_ids: dict[str, Tensor] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
@@ -416,6 +422,116 @@ class Flux2Pipeline(DiffusionPipeline):
         self._pack_models[key] = model
         return model
 
+    def _ensure_latent_prep_model(
+        self,
+        batch_size: int,
+        channels: int,
+        height: int,
+        width: int,
+        device: DeviceRef,
+        input_dtype: DType,
+        output_dtype: DType,
+    ):
+        """Compile fused latent prep graph: cast + patchify + pack.
+        
+        Input: (B, C, H, W) in input_dtype (usually float32)
+        Output: (B, H/2 * W/2, C*4) in output_dtype (usually bfloat16)
+        
+        Fuses:
+        1. Cast to output_dtype
+        2. Patchify: (B, C, H, W) -> (B, C*4, H//2, W//2)
+        3. Pack: (B, C*4, H//2, W//2) -> (B, H//2*W//2, C*4)
+        """
+        key = f"{batch_size}_{channels}_{height}_{width}_{device}_{input_dtype}_{output_dtype}"
+        if key in self._latent_prep_models:
+            return self._latent_prep_models[key]
+
+        input_type = TensorType(input_dtype, shape=[batch_size, channels, height, width], device=device)
+        
+        with Graph("latent_prep", input_types=[input_type]) as graph:
+            latents = graph.inputs[0]
+            
+            # 1. Cast to output dtype
+            latents = ops.cast(latents, output_dtype)
+            
+            # 2. Patchify: (B, C, H, W) -> (B, C*4, H//2, W//2)
+            # Step 2a: Reshape to (B, C, H//2, 2, W//2, 2)
+            latents = ops.reshape(
+                latents, 
+                (batch_size, channels, height // 2, 2, width // 2, 2)
+            )
+            # Step 2b: Permute to (B, C, 2, 2, H//2, W//2)
+            latents = ops.permute(latents, (0, 1, 3, 5, 2, 4))
+            # Step 2c: Reshape to (B, C*4, H//2, W//2)
+            latents = ops.reshape(
+                latents,
+                (batch_size, channels * 4, height // 2, width // 2)
+            )
+            
+            # 3. Pack: (B, C*4, H//2, W//2) -> (B, H//2*W//2, C*4)
+            packed_channels = channels * 4
+            packed_height = height // 2
+            packed_width = width // 2
+            # Step 3a: Reshape to (B, C*4, H//2*W//2)
+            latents = ops.reshape(latents, (batch_size, packed_channels, packed_height * packed_width))
+            # Step 3b: Permute to (B, H//2*W//2, C*4)
+            latents = ops.permute(latents, (0, 2, 1))
+            
+            graph.output(latents)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._latent_prep_models[key] = model
+        return model
+
+    def _ensure_prompt_embed_model(
+        self, 
+        batch_size: int, 
+        num_layers: int, 
+        seq_len: int, 
+        hidden_dim: int, 
+        device: DeviceRef, 
+        dtype: DType,
+    ):
+        """Compile prompt embedding post-processing: concat 3 layers + permute + reshape.
+        
+        Input: 3 tensors of shape (batch, seq_len, hidden_dim)
+        Output: (batch, seq_len, num_layers * hidden_dim)
+        
+        This fuses: F.stack + F.permute + F.reshape into one compiled graph.
+        """
+        key = f"{batch_size}_{num_layers}_{seq_len}_{hidden_dim}_{device}_{dtype}"
+        if key in self._prompt_embed_models:
+            return self._prompt_embed_models[key]
+
+        # Input: list of layer hidden states, each (batch, seq_len, hidden_dim)
+        input_types = [
+            TensorType(dtype, shape=[batch_size, seq_len, hidden_dim], device=device)
+            for _ in range(num_layers)
+        ]
+        
+        with Graph("prompt_embed_postproc", input_types=input_types) as graph:
+            layer_inputs = [inp for inp in graph.inputs]
+            
+            # Stack: [batch, num_layers, seq_len, hidden_dim]
+            stacked = ops.stack(layer_inputs, axis=1)
+            
+            # Permute: [batch, seq_len, num_layers, hidden_dim]
+            stacked = ops.permute(stacked, [0, 2, 1, 3])
+            
+            # Reshape: [batch, seq_len, num_layers * hidden_dim]
+            result = ops.reshape(
+                stacked, 
+                [batch_size, seq_len, num_layers * hidden_dim]
+            )
+            
+            graph.output(result)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._prompt_embed_models[key] = model
+        return model
+
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         inputs = Flux2ModelInputs.from_context(context)
         
@@ -487,28 +603,55 @@ class Flux2Pipeline(DiffusionPipeline):
 
         # 2. Denoise
         dtype = prompt_embeds.dtype
-        latents: Tensor = (
-            Tensor.from_dlpack(model_inputs.latents)
-            .to(self.transformer.devices[0])
-            .cast(dtype)
+        device = self.transformer.devices[0]
+        
+        # Get raw latents from input
+        raw_latents = np.asarray(model_inputs.latents)
+        batch_size = raw_latents.shape[0]
+        channels = raw_latents.shape[1]
+        height = raw_latents.shape[2]
+        width = raw_latents.shape[3]
+        input_dtype = DType.float32  # Latents from numpy are float32
+        
+        # Use fused compiled graph for cast + patchify + pack
+        latent_prep_model = self._ensure_latent_prep_model(
+            batch_size=batch_size,
+            channels=channels,
+            height=height,
+            width=width,
+            device=DeviceRef.from_device(device),
+            input_dtype=input_dtype,
+            output_dtype=dtype,
         )
-        # Patchify then pack latents (critical for correct output)
-        latents = self._patchify_latents(latents)
-        latents = self._pack_latents(latents)
+        
+        # Upload latents to GPU and execute compiled graph
+        latents_drv = DriverTensor.from_dlpack(raw_latents).to(device)
+        latents_drv = latent_prep_model.execute(latents_drv)[0]
+        latents = Tensor.from_dlpack(latents_drv)
 
-        latent_image_ids: Tensor = (
-            Tensor.from_dlpack(model_inputs.latent_image_ids)
-            .to(self.transformer.devices[0])
-            # IDs must be int64, do not cast to model dtype
-        )
+        # Use cached latent_image_ids if available (same for same resolution)
+        ids_key = f"{batch_size}_{height}_{width}_{device}"
+        if ids_key in self._cached_latent_image_ids:
+            latent_image_ids = self._cached_latent_image_ids[ids_key]
+        else:
+            latent_image_ids = (
+                Tensor.from_dlpack(model_inputs.latent_image_ids)
+                .to(device)
+            )
+            self._cached_latent_image_ids[ids_key] = latent_image_ids
 
-        # Flux2 always uses guidance embeddings
-        guidance = Tensor.full(
-            [latents.shape[0]],
-            model_inputs.guidance_scale,
-            device=self.transformer.devices[0],
-            dtype=dtype,
-        )
+        # Use cached guidance tensor if available (same for same batch_size, guidance_scale, dtype)
+        guidance_key = f"{batch_size}_{model_inputs.guidance_scale}_{dtype}_{device}"
+        if guidance_key in self._cached_guidance:
+            guidance = self._cached_guidance[guidance_key]
+        else:
+            guidance = Tensor.full(
+                [batch_size],
+                model_inputs.guidance_scale,
+                device=device,
+                dtype=dtype,
+            )
+            self._cached_guidance[guidance_key] = guidance
 
         # Compute sigmas using scheduler with proper mu shifting (critical for correct output)
         image_seq_len = latents.shape[1].dim
@@ -564,15 +707,12 @@ class Flux2Pipeline(DiffusionPipeline):
             dt = self._sigmas_cpu[i + 1] - self._sigmas_cpu[i]
 
             # Manual float32 -> bfloat16 conversion (truncation) to avoid Tensor.cast overhead
-            # 1. View as uint32, shift right 16 bits to get top 16 bits (bfloat16)
-            # 2. Ensure shape is [1] (1D array of size 1)
             t_u16 = (np.array(t / 1000.0, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
             dt_u16 = (np.array(dt, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
 
-            # 3. Create uint16 Buffer -> View as bfloat16
+            # Create uint16 Buffer -> View as bfloat16
             timestep_drv = DriverTensor.from_dlpack(t_u16).to(device).view(DType.bfloat16)
             dt_drv = DriverTensor.from_dlpack(dt_u16).to(device).view(DType.bfloat16, shape=[])
-
 
             # Transformer forward pass
             noise_pred_drv = compiled_model(
@@ -584,11 +724,10 @@ class Flux2Pipeline(DiffusionPipeline):
                 guidance_drv,
             )[0]
 
-            # Scheduler step (compiled graph execution, no from_dlpack)
+            # Scheduler step (compiled graph execution)
             latents_drv = self._scheduler_step(latents_drv, noise_pred_drv, dt_drv)
 
             if callback_queue is not None:
-                # Need to convert to Tensor for decoding
                 latents = Tensor.from_dlpack(latents_drv)
                 image = self._decode_latents(
                     latents,
@@ -603,15 +742,12 @@ class Flux2Pipeline(DiffusionPipeline):
         latents = Tensor.from_dlpack(latents_drv)
 
         # 3. Decode
-        # Decode all images in the batch
         batch_size = latents.shape[0].dim
         image_list = []
         for b in range(batch_size):
-            # Extract single image latents and IDs
-            latents_b = latents[b : b + 1]  # Keep batch dimension
+            latents_b = latents[b : b + 1]
             latent_image_ids_b = latent_image_ids[b : b + 1]
             
-            # Decode single image
             image_b = self._decode_latents(
                 latents_b,
                 latent_image_ids_b,
@@ -636,12 +772,10 @@ class Flux2Pipeline(DiffusionPipeline):
         if tokens.array.ndim == 1:
             tokens.array = np.expand_dims(tokens.array, axis=0)
 
-        # Convert to numpy array (not Tensor) for text_encoder
-        # Mistral3TextEncoderModel expects numpy array, not Tensor
+        # Convert to numpy array for text_encoder
         text_input_ids = tokens.array.astype(np.int64)
 
         # Encode with Mistral3 text encoder
-        # Mistral3TextEncoderModel returns tuple of hidden states (all layers)
         hidden_states_tuple = self.text_encoder(text_input_ids)
 
         if not isinstance(hidden_states_tuple, tuple):
@@ -649,8 +783,7 @@ class Flux2Pipeline(DiffusionPipeline):
                 f"Expected tuple of hidden states, got {type(hidden_states_tuple)}"
             )
 
-        # Extract specific layers (10, 20, 30) and stack them
-        # Note: hidden_states_tuple is 0-indexed, but hidden_states_layers is 1-indexed
+        # Extract specific layers and stack them
         layer_tensors = []
         max_sequence_length = tokens.array.shape[-1]
         for k in hidden_states_layers:
@@ -669,7 +802,6 @@ class Flux2Pipeline(DiffusionPipeline):
 
             # Handle sequence length padding/truncation
             if hs.rank == 2:
-                # Shape: [seq_len, hidden_dim]
                 real_seq_len = hs.shape[0].dim
                 hidden_dim = hs.shape[1].dim
                 if real_seq_len < max_sequence_length:
@@ -682,11 +814,8 @@ class Flux2Pipeline(DiffusionPipeline):
                     hs = F.concat([hs, padding], axis=0)
                 elif real_seq_len > max_sequence_length:
                     hs = hs[:max_sequence_length]
-
-                # Reshape to [1, seq_len, hidden_dim]
                 hs = F.reshape(hs, [1, max_sequence_length, hidden_dim])
             elif hs.rank == 3:
-                # Shape: [batch, seq_len, hidden_dim]
                 batch_size = hs.shape[0].dim
                 real_seq_len = hs.shape[1].dim
                 hidden_dim = hs.shape[2].dim
@@ -702,28 +831,35 @@ class Flux2Pipeline(DiffusionPipeline):
                     hs = hs[:, :max_sequence_length, :]
 
             layer_tensors.append(hs)
-
-        # Stack layers: [1, 3, seq_len, hidden_dim]
-        stacked = F.stack(layer_tensors, axis=1)
-
-        # Permute to [1, seq_len, 3, hidden_dim]
-        stacked = F.permute(stacked, [0, 2, 1, 3])
-
-        # Reshape to [1, seq_len, 3*hidden_dim]
-        batch_size = stacked.shape[0].dim
-        seq_len = stacked.shape[1].dim
-        num_layers = stacked.shape[2].dim
-        hidden_dim = stacked.shape[3].dim
-        prompt_embeds = F.reshape(
-            stacked, [batch_size, seq_len, num_layers * hidden_dim]
+        
+        # Use compiled graph for stack/permute/reshape (avoids eager overhead)
+        first_hs = layer_tensors[0]
+        batch_size = first_hs.shape[0].dim
+        seq_len = first_hs.shape[1].dim
+        hidden_dim = first_hs.shape[2].dim
+        num_layers = len(layer_tensors)
+        
+        # Get or compile the prompt embedding model
+        prompt_embed_model = self._ensure_prompt_embed_model(
+            batch_size=batch_size,
+            num_layers=num_layers,
+            seq_len=seq_len,
+            hidden_dim=hidden_dim,
+            device=DeviceRef.from_device(self.text_encoder.devices[0]),
+            dtype=first_hs.dtype,
         )
-
-        bs_embed, seq_len, _ = prompt_embeds.shape
+        
+        # Execute compiled graph
+        driver_inputs = [hs.driver_tensor for hs in layer_tensors]
+        result_drv = prompt_embed_model.execute(*driver_inputs)[0]
+        prompt_embeds = Tensor.from_dlpack(result_drv)
+        
+        bs_embed, seq_len_dim, _ = prompt_embeds.shape
 
         # Tile for multiple images per prompt
         prompt_embeds = F.tile(prompt_embeds, (1, num_images_per_prompt, 1))
         prompt_embeds = prompt_embeds.reshape(
-            (bs_embed.dim * num_images_per_prompt, seq_len, -1)
+            (bs_embed.dim * num_images_per_prompt, seq_len_dim, -1)
         )
 
         # Prepare text position IDs (4D for Flux2)
