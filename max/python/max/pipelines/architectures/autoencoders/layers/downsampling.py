@@ -1,11 +1,11 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2025, Modular Inc. All rights reserved.
+# Copyright (c) 2026, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
 #
 # Unless required by applicable law or agreed to in writing, software
-# distributed on an "AS IS" BASIS,
+# distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
@@ -122,13 +122,11 @@ class Downsample2D(Module[[Tensor], Tensor]):
                     f"Got channels={self.channels}, out_channels={self.out_channels}"
                 )
 
-    def forward(self, hidden_states: Tensor, *args, **kwargs) -> Tensor:
+    def forward(self, hidden_states: Tensor) -> Tensor:
         """Apply 2D downsampling with optional convolution.
 
         Args:
             hidden_states: Input tensor of shape [N, C, H, W].
-            *args: Additional positional arguments (ignored, kept for compatibility).
-            **kwargs: Additional keyword arguments (ignored, kept for compatibility).
 
         Returns:
             Downsampled tensor of shape [N, C_out, H//2, W//2].
