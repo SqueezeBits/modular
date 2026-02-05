@@ -16,9 +16,8 @@ from typing import Any, ClassVar
 
 from max import functional as F
 from max.driver import Device
-from max.graph import DeviceRef, TensorType
 from max.graph.weights import Weights
-from max.nn import Conv2d, Module
+from max.nn import Module
 from max.pipelines.lib import SupportedEncoding
 from max.tensor import Tensor
 
@@ -50,7 +49,7 @@ class AutoencoderKLFlux2(Module[[Tensor, Tensor | None], Tensor]):
             layers_per_block=config.layers_per_block,
             norm_num_groups=config.norm_num_groups,
             act_fn=config.act_fn,
-            double_z=True,  # Output 2*latent_channels for mean and logvar
+            double_z=True,
             mid_block_add_attention=config.mid_block_add_attention,
             use_quant_conv=config.use_quant_conv,
             device=config.device,
@@ -86,11 +85,11 @@ class AutoencoderKLFlux2(Module[[Tensor, Tensor | None], Tensor]):
 
 
 class AutoencoderKLFlux2Model(BaseAutoencoderModel):
-    """MaxModel wrapper for AutoencoderKLFlux2.
+    """ComponentModel wrapper for AutoencoderKLFlux2.
 
-    This class provides the MaxModel interface for AutoencoderKLFlux2, handling
-    configuration, weight loading, model compilation, and BatchNorm statistics
-    for Flux2's latent patchification.
+    This class provides the ComponentModel interface for AutoencoderKLFlux2,
+    handling configuration, weight loading, model compilation, and BatchNorm
+    statistics for Flux2's latent patchification.
     """
 
     config_name: ClassVar[str] = AutoencoderKLFlux2Config.config_name
@@ -143,7 +142,6 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
 
         super().load_model()
 
-        # Convert BatchNorm statistics to Tensor in lazy context
         if bn_mean_data is not None or bn_var_data is not None:
             with F.lazy():
                 if bn_mean_data is not None:
