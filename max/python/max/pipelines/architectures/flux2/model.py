@@ -16,16 +16,16 @@ from typing import Any
 
 from max import functional as F
 from max.driver import Device
-from max.engine import Model
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from max.tensor import Tensor
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
 
 
-class Flux2Model(ComponentModel):
+class Flux2TransformerModel(ComponentModel):
     config_name = Flux2Config.config_name
 
     def __init__(
@@ -46,96 +46,39 @@ class Flux2Model(ComponentModel):
             encoding,
             devices,
         )
-        self._flux2: Flux2Transformer2DModel | None = None
-        self._state_dict: dict[str, Any] | None = None
-        self._compiled_model: Model | None = None
-        self._compiled_shapes: tuple[int, int, int] | None = None
         self.load_model()
 
     def load_model(self) -> Callable[..., Any]:
-        self._state_dict = {
-            key: value.data() for key, value in self.weights.items()
-        }
-        with F.lazy():
-            self._flux2 = Flux2Transformer2DModel(self.config)
-            self._flux2.to(self.devices[0])
-        return self.__call__
-
-    def _ensure_compiled(
-        self,
-        batch_size: int,
-        image_seq_len: int,
-        text_seq_len: int,
-    ) -> Model:
-        current_shapes = (batch_size, image_seq_len, text_seq_len)
-
-        # Recompile if shapes changed or not yet compiled
-        if (
-            self._compiled_model is None
-            or self._compiled_shapes != current_shapes
+        state_dict = {key: value.data() for key, value in self.weights.items()}
+        # Klein/distilled checkpoints omit guidance_embedder; infer from weights
+        has_guidance_embedder = any(
+            "time_guidance_embed.guidance_embedder." in k for k in state_dict
+        )
+        if not has_guidance_embedder and getattr(
+            self.config, "guidance_embeds", True
         ):
-            if self._flux2 is None or self._state_dict is None:
-                raise RuntimeError("Model not loaded. Call load_model() first.")
-
-            input_types = self._flux2.input_types_with_shapes(
-                batch_size=batch_size,
-                image_seq_len=image_seq_len,
-                text_seq_len=text_seq_len,
-            )
-            compiled = self._flux2.compile(
-                *input_types, weights=self._state_dict
-            )
-            # compile returns a callable, but we need to store it as Model
-            # The actual Model is created when the callable is invoked
-            self._compiled_model = compiled  # type: ignore[assignment]
-            self._compiled_shapes = current_shapes
-
-        if self._compiled_model is None:
-            raise RuntimeError("Model compilation failed")
-        return self._compiled_model
+            if hasattr(self.config, "model_copy"):
+                self.config = self.config.model_copy(
+                    update={"guidance_embeds": False}
+                )
+            else:
+                setattr(self.config, "guidance_embeds", False)
+        with F.lazy():
+            flux = Flux2Transformer2DModel(self.config)
+            flux.to(self.devices[0])
+        self.model = flux.compile(*flux.input_types(), weights=state_dict)
+        return self.model
 
     def __call__(
         self,
-        hidden_states: Any,
-        encoder_hidden_states: Any,
-        timestep: Any,
-        img_ids: Any,
-        txt_ids: Any,
-        guidance: Any,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor,
+        timestep: Tensor,
+        img_ids: Tensor,
+        txt_ids: Tensor,
+        guidance: Tensor,
     ) -> Any:
-        # Extract shapes for compilation
-        # Handle both Tensor_v3 and driver.Tensor
-        if hasattr(hidden_states, "shape"):
-            hs_shape = hidden_states.shape
-            batch_size = (
-                hs_shape[0].dim if hasattr(hs_shape[0], "dim") else hs_shape[0]
-            )
-            image_seq_len = (
-                hs_shape[1].dim if hasattr(hs_shape[1], "dim") else hs_shape[1]
-            )
-        else:
-            raise ValueError("hidden_states must have a shape attribute")
-
-        if hasattr(encoder_hidden_states, "shape"):
-            enc_shape = encoder_hidden_states.shape
-            text_seq_len = (
-                enc_shape[1].dim
-                if hasattr(enc_shape[1], "dim")
-                else enc_shape[1]
-            )
-        else:
-            raise ValueError(
-                "encoder_hidden_states must have a shape attribute"
-            )
-
-        # Ensure model is compiled for these shapes
-        model = self._ensure_compiled(
-            batch_size=int(batch_size),
-            image_seq_len=int(image_seq_len),
-            text_seq_len=int(text_seq_len),
-        )
-
-        return model(
+        return self.model(
             hidden_states,
             encoder_hidden_states,
             timestep,
@@ -143,7 +86,3 @@ class Flux2Model(ComponentModel):
             txt_ids,
             guidance,
         )
-
-    @property
-    def model(self) -> Model | None:
-        return self._compiled_model

@@ -11,9 +11,5 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-"""Flux2 architecture package."""
-
-from .arch import flux2_arch, flux2_klein_arch
-from .model import Flux2TransformerModel
-
-__all__ = ["Flux2TransformerModel", "flux2_arch", "flux2_klein_arch"]
+from .attention import EncoderAttention
+from .rotary_embedding import RotaryEmbedding

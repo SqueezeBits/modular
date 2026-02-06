@@ -25,7 +25,7 @@ from .model_config import FluxConfig
 from .weight_adapters import convert_safetensor_state_dict
 
 
-class Flux1Model(ComponentModel):
+class Flux1TransformerModel(ComponentModel):
     config_name = FluxConfig.config_name
 
     def __init__(

@@ -17,12 +17,15 @@ from max import functional as F
 from max.dtype import DType
 from max.nn import Linear, Module, module_dataclass
 from max.nn.legacy.attention.mask_config import MHAMaskVariant
-from max.nn.legacy.kernels import flash_attention_gpu
+from max.nn.legacy.kernels import flash_attention_gpu as _flash_attention_gpu
 from max.nn.sequential import ModuleList
 from max.tensor import Tensor
 
+flash_attention_gpu = F.functional(_flash_attention_gpu)
+
+from max.nn.norm import RMSNorm
+
 from .embeddings import apply_rotary_emb, get_1d_rotary_pos_embed
-from .normalizations import WeightedRMSNorm
 
 
 @module_dataclass
@@ -160,7 +163,6 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         out_bias: bool = True,
         eps: float = 1e-5,
         out_dim: int | None = None,
-        elementwise_affine: bool = True,
     ):
         """Initialize Flux2Attention.
 
@@ -175,7 +177,6 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
             out_bias: Whether to use bias in output projection.
             eps: Epsilon for RMSNorm.
             out_dim: Output dimension (defaults to query_dim).
-            elementwise_affine: Whether to use learnable affine in RMSNorm.
         """
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
@@ -189,39 +190,23 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         self.to_v = Linear(query_dim, self.inner_dim, bias=bias)
 
         # QK normalization
-        self.norm_q = WeightedRMSNorm(
-            normalized_shape=dim_head,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-        )
-        self.norm_k = WeightedRMSNorm(
-            normalized_shape=dim_head,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-        )
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Output projection (skip dropout as it's not supported)
         self.to_out = ModuleList()
         self.to_out.append(Linear(self.inner_dim, out_dim, bias=out_bias))
 
         # Optional: encoder projections
-        self.norm_added_q: WeightedRMSNorm | None
-        self.norm_added_k: WeightedRMSNorm | None
+        self.norm_added_q: RMSNorm | None
+        self.norm_added_k: RMSNorm | None
         self.add_q_proj: Linear | None
         self.add_k_proj: Linear | None
         self.add_v_proj: Linear | None
         self.to_add_out: Linear | None
         if added_kv_proj_dim is not None:
-            self.norm_added_q = WeightedRMSNorm(
-                normalized_shape=dim_head,
-                eps=eps,
-                elementwise_affine=elementwise_affine,
-            )
-            self.norm_added_k = WeightedRMSNorm(
-                normalized_shape=dim_head,
-                eps=eps,
-                elementwise_affine=elementwise_affine,
-            )
+            self.norm_added_q = RMSNorm(dim_head, eps=eps)
+            self.norm_added_k = RMSNorm(dim_head, eps=eps)
             self.add_q_proj = Linear(
                 added_kv_proj_dim,
                 self.inner_dim,
@@ -349,16 +334,13 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
 
         # Scaled dot-product attention
         scale = 1.0 / (self.head_dim**0.5)
-        from max.tensor import Tensor as TensorType
-
-        hidden_states_tv = flash_attention_gpu(
-            query.__tensorvalue__(),
-            key.__tensorvalue__(),
-            value.__tensorvalue__(),
+        hidden_states = flash_attention_gpu(
+            query,
+            key,
+            value,
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=scale,
         )
-        hidden_states = TensorType.from_graph_value(hidden_states_tv)
 
         # hidden_states = F.flatten(hidden_states, 2, 3)
         # Reshape from [B, S, num_heads, head_dim] to [B, S, num_heads * head_dim]
@@ -406,7 +388,6 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         out_bias: bool = True,
         eps: float = 1e-5,
         out_dim: int | None = None,
-        elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
     ):
@@ -421,7 +402,6 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
             out_bias: Whether to use bias in output projection.
             eps: Epsilon for RMSNorm.
             out_dim: Output dimension (defaults to query_dim).
-            elementwise_affine: Whether to use learnable affine in RMSNorm.
             mlp_ratio: Multiplier for MLP hidden dimension.
             mlp_mult_factor: Multiplier for MLP projection (2 for SwiGLU).
         """
@@ -441,16 +421,8 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         self.mlp_act_fn = Flux2SwiGLU()
 
         # QK normalization
-        self.norm_q = WeightedRMSNorm(
-            normalized_shape=dim_head,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-        )
-        self.norm_k = WeightedRMSNorm(
-            normalized_shape=dim_head,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-        )
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Fused output projection (Attention output + MLP output)
         self.to_out = Linear(
@@ -522,16 +494,13 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
             key = key.cast(original_dtype)
 
         # Attention computation
-        hidden_states_tv = flash_attention_gpu(
-            query.__tensorvalue__(),
-            key.__tensorvalue__(),
-            value.__tensorvalue__(),
+        hidden_states = flash_attention_gpu(
+            query,
+            key,
+            value,
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=1.0 / (self.head_dim**0.5),
         )
-        from max.tensor import Tensor as TensorType
-
-        hidden_states = TensorType.from_graph_value(hidden_states_tv)
         # hidden_states = F.flatten(hidden_states, 2, 3)
         # Reshape from [B, S, num_heads, head_dim] to [B, S, num_heads * head_dim]
         batch_size = hidden_states.shape[0]

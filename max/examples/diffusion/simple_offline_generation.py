@@ -39,6 +39,7 @@ from max.interfaces import (
 )
 from max.pipelines import PipelineConfig
 from max.pipelines.architectures.flux2.pipeline_flux2 import Flux2Pipeline
+from max.pipelines.architectures.flux2.pipeline_flux2_klein import Flux2KleinPipeline
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import PixelGenerationTokenizer
 from max.pipelines.lib.pipeline_variants.pixel_generation import (
@@ -170,18 +171,19 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Step 2: Initialize the tokenizer
     # The tokenizer handles prompt encoding and context preparation
     is_flux2 = "FLUX.2" in args.model
+    is_klein = "klein" in args.model.lower()
     tokenizer = PixelGenerationTokenizer(
         model_path=args.model,
         pipeline_config=config,
         subfolder="tokenizer",  # Tokenizer is in a subfolder for diffusion models
-        max_length=512 if is_flux2 else 77,  # Mistral3 uses 512, CLIP uses 77
+        max_length=512 if is_flux2 else 77,  # Flux2/Klein use 512, CLIP uses 77
     )
 
-    # Step 3: Initialize the pipeline
-    # The pipeline executes the diffusion model
+    # Step 3: Initialize the pipeline (Flux2Klein = Qwen3 text encoder, Flux2 = Mistral3)
+    pipeline_model = Flux2KleinPipeline if is_klein else Flux2Pipeline
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
-        pipeline_model=Flux2Pipeline,
+        pipeline_model=pipeline_model,
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")

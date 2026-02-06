@@ -11,9 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-"""Flux2 architecture package."""
+"""Qwen3 text encoder for diffusion pipelines."""
 
-from .arch import flux2_arch, flux2_klein_arch
-from .model import Flux2TransformerModel
+from .model import Qwen3TextEncoderModel
 
-__all__ = ["Flux2TransformerModel", "flux2_arch", "flux2_klein_arch"]

@@ -35,87 +35,50 @@ from max.tensor import Tensor
 from tqdm import tqdm
 
 from ..autoencoders import AutoencoderKLFlux2Model
-from ..mistral3.text_encoder import Mistral3TextEncoderModel
-from ..mistral3.tokenizer import Mistral3Tokenizer
+from ..qwen3.text_encoder import Qwen3TextEncoderModel
+from ..qwen3.tokenizer import Qwen3Tokenizer
 from .model import Flux2TransformerModel
-from .system_messages import SYSTEM_MESSAGE
 
 
-def format_input(
+def format_input_klein(
     prompts: list[str],
-    system_message: str = SYSTEM_MESSAGE,
     images: list[PIL.Image.Image] | list[list[PIL.Image.Image]] | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """Format a batch of text prompts into the conversation format expected by apply_chat_template.
+    """Format prompts for Flux2 Klein (Qwen3): user message only, no system message.
 
-    Optionally, add images to the input.
-
-    Adapted from:
-    https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/text_encoder.py#L68
-
-    Args:
-        prompts: List of text prompts.
-        system_message: System message to use (default: SYSTEM_MESSAGE).
-        images: Optional list of images to add to the input.
-
-    Returns:
-        List of conversations, where each conversation is a list of message dicts.
+    Matches diffusers Flux2KleinPipeline: messages = [{"role": "user", "content": prompt}].
     """
-    # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
-    # when truncation is enabled. The processor counts [IMG] tokens and fails
-    # if the count changes after truncation.
-    cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
+    cleaned_txt = [p.replace("[IMG]", "") for p in prompts]
 
     if images is None or len(images) == 0:
         return [
-            [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": system_message}],
-                },
-                {"role": "user", "content": [{"type": "text", "text": prompt}]},
-            ]
+            [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
             for prompt in cleaned_txt
         ]
-    else:
-        assert len(images) == len(prompts), (
-            "Number of images must match number of prompts"
-        )
-        messages = [
-            [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": system_message}],
-                },
-            ]
-            for _ in cleaned_txt
-        ]
 
-        for i, (el, img_list) in enumerate(zip(messages, images, strict=False)):
-            if img_list is not None:
-                el.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": image_obj}
-                            for image_obj in img_list
-                        ],
-                    }
-                )
+    assert len(images) == len(prompts), "Number of images must match number of prompts"
+    messages = [[] for _ in cleaned_txt]
+    for i, (el, img_list) in enumerate(zip(messages, images, strict=False)):
+        if img_list is not None:
             el.append(
                 {
                     "role": "user",
-                    "content": [{"type": "text", "text": cleaned_txt[i]}],
+                    "content": [
+                        {"type": "image", "image": image_obj}
+                        for image_obj in img_list
+                    ],
                 }
             )
-
-        return messages
+        el.append(
+            {"role": "user", "content": [{"type": "text", "text": cleaned_txt[i]}]}
+        )
+    return messages
 
 
 @dataclass(kw_only=True)
-class Flux2ModelInputs(PixelModelInputs):
+class Flux2KleinModelInputs(PixelModelInputs):
     """
-    Flux2-specific PixelModelInputs.
+    Flux2 Klein-specific PixelModelInputs (Qwen3 text encoder).
 
     Defaults:
     - width: 1024
@@ -124,7 +87,6 @@ class Flux2ModelInputs(PixelModelInputs):
     - num_inference_steps: 50
     - num_images_per_prompt: 1
     - input_image: None (optional input image for image-to-image generation)
-
     """
 
     width: int = 1024
@@ -134,35 +96,35 @@ class Flux2ModelInputs(PixelModelInputs):
     num_images_per_prompt: int = 1
     input_image: Any | None = None
     """Optional input image for image-to-image generation (PIL.Image.Image).
-    
-    This field is used for Flux2 image-to-image generation where an input image
+
+    This field is used for Flux2 Klein image-to-image generation where an input image
     is provided as a condition for the generation process.
     """
 
 
 @dataclass
-class Flux2PipelineOutput:
-    """Output class for Flux2 image generation pipelines.
+class Flux2KleinPipelineOutput:
+    """Output class for Flux2 Klein image generation pipelines.
 
     Args:
         images (`list[PIL.Image.Image]` or `np.ndarray` or `Tensor`)
             List of denoised PIL images of length `batch_size` or numpy array or Max tensor of shape `(batch_size,
-            height, width, num_channels)`. PIL images or numpy array present the denoised images of the diffusion
-            pipeline. Max tensors can represent either the denoised images or the intermediate latents ready to be
-            passed to the decoder.
+            height, width, num_channels)`.
     """
 
     images: list[PIL.Image.Image] | np.ndarray | Tensor
 
 
-class Flux2Pipeline(DiffusionPipeline):
+class Flux2KleinPipeline(DiffusionPipeline):
+    """Flux2 Klein diffusion pipeline (Qwen3 text encoder)."""
+
     config_name = "model_index.json"
 
     components = {
         "scheduler": FlowMatchEulerDiscreteScheduler,
         "vae": AutoencoderKLFlux2Model,
-        "text_encoder": Mistral3TextEncoderModel,
-        "tokenizer": Mistral3Tokenizer,
+        "text_encoder": Qwen3TextEncoderModel,
+        "tokenizer": Qwen3Tokenizer,
         "transformer": Flux2TransformerModel,
     }
 
@@ -182,8 +144,8 @@ class Flux2Pipeline(DiffusionPipeline):
         )
         self.image_processor = image_processor
 
-    def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
-        return Flux2ModelInputs.from_context(context)
+    def prepare_inputs(self, context: PixelContext) -> Flux2KleinModelInputs:
+        return Flux2KleinModelInputs.from_context(context)
 
     def _pil_image_to_tensor(
         self,
@@ -201,14 +163,19 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return img_tensor
 
-    def _get_mistral_3_small_prompt_embeds(
+    def _get_prompt_embeds(
         self,
         tokens: TokenBuffer,
         hidden_states_layers: list[int] | None = None,
         max_sequence_length: int | None = None,
     ) -> Tensor:
+        """Get prompt embeddings from Qwen3 text encoder.
+
+        Default layers (0-based 9, 18, 27) match diffusers Flux2KleinPipeline.
+        Passed as 1-based [10, 19, 28] so layer_idx = k - 1.
+        """
         if hidden_states_layers is None:
-            hidden_states_layers = [10, 20, 30]
+            hidden_states_layers = [10, 19, 28]
 
         if max_sequence_length is None:
             max_sequence_length = int(tokens.array.shape[-1])
@@ -287,7 +254,7 @@ class Flux2Pipeline(DiffusionPipeline):
         tokens: TokenBuffer,
         num_images_per_prompt: int = 1,
     ) -> tuple[Tensor, Tensor]:
-        prompt_embeds = self._get_mistral_3_small_prompt_embeds(
+        prompt_embeds = self._get_prompt_embeds(
             tokens=tokens,
         )
 
@@ -310,7 +277,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def _prepare_latents_for_denoising(
         self,
-        model_inputs: Flux2ModelInputs,
+        model_inputs: Flux2KleinModelInputs,
         dtype: DType,
     ) -> tuple[Tensor, Tensor, Tensor]:
         latents: Tensor = (
@@ -727,11 +694,11 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def execute(
         self,
-        model_inputs: Flux2ModelInputs,
+        model_inputs: Flux2KleinModelInputs,
         callback_queue: Queue[np.ndarray] | None = None,
         output_type: Literal["np", "latent", "pil"] = "np",
-    ) -> Flux2PipelineOutput:
-        """Execute the pipeline."""
+    ) -> Flux2KleinPipelineOutput:
+        """Execute the Flux2 Klein pipeline."""
         # 1. Encode prompts
         prompt_embeds, text_ids = self._prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
@@ -853,4 +820,4 @@ class Flux2Pipeline(DiffusionPipeline):
             output_type=output_type,
         )
 
-        return Flux2PipelineOutput(images=outputs)
+        return Flux2KleinPipelineOutput(images=outputs)

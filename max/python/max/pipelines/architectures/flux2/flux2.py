@@ -26,21 +26,25 @@ from .layers.flux2_attention import (
     Flux2ParallelSelfAttention,
     Flux2PosEmbed,
 )
-from .layers.normalizations import (
-    AdaLayerNormContinuous,
-    WeightedLayerNorm,
-)
+from max.nn.norm import LayerNorm
+
+from .layers.normalizations import AdaLayerNormContinuous
 from .model_config import Flux2Config
 
 
 class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
-    """Combined timestep and guidance scale embeddings for Flux2."""
+    """Combined timestep and optional guidance scale embeddings for Flux2.
+
+    When guidance_embeds=False (Klein/distilled), only timestep embedding is used;
+    no guidance_embedder submodule (matches diffusers, checkpoint has no guidance weights).
+    """
 
     def __init__(
         self,
         in_channels: int = 256,
         embedding_dim: int = 6144,
         bias: bool = False,
+        guidance_embeds: bool = True,
     ):
         """Initialize Flux2TimestepGuidanceEmbeddings.
 
@@ -48,6 +52,7 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
             in_channels: Number of sinusoidal channels.
             embedding_dim: Output embedding dimension.
             bias: Whether to use bias in MLP layers.
+            guidance_embeds: If True, add guidance_embedder (CFG). If False (distilled/Klein), omit it.
         """
         self.time_proj = Timesteps(
             num_channels=in_channels,
@@ -59,38 +64,37 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
             time_embed_dim=embedding_dim,
             sample_proj_bias=bias,
         )
-        self.guidance_embedder = TimestepEmbedding(
-            in_channels=in_channels,
-            time_embed_dim=embedding_dim,
-            sample_proj_bias=bias,
-        )
+        if guidance_embeds:
+            self.guidance_embedder = TimestepEmbedding(
+                in_channels=in_channels,
+                time_embed_dim=embedding_dim,
+                sample_proj_bias=bias,
+            )
+        else:
+            self.guidance_embedder = None
 
     def __call__(self, timestep: Tensor, guidance: Tensor) -> Tensor:
-        """Compute combined timestep and guidance embeddings.
+        """Compute timestep (+ optional guidance) embeddings.
 
         Args:
             timestep: Timestep values of shape [B].
-            guidance: Guidance scale values of shape [B].
+            guidance: Guidance scale values of shape [B] (ignored if guidance_embeds=False).
 
         Returns:
-            Combined embedding of shape [B, embedding_dim].
+            Embedding of shape [B, embedding_dim].
         """
-        # Project timesteps to sinusoidal embeddings
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(
             timesteps_proj.cast(timestep.dtype)
         )
 
-        # Project guidance to sinusoidal embeddings
-        guidance_proj = self.time_proj(guidance)
-        guidance_emb = self.guidance_embedder(
-            guidance_proj.cast(guidance.dtype)
-        )
-
-        # Combine embeddings
-        time_guidance_emb = timesteps_emb + guidance_emb
-
-        return time_guidance_emb
+        if self.guidance_embedder is not None:
+            guidance_proj = self.time_proj(guidance)
+            guidance_emb = self.guidance_embedder(
+                guidance_proj.cast(guidance.dtype)
+            )
+            return timesteps_emb + guidance_emb
+        return timesteps_emb
 
 
 class Flux2Modulation(
@@ -173,11 +177,11 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         # Normalizations (elementwise_affine=False for all)
-        self.norm1 = WeightedLayerNorm(
-            dim, eps=eps, elementwise_affine=False, bias=False
+        self.norm1 = LayerNorm(
+            dim, eps=eps, elementwise_affine=False, use_bias=False
         )
-        self.norm1_context = WeightedLayerNorm(
-            dim, eps=eps, elementwise_affine=False, bias=False
+        self.norm1_context = LayerNorm(
+            dim, eps=eps, elementwise_affine=False, use_bias=False
         )
 
         # Dual-stream attention
@@ -194,15 +198,15 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
         )
 
         # Feedforward layers
-        self.norm2 = WeightedLayerNorm(
-            dim, eps=eps, elementwise_affine=False, bias=False
+        self.norm2 = LayerNorm(
+            dim, eps=eps, elementwise_affine=False, use_bias=False
         )
         self.ff = Flux2FeedForward(
             dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias
         )
 
-        self.norm2_context = WeightedLayerNorm(
-            dim, eps=eps, elementwise_affine=False, bias=False
+        self.norm2_context = LayerNorm(
+            dim, eps=eps, elementwise_affine=False, use_bias=False
         )
         self.ff_context = Flux2FeedForward(
             dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias
@@ -320,8 +324,8 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
             bias: Whether to use bias in linear layers.
         """
         # Single normalization (elementwise_affine=False)
-        self.norm = WeightedLayerNorm(
-            dim, eps=eps, elementwise_affine=False, bias=False
+        self.norm = LayerNorm(
+            dim, eps=eps, elementwise_affine=False, use_bias=False
         )
 
         # Parallel attention+MLP
@@ -444,11 +448,12 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
             theta=rope_theta, axes_dim=axes_dims_rope
         )
 
-        # 2. Timestep and guidance embeddings
+        # 2. Timestep and optional guidance embeddings (guidance_embeds=False for Klein/distilled)
         self.time_guidance_embed = Flux2TimestepGuidanceEmbeddings(
             in_channels=timestep_guidance_channels,
             embedding_dim=self.inner_dim,
             bias=False,
+            guidance_embeds=getattr(config, "guidance_embeds", True),
         )
 
         # 3. Modulation layers
@@ -525,9 +530,6 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the model with symbolic shapes.
 
-        Note: This uses symbolic shapes which may cause excessive memory allocation.
-        For production use, prefer input_types_with_shapes() with concrete dimensions.
-
         Returns:
             Tuple of TensorType specifications for all model inputs.
         """
@@ -556,61 +558,6 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
         )
         guidance_type = TensorType(
             self.max_dtype, shape=["batch_size"], device=self.max_device
-        )
-
-        return (
-            hidden_states_type,
-            encoder_hidden_states_type,
-            timestep_type,
-            img_ids_type,
-            txt_ids_type,
-            guidance_type,
-        )
-
-    def input_types_with_shapes(
-        self,
-        batch_size: int,
-        image_seq_len: int,
-        text_seq_len: int,
-    ) -> tuple[TensorType, ...]:
-        """Define input tensor types with concrete shapes for memory-efficient compilation.
-
-        This method creates TensorTypes with fixed dimensions instead of symbolic shapes,
-        allowing the compiler to allocate exact memory sizes and optimize better.
-
-        Args:
-            batch_size: Batch size for inference.
-            image_seq_len: Number of image tokens (height * width for packed latents).
-            text_seq_len: Number of text tokens from the encoder.
-
-        Returns:
-            Tuple of TensorType specifications with concrete shapes.
-        """
-        hidden_states_type = TensorType(
-            self.max_dtype,
-            shape=[batch_size, image_seq_len, self.in_channels],
-            device=self.max_device,
-        )
-        encoder_hidden_states_type = TensorType(
-            self.max_dtype,
-            shape=[batch_size, text_seq_len, self.joint_attention_dim],
-            device=self.max_device,
-        )
-        timestep_type = TensorType(
-            self.max_dtype, shape=[batch_size], device=self.max_device
-        )
-        img_ids_type = TensorType(
-            DType.int64,
-            shape=[batch_size, image_seq_len, 4],
-            device=self.max_device,
-        )
-        txt_ids_type = TensorType(
-            DType.int64,
-            shape=[batch_size, text_seq_len, 4],
-            device=self.max_device,
-        )
-        guidance_type = TensorType(
-            self.max_dtype, shape=[batch_size], device=self.max_device
         )
 
         return (

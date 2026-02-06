@@ -487,37 +487,52 @@ class PixelGenerationTokenizer(
 
         tokenizer_output: Any
 
-        # Check if this is Flux2 pipeline (uses Mistral3Tokenizer with chat_template)
-        # Flux2 requires apply_chat_template for proper tokenization
+        # Check if this is Flux2 or Flux2 Klein pipeline (chat_template tokenization)
         is_flux2 = (
             self._pipeline_class_name == "Flux2Pipeline"
-            or "flux2" in self._pipeline_class_name.lower()
-            if self._pipeline_class_name
-            else False
+            or self._pipeline_class_name == "Flux2KleinPipeline"
+            or (
+                "flux2" in self._pipeline_class_name.lower()
+                if self._pipeline_class_name
+                else False
+            )
         )
 
         def _encode_fn(prompt_str: str) -> Any:
             assert delegate is not None
 
-            # For Flux2, use apply_chat_template with format_input
+            # For Flux2 / Flux2 Klein, use apply_chat_template with format_input
             if is_flux2 and not use_secondary:
                 # Import here to avoid circular dependencies
-                from max.pipelines.architectures.flux2.pipeline_flux2 import (
-                    format_input,
-                )
-                from max.pipelines.architectures.flux2.system_messages import (
-                    SYSTEM_MESSAGE,
-                )
+                if self._pipeline_class_name == "Flux2KleinPipeline":
+                    # Klein: user message only, no system message (match diffusers)
+                    from max.pipelines.architectures.flux2.pipeline_flux2_klein import (
+                        format_input_klein,
+                    )
 
-                messages_batch = format_input(
-                    prompts=[prompt_str],
-                    system_message=SYSTEM_MESSAGE,
-                    images=None,
-                )
+                    messages_batch = format_input_klein(
+                        prompts=[prompt_str],
+                        images=None,
+                    )
+                    add_generation_prompt = True
+                else:
+                    from max.pipelines.architectures.flux2.pipeline_flux2 import (
+                        format_input,
+                    )
+                    from max.pipelines.architectures.flux2.system_messages import (
+                        SYSTEM_MESSAGE,
+                    )
+
+                    messages_batch = format_input(
+                        prompts=[prompt_str],
+                        system_message=SYSTEM_MESSAGE,
+                        images=None,
+                    )
+                    add_generation_prompt = False
 
                 return delegate.apply_chat_template(
                     messages_batch[0],
-                    add_generation_prompt=False,
+                    add_generation_prompt=add_generation_prompt,
                     tokenize=True,
                     return_dict=True,
                     padding="max_length",
