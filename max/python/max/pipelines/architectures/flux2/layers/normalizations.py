@@ -59,9 +59,13 @@ class WeightedRMSNorm(Module):
         Returns:
             Normalized tensor of same shape as input.
         """
+        # Cast weight to match input dtype if needed
+        weight = self.weight
+        if weight is not None and weight.dtype != x.dtype:
+            weight = weight.cast(x.dtype)
         return rms_norm(
             x,
-            self.weight,
+            weight,
             self.eps,
             weight_offset=0.0,
             multiply_before_cast=self.elementwise_affine,
