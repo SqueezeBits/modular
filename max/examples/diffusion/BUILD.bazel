@@ -2,6 +2,21 @@ load("//bazel:api.bzl", "modular_py_binary", "requirement")
 
 package(default_visibility = ["//visibility:private"])
 
+
+modular_py_binary(
+    name = "verify_fused_rope",
+    srcs = ["verify_fused_rope.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("torch"),
+    ],
+)
+
 modular_py_binary(
     name = "simple_offline_generation",
     srcs = ["simple_offline_generation.py"],
@@ -106,5 +121,20 @@ modular_py_binary(
         "//max/python/max/pipelines/lib",
         requirement("numpy"),
         requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "benchmark_transformer_latency",
+    srcs = ["benchmark_transformer_latency.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("torch"),
+        requirement("diffusers"),
     ],
 )

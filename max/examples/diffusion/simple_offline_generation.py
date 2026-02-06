@@ -182,7 +182,7 @@ async def generate_image(args: argparse.Namespace) -> None:
     # The pipeline executes the diffusion model
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
-        pipeline_model=Flux2Pipeline if is_flux2 else FluxPipeline,
+        pipeline_model=Flux2Pipeline, # if is_flux2 else FluxPipeline,
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")

@@ -16,6 +16,10 @@ package(default_visibility = [
             "-n",
             "auto",
         ],
+        data = [
+            # Include custom_ops .mojo files for fused_rope_vision tests
+            "//max/python/max/pipelines/architectures/flux2/custom_ops:custom_ops",
+        ],
         tags = [
             "no-pydeps",  # TODO: Fix and re-enable
         ] + (["manual"] if src in [

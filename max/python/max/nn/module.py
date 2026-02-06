@@ -511,6 +511,7 @@ class Module(Generic[_P, _R]):
         self,
         *input_types: graph.Type[Any],
         weights: Mapping[str, DLPackArray] | None = None,
+        custom_extensions: Iterable[Path] | None = None,
     ) -> Callable[..., Any]:
         """Compiles the module to an optimized executable through graph tracing.
 
@@ -570,6 +571,7 @@ class Module(Generic[_P, _R]):
                 be on CPU and will be transferred to the target device as part
                 of model initialization. If not passed, the model's parameters
                 will be used as the weights.
+            custom_extensions: Optional list of paths to custom ops.
 
         Returns:
             Callable[..., Any]
@@ -584,7 +586,11 @@ class Module(Generic[_P, _R]):
             RuntimeError: If graph construction fails due to incompatible
                 operations or parameter access issues.
         """
-        graph = Graph(type(self).__qualname__, input_types=input_types)
+        graph = Graph(
+            type(self).__qualname__, 
+            input_types=input_types,
+            custom_extensions=custom_extensions or [],
+        )
         with realization_context(GraphRealizationContext(graph)) as ctx, ctx:
             # Wrap the graph inputs in Tensors
             inputs = [Tensor.from_graph_value(input) for input in graph.inputs]
