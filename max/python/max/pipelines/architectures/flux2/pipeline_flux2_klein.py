@@ -46,32 +46,22 @@ def format_input_klein(
 ) -> list[list[dict[str, Any]]]:
     """Format prompts for Flux2 Klein (Qwen3): user message only, no system message.
 
-    Matches diffusers Flux2KleinPipeline: messages = [{"role": "user", "content": prompt}].
+    Matches diffusers Flux2KleinPipeline: content must be a plain string for
+    Qwen apply_chat_template, not [{"type": "text", "text": ...]}.
     """
     cleaned_txt = [p.replace("[IMG]", "") for p in prompts]
 
     if images is None or len(images) == 0:
         return [
-            [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            [{"role": "user", "content": prompt}]
             for prompt in cleaned_txt
         ]
 
     assert len(images) == len(prompts), "Number of images must match number of prompts"
-    messages = [[] for _ in cleaned_txt]
-    for i, (el, img_list) in enumerate(zip(messages, images, strict=False)):
-        if img_list is not None:
-            el.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image_obj}
-                        for image_obj in img_list
-                    ],
-                }
-            )
-        el.append(
-            {"role": "user", "content": [{"type": "text", "text": cleaned_txt[i]}]}
-        )
+    messages = []
+    for i, img_list in enumerate(images):
+        # With images, diffusers-style would use multimodal content; for text-only path we keep string content
+        messages.append([{"role": "user", "content": cleaned_txt[i]}])
     return messages
 
 
@@ -171,17 +161,22 @@ class Flux2KleinPipeline(DiffusionPipeline):
     ) -> Tensor:
         """Get prompt embeddings from Qwen3 text encoder.
 
-        Default layers (0-based 9, 18, 27) match diffusers Flux2KleinPipeline.
-        Passed as 1-based [10, 19, 28] so layer_idx = k - 1.
+        Match diffusers: HF hidden_states[k] = after layer (k-1); we have
+        all_hidden_states[i] = after layer i. So HF (9,18,27) = after layers 8,17,26
+        = our indices 8,17,26. We pass 1-based [9,18,27] so layer_idx = k-1 = 8,17,26.
         """
         if hidden_states_layers is None:
-            hidden_states_layers = [10, 19, 28]
+            hidden_states_layers = [9, 18, 27]
 
         if max_sequence_length is None:
             max_sequence_length = int(tokens.array.shape[-1])
-        
+
+        # Text encoder expects 1D [total_seq_len]; tokenizer gives (1, seq_len)
+        token_ids = tokens.array
+        if token_ids.ndim == 2 and token_ids.shape[0] == 1:
+            token_ids = np.squeeze(token_ids, axis=0)
         text_input_ids = Tensor.constant(
-            tokens.array, dtype=DType.int64, device=self.text_encoder.devices[0]
+            token_ids, dtype=DType.int64, device=self.text_encoder.devices[0]
         )
         hidden_states_tuple = self.text_encoder(text_input_ids)
 

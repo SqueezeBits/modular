@@ -530,16 +530,21 @@ class PixelGenerationTokenizer(
                     )
                     add_generation_prompt = False
 
+                apply_kwargs: dict = {
+                    "add_generation_prompt": add_generation_prompt,
+                    "tokenize": True,
+                    "return_dict": True,
+                    "padding": "max_length",
+                    "truncation": True,
+                    "max_length": max_sequence_length,
+                    "return_length": False,
+                    "return_overflowing_tokens": False,
+                }
+                if self._pipeline_class_name == "Flux2KleinPipeline":
+                    apply_kwargs["enable_thinking"] = False
                 return delegate.apply_chat_template(
                     messages_batch[0],
-                    add_generation_prompt=add_generation_prompt,
-                    tokenize=True,
-                    return_dict=True,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=max_sequence_length,
-                    return_length=False,
-                    return_overflowing_tokens=False,
+                    **apply_kwargs,
                 )
             else:
                 return delegate(
