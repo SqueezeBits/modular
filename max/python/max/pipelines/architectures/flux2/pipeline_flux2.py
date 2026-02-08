@@ -330,13 +330,13 @@ class Flux2Pipeline(DiffusionPipeline):
         self._cached_guidance: dict[str, Tensor] = {}
         self._cached_latent_image_ids: dict[str, Tensor] = {}
         self._cached_text_ids: dict[str, Tensor] = {}
+        self._cached_sigmas: dict[str, Tensor] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
         key = f"{batch_size}_{channels}_{height}_{width}_{device}_{dtype}"
         if key in self._patchify_models:
             return self._patchify_models[key]
-            
         input_type = TensorType(dtype, shape=[batch_size, channels, height, width], device=device)
         with Graph("patchify", input_types=[input_type]) as graph:
             latents = graph.inputs[0]
@@ -799,18 +799,12 @@ class Flux2Pipeline(DiffusionPipeline):
         output_type: Literal["np", "latent", "pil"] = "np",
     ) -> Flux2PipelineOutput:
         """Execute the pipeline."""
-        import time as _time
-        _t_start = _time.time()
-        
+
         # 1. Encode prompts
-        _t_encode_start = _time.time()
         prompt_embeds, text_ids = self._prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
         )
-        _t_encode_end = _time.time()
-        if os.environ.get("FLUX2_DEBUG", "0") == "1":
-            print(f"[Profiling] Prompt Encoding: {(_t_encode_end - _t_encode_start)*1000:.2f}ms", flush=True)
 
         # 2. Denoise
         dtype = prompt_embeds.dtype
@@ -836,13 +830,9 @@ class Flux2Pipeline(DiffusionPipeline):
         )
         
         # Upload latents to GPU and execute compiled graph
-        _t_latent_start = _time.time()
         latents_drv = DriverTensor.from_dlpack(raw_latents).to(device)
         latents_drv = latent_prep_model.execute(latents_drv)[0]
         latents = Tensor.from_dlpack(latents_drv)
-        _t_latent_end = _time.time()
-        if os.environ.get("FLUX2_DEBUG", "0") == "1":
-            print(f"[Profiling] Latent Prep: {(_t_latent_end - _t_latent_start)*1000:.2f}ms", flush=True)
 
         # Use cached latent_image_ids if available (same for same resolution)
         ids_key = f"{batch_size}_{height}_{width}_{device}"
@@ -855,7 +845,6 @@ class Flux2Pipeline(DiffusionPipeline):
             )
             self._cached_latent_image_ids[ids_key] = latent_image_ids
 
-        _t_gap1_start = _time.time()
         # Use cached guidance tensor if available (same for same batch_size, guidance_scale, dtype)
         guidance_key = f"{batch_size}_{model_inputs.guidance_scale}_{dtype}_{device}"
         if guidance_key in self._cached_guidance:
@@ -868,9 +857,6 @@ class Flux2Pipeline(DiffusionPipeline):
                 dtype=dtype,
             )
             self._cached_guidance[guidance_key] = guidance
-        _t_gap1_end = _time.time()
-        if os.environ.get("FLUX2_DEBUG", "0") == "1":
-            print(f"[Profiling] Guidance/IDs Cache: {(_t_gap1_end - _t_gap1_start)*1000:.2f}ms", flush=True)
 
         # Compute sigmas using scheduler with proper mu shifting (critical for correct output)
         image_seq_len = latents.shape[1].dim
@@ -887,10 +873,17 @@ class Flux2Pipeline(DiffusionPipeline):
         # Store sigmas on CPU for optimized scheduler step (no GPU sync)
         self._sigmas_cpu = np.ascontiguousarray(self.scheduler.sigmas)
 
-        sigmas = (
-            Tensor.from_dlpack(self._sigmas_cpu)
-            .to(self.transformer.devices[0])
-        )
+        # Cache sigmas on device
+        sigmas_key = f"{num_inference_steps}_{image_seq_len}_{device}"
+        if sigmas_key in self._cached_sigmas:
+             sigmas = self._cached_sigmas[sigmas_key]
+        else:
+             sigmas = (
+                 Tensor.from_dlpack(self._sigmas_cpu)
+                 .to(self.transformer.devices[0])
+             )
+             self._cached_sigmas[sigmas_key] = sigmas
+
         timesteps: np.ndarray = self.scheduler.timesteps
         num_timesteps = timesteps.shape[0]
 
@@ -898,21 +891,15 @@ class Flux2Pipeline(DiffusionPipeline):
         image_seq_len = latents.shape[1].dim
         text_seq_len = prompt_embeds.shape[1].dim
         batch_size = latents.shape[0]
-        _t_compile_start = _time.time()
         compiled_model = self.transformer._ensure_compiled(
             batch_size=batch_size,
             image_seq_len=image_seq_len,
             text_seq_len=text_seq_len,
         )
-        _t_compile_end = _time.time()
-        if os.environ.get("FLUX2_DEBUG", "0") == "1":
-            print(f"[Profiling] Transformer Compilation/Lookup: {(_t_compile_end - _t_compile_start)*1000:.2f}ms", flush=True)
 
         # Build scheduler step graph if not already built
         device = self.transformer.devices[0]
         if self._scheduler_step_model is None:
-            if os.environ.get("FLUX2_DEBUG", "0") == "1":
-                print("[Profiling] Building Scheduler Graph...", flush=True)
             self._build_scheduler_step_graph(dtype, device)
             
         # Ensure all time steps model is built
@@ -920,10 +907,6 @@ class Flux2Pipeline(DiffusionPipeline):
             num_steps=num_inference_steps,
             device=DeviceRef.from_device(device),
         )
-
-        _t_scheduler_setup_end = _time.time()
-        if os.environ.get("FLUX2_DEBUG", "0") == "1":
-            print(f"[Profiling] Scheduler Setup: {(_t_scheduler_setup_end - _t_compile_end)*1000:.2f}ms", flush=True)
 
         # Pre-convert unchanging tensors to driver_tensor
         encoder_hidden_states_drv = prompt_embeds.driver_tensor
@@ -960,24 +943,15 @@ class Flux2Pipeline(DiffusionPipeline):
         raw_compiled_model = _unwrap_model(compiled_model)
         raw_scheduler_step_model = _unwrap_model(self._scheduler_step_model)
 
-        import time as _time
-
-        _t_loop_start_real = _time.time()
-        if os.environ.get("FLUX2_DEBUG", "0") == "1":
-            print(f"[Profiling] Pre-Loop Overhead: {(_t_loop_start_real - _t_scheduler_setup_end)*1000:.2f}ms", flush=True)
 
         for i in range(num_timesteps):
-            _t0 = _time.time()
             self._current_timestep = i
 
             # Retrieve timestep and dt from precomputed tensors by slicing
             # [i:i+1] keeps rank 1 for timestep
             timestep_drv = all_timesteps_drv[i : i + 1]
-            
             # [i:i+1] gives vector-1 for dt (compatible with shape=[1])
             dt_drv = all_dts_drv[i : i + 1]
-            
-            _t1 = _time.time()
 
             # Transformer forward pass
             noise_pred_drv = raw_compiled_model.execute(
@@ -988,14 +962,9 @@ class Flux2Pipeline(DiffusionPipeline):
                 txt_ids_drv,
                 guidance_drv,
             )[0]
-            _t2 = _time.time()
 
             # Scheduler step (compiled graph execution)
             latents_drv = raw_scheduler_step_model.execute(latents_drv, noise_pred_drv, dt_drv)[0]
-            _t3 = _time.time()
-            
-            if os.environ.get("FLUX2_DEBUG", "0") == "1":
-                print(f"step {i}: prep={(_t1-_t0)*1000:.2f}ms, transformer={(_t2-_t1)*1000:.2f}ms, scheduler={(_t3-_t2)*1000:.2f}ms, total={(_t3-_t0)*1000:.2f}ms", flush=True)
 
             # Explicit synchronization to prevent queue buildup and OOM when bypassing max.functional
             if hasattr(device, "synchronize"):
@@ -1014,9 +983,6 @@ class Flux2Pipeline(DiffusionPipeline):
 
         # Convert back to Tensor for decoding
         latents = Tensor.from_dlpack(latents_drv)
-        _t_loop_end = _time.time()
-        if os.environ.get("FLUX2_DEBUG", "0") == "1":
-            print(f"[Profiling] Decode Gap: {(_t_loop_end - _t_loop_end)*1000:.2f}ms", flush=True) # Dummy print to mark end of loop
 
         # 3. Decode
         batch_size = latents.shape[0].dim
@@ -1043,12 +1009,6 @@ class Flux2Pipeline(DiffusionPipeline):
             )
             image_list.append(image_b)
 
-        try:
-             _t_total_end = _time.time()
-             if os.environ.get("FLUX2_DEBUG", "0") == "1":
-                 print(f"[Profiling] Total Execute Time: {(_t_total_end - _t_start)*1000:.2f}ms", flush=True)
-        except:
-             pass
         return Flux2PipelineOutput(images=image_list)
 
     def _prepare_prompt_embeddings(
@@ -1297,7 +1257,6 @@ class Flux2Pipeline(DiffusionPipeline):
             
             session = InferenceSession([Accelerator()])
             cache[key] = session.load(graph)
-            
         model = cache[key]
         return Tensor.from_dlpack(model.execute(latents.driver_tensor)[0])
 

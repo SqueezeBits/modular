@@ -201,7 +201,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         negative_prompt=None,
         height=args.height,
         width=args.width,
-        num_inference_steps=3,
+        num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         seed=42,
     )

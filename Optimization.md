@@ -31,3 +31,18 @@ Run `simple_offline_generation.py` with `FLUX2_DEBUG=1`.
 **Verification:**
 Run `simple_offline_generation.py` with `FLUX2_DEBUG=1`.
 
+
+## Scheduler Latency Optimization
+
+**Goal:** Reduce `~200ms` latency observed before the denoising loop in FLUX.2-dev.
+
+**Changes:**
+- **Sigmas Caching:** Identified that `Tensor.from_dlpack(sigmas_cpu).to(device)` was taking ~200ms on every `execute` call.
+- **Optimization:** Added `_cached_sigmas` to `Flux2Pipeline`. Sigmas are now computed on CPU, uploaded to GPU once, and cached based on `(num_inference_steps, image_seq_len, device)`.
+
+**Results:**
+- Eliminated ~200ms latency per generation call (after warmup/first run).
+- `Block 3 (Scheduler/Sigmas)` latency reduced from ~207ms to <1ms.
+
+**Verification:**
+- Validated via `simple_offline_generation.py` with `FLUX2_DEBUG=1` previously, confirmed removal of latency block.
