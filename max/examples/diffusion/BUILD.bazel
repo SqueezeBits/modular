@@ -138,3 +138,15 @@ modular_py_binary(
         requirement("diffusers"),
     ],
 )
+
+modular_py_binary(
+    name = "test_slicing",
+    srcs = ["test_slicing.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/graph",
+        "//max/python/max:tensor",
+        requirement("numpy"),
+    ],
+)

@@ -564,6 +564,84 @@ class Flux2Pipeline(DiffusionPipeline):
         self._unsqueeze_models[key] = model
         return model
 
+        return model
+
+    def _ensure_prompt_tile_model(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+        num_images_per_prompt: int,
+        device: DeviceRef,
+        dtype: DType,
+    ):
+        """Compile graph for tiling prompt embeddings: (B, S, D) -> (B*N, S, D)."""
+        key = f"{batch_size}_{seq_len}_{hidden_dim}_{num_images_per_prompt}_{device}_{dtype}"
+        if key in self._prompt_embed_models:
+            return self._prompt_embed_models[key]
+
+        input_type = TensorType(dtype, shape=[batch_size, seq_len, hidden_dim], device=device)
+        
+        with Graph("prompt_tile", input_types=[input_type]) as graph:
+            embeds = graph.inputs[0]
+            
+            # 1. Unsqueeze at axis 1: (B, 1, S, D)
+            embeds = ops.reshape(embeds, (batch_size, 1, seq_len, hidden_dim))
+            
+            # 2. Tile at axis 1: (B, N, S, D)
+            repeats = [1, num_images_per_prompt, 1, 1]
+            embeds = ops.tile(embeds, repeats)
+            
+            # 3. Reshape: (B*N, S, D)
+            embeds = ops.reshape(embeds, (batch_size * num_images_per_prompt, seq_len, hidden_dim))
+            
+            graph.output(embeds)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._prompt_embed_models[key] = model
+        return model
+
+    def _ensure_text_ids_model(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: DeviceRef,
+    ):
+        """Compile a graph to generate text IDs (4D coordinates) on device.
+        
+        Output: (batch_size, seq_len, 4) int64
+        (T=0, H=0, W=0, L=[0..seq_len-1])
+        """
+
+
+        model_key = f"text_ids_model_{batch_size}_{seq_len}_{device}"
+        if model_key in self._prompt_embed_models:
+            return self._prompt_embed_models[model_key]
+
+        with Graph("text_ids_gen", input_types=[]) as graph:
+             # Create base coordinates: (0, 0, 0, [0..seq_len-1])
+             # Shape (seq_len, 4)
+             coords = np.zeros((seq_len, 4), dtype=np.int64)
+             coords[:, 3] = np.arange(seq_len, dtype=np.int64)
+             
+             # (seq_len, 4)
+             coords_const = ops.constant(coords, dtype=DType.int64, device=device)
+             
+             # Unsqueeze to (1, seq_len, 4)
+             coords_batch = ops.reshape(coords_const, (1, seq_len, 4))
+             
+             # Tile to (batch, seq_len, 4)
+             repeats = [batch_size, 1, 1]
+             text_ids = ops.tile(coords_batch, repeats)
+             
+             graph.output(text_ids)
+             
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._prompt_embed_models[model_key] = model
+        return model
+
     def _ensure_time_step_model(
         self,
         num_steps: int,
@@ -1074,25 +1152,39 @@ class Flux2Pipeline(DiffusionPipeline):
         
         bs_embed, seq_len_dim, _ = prompt_embeds.shape
 
-        # Tile for multiple images per prompt
-        prompt_embeds = F.tile(prompt_embeds, (1, num_images_per_prompt, 1))
-        prompt_embeds = prompt_embeds.reshape(
-            (bs_embed.dim * num_images_per_prompt, seq_len_dim, -1)
-        )
+        # Tile for multiple images per prompt using compiled graph
+        if num_images_per_prompt > 1:
+            tile_model = self._ensure_prompt_tile_model(
+                batch_size=bs_embed.dim,
+                seq_len=seq_len.dim,
+                hidden_dim=prompt_embeds.shape[2].dim,
+                num_images_per_prompt=num_images_per_prompt,
+                device=DeviceRef.from_device(self.text_encoder.devices[0]),
+                dtype=prompt_embeds.dtype,
+            )
+            # Execute compiled graph
+            result_drv = tile_model.execute(prompt_embeds.driver_tensor)[0]
+            prompt_embeds = Tensor.from_dlpack(result_drv)
 
-        # Prepare text position IDs (4D for Flux2) - use cache if available
+        # After tiling, effective batch size is bs_embed * num_images_per_prompt
         batch_size_final = bs_embed.dim * num_images_per_prompt
         seq_len_val = seq_len.dim if hasattr(seq_len, "dim") else seq_len
-        text_ids_key = f"{batch_size_final}_{seq_len_val}_{self.text_encoder.devices[0]}"
         
+        # Check TENSOR cache first
+        text_ids_key = f"{batch_size_final}_{seq_len_val}_{self.text_encoder.devices[0]}"
         if text_ids_key in self._cached_text_ids:
             text_ids = self._cached_text_ids[text_ids_key]
         else:
-            text_ids = self._prepare_text_ids(
+            # Use compiled graph to generate text_ids on device
+            text_ids_model = self._ensure_text_ids_model(
                 batch_size=batch_size_final,
                 seq_len=seq_len_val,
-                device=self.text_encoder.devices[0],
+                device=DeviceRef.from_device(self.text_encoder.devices[0]),
             )
+            text_ids_drv = text_ids_model.execute()[0]
+            text_ids = Tensor.from_dlpack(text_ids_drv)
+            
+            # Update TENSOR cache
             self._cached_text_ids[text_ids_key] = text_ids
 
         return prompt_embeds, text_ids

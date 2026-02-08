@@ -112,6 +112,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="output.png",
         help="Output filename for the generated image.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable torch.profiler tracing",
+    )
 
     args = parser.parse_args(argv)
 
@@ -242,7 +247,25 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
     t0 = time.time()
-    outputs = pipeline.execute(inputs)
+    
+    if args.profile:
+        print("Profiling enabled...")
+        import torch
+        from torch.profiler import profile, ProfilerActivity
+        
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            with_stack=True,
+        ) as prof:
+            outputs = pipeline.execute(inputs)
+            
+        print("Exporting trace...")
+        prof.export_chrome_trace("trace.json")
+        print("Trace saved to trace.json")
+    else:
+        outputs = pipeline.execute(inputs)
+        
     latency = time.time() - t0
     print(f"Latency: {latency:.4f}s")
 
