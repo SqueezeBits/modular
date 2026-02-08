@@ -322,7 +322,9 @@ class Flux2Pipeline(DiffusionPipeline):
         self._pack_models: dict[str, Any] = {}
         self._prompt_embed_models: dict[str, Any] = {}
         self._latent_prep_models: dict[str, Any] = {}
+        self._latent_prep_models: dict[str, Any] = {}
         self._unsqueeze_models: dict[str, Any] = {}  # For layer tensor unsqueezing
+        self._time_step_models: dict[str, Any] = {}
         
         # Cache for invariant tensors (to avoid Tensor.full and Tensor.from_dlpack overhead)
         self._cached_guidance: dict[str, Tensor] = {}
@@ -562,6 +564,100 @@ class Flux2Pipeline(DiffusionPipeline):
         self._unsqueeze_models[key] = model
         return model
 
+    def _ensure_time_step_model(
+        self,
+        num_steps: int,
+        device: DeviceRef,
+    ):
+        """Compile a graph to compute current timestep and dt from step index.
+        
+        Input: 
+            step_idx: int64 [1]
+            sigmas: float32 [num_steps + 1] (on device)
+        Output:
+            timestep: bfloat16 [1]
+            dt: bfloat16 scalar
+        """
+        # Key depends on number of steps and device
+        # We assume sigmas are always float32 as per scheduler
+        key = f"{num_steps}_{device}"
+        if key in self._time_step_models:
+            return self._time_step_models[key]
+
+        with Graph("time_step", input_types=[
+            TensorType(DType.int64, [1], device), # step_idx
+            TensorType(DType.float32, [num_steps + 1], device) # sigmas
+        ]) as graph:
+            step_idx, sigmas = graph.inputs
+            
+            # Gather sigma[i] and sigma[i+1]
+            # step_idx is [1], so gather returns [1]
+            sigma_i = ops.gather(sigmas, step_idx, axis=0)
+            
+            # Compute i+1
+            one = ops.constant(np.array([1], dtype=np.int64), dtype=DType.int64, device=device)
+            step_idx_plus_1 = ops.add(step_idx, one)
+            sigma_i_plus_1 = ops.gather(sigmas, step_idx_plus_1, axis=0)
+            
+            # Compute t and dt
+            # t = sigma_i.cast(bfloat16)
+            t = ops.cast(sigma_i, DType.bfloat16)
+            
+            # dt = (sigma_i+1 - sigma_i).cast(bfloat16)
+            dt_f32 = ops.sub(sigma_i_plus_1, sigma_i)
+            dt = ops.cast(dt_f32, DType.bfloat16)
+            
+            # Squeeze dt to scalar (rank 0)
+            dt = ops.squeeze(dt, axis=0)
+            
+            graph.output(t, dt)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._time_step_models[key] = model
+        return model
+
+    def _ensure_all_time_steps_model(
+        self,
+        num_steps: int,
+        device: DeviceRef,
+    ):
+        """Compile a graph to compute all timesteps and dts for the entire schedule.
+        
+        Input: 
+            sigmas: float32 [num_steps + 1] (on device)
+        Output:
+            all_timesteps: bfloat16 [num_steps]
+            all_dts: bfloat16 [num_steps]
+        """
+        # Use a generic cache key since the graph is symbolic over num_steps
+        key = f"{device}"
+        if key in self._time_step_models:
+            return self._time_step_models[key]
+
+        # Use symbolic shape for sigmas so we don't recompile for different step counts
+        # (e.g. warmup vs actual run)
+        with Graph("time_step_all", input_types=[
+            TensorType(DType.float32, ["num_sigmas"], device) # sigmas
+        ]) as graph:
+            sigmas = graph.inputs[0]
+            
+            # all_t = sigmas[:-1].cast(bfloat16)
+            sigmas_curr = ops.slice_tensor(sigmas, [slice(0, -1)])
+            all_t = ops.cast(sigmas_curr, DType.bfloat16)
+            
+            # all_dt = (sigmas[1:] - sigmas[:-1]).cast(bfloat16)
+            sigmas_next = ops.slice_tensor(sigmas, [slice(1, None)])
+            dt_f32 = ops.sub(sigmas_next, sigmas_curr)
+            all_dt = ops.cast(dt_f32, DType.bfloat16)
+            
+            graph.output(all_t, all_dt)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._time_step_models[key] = model
+        return model
+
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         inputs = Flux2ModelInputs.from_context(context)
         
@@ -593,7 +689,7 @@ class Flux2Pipeline(DiffusionPipeline):
         input_types = [
             TensorType(dtype, shape=["batch", "seq", "channels"], device=device),  # latents
             TensorType(dtype, shape=["batch", "seq", "channels"], device=device),  # noise_pred
-            TensorType(dtype, shape=[], device=device),  # dt (scalar)
+            TensorType(dtype, shape=[1], device=device),  # dt (vector-1)
         ]
 
         with Graph("scheduler_step", input_types=input_types) as graph:
@@ -608,7 +704,7 @@ class Flux2Pipeline(DiffusionPipeline):
         self,
         latents_drv,  # DriverTensor
         noise_pred_drv,  # DriverTensor
-        dt_drv,  # DriverTensor (scalar)
+        dt_drv,  # DriverTensor (vector-1)
     ):
         """Execute compiled scheduler step: latents + dt * noise_pred."""
         result_drv = self._scheduler_step_model.execute(
@@ -740,6 +836,13 @@ class Flux2Pipeline(DiffusionPipeline):
             if os.environ.get("FLUX2_DEBUG", "0") == "1":
                 print("[Profiling] Building Scheduler Graph...", flush=True)
             self._build_scheduler_step_graph(dtype, device)
+            
+        # Ensure all time steps model is built
+        _all_time_steps_model = self._ensure_all_time_steps_model(
+            num_steps=num_inference_steps,
+            device=DeviceRef.from_device(device),
+        )
+
         _t_scheduler_setup_end = _time.time()
         if os.environ.get("FLUX2_DEBUG", "0") == "1":
             print(f"[Profiling] Scheduler Setup: {(_t_scheduler_setup_end - _t_compile_end)*1000:.2f}ms", flush=True)
@@ -749,9 +852,35 @@ class Flux2Pipeline(DiffusionPipeline):
         guidance_drv = guidance.driver_tensor
         txt_ids_drv = text_ids.driver_tensor
         img_ids_drv = latent_image_ids.driver_tensor
+        
+        # Pre-upload sigmas to GPU for time step model
+        sigmas_drv = sigmas.driver_tensor
 
         # Keep latents as DriverTensor throughout the loop
         latents_drv = latents.driver_tensor
+
+        # Pre-compute all timesteps and dts on device
+        # This replaces the per-step host-to-device copy and kernel launch
+        all_timesteps_drv, all_dts_drv = _all_time_steps_model.execute(sigmas_drv)
+        
+
+        # Helper to unwrap compiled models from max.functional wrappers to access the raw Model object
+        def _unwrap_model(model):
+            while hasattr(model, "__wrapped__"):
+                model = model.__wrapped__
+            return model
+
+        # Ensure we have driver tensors (buffers), not Tensor objects
+        if hasattr(all_timesteps_drv, "driver_tensor"):
+            all_timesteps_drv = all_timesteps_drv.driver_tensor
+        
+        if hasattr(all_dts_drv, "driver_tensor"):
+            all_dts_drv = all_dts_drv.driver_tensor
+
+        # Retrieve raw Model objects to bypass python overhead from max.functional wrappers
+        # and Model.__call__ signature binding.
+        raw_compiled_model = _unwrap_model(compiled_model)
+        raw_scheduler_step_model = _unwrap_model(self._scheduler_step_model)
 
         import time as _time
 
@@ -763,21 +892,17 @@ class Flux2Pipeline(DiffusionPipeline):
             _t0 = _time.time()
             self._current_timestep = i
 
-            # Calculate dt in Python (CPU)
-            t = self.scheduler.timesteps[i]
-            dt = self._sigmas_cpu[i + 1] - self._sigmas_cpu[i]
-
-            # Manual float32 -> bfloat16 conversion (truncation) to avoid Tensor.cast overhead
-            t_u16 = (np.array(t / 1000.0, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
-            dt_u16 = (np.array(dt, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)[None]
-
-            # Create uint16 Buffer -> View as bfloat16
-            timestep_drv = DriverTensor.from_dlpack(t_u16).to(device).view(DType.bfloat16)
-            dt_drv = DriverTensor.from_dlpack(dt_u16).to(device).view(DType.bfloat16, shape=[])
+            # Retrieve timestep and dt from precomputed tensors by slicing
+            # [i:i+1] keeps rank 1 for timestep
+            timestep_drv = all_timesteps_drv[i : i + 1]
+            
+            # [i:i+1] gives vector-1 for dt (compatible with shape=[1])
+            dt_drv = all_dts_drv[i : i + 1]
+            
             _t1 = _time.time()
 
             # Transformer forward pass
-            noise_pred_drv = compiled_model(
+            noise_pred_drv = raw_compiled_model.execute(
                 latents_drv,
                 encoder_hidden_states_drv,
                 timestep_drv,
@@ -788,11 +913,15 @@ class Flux2Pipeline(DiffusionPipeline):
             _t2 = _time.time()
 
             # Scheduler step (compiled graph execution)
-            latents_drv = self._scheduler_step(latents_drv, noise_pred_drv, dt_drv)
+            latents_drv = raw_scheduler_step_model.execute(latents_drv, noise_pred_drv, dt_drv)[0]
             _t3 = _time.time()
             
             if os.environ.get("FLUX2_DEBUG", "0") == "1":
                 print(f"step {i}: prep={(_t1-_t0)*1000:.2f}ms, transformer={(_t2-_t1)*1000:.2f}ms, scheduler={(_t3-_t2)*1000:.2f}ms, total={(_t3-_t0)*1000:.2f}ms", flush=True)
+
+            # Explicit synchronization to prevent queue buildup and OOM when bypassing max.functional
+            if hasattr(device, "synchronize"):
+                device.synchronize()
 
             if callback_queue is not None:
                 latents = Tensor.from_dlpack(latents_drv)
