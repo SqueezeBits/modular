@@ -1021,9 +1021,18 @@ class Flux2Pipeline(DiffusionPipeline):
         # 3. Decode
         batch_size = latents.shape[0].dim
         image_list = []
+        
+        # Get driver tensor for IDs to allow cheap slicing
+        latent_image_ids_drv = latent_image_ids.driver_tensor
+        
         for b in range(batch_size):
-            latents_b = latents[b : b + 1]
-            latent_image_ids_b = latent_image_ids[b : b + 1]
+            # DriverTensor requires explicit slicing for all dimensions (Rank 3: B, L, C)
+            latents_drv_b = latents_drv[b : b + 1, :, :]
+            latent_image_ids_drv_b = latent_image_ids_drv[b : b + 1, :, :]
+            
+            # Wrap back in Tensor for API compatibility
+            latents_b = Tensor.from_dlpack(latents_drv_b)
+            latent_image_ids_b = Tensor.from_dlpack(latent_image_ids_drv_b)
             
             image_b = self._decode_latents(
                 latents_b,

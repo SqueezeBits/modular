@@ -14,7 +14,7 @@
 from typing import Any, ClassVar, Optional
 
 from max import functional as F
-from max.driver import Device
+from max.driver import Buffer, Device
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType
 from max.graph.weights import Weights
@@ -299,6 +299,28 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
                 )
 
         return self.model
+
+    def decode(self, z: Any, temb: Any = None) -> Any:
+        """Optimized decode that uses execute() for DriverTensors."""
+        # Check if z is a DriverTensor (Buffer)
+        is_driver = isinstance(z, Buffer)
+
+        if is_driver:
+            # Unwrap model if needed (though usually it's already unwrapped in load_model)
+            model = self.model
+            while hasattr(model, "__wrapped__"):
+                model = model.__wrapped__
+
+            if hasattr(model, "execute"):
+                args = [z]
+                if temb is not None:
+                    args.append(temb)
+                return model.execute(*args)[0]
+
+        # Fallback to eager/standard execution
+        if temb is not None:
+            return super().decode(z, temb)
+        return super().decode(z)
 
     @property
     def bn(self) -> BatchNormStats:
