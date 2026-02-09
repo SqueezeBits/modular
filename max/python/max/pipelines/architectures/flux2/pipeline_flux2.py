@@ -309,6 +309,7 @@ class Flux2Pipeline(DiffusionPipeline):
         self._prompt_embed_models: dict[str, Any] = {}
         self._pack_models: dict[str, Any] = {}
         self._latent_prep_models: dict[str, Any] = {}
+        self._unsqueeze_models: dict[str, Any] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
@@ -460,6 +461,28 @@ class Flux2Pipeline(DiffusionPipeline):
         self._prompt_embed_models[model_key] = model
         return model
 
+    def _ensure_unsqueeze_model(
+        self,
+        seq_len: int,
+        hidden_dim: int,
+        device: DeviceRef,
+        dtype: DType,
+    ):
+        key = f"{seq_len}_{hidden_dim}_{device}_{dtype}"
+        if key in self._unsqueeze_models:
+            return self._unsqueeze_models[key]
+
+        input_type = TensorType(dtype, shape=[seq_len, hidden_dim], device=device)
+        with Graph("unsqueeze_layer", input_types=[input_type]) as graph:
+            tensor_in = graph.inputs[0]
+            result = ops.reshape(tensor_in, [1, seq_len, hidden_dim])
+            graph.output(result)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._unsqueeze_models[key] = model
+        return model
+
     def _ensure_pack_model(self, batch_size, channels, height, width, device, dtype):
         key = f"{batch_size}_{channels}_{height}_{width}_{device}_{dtype}"
         if key in self._pack_models:
@@ -573,10 +596,11 @@ class Flux2Pipeline(DiffusionPipeline):
                 hs = Tensor.from_dlpack(hs)
 
             # Handle sequence length padding/truncation
-            if hs.rank == 2:
-                # Shape: [seq_len, hidden_dim]
-                real_seq_len = hs.shape[0].dim
-                hidden_dim = hs.shape[1].dim
+            tensor_rank = hs.rank
+            if tensor_rank == 2:
+                drv_shape = hs.driver_tensor.shape
+                real_seq_len = drv_shape[0]
+                hidden_dim = drv_shape[1]
                 if real_seq_len < max_sequence_length:
                     padding_size = max_sequence_length - real_seq_len
                     padding = Tensor.zeros(
@@ -587,14 +611,19 @@ class Flux2Pipeline(DiffusionPipeline):
                     hs = F.concat([hs, padding], axis=0)
                 elif real_seq_len > max_sequence_length:
                     hs = hs[:max_sequence_length]
-
-                # Reshape to [1, seq_len, hidden_dim]
-                hs = F.reshape(hs, [1, max_sequence_length, hidden_dim])
-            elif hs.rank == 3:
-                # Shape: [batch, seq_len, hidden_dim]
-                batch_size = hs.shape[0].dim
-                real_seq_len = hs.shape[1].dim
-                hidden_dim = hs.shape[2].dim
+                unsqueeze_model = self._ensure_unsqueeze_model(
+                    seq_len=max_sequence_length,
+                    hidden_dim=hidden_dim,
+                    device=hs.device,
+                    dtype=hs.dtype,
+                )
+                (hs_out,) = unsqueeze_model.execute(hs.driver_tensor)
+                hs = Tensor.from_dlpack(hs_out)
+            elif tensor_rank == 3:
+                drv_shape = hs.driver_tensor.shape
+                batch_size = drv_shape[0]
+                real_seq_len = drv_shape[1]
+                hidden_dim = drv_shape[2]
                 if real_seq_len < max_sequence_length:
                     padding_size = max_sequence_length - real_seq_len
                     padding = Tensor.zeros(
