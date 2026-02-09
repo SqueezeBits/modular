@@ -307,6 +307,8 @@ class Flux2Pipeline(DiffusionPipeline):
         self._patchify_models: dict[str, Any] = {}
         self._vae_prep_models: dict[str, Any] = {}
         self._prompt_embed_models: dict[str, Any] = {}
+        self._pack_models: dict[str, Any] = {}
+        self._latent_prep_models: dict[str, Any] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
@@ -456,6 +458,71 @@ class Flux2Pipeline(DiffusionPipeline):
         session = InferenceSession([Accelerator()])
         model = session.load(graph)
         self._prompt_embed_models[model_key] = model
+        return model
+
+    def _ensure_pack_model(self, batch_size, channels, height, width, device, dtype):
+        key = f"{batch_size}_{channels}_{height}_{width}_{device}_{dtype}"
+        if key in self._pack_models:
+            return self._pack_models[key]
+
+        input_type = TensorType(
+            dtype, shape=[batch_size, channels, height, width], device=device
+        )
+        with Graph("pack", input_types=[input_type]) as graph:
+            latents = graph.inputs[0]
+            latents = ops.reshape(latents, (batch_size, channels, height * width))
+            latents = ops.permute(latents, (0, 2, 1))
+            graph.output(latents)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._pack_models[key] = model
+        return model
+
+    def _ensure_latent_prep_model(
+        self,
+        batch_size: int,
+        channels: int,
+        height: int,
+        width: int,
+        device: DeviceRef,
+        input_dtype: DType,
+        output_dtype: DType,
+    ):
+        key = f"{batch_size}_{channels}_{height}_{width}_{device}_{input_dtype}_{output_dtype}"
+        if key in self._latent_prep_models:
+            return self._latent_prep_models[key]
+
+        input_type = TensorType(
+            input_dtype, shape=[batch_size, channels, height, width], device=device
+        )
+        with Graph("latent_prep", input_types=[input_type]) as graph:
+            latents = graph.inputs[0]
+            latents = ops.cast(latents, output_dtype)
+            latents = ops.reshape(
+                latents, (batch_size, channels, height // 2, 2, width // 2, 2)
+            )
+            latents = ops.permute(latents, (0, 1, 3, 5, 2, 4))
+            latents = ops.reshape(
+                latents, (batch_size, channels * 4, height // 2, width // 2)
+            )
+            packed_channels = channels * 4
+            packed_height = height // 2
+            packed_width = width // 2
+            latents = ops.reshape(
+                latents,
+                (
+                    batch_size,
+                    packed_channels,
+                    packed_height * packed_width,
+                ),
+            )
+            latents = ops.permute(latents, (0, 2, 1))
+            graph.output(latents)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._latent_prep_models[key] = model
         return model
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
@@ -940,15 +1007,18 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return image_latent_ids
 
-    @staticmethod
-    def _pack_latents(latents: Tensor) -> Tensor:
+    def _pack_latents(self, latents: Tensor) -> Tensor:
         batch_size = latents.shape[0].dim
         num_channels = latents.shape[1].dim
         height = latents.shape[2].dim
         width = latents.shape[3].dim
-        latents = F.reshape(latents, (batch_size, num_channels, height * width))
-        latents = F.permute(latents, (0, 2, 1))
-        return latents
+        device = latents.device
+        dtype = latents.dtype
+        model = self._ensure_pack_model(
+            batch_size, num_channels, height, width, device, dtype
+        )
+        latents_drv = model.execute(latents.driver_tensor)[0]
+        return Tensor.from_dlpack(latents_drv)
 
     @staticmethod
     def retrieve_latents(
@@ -1144,13 +1214,26 @@ class Flux2Pipeline(DiffusionPipeline):
 
         # 2. Denoise
         dtype = prompt_embeds.dtype
-        latents: Tensor = (
-            Tensor.from_dlpack(model_inputs.latents)
-            .to(self.transformer.devices[0])
-            .cast(dtype)
+        device = self.transformer.devices[0]
+        raw_latents = np.asarray(model_inputs.latents)
+        batch_size = raw_latents.shape[0]
+        channels = raw_latents.shape[1]
+        height = raw_latents.shape[2]
+        width = raw_latents.shape[3]
+        input_dtype = DType.float32
+
+        latent_prep_model = self._ensure_latent_prep_model(
+            batch_size=batch_size,
+            channels=channels,
+            height=height,
+            width=width,
+            device=DeviceRef.from_device(device),
+            input_dtype=input_dtype,
+            output_dtype=dtype,
         )
-        latents = self._patchify_latents(latents)
-        latents = self._pack_latents(latents)
+        latents_drv = DriverTensor.from_dlpack(raw_latents).to(device)
+        latents_drv = latent_prep_model.execute(latents_drv)[0]
+        latents = Tensor.from_dlpack(latents_drv)
 
         image_seq_len = latents.shape[1].dim
         patch_h = patch_w = int(image_seq_len**0.5)
