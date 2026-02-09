@@ -306,6 +306,7 @@ class Flux2Pipeline(DiffusionPipeline):
         self.image_processor = image_processor
         self._patchify_models: dict[str, Any] = {}
         self._vae_prep_models: dict[str, Any] = {}
+        self._prompt_embed_models: dict[str, Any] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
@@ -370,6 +371,91 @@ class Flux2Pipeline(DiffusionPipeline):
         session = InferenceSession([Accelerator()])
         model = session.load(graph)
         self._vae_prep_models[key] = model
+        return model
+
+    def _ensure_prompt_embed_model(
+        self,
+        batch_size: int,
+        num_layers: int,
+        seq_len: int,
+        hidden_dim: int,
+        device: DeviceRef,
+        dtype: DType,
+    ):
+        key = f"{batch_size}_{num_layers}_{seq_len}_{hidden_dim}_{device}_{dtype}"
+        if key in self._prompt_embed_models:
+            return self._prompt_embed_models[key]
+
+        input_types = [
+            TensorType(dtype, shape=[batch_size, seq_len, hidden_dim], device=device)
+            for _ in range(num_layers)
+        ]
+        with Graph("prompt_embed_postproc", input_types=input_types) as graph:
+            layer_inputs = [inp for inp in graph.inputs]
+            stacked = ops.stack(layer_inputs, axis=1)
+            stacked = ops.permute(stacked, [0, 2, 1, 3])
+            result = ops.reshape(
+                stacked, [batch_size, seq_len, num_layers * hidden_dim]
+            )
+            graph.output(result)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._prompt_embed_models[key] = model
+        return model
+
+    def _ensure_prompt_tile_model(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+        num_images_per_prompt: int,
+        device: DeviceRef,
+        dtype: DType,
+    ):
+        key = f"{batch_size}_{seq_len}_{hidden_dim}_{num_images_per_prompt}_{device}_{dtype}"
+        if key in self._prompt_embed_models:
+            return self._prompt_embed_models[key]
+
+        input_type = TensorType(
+            dtype, shape=[batch_size, seq_len, hidden_dim], device=device
+        )
+        with Graph("prompt_tile", input_types=[input_type]) as graph:
+            embeds = graph.inputs[0]
+            embeds = ops.reshape(embeds, (batch_size, 1, seq_len, hidden_dim))
+            embeds = ops.tile(embeds, [1, num_images_per_prompt, 1, 1])
+            embeds = ops.reshape(
+                embeds,
+                (batch_size * num_images_per_prompt, seq_len, hidden_dim),
+            )
+            graph.output(embeds)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._prompt_embed_models[key] = model
+        return model
+
+    def _ensure_text_ids_model(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: DeviceRef,
+    ):
+        model_key = f"text_ids_model_{batch_size}_{seq_len}_{device}"
+        if model_key in self._prompt_embed_models:
+            return self._prompt_embed_models[model_key]
+
+        with Graph("text_ids_gen", input_types=[]) as graph:
+            coords = np.zeros((seq_len, 4), dtype=np.int64)
+            coords[:, 3] = np.arange(seq_len, dtype=np.int64)
+            coords_const = ops.constant(coords, dtype=DType.int64, device=device)
+            coords_batch = ops.reshape(coords_const, (1, seq_len, 4))
+            text_ids = ops.tile(coords_batch, [batch_size, 1, 1])
+            graph.output(text_ids)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._prompt_embed_models[model_key] = model
         return model
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
@@ -455,36 +541,45 @@ class Flux2Pipeline(DiffusionPipeline):
 
             layer_tensors.append(hs)
 
-        # Stack layers: [1, 3, seq_len, hidden_dim]
-        stacked = F.stack(layer_tensors, axis=1)
+        first_hs = layer_tensors[0]
+        batch_size = first_hs.shape[0].dim
+        seq_len = first_hs.shape[1].dim
+        hidden_dim = first_hs.shape[2].dim
+        num_layers = len(layer_tensors)
 
-        # Permute to [1, seq_len, 3, hidden_dim]
-        stacked = F.permute(stacked, [0, 2, 1, 3])
-
-        # Reshape to [1, seq_len, 3*hidden_dim]
-        batch_size = stacked.shape[0].dim
-        seq_len = stacked.shape[1].dim
-        num_layers = stacked.shape[2].dim
-        hidden_dim = stacked.shape[3].dim
-        prompt_embeds = F.reshape(
-            stacked, [batch_size, seq_len, num_layers * hidden_dim]
+        prompt_embed_model = self._ensure_prompt_embed_model(
+            batch_size=batch_size,
+            num_layers=num_layers,
+            seq_len=seq_len,
+            hidden_dim=hidden_dim,
+            device=DeviceRef.from_device(self.text_encoder.devices[0]),
+            dtype=first_hs.dtype,
         )
+        driver_inputs = [hs.driver_tensor for hs in layer_tensors]
+        prompt_embeds = Tensor.from_dlpack(prompt_embed_model.execute(*driver_inputs)[0])
 
-        bs_embed, seq_len, _ = prompt_embeds.shape
+        bs_embed, seq_len_dim, _ = prompt_embeds.shape
+        if num_images_per_prompt > 1:
+            tile_model = self._ensure_prompt_tile_model(
+                batch_size=bs_embed.dim,
+                seq_len=seq_len,
+                hidden_dim=prompt_embeds.shape[2].dim,
+                num_images_per_prompt=num_images_per_prompt,
+                device=DeviceRef.from_device(self.text_encoder.devices[0]),
+                dtype=prompt_embeds.dtype,
+            )
+            prompt_embeds = Tensor.from_dlpack(
+                tile_model.execute(prompt_embeds.driver_tensor)[0]
+            )
 
-        # Tile for multiple images per prompt
-        prompt_embeds = F.tile(prompt_embeds, (1, num_images_per_prompt, 1))
-        prompt_embeds = prompt_embeds.reshape(
-            (bs_embed.dim * num_images_per_prompt, seq_len, -1)
-        )
-
-        # Prepare text position IDs (4D for Flux2)
         batch_size_final = bs_embed.dim * num_images_per_prompt
-        text_ids = self._prepare_text_ids(
+        seq_len_val = seq_len_dim.dim if hasattr(seq_len_dim, "dim") else seq_len_dim
+        text_ids_model = self._ensure_text_ids_model(
             batch_size=batch_size_final,
-            seq_len=seq_len.dim if hasattr(seq_len, "dim") else seq_len,
-            device=self.text_encoder.devices[0],
+            seq_len=seq_len_val,
+            device=DeviceRef.from_device(self.text_encoder.devices[0]),
         )
+        text_ids = Tensor.from_dlpack(text_ids_model.execute()[0])
 
         return prompt_embeds, text_ids
 
@@ -752,28 +847,6 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
         return prompt_embeds, text_ids
-
-    @staticmethod
-    def _prepare_text_ids(
-        batch_size: int,
-        seq_len: int,
-        device: DeviceRef,
-    ) -> Tensor:
-        # Create 4D coordinates: (T=0, H=0, W=0, L=[0..seq_len-1])
-        coords = np.stack(
-            [
-                np.zeros(seq_len, dtype=np.int64),  # T dimension
-                np.zeros(seq_len, dtype=np.int64),  # H dimension
-                np.zeros(seq_len, dtype=np.int64),  # W dimension
-                np.arange(seq_len, dtype=np.int64),  # L dimension
-            ],
-            axis=-1,
-        )  # (seq_len, 4)
-
-        # Expand to batch (batch_size, seq_len, 4)
-        text_ids = np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
-        text_ids = Tensor.from_dlpack(text_ids).to(device)
-        return text_ids
 
     @staticmethod
     def _prepare_latent_image_ids(
