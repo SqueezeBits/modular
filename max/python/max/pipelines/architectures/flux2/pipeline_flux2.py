@@ -39,7 +39,6 @@ from max.pipelines.architectures.mistral3.arch import mistral3_arch
 from max.pipelines.architectures.mistral3.model import Mistral3Model
 from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
 from transformers import AutoConfig
-from tqdm import tqdm
 from max.graph.weights import WeightsFormat
 from typing import Callable
 
@@ -1181,7 +1180,7 @@ class Flux2Pipeline(DiffusionPipeline):
         raw_compiled_model = _unwrap_model(compiled_model)
         raw_scheduler_step_model = _unwrap_model(self._scheduler_step_model)
 
-        for i in tqdm(range(num_timesteps), desc="Denoising"):
+        for i in range(num_timesteps):
             self._current_timestep = i
             timestep_drv = all_timesteps_drv[i : i + 1]
             dt_drv = all_dts_drv[i : i + 1]
