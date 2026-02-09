@@ -39,6 +39,7 @@ from max.pipelines.architectures.mistral3.arch import mistral3_arch
 from max.pipelines.architectures.mistral3.model import Mistral3Model
 from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
 from transformers import AutoConfig
+from tqdm import tqdm
 from max.graph.weights import WeightsFormat
 from typing import Callable
 
@@ -310,6 +311,8 @@ class Flux2Pipeline(DiffusionPipeline):
         self._pack_models: dict[str, Any] = {}
         self._latent_prep_models: dict[str, Any] = {}
         self._unsqueeze_models: dict[str, Any] = {}
+        self._scheduler_step_model = None
+        self._time_step_models: dict[str, Any] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
@@ -547,6 +550,50 @@ class Flux2Pipeline(DiffusionPipeline):
         model = session.load(graph)
         self._latent_prep_models[key] = model
         return model
+
+    def _ensure_all_time_steps_model(
+        self,
+        num_steps: int,
+        device: DeviceRef,
+    ):
+        key = f"{device}"
+        if key in self._time_step_models:
+            return self._time_step_models[key]
+
+        with Graph(
+            "time_step_all",
+            input_types=[TensorType(DType.float32, ["num_sigmas"], device)],
+        ) as graph:
+            sigmas = graph.inputs[0]
+            sigmas_curr = ops.slice_tensor(sigmas, [slice(0, -1)])
+            all_t = ops.cast(sigmas_curr, DType.bfloat16)
+            sigmas_next = ops.slice_tensor(sigmas, [slice(1, None)])
+            dt_f32 = ops.sub(sigmas_next, sigmas_curr)
+            all_dt = ops.cast(dt_f32, DType.bfloat16)
+            graph.output(all_t, all_dt)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._time_step_models[key] = model
+        return model
+
+    def _build_scheduler_step_graph(
+        self,
+        dtype: DType,
+        device: DeviceRef,
+    ) -> None:
+        input_types = [
+            TensorType(dtype, shape=["batch", "seq", "channels"], device=device),
+            TensorType(dtype, shape=["batch", "seq", "channels"], device=device),
+            TensorType(dtype, shape=[1], device=device),
+        ]
+        with Graph("scheduler_step", input_types=input_types) as graph:
+            latents_in, noise_pred_in, dt_in = graph.inputs
+            result = latents_in + dt_in * noise_pred_in
+            graph.output(result)
+
+        session = InferenceSession([Accelerator()])
+        self._scheduler_step_model = session.load(graph)
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         return Flux2ModelInputs.from_context(context)
@@ -1212,22 +1259,6 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return image_latents, image_latent_ids
 
-    def _scheduler_step(
-        self,
-        latents: Tensor,
-        noise_pred: Tensor,
-        sigmas: Tensor,
-        step_index: int,
-    ) -> Tensor:
-        latents_dtype = latents.dtype
-        latents = latents.cast(DType.float32)
-        sigma = sigmas[step_index]
-        sigma_next = sigmas[step_index + 1]
-        dt = sigma_next - sigma
-        latents = latents + dt * noise_pred
-        latents = latents.cast(latents_dtype)
-        return latents
-
     def execute(
         self,
         model_inputs: Flux2ModelInputs,
@@ -1299,13 +1330,6 @@ class Flux2Pipeline(DiffusionPipeline):
 
         timesteps: np.ndarray = self.scheduler.timesteps
         num_timesteps = timesteps.shape[0]
-        timesteps_normalized = (timesteps / 1000.0).astype(np.float32)
-        timesteps_batched = np.broadcast_to(
-            timesteps_normalized[:, None], (num_timesteps, batch_size)
-        )
-        timesteps_batched = Tensor.from_dlpack(timesteps_batched).to(
-            self.transformer.devices[0]
-        )
 
         image_seq_len = latents.shape[1].dim
         text_seq_len = prompt_embeds.shape[1].dim
@@ -1319,22 +1343,39 @@ class Flux2Pipeline(DiffusionPipeline):
         guidance_drv = guidance.driver_tensor
         txt_ids_drv = text_ids.driver_tensor
         img_ids_drv = latent_image_ids.driver_tensor
+        device = self.transformer.devices[0]
+        if self._scheduler_step_model is None:
+            self._build_scheduler_step_graph(dtype, device)
+
+        _all_time_steps_model = self._ensure_all_time_steps_model(
+            num_steps=num_inference_steps,
+            device=DeviceRef.from_device(device),
+        )
+
+        sigmas_drv = sigmas.driver_tensor
+        latents_drv = latents.driver_tensor
+        all_timesteps_drv, all_dts_drv = _all_time_steps_model.execute(sigmas_drv)
+
+        def _unwrap_model(model):
+            while hasattr(model, "__wrapped__"):
+                model = model.__wrapped__
+            return model
+
+        if hasattr(all_timesteps_drv, "driver_tensor"):
+            all_timesteps_drv = all_timesteps_drv.driver_tensor
+        if hasattr(all_dts_drv, "driver_tensor"):
+            all_dts_drv = all_dts_drv.driver_tensor
+
+        raw_compiled_model = _unwrap_model(compiled_model)
+        raw_scheduler_step_model = _unwrap_model(self._scheduler_step_model)
 
         for i in tqdm(range(num_timesteps), desc="Denoising"):
             self._current_timestep = i
-            t = timesteps[i]
-            timestep_np = np.full((batch_size,), t, dtype=np.float32) / 1000.0
-            timestep_tensor = (
-                Tensor.from_dlpack(timestep_np)
-                .to(prompt_embeds.device)
-                .cast(prompt_embeds.dtype)
-            )
-            timestep_drv = timestep_tensor.driver_tensor
+            timestep_drv = all_timesteps_drv[i : i + 1]
+            dt_drv = all_dts_drv[i : i + 1]
 
-            hidden_states_drv = latents.driver_tensor
-
-            noise_pred_drv = compiled_model(
-                hidden_states_drv,
+            noise_pred_drv = raw_compiled_model.execute(
+                latents_drv,
                 encoder_hidden_states_drv,
                 timestep_drv,
                 img_ids_drv,
@@ -1342,12 +1383,15 @@ class Flux2Pipeline(DiffusionPipeline):
                 guidance_drv,
             )[0]
 
-            noise_pred = Tensor.from_dlpack(noise_pred_drv)
+            latents_drv = raw_scheduler_step_model.execute(
+                latents_drv, noise_pred_drv, dt_drv
+            )[0]
 
-            # scheduler step
-            latents = self._scheduler_step(latents, noise_pred, sigmas, i)
+            if hasattr(device, "synchronize"):
+                device.synchronize()
 
             if callback_queue is not None:
+                latents = Tensor.from_dlpack(latents_drv)
                 image = self._decode_latents(
                     latents,
                     latent_image_ids,
@@ -1357,12 +1401,17 @@ class Flux2Pipeline(DiffusionPipeline):
                 )
                 callback_queue.put_nowait(image)
 
+        latents = Tensor.from_dlpack(latents_drv)
+
         # 3. Decode
         batch_size = latents.shape[0].dim
         image_list = []
+        latent_image_ids_drv = latent_image_ids.driver_tensor
         for b in range(batch_size):
-            latents_b = latents[b : b + 1]
-            latent_image_ids_b = latent_image_ids[b : b + 1]
+            latents_drv_b = latents_drv[b : b + 1, :, :]
+            latent_image_ids_drv_b = latent_image_ids_drv[b : b + 1, :, :]
+            latents_b = Tensor.from_dlpack(latents_drv_b)
+            latent_image_ids_b = Tensor.from_dlpack(latent_image_ids_drv_b)
 
             image_b = self._decode_latents(
                 latents_b,
