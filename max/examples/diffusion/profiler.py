@@ -125,10 +125,12 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
         *,
         enabled: bool = True,
         patch_tensor_ops: bool = False,
+        is_diffusers: bool = False,
     ) -> None:
         self._obj: Any = pipeline_or_wrapper
         self._enabled: bool = enabled
         self._patch_tensor_ops: bool = patch_tensor_ops
+        self._is_diffusers: bool = is_diffusers
         self.stats: dict[str, Stat] = {}
         self.component_stats: dict[str, Stat] = {}
         self._patcher: _Patcher = _Patcher()
@@ -223,13 +225,25 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
 
     def _wrap_methods(self, target: Any) -> None:
         """Wrap key pipeline methods when present on the target object."""
-        method_specs: tuple[tuple[str, str], ...] = (
-            ("execute", "E2E execute"),
-            ("_prepare_prompt_embeddings", "prepare_embeddings"),
-            ("_decode_latents", "decode_latents"),
-            ("_scheduler_step", "scheduler_step"),
-            ("_preprocess_latents", "preprocess_latents"),
-        )
+        if not self._is_diffusers:
+            method_specs: tuple[tuple[str, str], ...] = (
+                ("execute", "E2E execute"),
+                ("_prepare_prompt_embeddings", "prepare_embeddings"),
+                ("_decode_latents", "decode_latents"),
+                ("_scheduler_step", "scheduler_step"),
+                ("_preprocess_latents", "preprocess_latents"),
+            )
+        else:
+            method_specs: tuple[tuple[str, str], ...] = (
+                ("__call__", "E2E execute"),
+                ("encode_prompt", "encode_prompt"),
+                ("prepare_latents", "prepare_latents"),
+                ("retrieve_timesteps", "retrieve_timesteps"),
+                ("_unpack_latents_with_ids", "_unpack_latents_with_ids"),
+                ("_unpatchify_latents", "_unpatchify_latents"),
+                ("scheduler.step", "scheduler.step"),
+                ("image_processor.postprocess", "image_processor.postprocess"),
+            )
         for method_name, label in method_specs:
             self._wrap_method_if_exists(target, method_name, label)
 
@@ -237,9 +251,19 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
         self, obj: Any, method_name: str, label: str
     ) -> None:
         """Wrap `obj.method_name` and aggregate into method and module buckets."""
-        if not hasattr(obj, method_name):
+        patch_target: Any = obj
+        target_method_name: str = method_name
+        if "." in method_name:
+            patch_target = self._resolve_attr_path(obj, method_name)
+            if patch_target is None:
+                return
+            target_method_name = method_name.split(".")[-1]
+        elif method_name == "__call__":
+            # __call__ is resolved on the class, so patch there for correctness.
+            patch_target = type(obj)
+        if not hasattr(patch_target, target_method_name):
             return
-        original: Any = getattr(obj, method_name)
+        original: Any = getattr(patch_target, target_method_name)
         if not callable(original):
             return
         if getattr(original, "__is_execute_profiler_wrapper__", False):
@@ -257,14 +281,27 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
         wrapper.__wrapped__ = original  # type: ignore[attr-defined]
 
         try:
-            self._patcher.patch(obj, method_name, wrapper)
+            self._patcher.patch(patch_target, target_method_name, wrapper)
         except (AttributeError, TypeError):
             pass
 
-    def _wrap_components(self, target: Any) -> None:
-        """Replace `target.<component>` with a proxy.
+    def _resolve_attr_path(self, obj: Any, path: str) -> Any | None:
+        """Resolve a dotted attribute path (e.g. 'scheduler.step') on obj."""
+        current: Any = obj
+        for part in path.split(".")[:-1]:
+            if not hasattr(current, part):
+                return None
+            current = getattr(current, part)
+            if current is None:
+                return None
+        return current
 
-        For the VAE, also time `.encode()` and `.decode()` calls explicitly.
+    def _wrap_components(self, target: Any) -> None:
+        """Wrap component execution without disrupting pipeline semantics.
+
+        For torch modules, wrap `forward` on the instance. For other components,
+        replace the attribute with a proxy. For the VAE, also time `.encode()`
+        and `.decode()` calls explicitly.
         """
         comps: Any = getattr(target, "components", {}) or {}
         if not isinstance(comps, dict):
@@ -272,6 +309,8 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
 
         for name in comps:
             if not hasattr(target, name):
+                continue
+            if "scheduler" in name or "tokenizer" in name:
                 continue
             comp: Any = getattr(target, name)
             if comp is None:
@@ -285,8 +324,19 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
 
                 return on_time
 
-            timed_methods: dict[str, Callable[[float], None]] = {}
 
+            if self._is_diffusers:
+                self._wrap_component_method_if_exists(comp, "forward", base_label)
+                if name == "vae":
+                    self._wrap_component_method_if_exists(
+                        comp, "encode", "component/vae.encode"
+                    )
+                    self._wrap_component_method_if_exists(
+                        comp, "decode", "component/vae.decode"
+                    )
+                continue
+
+            timed_methods: dict[str, Callable[[float], None]] = {}
             if name == "vae":
                 timed_methods["encode"] = make_on_time("component/vae.encode")
                 timed_methods["decode"] = make_on_time("component/vae.decode")
@@ -301,6 +351,34 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
                 self._patcher.patch(target, name, proxy)
             except (AttributeError, TypeError):
                 continue
+
+    def _wrap_component_method_if_exists(
+        self, obj: Any, method_name: str, label: str
+    ) -> None:
+        """Wrap `obj.method_name` and aggregate into component buckets."""
+        if not hasattr(obj, method_name):
+            return
+        original: Any = getattr(obj, method_name)
+        if not callable(original):
+            return
+        if getattr(original, "__is_execute_profiler_wrapper__", False):
+            return
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            t0: float = perf_counter()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                dt: float = perf_counter() - t0
+                self._accum_component(label, dt)
+
+        wrapper.__is_execute_profiler_wrapper__ = True  # type: ignore[attr-defined]
+        wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+
+        try:
+            self._patcher.patch(obj, method_name, wrapper)
+        except (AttributeError, TypeError):
+            pass
 
     def _wrap_tensor_ops(self) -> None:
         """Patch Tensor conversion/movement ops (process-wide while active)."""
@@ -363,10 +441,12 @@ def profile_execute(
     *,
     enabled: bool = True,
     patch_tensor_ops: bool = False,
+    is_diffusers: bool = False,
 ) -> ExecuteProfiler:
     """Create a profiler for a diffusion pipeline or a wrapper pipeline."""
     return ExecuteProfiler(
         pipeline_or_wrapper,
         enabled=enabled,
         patch_tensor_ops=patch_tensor_ops,
+        is_diffusers=is_diffusers,
     )

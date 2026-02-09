@@ -23,3 +23,18 @@ modular_py_binary(
         requirement("torch"),  # for test
     ],
 )
+
+modular_py_binary(
+    name = "run_diffusers",
+    srcs = ["run_diffusers.py"],
+    tags = ["no-pydeps"],  # TODO: Fix and re-enable
+    deps = [
+        ":profiler",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("sentencepiece"),
+        requirement("torch"),  # for test
+        requirement("diffusers"),
+        requirement("transformers"),
+    ],
+)
