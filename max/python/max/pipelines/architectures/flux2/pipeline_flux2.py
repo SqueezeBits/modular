@@ -18,8 +18,10 @@ from typing import Any, Literal
 import numpy as np
 from max import functional as F
 from max.driver import CPU
+from max.driver import Accelerator
 from max.dtype import DType
-from max.graph import DeviceRef
+from max.engine import InferenceSession
+from max.graph import DeviceRef, Graph, TensorType, ops
 from max.interfaces import TokenBuffer
 from max.pipelines import PixelContext
 from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
@@ -100,6 +102,31 @@ class Flux2Pipeline(DiffusionPipeline):
             if getattr(self, "vae", None)
             else 8
         )
+        self._patchify_models: dict[str, Any] = {}
+
+    def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
+        """Get or compile a patchify graph for the given shape."""
+        key = f"{batch_size}_{channels}_{height}_{width}_{device}_{dtype}"
+        if key in self._patchify_models:
+            return self._patchify_models[key]
+        input_type = TensorType(
+            dtype, shape=[batch_size, channels, height, width], device=device
+        )
+        with Graph("patchify", input_types=[input_type]) as graph:
+            latents = graph.inputs[0]
+            latents = ops.reshape(
+                latents, (batch_size, channels, height // 2, 2, width // 2, 2)
+            )
+            latents = ops.permute(latents, (0, 1, 3, 5, 2, 4))
+            latents = ops.reshape(
+                latents, (batch_size, channels * 4, height // 2, width // 2)
+            )
+            graph.output(latents)
+
+        session = InferenceSession([Accelerator()])
+        model = session.load(graph)
+        self._patchify_models[key] = model
+        return model
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         """Convert a PixelContext into Flux2ModelInputs."""
@@ -442,47 +469,40 @@ class Flux2Pipeline(DiffusionPipeline):
         ).to(self.transformer.devices[0])
         return latents, latent_image_ids
 
-    @staticmethod
-    def _patchify_latents(latents: Tensor) -> Tensor:
-        """Patchify latents by folding 2x2 spatial blocks into the channel dimension.
+    def _patchify_latents(self, latents: Tensor) -> Tensor:
+        batch_size = latents.shape[0].dim
+        num_channels_latents = latents.shape[1].dim
+        height = latents.shape[2].dim
+        width = latents.shape[3].dim
+        device = latents.device
+        dtype = latents.dtype
 
-        Converts:
-            (B, C, H, W) -> (B, C*4, H//2, W//2)
-        """
-        batch_size, num_channels_latents, height, width = map(
-            int, latents.shape
+        model = self._ensure_patchify_model(
+            batch_size, num_channels_latents, height, width, device, dtype
         )
-
-        latents = F.reshape(
-            latents,
-            (batch_size, num_channels_latents, height // 2, 2, width // 2, 2),
-        )
-        latents = F.permute(latents, (0, 1, 3, 5, 2, 4))
-        latents = F.reshape(
-            latents,
-            (batch_size, num_channels_latents * 4, height // 2, width // 2),
-        )
-        return latents
+        latents_drv = model.execute(latents.driver_tensor)[0]
+        return Tensor.from_dlpack(latents_drv)
 
     @staticmethod
     def _unpatchify_latents(latents: Tensor) -> Tensor:
-        """Inverse of `_patchify_latents`.
+        batch_size = latents.shape[0].dim
+        num_channels_latents = latents.shape[1].dim
+        height = latents.shape[2].dim
+        width = latents.shape[3].dim
 
-        Converts:
-            (B, C*4, H//2, W//2) -> (B, C, H, W)
-        """
-        batch_size, num_channels_latents, height, width = map(
-            int, latents.shape
-        )
         latents = F.reshape(
             latents,
             (batch_size, num_channels_latents // 4, 2, 2, height, width),
         )
+        # Reverse the patchify permute: (0, 1, 3, 5, 2, 4) -> (0, 1, 4, 2, 5, 3)
+        # From (B, C//4, 2, 2, H, W) to (B, C//4, H, 2, W, 2)
         latents = F.permute(latents, (0, 1, 4, 2, 5, 3))
-        return F.reshape(
+        # Reshape to (B, C//4, H*2, W*2)
+        latents = F.reshape(
             latents,
             (batch_size, num_channels_latents // 4, height * 2, width * 2),
         )
+        return latents
 
     def _pil_image_to_tensor(
         self,
