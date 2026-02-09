@@ -426,6 +426,22 @@ class Flux2Pipeline(DiffusionPipeline):
         result = F.stack(x_list, axis=0)
         return result
 
+    def _preprocess_latents(
+        self, latents: Tensor, latent_image_ids: Tensor, dtype: DType
+    ) -> tuple[Tensor, Tensor]:
+        latents: Tensor = (
+            Tensor.from_dlpack(latents)
+            .to(self.transformer.devices[0])
+            .cast(dtype)
+        )
+        latents = self._patchify_latents(latents)
+        latents = self._pack_latents(latents)
+
+        latent_image_ids = Tensor.from_dlpack(
+            latent_image_ids.astype(np.int64)
+        ).to(self.transformer.devices[0])
+        return latents, latent_image_ids
+
     @staticmethod
     def _patchify_latents(latents: Tensor) -> Tensor:
         """Patchify latents by folding 2x2 spatial blocks into the channel dimension.
@@ -536,18 +552,11 @@ class Flux2Pipeline(DiffusionPipeline):
             )
 
         # 2) Prepare latents and conditioning tensors.
-        latents: Tensor = (
-            Tensor.from_dlpack(model_inputs.latents)
-            .to(self.transformer.devices[0])
-            .cast(dtype)
+        latents, latent_image_ids = self._preprocess_latents(
+            model_inputs.latents, model_inputs.latent_image_ids, dtype
         )
-        latents = self._patchify_latents(latents)
-        latents = self._pack_latents(latents)
 
-        latent_image_ids = Tensor.from_dlpack(
-            model_inputs.latent_image_ids.astype(np.int64)
-        ).to(self.transformer.devices[0])
-
+        # 3) Prepare scheduler tensors.
         guidance = Tensor.full(
             [latents.shape[0]],
             model_inputs.guidance_scale,
@@ -569,7 +578,8 @@ class Flux2Pipeline(DiffusionPipeline):
             .to(self.transformer.devices[0])
             .cast(dtype)
         )
-        # 3) Denoising loop.
+
+        # 4) Denoising loop.
         for i in tqdm(range(num_timesteps), desc="Denoising"):
             timestep = timesteps_batched[i]
 

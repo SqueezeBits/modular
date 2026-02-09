@@ -139,6 +139,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Profile timings of the pipeline.",
     )
+    parser.add_argument(
+        "--num-warmups",
+        type=int,
+        default=3,
+        help="Number of warmups to run before profiling.",
+    )
+    parser.add_argument(
+        "--num-profile-iterations",
+        type=int,
+        default=3,
+        help="Number of iterations to run for profiling.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -300,12 +312,16 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
     if args.profile_timings:
-        with profile_execute(
-            pipeline, patch_concat=True, patch_tensor_ops=True
-        ) as prof:
-            outputs = pipeline.execute(inputs)
-        print(f"Method timings:\n{prof.report(unit='ms')}")
-        print(f"Module timings:\n{prof.report_modules(unit='ms')}")
+        for i in range(args.num_warmups):
+            print(f"Running warmup {i + 1} of {args.num_warmups}")
+            pipeline.execute(inputs)
+        with profile_execute(pipeline) as prof:
+            for i in range(args.num_profile_iterations):
+                print(
+                    f"Running inference {i + 1} of {args.num_profile_iterations}"
+                )
+                outputs = pipeline.execute(inputs)
+        prof.report()
     else:
         outputs = pipeline.execute(inputs)
 
