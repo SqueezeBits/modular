@@ -503,15 +503,20 @@ class PipelineRegistry:
             try:
                 # Check if model_index.json exists to identify diffusion pipelines
                 import json
+                import os
+                from .config_enums import RepoType
 
                 from huggingface_hub import hf_hub_download
 
                 # Try to download model_index.json
-                config_path = hf_hub_download(
-                    repo_id=huggingface_repo.repo_id,
-                    filename="model_index.json",
-                    revision=huggingface_repo.revision,
-                )
+                if huggingface_repo.repo_type == RepoType.local:
+                    config_path = os.path.join(huggingface_repo.repo_id, "model_index.json")
+                else:
+                    config_path = hf_hub_download(
+                        repo_id=huggingface_repo.repo_id,
+                        filename="model_index.json",
+                        revision=huggingface_repo.revision,
+                    )
 
                 # Load the config
                 with open(config_path) as f:
