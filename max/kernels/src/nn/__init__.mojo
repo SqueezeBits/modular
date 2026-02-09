@@ -11,3 +11,4 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 """Provides neural network operators for deep learning models."""
+from .fused_qk_rope_vision import fused_qk_rope_vision
