@@ -1103,12 +1103,17 @@ class Flux2Pipeline(DiffusionPipeline):
                 latent_image_ids = Tensor.from_dlpack(input_ids).to(device)
             self._cached_latent_image_ids[ids_key] = latent_image_ids
 
-        guidance = Tensor.full(
-            [latents.shape[0]],
-            model_inputs.guidance_scale,
-            device=self.transformer.devices[0],
-            dtype=dtype,
-        )
+        guidance_key = f"{batch_size}_{model_inputs.guidance_scale}_{dtype}_{device}"
+        if guidance_key in self._cached_guidance:
+            guidance = self._cached_guidance[guidance_key]
+        else:
+            guidance = Tensor.full(
+                [latents.shape[0]],
+                model_inputs.guidance_scale,
+                device=device,
+                dtype=dtype,
+            )
+            self._cached_guidance[guidance_key] = guidance
 
         image_seq_len = latents.shape[1].dim
         num_inference_steps = model_inputs.num_inference_steps
@@ -1120,10 +1125,14 @@ class Flux2Pipeline(DiffusionPipeline):
             dtype=np.float32,
         )
         self.scheduler.set_timesteps(sigmas=base_sigmas, mu=mu)
-        sigmas = (
-            Tensor.from_dlpack(np.ascontiguousarray(self.scheduler.sigmas))
-            .to(self.transformer.devices[0])
-        )
+        self._sigmas_cpu = np.ascontiguousarray(self.scheduler.sigmas)
+
+        sigmas_key = f"{num_inference_steps}_{image_seq_len}_{device}"
+        if sigmas_key in self._cached_sigmas:
+            sigmas = self._cached_sigmas[sigmas_key]
+        else:
+            sigmas = Tensor.from_dlpack(self._sigmas_cpu).to(device)
+            self._cached_sigmas[sigmas_key] = sigmas
         batch_size = prompt_embeds.shape[0].dim
 
         timesteps: np.ndarray = self.scheduler.timesteps
