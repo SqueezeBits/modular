@@ -534,7 +534,25 @@ class Flux2Pipeline(DiffusionPipeline):
         self._scheduler_step_model = session.load(graph)
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
-        return Flux2ModelInputs.from_context(context)
+        inputs = Flux2ModelInputs.from_context(context)
+
+        # Flux2 latent IDs are defined on the packed latent grid (H/16, W/16).
+        if getattr(inputs, "latent_image_ids", None) is None:
+            batch_size = 1
+            if getattr(inputs, "latents", None) is not None:
+                latents_np = np.asarray(inputs.latents)
+                if latents_np.ndim > 0:
+                    batch_size = latents_np.shape[0]
+
+            inputs.latent_image_ids = self._prepare_latent_image_ids(
+                batch_size=batch_size,
+                height=inputs.height // 16,
+                width=inputs.width // 16,
+                device=self.transformer.devices[0],
+                dtype=DType.int64,
+            )
+
+        return inputs
 
     def _prepare_prompt_embeddings(
         self,
@@ -1066,15 +1084,24 @@ class Flux2Pipeline(DiffusionPipeline):
         latents_drv = latent_prep_model.execute(latents_drv)[0]
         latents = Tensor.from_dlpack(latents_drv)
 
-        image_seq_len = latents.shape[1].dim
-        patch_h = patch_w = int(image_seq_len**0.5)
-        latent_image_ids = self._prepare_latent_image_ids(
-            batch_size=latents.shape[0].dim,
-            height=patch_h,
-            width=patch_w,
-            device=self.transformer.devices[0],
-            dtype=dtype,
-        )
+        ids_key = f"{batch_size}_{height}_{width}_{device}"
+        if ids_key in self._cached_latent_image_ids:
+            latent_image_ids = self._cached_latent_image_ids[ids_key]
+        else:
+            input_ids = getattr(model_inputs, "latent_image_ids", None)
+            if input_ids is None:
+                latent_image_ids = self._prepare_latent_image_ids(
+                    batch_size=batch_size,
+                    height=height,
+                    width=width,
+                    device=device,
+                    dtype=DType.int64,
+                )
+            elif isinstance(input_ids, Tensor):
+                latent_image_ids = input_ids.to(device)
+            else:
+                latent_image_ids = Tensor.from_dlpack(input_ids).to(device)
+            self._cached_latent_image_ids[ids_key] = latent_image_ids
 
         guidance = Tensor.full(
             [latents.shape[0]],
