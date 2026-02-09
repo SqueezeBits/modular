@@ -231,14 +231,26 @@ class Flux2Pipeline(DiffusionPipeline):
             vae_scale_factor=self.vae_scale_factor * 2
         )
         self.image_processor = image_processor
+
+        # Store CPU sigmas for optimized scheduler step
+        self._sigmas_cpu: np.ndarray | None = None
+        # Compiled scheduler step graph
+        self._scheduler_step_model = None
+
+        # Cache for compiled graphs to avoid per-call compilation
         self._patchify_models: dict[str, Any] = {}
         self._vae_prep_models: dict[str, Any] = {}
         self._prompt_embed_models: dict[str, Any] = {}
         self._pack_models: dict[str, Any] = {}
         self._latent_prep_models: dict[str, Any] = {}
         self._unsqueeze_models: dict[str, Any] = {}
-        self._scheduler_step_model = None
         self._time_step_models: dict[str, Any] = {}
+
+        # Cache for invariant tensors (to avoid Tensor.full and Tensor.from_dlpack overhead)
+        self._cached_guidance: dict[str, Tensor] = {}
+        self._cached_latent_image_ids: dict[str, Tensor] = {}
+        self._cached_text_ids: dict[str, Tensor] = {}
+        self._cached_sigmas: dict[str, Tensor] = {}
 
     def _ensure_patchify_model(self, batch_size, channels, height, width, device, dtype):
         """Get or compile a patchify graph for the given shape."""
