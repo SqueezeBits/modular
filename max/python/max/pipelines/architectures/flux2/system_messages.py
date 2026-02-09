@@ -121,3 +121,20 @@ def format_input(
             )
 
         return messages
+
+
+def format_input_klein(prompts: list[str]) -> list[list[dict[str, Any]]]:
+    """Format prompts for Flux2 Klein (Qwen3): user message only, no system message.
+
+    Matches diffusers Flux2KleinPipeline: each conversation is
+    [{"role": "user", "content": prompt}]. Used with apply_chat_template(..., tokenize=False,
+    add_generation_prompt=True, enable_thinking=False).
+
+    Args:
+        prompts: List of text prompts.
+
+    Returns:
+        List of conversations, where each conversation is a list of one user message dict.
+    """
+    cleaned = [p.replace("[IMG]", "") for p in prompts]
+    return [[{"role": "user", "content": prompt}] for prompt in cleaned]

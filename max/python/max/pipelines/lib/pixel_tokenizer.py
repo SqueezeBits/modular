@@ -50,6 +50,7 @@ async def run_with_default_executor(
 class PipelineClassName(str, Enum):
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
+    FLUX2_KLEIN = "Flux2KleinPipeline"
     ZIMAGE = "ZImagePipeline"
 
     @classmethod
@@ -197,7 +198,8 @@ class PixelGenerationTokenizer(
         )
         scheduler_cfg = components.get("scheduler", {}).get("config_dict", {})
         scheduler_cfg["use_empirical_mu"] = (
-            self._pipeline_class_name == PipelineClassName.FLUX2
+            self._pipeline_class_name
+            in (PipelineClassName.FLUX2, PipelineClassName.FLUX2_KLEIN)
         )
         self._scheduler = SchedulerFactory.create(
             class_name=scheduler_class_name,
@@ -205,13 +207,19 @@ class PixelGenerationTokenizer(
         )
 
         self._max_pixel_size = None
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             self._max_pixel_size = 1024 * 1024
 
     def _prepare_latent_image_ids(
         self, height: int, width: int, batch_size: int = 1
     ) -> npt.NDArray[np.float32]:
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             # Create 4D coordinates using numpy (T=0, H, W, L=0)
             t_coords, h_coords, w_coords, l_coords = np.meshgrid(
                 np.array([0]),  # T dimension
@@ -436,6 +444,40 @@ class PixelGenerationTokenizer(
                     return_length=False,
                     return_overflowing_tokens=False,
                 )
+            elif self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
+                from max.pipelines.architectures.flux2.system_messages import (
+                    format_input_klein,
+                )
+
+                messages_batch = format_input_klein(prompts=[prompt_str])
+                text = delegate.apply_chat_template(
+                    messages_batch[0],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                enc = delegate(
+                    text,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_sequence_length,
+                    return_tensors=None,
+                )
+                input_ids = enc["input_ids"]
+                attention_mask = enc.get("attention_mask")
+                if attention_mask is None:
+                    seq_len = (
+                        len(input_ids[0])
+                        if isinstance(input_ids[0], list)
+                        else len(input_ids)
+                    )
+                    attention_mask = [[1] * seq_len] if isinstance(
+                        input_ids[0], list
+                    ) else [1] * seq_len
+                if isinstance(input_ids[0], int):
+                    input_ids = [input_ids]
+                    attention_mask = [attention_mask]
+                return {"input_ids": input_ids, "attention_mask": attention_mask}
             else:
                 return delegate(
                     prompt_str,
@@ -457,8 +499,11 @@ class PixelGenerationTokenizer(
             if attention_mask is None:
                 attention_mask = [1] * len(input_ids)
 
-            # Extract real tokens only (using attention mask) for Flux2
-            if self._pipeline_class_name == PipelineClassName.FLUX2:
+            # Extract real tokens only (using attention mask) for Flux2 / Flux2 Klein
+            if self._pipeline_class_name in (
+                PipelineClassName.FLUX2,
+                PipelineClassName.FLUX2_KLEIN,
+            ):
                 # Filter to keep only real tokens (where mask == 1)
                 real_token_ids = [
                     token_id
@@ -513,20 +558,44 @@ class PixelGenerationTokenizer(
                 " but may produce lower quality or unexpected results."
             )
 
-        if request.true_cfg_scale > 1.0 and request.negative_prompt is None:
+        if self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN and (
+            request.guidance_scale > 1.0
+        ):
+            do_true_cfg = True
+            effective_negative_prompt = (
+                request.negative_prompt if request.negative_prompt is not None else ""
+            )
+            effective_secondary_negative_prompt = (
+                request.secondary_negative_prompt
+                if request.secondary_negative_prompt is not None
+                else ""
+            )
+        elif request.true_cfg_scale > 1.0 and request.negative_prompt is not None:
+            do_true_cfg = True
+            effective_negative_prompt = request.negative_prompt
+            effective_secondary_negative_prompt = request.secondary_negative_prompt
+        else:
+            do_true_cfg = False
+            effective_negative_prompt = request.negative_prompt
+            effective_secondary_negative_prompt = request.secondary_negative_prompt
+
+        if (
+            request.true_cfg_scale > 1.0
+            and request.negative_prompt is None
+            and not (
+                self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN
+                and request.guidance_scale > 1.0
+            )
+        ):
             logger.warning(
                 f"true_cfg_scale={request.true_cfg_scale} is set, but no negative_prompt "
                 "is provided. True classifier-free guidance requires a negative prompt; "
                 "falling back to standard generation."
             )
 
-        do_true_cfg = (
-            request.true_cfg_scale > 1.0 and request.negative_prompt is not None
-        )
         import PIL.Image
 
         # 1. Tokenize prompts
-        # Convert input_image to list format for _generate_tokens_ids
         images_for_tokenization: list[PIL.Image.Image] | None = None
         if request.input_image is not None:
             input_img: PIL.Image.Image
@@ -547,30 +616,28 @@ class PixelGenerationTokenizer(
         ) = await self._generate_tokens_ids(
             request.prompt,
             request.secondary_prompt,
-            request.negative_prompt,
-            request.secondary_negative_prompt,
+            effective_negative_prompt,
+            effective_secondary_negative_prompt,
             do_true_cfg,
             images=images_for_tokenization,
         )
 
-        token_buffer = TokenBuffer(
-            array=token_ids.astype(np.int64, copy=False),
-        )
+        def _to_1d(arr: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+            out = arr.astype(np.int64, copy=False)
+            if out.ndim == 2 and out.shape[0] == 1:
+                out = out[0]
+            return out
+
+        token_buffer = TokenBuffer(array=_to_1d(token_ids))
         token_buffer_2 = None
         if token_ids_2 is not None:
-            token_buffer_2 = TokenBuffer(
-                array=token_ids_2.astype(np.int64, copy=False),
-            )
+            token_buffer_2 = TokenBuffer(array=_to_1d(token_ids_2))
         negative_token_buffer = None
         if negative_token_ids is not None:
-            negative_token_buffer = TokenBuffer(
-                array=negative_token_ids.astype(np.int64, copy=False),
-            )
+            negative_token_buffer = TokenBuffer(array=_to_1d(negative_token_ids))
         negative_token_buffer_2 = None
         if negative_token_ids_2 is not None:
-            negative_token_buffer_2 = TokenBuffer(
-                array=negative_token_ids_2.astype(np.int64, copy=False),
-            )
+            negative_token_buffer_2 = TokenBuffer(array=_to_1d(negative_token_ids_2))
 
         default_sample_size = self._default_sample_size
         vae_scale_factor = self._vae_scale_factor

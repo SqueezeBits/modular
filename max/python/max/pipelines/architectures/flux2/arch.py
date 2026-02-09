@@ -28,6 +28,7 @@ from max.pipelines.lib.interfaces import ArchConfig
 from typing_extensions import Self
 
 from .pipeline_flux2 import Flux2Pipeline
+from .pipeline_flux2_klein import Flux2KleinPipeline
 
 
 @dataclass(kw_only=True)
@@ -55,6 +56,21 @@ flux2_arch = SupportedArchitecture(
         "black-forest-labs/FLUX.2-dev",
     ],
     pipeline_model=Flux2Pipeline,
+    context_type=PixelContext,
+    default_weights_format=WeightsFormat.safetensors,
+    tokenizer=PixelGenerationTokenizer,
+    config=Flux2ArchConfig,
+)
+
+flux2_klein_arch = SupportedArchitecture(
+    name="Flux2KleinPipeline",
+    task=PipelineTask.PIXEL_GENERATION,
+    default_encoding=SupportedEncoding.bfloat16,
+    supported_encodings={SupportedEncoding.bfloat16: []},
+    example_repo_ids=[
+        "black-forest-labs/FLUX.2-klein-4B",
+    ],
+    pipeline_model=Flux2KleinPipeline,
     context_type=PixelContext,
     default_weights_format=WeightsFormat.safetensors,
     tokenizer=PixelGenerationTokenizer,

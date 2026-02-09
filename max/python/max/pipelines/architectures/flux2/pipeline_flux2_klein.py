@@ -28,41 +28,40 @@ from PIL import Image
 from tqdm import tqdm
 
 from ..autoencoders import AutoencoderKLFlux2Model
-from ..mistral3.text_encoder import Mistral3TextEncoderModel
+from ..qwen3.text_encoder import Qwen3TextEncoderModel
 from .model import Flux2TransformerModel
 
 
 @dataclass(kw_only=True)
-class Flux2ModelInputs(PixelModelInputs):
+class Flux2KleinModelInputs(PixelModelInputs):
     """
-    Flux2-specific PixelModelInputs.
+    Flux2 Klein-specific PixelModelInputs (Qwen3 text encoder).
 
     Defaults:
     - width: 1024
     - height: 1024
-    - guidance_scale: 4.0
-    - num_inference_steps: 50
+    - guidance_scale: 1.0
+    - num_inference_steps: 4
     - num_images_per_prompt: 1
     - input_image: None (optional input image for image-to-image generation)
-
     """
 
     width: int = 1024
     height: int = 1024
-    guidance_scale: float = 4.0
-    num_inference_steps: int = 50
+    guidance_scale: float = 1.0
+    num_inference_steps: int = 4
     num_images_per_prompt: int = 1
     input_image: Image.Image | None = None
     """Optional input image for image-to-image generation (PIL.Image.Image).
     
-    This field is used for Flux2 image-to-image generation where an input image
+    This field is used for Flux2 Klein image-to-image generation where an input image
     is provided as a condition for the generation process.
     """
 
 
 @dataclass
-class Flux2PipelineOutput:
-    """Container for Flux2 pipeline results.
+class Flux2KleinPipelineOutput:
+    """Container for Flux2 Klein pipeline results.
 
     Attributes:
         images:
@@ -74,22 +73,27 @@ class Flux2PipelineOutput:
     images: np.ndarray | Tensor
 
 
-class Flux2Pipeline(DiffusionPipeline):
-    """Diffusion pipeline for Flux2 image generation.
+class Flux2KleinPipeline(DiffusionPipeline):
+    """Diffusion pipeline for Flux2 Klein image generation.
 
     This pipeline wires together:
-        - Mistral3 text encoder
+        - Qwen3 text encoder
         - Flux2 transformer denoiser
         - Flux2 VAE (with BatchNorm-based latent normalization)
+
+    When is_distilled is True (default for step-wise distilled Klein models),
+    classifier-free guidance is disabled and guidance_scale is ignored.
+    When is_distilled is False and guidance_scale > 1, CFG is applied
+    (uncond + guidance_scale * (cond - uncond)).
     """
 
     vae: AutoencoderKLFlux2Model
-    text_encoder: Mistral3TextEncoderModel
+    text_encoder: Qwen3TextEncoderModel
     transformer: Flux2TransformerModel
 
     components = {
         "vae": AutoencoderKLFlux2Model,
-        "text_encoder": Mistral3TextEncoderModel,
+        "text_encoder": Qwen3TextEncoderModel,
         "transformer": Flux2TransformerModel,
     }
 
@@ -100,16 +104,25 @@ class Flux2Pipeline(DiffusionPipeline):
             if getattr(self, "vae", None)
             else 8
         )
+        self.is_distilled = self.pipeline_config.model.diffusers_config.get(
+            "is_distilled", False
+        )
 
-    def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
-        """Convert a PixelContext into Flux2ModelInputs."""
+    @property
+    def do_classifier_free_guidance(self) -> bool:
+        """True when CFG should be applied: guidance_scale > 1 and not distilled."""
+        guidance_scale = getattr(self, "_guidance_scale", 1.0)
+        return guidance_scale > 1 and not self.is_distilled
+
+    def prepare_inputs(self, context: PixelContext) -> Flux2KleinModelInputs:
+        """Convert a PixelContext into Flux2KleinModelInputs."""
         if context.input_image is not None and isinstance(
             context.input_image, np.ndarray
         ):
             context.input_image = Image.fromarray(
                 context.input_image.astype(np.uint8)
             )
-        return Flux2ModelInputs.from_context(context)
+        return Flux2KleinModelInputs.from_context(context)
 
     @staticmethod
     def _prepare_image_ids(
@@ -241,22 +254,23 @@ class Flux2Pipeline(DiffusionPipeline):
     ) -> tuple[Tensor, Tensor]:
         """Create prompt embeddings and text position IDs for the transformer.
 
-        Flux2 uses multiple hidden-state layers from the text encoder. Selected
-        layers are padded/trimmed to a common sequence length, stacked, and then
-        flattened across the layer/hidden dimensions.
+        Flux2 Klein uses Qwen3; selected hidden-state layers (0-based indices 9, 18, 27
+        by default, matching diffusers Flux2KleinPipeline) are padded/trimmed to a common
+        sequence length, stacked, and flattened across the layer/hidden dimensions.
 
         Args:
             tokens: TokenBuffer produced by tokenization / chat templating.
             num_images_per_prompt: Number of image generations per prompt.
-            hidden_states_layers: Optional indices of hidden-state layers to use.
+            hidden_states_layers: Optional 0-based indices of hidden-state layers to use.
 
         Returns:
             A tuple of:
                 - prompt_embeds: Tensor of shape (B', S, L*D)
                 - text_ids: Tensor[int64] of shape (B', S, 4)
         """
-        layers = hidden_states_layers or [10, 20, 30]
-        # Mistral3 text encoder expects 1D [total_seq_len]; TokenBuffer holds 1D for batch size 1
+        # Qwen3: 0-based layer indices 9, 18, 27 (diffusers default).
+        layers = hidden_states_layers or [9, 18, 27]
+        # Qwen3 text encoder expects 1D [total_seq_len]; TokenBuffer holds 1D for batch size 1
         token_ids = tokens.array
         max_seq = int(token_ids.shape[-1])
 
@@ -265,8 +279,17 @@ class Flux2Pipeline(DiffusionPipeline):
         )
         hs_all = self.text_encoder(text_input_ids)
 
+        if not isinstance(hs_all, tuple):
+            raise ValueError(
+                f"Expected tuple of hidden states from Qwen3, got {type(hs_all)}"
+            )
+
         selected: list[Tensor] = []
         for i in layers:
+            if i >= len(hs_all):
+                raise ValueError(
+                    f"Layer index {i} out of range (model has {len(hs_all)} layers)."
+                )
             hs = hs_all[i]
             hs = hs if isinstance(hs, Tensor) else Tensor.from_dlpack(hs)
 
@@ -504,11 +527,11 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def execute(
         self,
-        model_inputs: Flux2ModelInputs,
+        model_inputs: Flux2KleinModelInputs,
         callback_queue: Queue[np.ndarray] | None = None,
         output_type: Literal["np", "latent"] = "np",
-    ) -> Flux2PipelineOutput:
-        """Run the Flux2 denoising loop and decode outputs.
+    ) -> Flux2KleinPipelineOutput:
+        """Run the Flux2 Klein denoising loop and decode outputs.
 
         Args:
             model_inputs: Inputs containing tokens, latents, timesteps, sigmas, and IDs.
@@ -516,8 +539,18 @@ class Flux2Pipeline(DiffusionPipeline):
             output_type: Output mode ("np", "latent")
 
         Returns:
-            Flux2PipelineOutput containing one output per batch element.
+            Flux2KleinPipelineOutput containing one output per batch element.
         """
+        self._guidance_scale = model_inputs.guidance_scale
+
+        if (
+            model_inputs.guidance_scale > 1.0
+            and self.is_distilled
+        ):
+            print(
+                f"Guidance scale {model_inputs.guidance_scale} is ignored for step-wise distilled models."
+            )
+
         # 1) Encode prompts.
         prompt_embeds, text_ids = self._prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
@@ -525,6 +558,14 @@ class Flux2Pipeline(DiffusionPipeline):
         )
         batch_size = int(prompt_embeds.shape[0])
         dtype = prompt_embeds.dtype
+
+        negative_prompt_embeds: Tensor | None = None
+        negative_text_ids: Tensor | None = None
+        if self.do_classifier_free_guidance and model_inputs.negative_tokens is not None:
+            negative_prompt_embeds, negative_text_ids = self._prepare_prompt_embeddings(
+                tokens=model_inputs.negative_tokens,
+                num_images_per_prompt=model_inputs.num_images_per_prompt,
+            )
 
         image_latents = None
         image_latent_ids = None
@@ -600,6 +641,22 @@ class Flux2Pipeline(DiffusionPipeline):
 
             noise_pred = noise_pred[:, :num_noise_tokens, :]
 
+            if self.do_classifier_free_guidance and negative_prompt_embeds is not None:
+                assert negative_text_ids is not None
+                neg_noise_pred = self.transformer(
+                    latent_model_input,
+                    negative_prompt_embeds,
+                    timestep,
+                    latent_model_ids,
+                    negative_text_ids,
+                    guidance,
+                )[0]
+                neg_noise_pred = Tensor.from_dlpack(neg_noise_pred)
+                neg_noise_pred = neg_noise_pred[:, :num_noise_tokens, :]
+                noise_pred = neg_noise_pred + model_inputs.guidance_scale * (
+                    noise_pred - neg_noise_pred
+                )
+
             latents = self._scheduler_step(latents, noise_pred, sigmas, i)
 
             if callback_queue is not None:
@@ -622,4 +679,4 @@ class Flux2Pipeline(DiffusionPipeline):
                 )
             )
 
-        return Flux2PipelineOutput(images=image_list)
+        return Flux2KleinPipelineOutput(images=image_list)
