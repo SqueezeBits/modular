@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
+import torch
+
 
 @dataclass
 class Stat:
@@ -67,10 +69,12 @@ class _TimedFn:
         self._on_time: Callable[[float], None] = on_time
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        torch.cuda.synchronize()
         t0: float = perf_counter()
         try:
             return self._fn(*args, **kwargs)
         finally:
+            torch.cuda.synchronize()
             self._on_time(perf_counter() - t0)
 
 
@@ -94,10 +98,12 @@ class _TimedCallableProxy:
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        torch.cuda.synchronize()
         t0: float = perf_counter()
         try:
             return self._obj(*args, **kwargs)
         finally:
+            torch.cuda.synchronize()
             self._on_time_call(perf_counter() - t0)
 
     def __getattr__(self, name: str) -> Any:
@@ -270,10 +276,12 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
             return
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            torch.cuda.synchronize()
             t0: float = perf_counter()
             try:
                 return original(*args, **kwargs)
             finally:
+                torch.cuda.synchronize()
                 dt: float = perf_counter() - t0
                 self._accum(label, dt)
 
@@ -365,10 +373,12 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
             return
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            torch.cuda.synchronize()
             t0: float = perf_counter()
             try:
                 return original(*args, **kwargs)
             finally:
+                torch.cuda.synchronize()
                 dt: float = perf_counter() - t0
                 self._accum_component(label, dt)
 
@@ -392,10 +402,12 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
             if not getattr(orig_from, "__is_execute_profiler_wrapper__", False):
 
                 def from_dlpack_wrapped(*args: Any, **kwargs: Any) -> Any:
+                    torch.cuda.synchronize()
                     t0: float = perf_counter()
                     try:
                         return orig_from(*args, **kwargs)
                     finally:
+                        torch.cuda.synchronize()
                         dt: float = perf_counter() - t0
                         self._accum("tensor/from_dlpack", dt)
 
@@ -418,10 +430,12 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
                     o: Callable[..., Any], meth_label: str
                 ) -> Callable[..., Any]:
                     def wrapped(self_: Any, *args: Any, **kwargs: Any) -> Any:
+                        torch.cuda.synchronize()
                         t0: float = perf_counter()
                         try:
                             return o(self_, *args, **kwargs)
                         finally:
+                            torch.cuda.synchronize()
                             dt: float = perf_counter() - t0
                             self._accum(meth_label, dt)
 
