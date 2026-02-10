@@ -320,11 +320,39 @@ class FluxPipeline(DiffusionPipeline):
         timesteps_batched = Tensor.from_dlpack(timesteps_np).to(
             self.transformer.devices[0]
         )
+        dev = self.transformer.devices[0]
+        cfg = self.transformer.config
+        batch_size_int = int(prompt_embeds.shape[0])
+        image_seq_len = int(latents.shape[1])
+        inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
+        out_dim = (
+            cfg.patch_size * cfg.patch_size * (cfg.out_channels or cfg.in_channels)
+        )
+        prev_residual = Tensor.zeros(
+            (batch_size_int, image_seq_len, inner_dim),
+            dtype=dtype,
+            device=dev,
+        )
+        prev_output = Tensor.zeros(
+            (batch_size_int, image_seq_len, out_dim),
+            dtype=dtype,
+            device=dev,
+        )
+        prev_neg_residual = Tensor.zeros(
+            (batch_size_int, image_seq_len, inner_dim),
+            dtype=dtype,
+            device=dev,
+        )
+        prev_neg_output = Tensor.zeros(
+            (batch_size_int, image_seq_len, out_dim),
+            dtype=dtype,
+            device=dev,
+        )
+
         for i in tqdm(range(num_timesteps), desc="Denoising"):
             self._current_timestep = i
             timestep = timesteps_batched[i]
-
-            noise_pred = self.transformer(
+            noise_pred, new_residual = self.transformer(
                 latents,
                 prompt_embeds,
                 pooled_prompt_embeds,
@@ -332,13 +360,17 @@ class FluxPipeline(DiffusionPipeline):
                 latent_image_ids,
                 text_ids,
                 guidance,
-            )[0]
+                prev_residual,
+                prev_output,
+            )
+            prev_residual = new_residual
+            prev_output = noise_pred
 
             if model_inputs.do_true_cfg:
                 assert negative_prompt_embeds is not None
                 assert negative_pooled_prompt_embeds is not None
                 assert negative_text_ids is not None
-                neg_noise_pred = self.transformer(
+                neg_noise_pred, new_neg_residual = self.transformer(
                     latents,
                     negative_prompt_embeds,
                     negative_pooled_prompt_embeds,
@@ -346,7 +378,11 @@ class FluxPipeline(DiffusionPipeline):
                     latent_image_ids,
                     negative_text_ids,
                     guidance,
-                )[0]
+                    prev_neg_residual,
+                    prev_neg_output,
+                )
+                prev_neg_residual = new_neg_residual
+                prev_neg_output = neg_noise_pred
 
                 noise_pred = neg_noise_pred + model_inputs.true_cfg_scale * (
                     noise_pred - neg_noise_pred
