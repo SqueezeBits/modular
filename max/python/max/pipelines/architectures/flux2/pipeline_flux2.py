@@ -662,6 +662,10 @@ class Flux2Pipeline(DiffusionPipeline):
             .to(device)
         )
 
+        encoder_hidden_states_drv = prompt_embeds.driver_tensor
+        guidance_drv = guidance.driver_tensor
+        txt_ids_drv = text_ids.driver_tensor
+        img_ids_drv = latent_image_ids.driver_tensor
         if self._scheduler_step_model is None:
             self._build_scheduler_step_graph(dtype, device)
 
@@ -670,38 +674,54 @@ class Flux2Pipeline(DiffusionPipeline):
             device=DeviceRef.from_device(device),
         )
 
-        all_timesteps, all_dts = _all_time_steps_model.execute(sigmas)
-        all_timesteps_tensor = Tensor.from_dlpack(all_timesteps).to(device)
-        all_dts_tensor = Tensor.from_dlpack(all_dts).to(device)
+        sigmas_drv = sigmas.driver_tensor
+        latents_drv = latents.driver_tensor
+        all_timesteps_drv, all_dts_drv = _all_time_steps_model.execute(sigmas_drv)
+
+        if hasattr(all_timesteps_drv, "driver_tensor"):
+            all_timesteps_drv = all_timesteps_drv.driver_tensor
+        if hasattr(all_dts_drv, "driver_tensor"):
+            all_dts_drv = all_dts_drv.driver_tensor
+
+        def _unwrap_model(model):
+            while hasattr(model, "__wrapped__"):
+                model = model.__wrapped__
+            return model
+
+        raw_compiled_model = _unwrap_model(self.transformer.model)
+        raw_scheduler_step_model = _unwrap_model(self._scheduler_step_model)
 
         # 4) Denoising loop.
         for i in tqdm(range(num_inference_steps), desc="Denoising"):
             self._current_timestep = i
-            timestep = all_timesteps_tensor[i : i + 1]
-            dt = all_dts_tensor[i : i + 1]
+            timestep_drv = all_timesteps_drv[i : i + 1]
+            dt_drv = all_dts_drv[i : i + 1]
 
-            if image_latents is not None:
-                latents = F.concat([latents, image_latents], axis=1)
-                latent_image_ids = F.concat(
-                    [latent_image_ids, image_latent_ids], axis=1
-                )
+            # TODO: support image latents (taesu)
+            # if image_latents is not None:
+            #     latents = F.concat([latents, image_latents], axis=1)
+            #     latent_image_ids = F.concat(
+            #         [latent_image_ids, image_latent_ids], axis=1
+            #     )
 
-            noise_pred = self.transformer(
-                latents,
-                prompt_embeds,
-                timestep,
-                latent_image_ids,
-                text_ids,
-                guidance,
+            noise_pred_drv = raw_compiled_model.execute(
+                latents_drv,
+                encoder_hidden_states_drv,
+                timestep_drv,
+                img_ids_drv,
+                txt_ids_drv,
+                guidance_drv,
             )[0]
 
-            latents = self._scheduler_step_model(
-                latents,
-                noise_pred,
-                dt,
+            latents_drv = raw_scheduler_step_model.execute(
+                latents_drv, noise_pred_drv, dt_drv
             )[0]
+
+            if hasattr(device, "synchronize"):
+                device.synchronize()
 
             if callback_queue is not None:
+                latents = Tensor.from_dlpack(latents_drv)
                 image = self._decode_latents(
                     latents,
                     latent_image_ids,
@@ -710,15 +730,21 @@ class Flux2Pipeline(DiffusionPipeline):
                     output_type=output_type,
                 )
 
-        latents_tensor = Tensor.from_dlpack(latents)
+        latents = Tensor.from_dlpack(latents_drv)
 
         # 4) Decode final outputs per batch element.
-        batch_size = latents_tensor.shape[0].dim
+        batch_size = latents.shape[0].dim
         image_list = []
+        latent_image_ids_drv = latent_image_ids.driver_tensor
         for b in range(batch_size):
+            latents_drv_b = latents_drv[b : b + 1, :, :]
+            latent_image_ids_drv_b = latent_image_ids_drv[b : b + 1, :, :]
+            latents_b = Tensor.from_dlpack(latents_drv_b)
+            latent_image_ids_b = Tensor.from_dlpack(latent_image_ids_drv_b)
+
             image_b = self._decode_latents(
-                latents_tensor[b:b+1,:,:],
-                latent_image_ids[b:b+1,:,:],
+                latents_b,
+                latent_image_ids_b,
                 model_inputs.height,
                 model_inputs.width,
                 output_type=output_type,
