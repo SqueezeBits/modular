@@ -62,6 +62,8 @@ class Flux2TransformerModel(ComponentModel):
         img_ids: Tensor,
         txt_ids: Tensor,
         guidance: Tensor,
+        prev_residual: Tensor,
+        prev_output: Tensor,
     ) -> Any:
         return self.model(
             hidden_states,
@@ -70,4 +72,6 @@ class Flux2TransformerModel(ComponentModel):
             img_ids,
             txt_ids,
             guidance,
+            prev_residual,
+            prev_output,
         )
