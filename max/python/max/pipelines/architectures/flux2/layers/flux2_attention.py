@@ -17,6 +17,7 @@ from max.nn import Linear, Module, module_dataclass
 from max.nn.legacy.attention.mask_config import MHAMaskVariant
 from max.nn.legacy.kernels import flash_attention_gpu as _flash_attention_gpu
 from max.nn.sequential import ModuleList
+from max.nn.rope import fused_qk_rope_vision
 from max.tensor import Tensor
 
 flash_attention_gpu = F.functional(_flash_attention_gpu)
@@ -300,23 +301,11 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         # Store original dtype to cast back after RoPE (which may upcast to float32)
         original_dtype = query.dtype
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(
-                query,
-                image_rotary_emb,
-                use_real=True,
-                use_real_unbind_dim=-1,
-                sequence_dim=1,
+            # Use fused kernel for RoPE (GPU-compatible via elementwise)
+            cos, sin = image_rotary_emb
+            query, key = fused_qk_rope_vision(
+                query, key, cos, sin, repeat_interleave=True
             )
-            key = apply_rotary_emb(
-                key,
-                image_rotary_emb,
-                use_real=True,
-                use_real_unbind_dim=-1,
-                sequence_dim=1,
-            )
-            # Cast back to original dtype to match value
-            query = query.cast(original_dtype)
-            key = key.cast(original_dtype)
 
         # Scaled dot-product attention
         scale = 1.0 / (self.head_dim**0.5)
@@ -455,23 +444,11 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         # Store original dtype to cast back after RoPE (which may upcast to float32)
         original_dtype = query.dtype
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(
-                query,
-                image_rotary_emb,
-                use_real=True,
-                use_real_unbind_dim=-1,
-                sequence_dim=1,
+            # Use fused kernel for RoPE (GPU-compatible via elementwise)
+            cos, sin = image_rotary_emb
+            query, key = fused_qk_rope_vision(
+                query, key, cos, sin, repeat_interleave=True
             )
-            key = apply_rotary_emb(
-                key,
-                image_rotary_emb,
-                use_real=True,
-                use_real_unbind_dim=-1,
-                sequence_dim=1,
-            )
-            # Cast back to original dtype to match value
-            query = query.cast(original_dtype)
-            key = key.cast(original_dtype)
 
         # Attention computation
         hidden_states = flash_attention_gpu(
