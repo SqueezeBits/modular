@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 
 class FluxConfigBase(MAXModelConfigBase):
+    """use_fbc=False면 FBC 비활성화 (어댑터 등록돼 있어도 래핑 안 함)."""
+
+    use_fbc: bool = True
     patch_size: int = 1
     in_channels: int = 64
     out_channels: int | None = None

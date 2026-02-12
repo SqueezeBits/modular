@@ -22,6 +22,7 @@ from max import functional as F
 from max.driver import CPU
 from max.dtype import DType
 from max.interfaces import PixelGenerationContext, TokenBuffer
+from max.pipelines.lib.cache import FBCDenoiseMixin
 from max.pipelines.lib.interfaces import (
     DiffusionPipeline,
     PixelModelInputs,
@@ -78,7 +79,7 @@ class FluxPipelineOutput:
     images: np.ndarray | Tensor
 
 
-class FluxPipeline(DiffusionPipeline):
+class FluxPipeline(FBCDenoiseMixin, DiffusionPipeline):
     vae: AutoencoderKLModel
     text_encoder: ClipModel
     text_encoder_2: T5Model
@@ -321,38 +322,22 @@ class FluxPipeline(DiffusionPipeline):
             self.transformer.devices[0]
         )
         dev = self.transformer.devices[0]
-        cfg = self.transformer.config
         batch_size_int = int(prompt_embeds.shape[0])
         image_seq_len = int(latents.shape[1])
-        inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
-        out_dim = (
-            cfg.patch_size * cfg.patch_size * (cfg.out_channels or cfg.in_channels)
-        )
-        prev_residual = Tensor.zeros(
-            (batch_size_int, image_seq_len, inner_dim),
-            dtype=dtype,
-            device=dev,
-        )
-        prev_output = Tensor.zeros(
-            (batch_size_int, image_seq_len, out_dim),
-            dtype=dtype,
-            device=dev,
-        )
-        prev_neg_residual = Tensor.zeros(
-            (batch_size_int, image_seq_len, inner_dim),
-            dtype=dtype,
-            device=dev,
-        )
-        prev_neg_output = Tensor.zeros(
-            (batch_size_int, image_seq_len, out_dim),
-            dtype=dtype,
-            device=dev,
-        )
+
+        if self._use_fbc:
+            (
+                prev_residual,
+                prev_output,
+                prev_neg_residual,
+                prev_neg_output,
+            ) = self._init_fbc_buffers(batch_size_int, image_seq_len, dtype, dev)
 
         for i in tqdm(range(num_timesteps), desc="Denoising"):
             self._current_timestep = i
             timestep = timesteps_batched[i]
-            noise_pred, new_residual = self.transformer(
+
+            noise_pred, new_residual = self._call_transformer_step(
                 latents,
                 prompt_embeds,
                 pooled_prompt_embeds,
@@ -360,17 +345,17 @@ class FluxPipeline(DiffusionPipeline):
                 latent_image_ids,
                 text_ids,
                 guidance,
-                prev_residual,
-                prev_output,
+                prev_residual if self._use_fbc else None,
+                prev_output if self._use_fbc else None,
             )
-            prev_residual = new_residual
-            prev_output = noise_pred
+            if self._use_fbc:
+                prev_residual, prev_output = new_residual, noise_pred
 
             if model_inputs.do_true_cfg:
                 assert negative_prompt_embeds is not None
                 assert negative_pooled_prompt_embeds is not None
                 assert negative_text_ids is not None
-                neg_noise_pred, new_neg_residual = self.transformer(
+                neg_noise_pred, new_neg_residual = self._call_transformer_step(
                     latents,
                     negative_prompt_embeds,
                     negative_pooled_prompt_embeds,
@@ -378,12 +363,11 @@ class FluxPipeline(DiffusionPipeline):
                     latent_image_ids,
                     negative_text_ids,
                     guidance,
-                    prev_neg_residual,
-                    prev_neg_output,
+                    prev_neg_residual if self._use_fbc else None,
+                    prev_neg_output if self._use_fbc else None,
                 )
-                prev_neg_residual = new_neg_residual
-                prev_neg_output = neg_noise_pred
-
+                if self._use_fbc:
+                    prev_neg_residual, prev_neg_output = new_neg_residual, neg_noise_pred
                 noise_pred = neg_noise_pred + model_inputs.true_cfg_scale * (
                     noise_pred - neg_noise_pred
                 )

@@ -18,6 +18,7 @@ from max import functional as F
 from max.driver import Device
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
+from max.pipelines.lib.cache import FBCModelMixin
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
 from .flux1 import FluxTransformer2DModel
@@ -25,7 +26,7 @@ from .model_config import FluxConfig
 from .weight_adapters import convert_safetensor_state_dict
 
 
-class Flux1TransformerModel(ComponentModel):
+class Flux1TransformerModel(FBCModelMixin, ComponentModel):
     def __init__(
         self,
         config: dict[str, Any],
@@ -51,6 +52,9 @@ class Flux1TransformerModel(ComponentModel):
         state_dict = convert_safetensor_state_dict(state_dict)
         with F.lazy():
             flux = FluxTransformer2DModel(self.config)
+            flux, self.use_fbc, prefix = self._wrap_with_fbc_if_registered(flux)
+            if prefix:
+                state_dict = {prefix + k: v for k, v in state_dict.items()}
             flux.to(self.devices[0])
         self.model = flux.compile(*flux.input_types(), weights=state_dict)
         return self.model
