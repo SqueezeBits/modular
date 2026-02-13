@@ -30,7 +30,7 @@ def test_fused_rope_vision_import() -> None:
 
 def test_fused_rope_vision_execution() -> None:
     """Test that the kernel can be compiled and executed via MAX graph."""
-    
+
     # shapes
     batch = 1
     seq_len = 8
@@ -41,7 +41,7 @@ def test_fused_rope_vision_execution() -> None:
     # Q/K: [B, S, H, D]
     input_shape = (batch, seq_len, num_q_heads, head_dim)
     # Cos/Sin: [S, D]
-    freq_shape = (seq_len, head_dim) 
+    freq_shape = (seq_len, head_dim)
 
     # Select device
     device = CPU() if accelerator_count() == 0 else Accelerator()
@@ -59,24 +59,23 @@ def test_fused_rope_vision_execution() -> None:
             TensorType(DType.float32, freq_shape, device=device_ref),
             TensorType(DType.float32, freq_shape, device=device_ref),
         ],
-        ],
     )
-    
+
     # Load and compile
     session = InferenceSession(devices=[device])
     model = session.load(graph)
-    
+
     # Create dummy inputs
     q = Tensor.zeros(input_shape, dtype=DType.bfloat16).to(device)
     k = Tensor.zeros(input_shape, dtype=DType.bfloat16).to(device)
     cos = Tensor.ones(freq_shape, dtype=DType.float32).to(device)
     sin = Tensor.ones(freq_shape, dtype=DType.float32).to(device)
-    
+
     # Execute
     results = model.execute(q, k, cos, sin)
     q_out = results[0]
     k_out = results[1]
-    
+
     # Basic output check
     assert q_out.shape == list(input_shape)
     assert k_out.shape == list(input_shape)
