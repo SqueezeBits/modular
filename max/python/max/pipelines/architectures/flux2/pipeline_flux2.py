@@ -102,6 +102,7 @@ class Flux2Pipeline(DiffusionPipeline):
             else 8
         )
 
+        self.build_scheduler_step()
         self.build_prepare_prompt_embeddings()
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
@@ -126,6 +127,23 @@ class Flux2Pipeline(DiffusionPipeline):
         
         self._prepare_prompt_embeddings = max_compile(
             self._prepare_prompt_embeddings,
+            input_types=input_types,
+        )
+    
+    def build_scheduler_step(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        input_types = [
+            TensorType(
+                dtype, shape=["batch", "seq", "channels"], device=device
+            ),
+            TensorType(
+                dtype, shape=["batch", "seq", "channels"], device=device
+            ),
+            TensorType(DType.float32, shape=[], device=device),
+        ]
+        self._scheduler_step = max_compile(
+            self._scheduler_step,
             input_types=input_types,
         )
 
@@ -510,17 +528,25 @@ class Flux2Pipeline(DiffusionPipeline):
         self,
         latents: Tensor,
         noise_pred: Tensor,
-        sigmas: Tensor,
-        step_index: int,
+        dt: Tensor,
     ) -> Tensor:
         """Apply a single Euler update step in sigma space."""
         latents_dtype = latents.dtype
         latents = latents.cast(DType.float32)
+        latents = latents + dt * noise_pred
+        return latents.cast(latents_dtype)
+    
+    def scheduler_step(
+        self,
+        latents: Tensor,
+        noise_pred: Tensor,
+        sigmas: Tensor,
+        step_index: int,
+    ) -> Tensor:
         sigma = sigmas[step_index]
         sigma_next = sigmas[step_index + 1]
         dt = sigma_next - sigma
-        latents = latents + dt * noise_pred
-        return latents.cast(latents_dtype)
+        return self._scheduler_step(latents, noise_pred, dt)
 
     def execute(
         self,
@@ -607,7 +633,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
             noise_pred = noise_pred[:, : int(latents.shape[1]), :]
 
-            latents = self._scheduler_step(latents, noise_pred, sigmas, i)
+            latents = self.scheduler_step(latents, noise_pred, sigmas, i)
 
             if callback_queue is not None:
                 callback_queue.put_nowait(
