@@ -234,7 +234,7 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
         if not self._is_diffusers:
             method_specs: tuple[tuple[str, str], ...] = (
                 ("execute", "E2E execute"),
-                ("_prepare_prompt_embeddings", "prepare_embeddings"),
+                ("prepare_prompt_embeddings", "prepare_embeddings"),
                 ("_decode_latents", "decode_latents"),
                 ("_scheduler_step", "scheduler_step"),
                 ("_preprocess_latents", "preprocess_latents"),

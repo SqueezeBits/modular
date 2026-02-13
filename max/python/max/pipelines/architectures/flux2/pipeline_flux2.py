@@ -19,10 +19,11 @@ import numpy as np
 from max import functional as F
 from max.driver import CPU
 from max.dtype import DType
-from max.graph import DeviceRef
+from max.graph import DeviceRef, TensorType
 from max.interfaces import TokenBuffer
 from max.pipelines import PixelContext
 from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
+from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.tensor import Tensor
 from PIL import Image
 from tqdm import tqdm
@@ -101,6 +102,8 @@ class Flux2Pipeline(DiffusionPipeline):
             else 8
         )
 
+        self.build_prepare_prompt_embeddings()
+
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         """Convert a PixelContext into Flux2ModelInputs."""
         if context.input_image is not None and isinstance(
@@ -110,6 +113,21 @@ class Flux2Pipeline(DiffusionPipeline):
                 context.input_image.astype(np.uint8)
             )
         return Flux2ModelInputs.from_context(context)
+    
+    def build_prepare_prompt_embeddings(self) -> None:
+        input_types = [
+            TensorType(
+                self.text_encoder.config.dtype,
+                shape=["seq_len", "hidden_dim"],
+                device=self.text_encoder.devices[0],
+            )
+            for _ in range(3)
+        ]
+        
+        self._prepare_prompt_embeddings = max_compile(
+            self._prepare_prompt_embeddings,
+            input_types=input_types,
+        )
 
     @staticmethod
     def _prepare_image_ids(
@@ -233,7 +251,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return image_latents, image_latent_ids
 
-    def _prepare_prompt_embeddings(
+    def prepare_prompt_embeddings(
         self,
         tokens: TokenBuffer,
         num_images_per_prompt: int = 1,
@@ -256,46 +274,22 @@ class Flux2Pipeline(DiffusionPipeline):
                 - text_ids: Tensor[int64] of shape (B', S, 4)
         """
         layers = hidden_states_layers or [10, 20, 30]
-        max_seq = int(tokens.array.shape[-1])
 
         text_input_ids = Tensor.constant(
             tokens.array, dtype=DType.int64, device=self.text_encoder.devices[0]
         )
-        hs_all = self.text_encoder(text_input_ids)
+        hidden_states_all = self.text_encoder(text_input_ids)
+        hidden_states_selected = [hidden_states_all[i] for i in layers]
 
-        selected: list[Tensor] = []
-        for i in layers:
-            hs = hs_all[i]
-            hs = hs if isinstance(hs, Tensor) else Tensor.from_dlpack(hs)
-
-            # Ensure [B, S, D]
-            if hs.rank == 2:
-                hs = F.unsqueeze(hs, axis=0)
-
-            _, seq_len, _ = map(int, hs.shape)
-            if seq_len < max_seq:
-                hs = F.pad(
-                    hs, pad=((0, 0), (0, max_seq - seq_len), (0, 0))
-                )  # [B, max_seq, D]
-            elif seq_len > max_seq:
-                hs = hs[:, :max_seq, :]
-
-            selected.append(hs)
-
-        # [B, L, S, D] -> [B, S, L, D] -> [B, S, L*D]
-        stacked = F.stack(selected, axis=1)
-        stacked = F.permute(stacked, [0, 2, 1, 3])
-        batch_size, seq_len, num_layers, hidden_dim = map(int, stacked.shape)
-        prompt_embeds = F.reshape(
-            stacked, [batch_size, seq_len, num_layers * hidden_dim]
-        )
+        prompt_embeds = self._prepare_prompt_embeddings(*hidden_states_selected)
+        batch_size, seq_len, _ = map(int, prompt_embeds.shape)
 
         if num_images_per_prompt != 1:
             prompt_embeds = F.tile(prompt_embeds, (1, num_images_per_prompt, 1))
             prompt_embeds = F.reshape(
                 prompt_embeds, [batch_size * num_images_per_prompt, seq_len, -1]
             )
-
+        
         text_ids = self._prepare_text_ids(
             batch_size=batch_size * num_images_per_prompt,
             seq_len=seq_len,
@@ -303,6 +297,18 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
         return prompt_embeds, text_ids
+
+    def _prepare_prompt_embeddings(self, *hidden_states: Tensor) -> Tensor:
+        # [B, L, S, D] -> [B, S, L, D] -> [B, S, L*D]
+        stacked = F.stack(hidden_states, axis=0)
+        stacked = F.unsqueeze(stacked, axis=0)
+        stacked = F.permute(stacked, [0, 2, 1, 3])
+        batch_size, seq_len, num_layers, hidden_dim = stacked.shape
+        prompt_embeds = F.reshape(
+            stacked, [batch_size, seq_len, num_layers * hidden_dim]
+        )
+
+        return prompt_embeds
 
     def _decode_latents(
         self,
@@ -533,7 +539,7 @@ class Flux2Pipeline(DiffusionPipeline):
             Flux2PipelineOutput containing one output per batch element.
         """
         # 1) Encode prompts.
-        prompt_embeds, text_ids = self._prepare_prompt_embeddings(
+        prompt_embeds, text_ids = self.prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
         )
