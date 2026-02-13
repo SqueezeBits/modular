@@ -36,6 +36,7 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
         in_channels: int = 256,
         embedding_dim: int = 6144,
         bias: bool = False,
+        guidance_embeds: bool = True,
     ):
         """Initialize Flux2TimestepGuidanceEmbeddings.
 
@@ -43,6 +44,7 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
             in_channels: Number of sinusoidal channels.
             embedding_dim: Output embedding dimension.
             bias: Whether to use bias in MLP layers.
+            guidance_embeds: If False (e.g. Klein), no guidance embedder is used.
         """
         self.time_proj = Timesteps(
             num_channels=in_channels,
@@ -54,13 +56,16 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
             time_embed_dim=embedding_dim,
             sample_proj_bias=bias,
         )
-        self.guidance_embedder = TimestepEmbedding(
-            in_channels=in_channels,
-            time_embed_dim=embedding_dim,
-            sample_proj_bias=bias,
-        )
+        if guidance_embeds:
+            self.guidance_embedder = TimestepEmbedding(
+                in_channels=in_channels,
+                time_embed_dim=embedding_dim,
+                sample_proj_bias=bias,
+            )
+        else:
+            self.guidance_embedder = None
 
-    def forward(self, timestep: Tensor, guidance: Tensor) -> Tensor:
+    def forward(self, timestep: Tensor, guidance: Tensor | None) -> Tensor:
         """Compute combined timestep and guidance embeddings.
 
         Args:
@@ -76,14 +81,19 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
             timesteps_proj.cast(timestep.dtype)
         )
 
-        # Project guidance to sinusoidal embeddings
-        guidance_proj = self.time_proj(guidance)
-        guidance_emb = self.guidance_embedder(
-            guidance_proj.cast(guidance.dtype)
-        )
-
-        # Combine embeddings
-        time_guidance_emb = timesteps_emb + guidance_emb
+        if self.guidance_embedder is not None:
+            if guidance is None:
+                raise ValueError(
+                    "guidance must be provided when guidance_embeds is enabled."
+                )
+            # Project guidance to sinusoidal embeddings
+            guidance_proj = self.time_proj(guidance)
+            guidance_emb = self.guidance_embedder(
+                guidance_proj.cast(guidance.dtype)
+            )
+            time_guidance_emb = timesteps_emb + guidance_emb
+        else:
+            time_guidance_emb = timesteps_emb
 
         return time_guidance_emb
 
@@ -415,6 +425,7 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
         num_attention_heads = config.num_attention_heads
         joint_attention_dim = config.joint_attention_dim
         timestep_guidance_channels = config.timestep_guidance_channels
+        guidance_embeds = getattr(config, "guidance_embeds", True)
         mlp_ratio = config.mlp_ratio
         axes_dims_rope = config.axes_dims_rope
         rope_theta = config.rope_theta
@@ -436,6 +447,7 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
             in_channels=timestep_guidance_channels,
             embedding_dim=self.inner_dim,
             bias=False,
+            guidance_embeds=guidance_embeds,
         )
 
         # 3. Modulation layers
@@ -558,7 +570,7 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
         timestep: Tensor,
         img_ids: Tensor,
         txt_ids: Tensor,
-        guidance: Tensor,
+        guidance: Tensor | None,
     ) -> tuple[Tensor]:
         """Forward pass through Flux2 Transformer.
 
@@ -568,7 +580,7 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
             timestep: Denoising timestep of shape [B] (scaled to [0, 1] range).
             img_ids: Image position IDs of shape [image_seq_len, 4].
             txt_ids: Text position IDs of shape [text_seq_len, 4].
-            guidance: Guidance scale of shape [B] (scaled to [0, 1] range).
+            guidance: Optional guidance scale of shape [B] (scaled to [0, 1] range).
 
         Returns:
             Denoised output of shape [B, H*W, patch_size^2 * out_channels].
@@ -584,7 +596,8 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
         # 1. Calculate timestep embedding and modulation parameters
         # Scale timestep and guidance to [0, 1000] range
         timestep = (timestep * 1000.0).cast(hidden_states.dtype)
-        guidance = (guidance * 1000.0).cast(hidden_states.dtype)
+        if guidance is not None:
+            guidance = (guidance * 1000.0).cast(hidden_states.dtype)
 
         temb = self.time_guidance_embed(timestep, guidance)
 

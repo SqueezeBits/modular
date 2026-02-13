@@ -60,6 +60,7 @@ async def run_with_default_executor(
 class PipelineClassName(str, Enum):
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
+    FLUX2_KLEIN = "Flux2KleinPipeline"
     ZIMAGE = "ZImagePipeline"
 
     @classmethod
@@ -179,6 +180,9 @@ class PixelGenerationTokenizer(
                 "Please provide a valid diffusers_config."
             )
         self.diffusers_config = pipeline_config.model.diffusers_config
+        self._is_distilled = bool(
+            self.diffusers_config.get("is_distilled", False)
+        )
 
         # Store the pipeline class name for model-specific behavior
         self._pipeline_class_name = PipelineClassName.from_diffusers_config(
@@ -208,7 +212,8 @@ class PixelGenerationTokenizer(
         )
         scheduler_cfg = components.get("scheduler", {}).get("config_dict", {})
         scheduler_cfg["use_empirical_mu"] = (
-            self._pipeline_class_name == PipelineClassName.FLUX2
+            self._pipeline_class_name
+            in (PipelineClassName.FLUX2, PipelineClassName.FLUX2_KLEIN)
         )
         self._scheduler = SchedulerFactory.create(
             class_name=scheduler_class_name,
@@ -216,13 +221,19 @@ class PixelGenerationTokenizer(
         )
 
         self._max_pixel_size = None
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             self._max_pixel_size = 1024 * 1024
 
     def _prepare_latent_image_ids(
         self, height: int, width: int, batch_size: int = 1
     ) -> npt.NDArray[np.float32]:
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             # Create 4D coordinates using numpy (T=0, H, W, L=0)
             t_coords, h_coords, w_coords, l_coords = np.meshgrid(
                 np.array([0]),  # T dimension
@@ -450,6 +461,25 @@ class PixelGenerationTokenizer(
                     return_length=False,
                     return_overflowing_tokens=False,
                 )
+            elif self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
+                from max.pipelines.architectures.flux2.system_messages import (
+                    format_input_klein,
+                )
+
+                messages_batch = format_input_klein(prompts=[prompt_str])
+                chat_text = delegate.apply_chat_template(
+                    messages_batch[0],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                return delegate(
+                    chat_text,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_sequence_length,
+                    add_special_tokens=True,
+                )
             else:
                 return delegate(
                     prompt_str,
@@ -487,6 +517,19 @@ class PixelGenerationTokenizer(
             # Standard tokenizer output
             input_ids = tokenizer_output.input_ids
             attention_mask = tokenizer_output.attention_mask
+
+            # Klein text encoder path does not consume attention_mask.
+            # Keep only real tokens to avoid feeding massive padded sequences.
+            if self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
+                real_token_ids = [
+                    token_id
+                    for token_id, mask in zip(
+                        input_ids[0], attention_mask[0], strict=False
+                    )
+                    if mask == 1
+                ]
+                input_ids = [real_token_ids]
+                attention_mask = [[1] * len(real_token_ids)]
 
         if max_sequence_length and len(input_ids) > max_sequence_length:
             raise ValueError(
@@ -577,6 +620,18 @@ class PixelGenerationTokenizer(
             image_options.true_cfg_scale > 1.0
             and image_options.negative_prompt is not None
         )
+        do_cfg_negative_prompt = do_true_cfg or (
+            self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN
+            and image_options.guidance_scale > 1.0
+            and not self._is_distilled
+        )
+        negative_prompt_for_cfg = image_options.negative_prompt
+        if (
+            self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN
+            and do_cfg_negative_prompt
+        ):
+            # Match diffusers Flux2Klein behavior: unconditional branch uses empty prompt.
+            negative_prompt_for_cfg = ""
         import PIL.Image
 
         # 1. Tokenize prompts
@@ -599,9 +654,9 @@ class PixelGenerationTokenizer(
         ) = await self._generate_tokens_ids(
             prompt,
             image_options.secondary_prompt,
-            image_options.negative_prompt,
+            negative_prompt_for_cfg,
             image_options.secondary_negative_prompt,
-            do_true_cfg,
+            do_cfg_negative_prompt,
             images=images_for_tokenization,
         )
 

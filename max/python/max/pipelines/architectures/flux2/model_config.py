@@ -30,6 +30,7 @@ class Flux2ConfigBase(MAXModelConfigBase):
     num_attention_heads: int = 48
     joint_attention_dim: int = 15360
     timestep_guidance_channels: int = 256
+    guidance_embeds: bool = True
     mlp_ratio: float = 3.0
     axes_dims_rope: tuple[int, ...] = (32, 32, 32, 32)
     rope_theta: int = 2000
