@@ -102,8 +102,9 @@ class Flux2Pipeline(DiffusionPipeline):
             else 8
         )
 
-        self.build_scheduler_step()
         self.build_prepare_prompt_embeddings()
+        self.build_precompute_dts()
+        self.build_scheduler_step()
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         """Convert a PixelContext into Flux2ModelInputs."""
@@ -130,6 +131,15 @@ class Flux2Pipeline(DiffusionPipeline):
             input_types=input_types,
         )
     
+    def build_precompute_dts(self) -> None:
+        input_types = [
+            TensorType(DType.float32, shape=["num_sigmas"], device=self.transformer.devices[0]),
+        ]
+        self.precompute_dts = max_compile(
+            self.precompute_dts,
+            input_types=input_types,
+        )
+
     def build_scheduler_step(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -142,8 +152,8 @@ class Flux2Pipeline(DiffusionPipeline):
             ),
             TensorType(DType.float32, shape=[], device=device),
         ]
-        self._scheduler_step = max_compile(
-            self._scheduler_step,
+        self.scheduler_step = max_compile(
+            self.scheduler_step,
             input_types=input_types,
         )
 
@@ -524,7 +534,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return img_tensor
 
-    def _scheduler_step(
+    def scheduler_step(
         self,
         latents: Tensor,
         noise_pred: Tensor,
@@ -536,17 +546,11 @@ class Flux2Pipeline(DiffusionPipeline):
         latents = latents + dt * noise_pred
         return latents.cast(latents_dtype)
     
-    def scheduler_step(
-        self,
-        latents: Tensor,
-        noise_pred: Tensor,
-        sigmas: Tensor,
-        step_index: int,
-    ) -> Tensor:
-        sigma = sigmas[step_index]
-        sigma_next = sigmas[step_index + 1]
-        dt = sigma_next - sigma
-        return self._scheduler_step(latents, noise_pred, dt)
+    def precompute_dts(self, sigmas: Tensor) -> Tensor:
+        sigmas_curr = F.slice_tensor(sigmas, [slice(0, -1)])
+        sigmas_next = F.slice_tensor(sigmas, [slice(1, None)])
+        all_dt = F.sub(sigmas_next, sigmas_curr)
+        return all_dt
 
     def execute(
         self,
@@ -599,6 +603,7 @@ class Flux2Pipeline(DiffusionPipeline):
         sigmas = Tensor.from_dlpack(model_inputs.sigmas).to(
             self.transformer.devices[0]
         )
+        precomputed_dts = self.precompute_dts(sigmas)
 
         timesteps: np.ndarray = model_inputs.timesteps
         num_timesteps = timesteps.shape[0]
@@ -633,7 +638,8 @@ class Flux2Pipeline(DiffusionPipeline):
 
             noise_pred = noise_pred[:, : int(latents.shape[1]), :]
 
-            latents = self.scheduler_step(latents, noise_pred, sigmas, i)
+            dt = precomputed_dts[i]
+            latents = self.scheduler_step(latents, noise_pred, dt)
 
             if callback_queue is not None:
                 callback_queue.put_nowait(
