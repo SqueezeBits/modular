@@ -162,6 +162,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Number of iterations to run for profiling.",
     )
+    parser.add_argument(
+        "--step-cache",
+        action="store_true",
+        help="Enable first-block step cache optimization.",
+    )
+    parser.add_argument(
+        "--rdt",
+        type=float,
+        default=None,
+        help="Relative-difference threshold for step cache (Flux1 default: 0.05, Flux2 default: 0.08).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -175,6 +186,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "num-inference-steps must be a positive integer."
     )
     assert args.guidance_scale > 0.0, "guidance-scale must be positive."
+    if args.rdt is not None:
+        assert args.rdt >= 0.0, "rdt must be non-negative."
 
     return args
 
@@ -239,6 +252,9 @@ async def generate_image(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments
     """
     print(f"Loading model: {args.model}")
+
+    if args.step_cache:
+        os.environ["MAX_STEP_CACHE"] = "1"
 
     # Step 1: Initialize pipeline configuration
     config = PipelineConfig(
@@ -377,10 +393,16 @@ async def generate_image(args: argparse.Namespace) -> None:
     # latent initialization, and all other preprocessing
     # Image is now extracted from the message content automatically
     context = await tokenizer.new_context(request)
+    setattr(context, "step_cache", args.step_cache)
+    if args.rdt is not None:
+        setattr(context, "rdt", args.rdt)
 
     print(
         f"Context created: {context.height}x{context.width}, {context.num_inference_steps} steps"
     )
+    if args.step_cache:
+        rdt_info = f", rdt={args.rdt}" if args.rdt is not None else ""
+        print(f"Step cache enabled{rdt_info}.")
 
     # Step 6: Prepare inputs for the pipeline
     # Create a batch with a single context

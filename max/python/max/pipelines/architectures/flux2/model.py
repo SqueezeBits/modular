@@ -19,7 +19,6 @@ from max.driver import Device
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
-from max.tensor import Tensor
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
@@ -54,20 +53,5 @@ class Flux2TransformerModel(ComponentModel):
         self.model = flux.compile(*flux.input_types(), weights=state_dict)
         return self.model
 
-    def __call__(
-        self,
-        hidden_states: Tensor,
-        encoder_hidden_states: Tensor,
-        timestep: Tensor,
-        img_ids: Tensor,
-        txt_ids: Tensor,
-        guidance: Tensor,
-    ) -> Any:
-        return self.model(
-            hidden_states,
-            encoder_hidden_states,
-            timestep,
-            img_ids,
-            txt_ids,
-            guidance,
-        )
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.model(*args, **kwargs)

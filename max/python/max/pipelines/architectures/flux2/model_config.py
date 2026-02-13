@@ -11,6 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+import os
 from typing import Any
 
 from max.driver import Device
@@ -37,6 +38,7 @@ class Flux2ConfigBase(MAXModelConfigBase):
     eps: float = 1e-6
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
+    step_cache: bool = False
 
 
 class Flux2Config(Flux2ConfigBase):
@@ -55,6 +57,7 @@ class Flux2Config(Flux2ConfigBase):
             {
                 "dtype": supported_encoding_dtype(encoding),
                 "device": DeviceRef.from_device(devices[0]),
+                "step_cache": os.environ.get("MAX_STEP_CACHE", "0") == "1",
             }
         )
         return Flux2ConfigBase(**init_dict)
