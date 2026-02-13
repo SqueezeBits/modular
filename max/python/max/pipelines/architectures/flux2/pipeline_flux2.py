@@ -150,7 +150,7 @@ class Flux2Pipeline(DiffusionPipeline):
             TensorType(
                 dtype, shape=["batch", "seq", "channels"], device=device
             ),
-            TensorType(DType.float32, shape=[], device=device),
+            TensorType(DType.float32, shape=[1], device=device),
         ]
         self.scheduler_step = max_compile(
             self.scheduler_step,
@@ -615,10 +615,14 @@ class Flux2Pipeline(DiffusionPipeline):
             .to(self.transformer.devices[0])
             .cast(dtype)
         )
+        if hasattr(timesteps_batched, "driver_tensor"):
+            timesteps_batched = timesteps_batched.driver_tensor
+        if hasattr(precomputed_dts, "driver_tensor"):
+            precomputed_dts = precomputed_dts.driver_tensor
 
         # 4) Denoising loop.
         for i in tqdm(range(num_timesteps), desc="Denoising"):
-            timestep = timesteps_batched[i]
+            timestep = timesteps_batched[i : i + 1, 0]
 
             if image_latents is not None:
                 latents = F.concat([latents, image_latents], axis=1)
@@ -638,7 +642,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
             noise_pred = noise_pred[:, : int(latents.shape[1]), :]
 
-            dt = precomputed_dts[i]
+            dt = precomputed_dts[i : i + 1]
             latents = self.scheduler_step(latents, noise_pred, dt)
 
             if callback_queue is not None:
