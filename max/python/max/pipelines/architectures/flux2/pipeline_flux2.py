@@ -94,6 +94,8 @@ class Flux2ModelInputs(PixelModelInputs):
     guidance_scale: float = 4.0
     num_inference_steps: int = 50
     num_images_per_prompt: int = 1
+    step_cache: bool = False
+    rdt: float = 0.08
     input_image: Image.Image | None = None
     """Optional input image for image-to-image generation (PIL.Image.Image).
     
@@ -795,6 +797,64 @@ class Flux2Pipeline(DiffusionPipeline):
 
         raw_compiled_model = _unwrap_model(self.transformer.model)
         raw_scheduler_step_model = _unwrap_model(self._scheduler_step_model)
+        step_cache_flag = Tensor.constant(
+            np.array([model_inputs.step_cache], dtype=np.bool_),
+            dtype=DType.bool,
+            device=device,
+        )
+        step_cache_flag_drv = step_cache_flag.driver_tensor
+        rdt_tensor = Tensor.constant(
+            np.array([model_inputs.rdt], dtype=np.float32),
+            dtype=DType.float32,
+            device=device,
+        )
+        rdt_tensor_drv = rdt_tensor.driver_tensor
+
+        if not model_inputs.step_cache:
+            cfg = self.transformer.config
+            batch_size_int = batch_size
+            image_seq_len_int = int(image_seq_len)
+            inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
+            out_dim = (
+                cfg.patch_size
+                * cfg.patch_size
+                * (cfg.out_channels or cfg.in_channels)
+            )
+            dummy_prev_residual = Tensor.zeros(
+                (batch_size_int, image_seq_len_int, inner_dim),
+                dtype=dtype,
+                device=device,
+            )
+            dummy_prev_output = Tensor.zeros(
+                (batch_size_int, image_seq_len_int, out_dim),
+                dtype=dtype,
+                device=device,
+            )
+            dummy_prev_residual_drv = dummy_prev_residual.driver_tensor
+            dummy_prev_output_drv = dummy_prev_output.driver_tensor
+
+        if model_inputs.step_cache:
+            cfg = self.transformer.config
+            batch_size_int = batch_size
+            image_seq_len_int = int(image_seq_len)
+            inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
+            out_dim = (
+                cfg.patch_size
+                * cfg.patch_size
+                * (cfg.out_channels or cfg.in_channels)
+            )
+            prev_residual = Tensor.zeros(
+                (batch_size_int, image_seq_len_int, inner_dim),
+                dtype=dtype,
+                device=device,
+            )
+            prev_output = Tensor.zeros(
+                (batch_size_int, image_seq_len_int, out_dim),
+                dtype=dtype,
+                device=device,
+            )
+            prev_residual_drv = prev_residual.driver_tensor
+            prev_output_drv = prev_output.driver_tensor
 
         # 4) Denoising loop.
         for i in tqdm(range(num_inference_steps), desc="Denoising"):
@@ -809,14 +869,36 @@ class Flux2Pipeline(DiffusionPipeline):
             #         [latent_image_ids, image_latent_ids], axis=1
             #     )
 
-            noise_pred_drv = raw_compiled_model.execute(
-                latents_drv,
-                encoder_hidden_states_drv,
-                timestep_drv,
-                img_ids_drv,
-                txt_ids_drv,
-                guidance_drv,
-            )[0]
+            if model_inputs.step_cache:
+                result = raw_compiled_model.execute(
+                    latents_drv,
+                    encoder_hidden_states_drv,
+                    timestep_drv,
+                    img_ids_drv,
+                    txt_ids_drv,
+                    guidance_drv,
+                    prev_residual_drv,
+                    prev_output_drv,
+                    step_cache_flag_drv,
+                    rdt_tensor_drv,
+                )
+                noise_pred_drv = result[0]
+                new_residual_drv = result[1]
+                prev_residual_drv = new_residual_drv
+                prev_output_drv = noise_pred_drv
+            else:
+                noise_pred_drv = raw_compiled_model.execute(
+                    latents_drv,
+                    encoder_hidden_states_drv,
+                    timestep_drv,
+                    img_ids_drv,
+                    txt_ids_drv,
+                    guidance_drv,
+                    dummy_prev_residual_drv,
+                    dummy_prev_output_drv,
+                    step_cache_flag_drv,
+                    rdt_tensor_drv,
+                )[0]
 
             latents_drv = raw_scheduler_step_model.execute(
                 latents_drv, noise_pred_drv, dt_drv
