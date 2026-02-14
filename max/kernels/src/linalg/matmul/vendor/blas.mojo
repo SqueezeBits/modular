@@ -857,6 +857,61 @@ fn _rocblas_matmul[
 # ===----------------------------------------------------------------------===#
 
 
+struct CachedCuBLASLtMatmulMeta(ImplicitlyCopyable):
+    var heuristic_result: cublasLtMatmulHeuristicResult_t
+    var workspace_size: Int
+    var is_set: Bool
+    var m: Int
+    var n: Int
+    var k: Int
+    var c_row_major: Bool
+    var has_scales: Bool
+    var scale_mode: Int32
+
+    fn __init__(out self):
+        self.heuristic_result = cublasLtMatmulHeuristicResult_t()
+        self.workspace_size = 0
+        self.is_set = False
+        self.m = 0
+        self.n = 0
+        self.k = 0
+        self.c_row_major = False
+        self.has_scales = False
+        self.scale_mode = 0
+
+
+fn _get_cached_cublasLt_matmul_meta[
+    d_type: DType,
+    a_type: DType,
+    b_type: DType,
+    scales_type: DType,
+](ctx: DeviceContext) raises -> UnsafePointer[CachedCuBLASLtMatmulMeta]:
+    var cache_key = String(
+        "CUDA_CUBLASLT_MATMUL_CACHED_META_",
+        d_type,
+        "_",
+        a_type,
+        "_",
+        b_type,
+        "_",
+        scales_type,
+        "_",
+        ctx.id(),
+    )
+    if ptr_meta := _get_global_or_null(cache_key).bitcast[
+        CachedCuBLASLtMatmulMeta
+    ]():
+        return ptr_meta
+
+    var new_ptr_meta = UnsafePointer[CachedCuBLASLtMatmulMeta].alloc(1)
+    new_ptr_meta.init_pointee_move(CachedCuBLASLtMatmulMeta())
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(cache_key),
+        new_ptr_meta.bitcast[NoneType](),
+    )
+    return new_ptr_meta
+
+
 fn _cublasLt_matmul[
     d_type: DType,
     a_type: DType,
@@ -1172,12 +1227,12 @@ fn _cublasLt_matmul[
         msg="failed to create cublasLtMatmulPreference",
     )
 
-    var workspace_size = 32 * 1024 * 1024
+    var max_workspace_size = 32 * 1024 * 1024
     check_cublas_error(
         cublasLtMatmulPreferenceSetAttribute(
             preference,
             Preference.MAX_WORKSPACE_BYTES,
-            LegacyUnsafePointer(to=workspace_size).bitcast[NoneType](),
+            LegacyUnsafePointer(to=max_workspace_size).bitcast[NoneType](),
             size_of[Int64](),
         ),
         msg=(
@@ -1186,26 +1241,61 @@ fn _cublasLt_matmul[
         ),
     )
 
-    var heuristic_result = cublasLtMatmulHeuristicResult_t()
-    var algorithm_count = 0
-    check_cublas_error(
-        cublasLtMatmulAlgoGetHeuristic(
-            handle,
-            compute_desc,
-            _adesc,
-            _bdesc,
-            _cdesc,
-            _ddesc,
-            preference,
-            1,
-            LegacyUnsafePointer(to=heuristic_result),
-            LegacyUnsafePointer(to=algorithm_count),
-        ),
-        msg="failed to get cublasLtMatmulAlgoGetHeuristic",
-    )
+    var has_scales = a_scales and b_scales
+    var scale_mode_key = Int32(0)
+    if has_scales:
+        scale_mode_key = Int32(1 if scales_type == NVFP4_SF_DTYPE else 2)
 
-    if algorithm_count == 0:
-        raise Error("No algorithm was found!")
+    var ptr_meta = _get_cached_cublasLt_matmul_meta[
+        d_type, a_type, b_type, scales_type
+    ](ctx)
+
+    var params_match = ptr_meta[].is_set
+    if params_match:
+        if ptr_meta[].m != M or ptr_meta[].n != N or ptr_meta[].k != K:
+            params_match = False
+        elif ptr_meta[].c_row_major != c_row_major:
+            params_match = False
+        elif ptr_meta[].has_scales != has_scales:
+            params_match = False
+        elif ptr_meta[].scale_mode != scale_mode_key:
+            params_match = False
+
+    if not params_match:
+        var heuristic_result = cublasLtMatmulHeuristicResult_t()
+        var algorithm_count = 0
+        check_cublas_error(
+            cublasLtMatmulAlgoGetHeuristic(
+                handle,
+                compute_desc,
+                _adesc,
+                _bdesc,
+                _cdesc,
+                _ddesc,
+                preference,
+                1,
+                LegacyUnsafePointer(to=heuristic_result),
+                LegacyUnsafePointer(to=algorithm_count),
+            ),
+            msg="failed to get cublasLtMatmulAlgoGetHeuristic",
+        )
+
+        if algorithm_count == 0:
+            raise Error("No algorithm was found!")
+
+        ptr_meta[].heuristic_result = heuristic_result
+        ptr_meta[].workspace_size = heuristic_result.workspaceSize
+        ptr_meta[].is_set = True
+        ptr_meta[].m = M
+        ptr_meta[].n = N
+        ptr_meta[].k = K
+        ptr_meta[].c_row_major = c_row_major
+        ptr_meta[].has_scales = has_scales
+        ptr_meta[].scale_mode = scale_mode_key
+
+    var workspace_size = ptr_meta[].workspace_size
+    if workspace_size < 0:
+        workspace_size = 0
 
     var matmul_workspace = ctx.enqueue_create_buffer[DType.uint8](
         workspace_size
@@ -1226,7 +1316,7 @@ fn _cublasLt_matmul[
                 _cdesc,  # _cdesc
                 UnsafePointer(d.ptr.bitcast[NoneType]()),  # _d
                 _ddesc,  # _ddesc
-                LegacyUnsafePointer(to=heuristic_result.algo),  # algo
+                LegacyUnsafePointer(to=ptr_meta[].heuristic_result.algo),  # algo
                 matmul_workspace.unsafe_ptr().bitcast[NoneType](),  # workspace
                 workspace_size,  # workspace_size_in_bytes
                 cuda_stream[],  # stream
@@ -1248,7 +1338,7 @@ fn _cublasLt_matmul[
                 _cdesc,  # _cdesc
                 UnsafePointer(d.ptr.bitcast[NoneType]()),  # _d
                 _ddesc,  # _ddesc
-                LegacyUnsafePointer(to=heuristic_result.algo),  # algo
+                LegacyUnsafePointer(to=ptr_meta[].heuristic_result.algo),  # algo
                 matmul_workspace.unsafe_ptr().bitcast[NoneType](),  # workspace
                 workspace_size,  # workspace_size_in_bytes
                 cuda_stream[],  # stream
