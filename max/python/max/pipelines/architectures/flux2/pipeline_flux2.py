@@ -105,6 +105,8 @@ class Flux2Pipeline(DiffusionPipeline):
         self.build_prepare_prompt_embeddings()
         self.build_precompute_dts()
         self.build_scheduler_step()
+        self.build_decode_latents()
+        self.build_preprocess_latents()
 
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:
         """Convert a PixelContext into Flux2ModelInputs."""
@@ -156,6 +158,92 @@ class Flux2Pipeline(DiffusionPipeline):
             self.scheduler_step,
             input_types=input_types,
         )
+
+    def build_preprocess_latents(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        input_types = [
+            TensorType(
+                dtype,
+                shape=["batch", "channels", "height", "width"],
+                device=device,
+            ),
+        ]
+        self._patchify_and_pack = max_compile(
+            self._patchify_and_pack,
+            input_types=input_types,
+        )
+
+    def _patchify_and_pack(self, latents: Tensor) -> Tensor:
+        """Patchify (B,C,H,W)->(B,C*4,H//2,W//2) then pack to (B,H//2*W//2,C*4)."""
+        batch = latents.shape[0]
+        c = latents.shape[1]
+        h = latents.shape[2]
+        w = latents.shape[3]
+
+        # Assert height and width are even for valid reshape.
+        h2 = h // 2
+        w2 = w // 2
+        latents = latents.rebind((batch, c, h2 * 2, w2 * 2))
+
+        # Patchify: (B, C, H, W) -> (B, C*4, H//2, W//2)
+        latents = F.reshape(latents, (batch, c, h2, 2, w2, 2))
+        latents = F.permute(latents, (0, 1, 3, 5, 2, 4))
+        latents = F.reshape(latents, (batch, c * 4, h2, w2))
+
+        # Pack: (B, C*4, H//2, W//2) -> (B, H//2*W//2, C*4)
+        c4 = c * 4
+        latents = F.reshape(latents, (batch, c4, h2 * w2))
+        latents = F.permute(latents, (0, 2, 1))
+
+        return latents
+
+    def build_decode_latents(self) -> None:
+        dtype = self.vae.config.dtype
+        device = self.transformer.devices[0]
+        num_channels = self.vae.bn.running_mean.shape[0].dim
+
+        input_types = [
+            TensorType(
+                dtype,
+                shape=["batch", "h", "w", num_channels],
+                device=device,
+            ),
+            TensorType(dtype, shape=[num_channels], device=device),
+            TensorType(dtype, shape=[num_channels], device=device),
+        ]
+
+        self._postprocess_latents = max_compile(
+            self._postprocess_latents,
+            input_types=input_types,
+        )
+
+    def _postprocess_latents(
+        self,
+        latents_bhwc: Tensor,
+        bn_mean: Tensor,
+        bn_var: Tensor,
+    ) -> Tensor:
+        batch = latents_bhwc.shape[0]
+        h = latents_bhwc.shape[1]
+        w = latents_bhwc.shape[2]
+        c = latents_bhwc.shape[3]
+
+        # Permute (B, H, W, C) -> (B, C, H, W)
+        latents = F.permute(latents_bhwc, (0, 3, 1, 2))
+
+        # BN denormalization
+        bn_mean_r = F.reshape(bn_mean, (1, c, 1, 1))
+        bn_var_r = F.reshape(bn_var, (1, c, 1, 1))
+        bn_std = F.sqrt(bn_var_r + self.vae.config.batch_norm_eps)
+        latents = latents * bn_std + bn_mean_r
+
+        # Unpatchify: (B, C, H, W) -> (B, C//4, H*2, W*2)
+        latents = F.reshape(latents, (batch, c // 4, 2, 2, h, w))
+        latents = F.permute(latents, (0, 1, 4, 2, 5, 3))
+        latents = F.reshape(latents, (batch, c // 4, h * 2, w * 2))
+
+        return latents
 
     @staticmethod
     def _prepare_image_ids(
@@ -338,18 +426,27 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return prompt_embeds
 
-    def _decode_latents(
+    def decode_latents(
         self,
         latents: Tensor,
         latent_image_ids: Tensor,
+        height: int,
+        width: int,
         output_type: Literal["np", "latent"] = "np",
+        is_img2img: bool = False,
     ) -> np.ndarray | Tensor:
         """Decode Flux2 packed latents into an image array (or return latents).
 
         Args:
             latents: Packed latents, typically shaped (B, S, C).
             latent_image_ids: Position IDs used to unpack into (B, C, H, W).
+            height: Output image height in pixels.
+            width: Output image width in pixels.
             output_type: "latent" to return latents, otherwise decode to NumPy.
+            is_img2img: If True, use scatter-based unpacking via position IDs
+                (required for image-to-image where IDs have mixed spatial
+                origins). If False, use fast reshape-based unpacking
+                (sufficient for text-to-image with regular grid IDs).
 
         Returns:
             If output_type == "latent", returns latents (first element if B > 1).
@@ -358,27 +455,32 @@ class Flux2Pipeline(DiffusionPipeline):
         if output_type == "latent":
             return latents[0] if latents.shape[0].dim > 1 else latents
 
-        # 1) Unpack sequence latents back to (B, C, H, W) using position IDs.
-        latents_unpacked = self._unpack_latents_with_ids(
-            latents, latent_image_ids
-        )
+        if is_img2img:
+            # Image-to-image: scatter-based unpack for mixed-origin IDs
+            latents_bhwc = self._unpack_latents_with_ids(
+                latents, latent_image_ids
+            )
+        else:
+            # Text-to-image: fast inverse of _pack_latents
+            # (B, S, C) -> (B, C, S) -> (B, C, H, W)
+            # Compute latent spatial dims from image dims.
+            h_latent = height // (self.vae_scale_factor * 2)
+            w_latent = width // (self.vae_scale_factor * 2)
 
-        # 2) Undo Flux2 BatchNorm latent normalization (BN stats are stored in the VAE).
+            # Unpack: (B, S, C) -> (B, H, W, C)
+            batch = int(latents.shape[0])
+            c = int(latents.shape[2])
+            latents_bhwc = F.reshape(latents, (batch, h_latent, w_latent, c))
+
+        # Compiled: permute + BN denorm + unpatchify
         bn_mean = self.vae.bn.running_mean
         bn_var = self.vae.bn.running_var
+        latents_decoded = self._postprocess_latents(
+            latents_bhwc, bn_mean, bn_var
+        )
 
-        num_channels = bn_mean.shape[0].dim
-        bn_mean = F.reshape(bn_mean, (1, num_channels, 1, 1))
-        bn_var = F.reshape(bn_var, (1, num_channels, 1, 1))
-        bn_std = F.sqrt(bn_var + self.vae.config.batch_norm_eps)
-
-        latents_unpacked = latents_unpacked * bn_std + bn_mean
-
-        # 3) Unpatchify latents: (B, C, H, W) -> (B, C//4, H*2, W*2)
-        latents_unpacked = self._unpatchify_latents(latents_unpacked)
-
-        # 4) Decode with the VAE and normalize layout to HWC.
-        decoded = self.vae.decode(latents_unpacked)
+        # Decode with the VAE and normalize layout to HWC.
+        decoded = self.vae.decode(latents_decoded)
         return self._image_to_flat_hwc(self._to_numpy(decoded))
 
     def _to_numpy(self, image: Tensor) -> np.ndarray:
@@ -454,22 +556,20 @@ class Flux2Pipeline(DiffusionPipeline):
             out = F.scatter_nd(out, data_b, indices)
 
             out = F.reshape(out, [h, w, ch])
-            out = F.permute(out, (2, 0, 1))
             x_list.append(out)
 
         result = F.stack(x_list, axis=0)
         return result
 
-    def _preprocess_latents(
+    def preprocess_latents(
         self, latents: Tensor, latent_image_ids: Tensor, dtype: DType
     ) -> tuple[Tensor, Tensor]:
-        latents: Tensor = (
+        latents = (
             Tensor.from_dlpack(latents)
             .to(self.transformer.devices[0])
             .cast(dtype)
         )
-        latents = self._patchify_latents(latents)
-        latents = self._pack_latents(latents)
+        latents = self._patchify_and_pack(latents)
 
         latent_image_ids = Tensor.from_dlpack(
             latent_image_ids.astype(np.int64)
@@ -588,7 +688,7 @@ class Flux2Pipeline(DiffusionPipeline):
             )
 
         # 2) Prepare latents and conditioning tensors.
-        latents, latent_image_ids = self._preprocess_latents(
+        latents, latent_image_ids = self.preprocess_latents(
             model_inputs.latents, model_inputs.latent_image_ids, dtype
         )
 
@@ -621,10 +721,11 @@ class Flux2Pipeline(DiffusionPipeline):
             precomputed_dts = precomputed_dts.driver_tensor
 
         # 4) Denoising loop.
+        is_img2img = image_latents is not None
         for i in tqdm(range(num_timesteps), desc="Denoising"):
             timestep = timesteps_batched[i : i + 1, 0]
 
-            if image_latents is not None:
+            if is_img2img:
                 latents = F.concat([latents, image_latents], axis=1)
                 latent_image_ids = F.concat(
                     [latent_image_ids, image_latent_ids], axis=1
@@ -647,10 +748,13 @@ class Flux2Pipeline(DiffusionPipeline):
 
             if callback_queue is not None:
                 callback_queue.put_nowait(
-                    self._decode_latents(
+                    self.decode_latents(
                         latents,
                         latent_image_ids,
+                        model_inputs.height,
+                        model_inputs.width,
                         output_type=output_type,
+                        is_img2img=is_img2img,
                     )
                 )
 
@@ -660,8 +764,13 @@ class Flux2Pipeline(DiffusionPipeline):
             latents_b = latents[b : b + 1]
             latent_image_ids_b = latent_image_ids[b : b + 1]
             image_list.append(
-                self._decode_latents(
-                    latents_b, latent_image_ids_b, output_type=output_type
+                self.decode_latents(
+                    latents_b,
+                    latent_image_ids_b,
+                    model_inputs.height,
+                    model_inputs.width,
+                    output_type=output_type,
+                    is_img2img=is_img2img,
                 )
             )
 

@@ -513,9 +513,12 @@ class CompileWrapper:
 
     @staticmethod
     def _unwrap_tensor(value: Any) -> Any:
-        if hasattr(value, "driver_tensor"):
-            return value.driver_tensor
-        return value
+        try:
+            if hasattr(value, "driver_tensor"):
+                return value.driver_tensor
+            return value
+        except TypeError:
+            return value
 
 def max_compile(
     compile_target: Callable | Module | None = None,
