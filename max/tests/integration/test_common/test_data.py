@@ -171,6 +171,9 @@ class MockPixelGenerationRequest:
     seed: int | None = None
     """Random seed for reproducibility."""
 
+    input_image: str | None = None
+    """Optional input image URI for image-to-image generation."""
+
     model_name: str = ""
     """Model name for the request."""
 
@@ -188,6 +191,7 @@ class MockPixelGenerationRequest:
         guidance_scale: float = 3.5,
         true_cfg_scale: float = 1.0,
         seed: int | None = None,
+        input_image: str | None = None,
         model_name: str = "",
     ) -> MockPixelGenerationRequest:
         """Creates a pixel generation request from a prompt."""
@@ -202,6 +206,7 @@ class MockPixelGenerationRequest:
             guidance_scale=guidance_scale,
             true_cfg_scale=true_cfg_scale,
             seed=seed,
+            input_image=input_image,
             model_name=model_name,
         )
 
@@ -347,13 +352,32 @@ IDEFICS3_INSTRUCT_REQUESTS = [
 # Default pixel generation prompts
 DEFAULT_PIXEL_GENERATION_PROMPTS = [
     "photography, soft natural textures, highly realistic light, editorial, A black panther stalking through the dense undergrowth of an Indian jungle, early evening with shadows from tall trees, captured with low light photography, high ISO setting to highlight the panther's muscles in motion",
-    "Dramatic news broadcast scene in a Teahupoʻo wave's where a cow surfing, mimicking pro surf rider poses. Yogis laugh and take pictures. The news banner reads: 'COW win Olympics!!'",
+    'The image show the fourth elements, each one in a part of the picture, first part is at top left and show a splashing multicolor water text with many water reflections, the text is made of water, the water word is "WATER", the background is splashing water, the second part of the image is a top right and show a soil rounded text, the word made of soil is "EARTH", the background is planet earth, the third part of the image is at bottom left and show a cloud multicolor rounded text, the word is "AIR" made of colorfull cloud the background is a sunset, and the last part of the image in the bottom right shows a red fire rounded text made of lava, the colorfull big word made of fire is "FIRE", the background is the closeup eruptive sun',
     "Full body shot of a handsome tattooed short dark haired man wearing a jean and a white tee-shirt in 'Chiaroscuro Chronicles', lost in a captivating, slate gray monochromatic realm of masterful lighting and careful shading, emphasizing the emotional depth of the narrative, abrasive authenticity, ambient occlusion",
     "A beautiful woman in a red dress walking down a street",
-    'The image show the fourth elements, each one in a part of the picture, first part is at top left and show a splashing multicolor water text with many water reflections, the text is made of water, the water word is "WATER", the background is splashing water, the second part of the image is a top right and show a soil rounded text, the word made of soil is "EARTH", the background is planet earth, the third part of the image is at bottom left and show a cloud multicolor rounded text, the word is "AIR" made of colorfull cloud the background is a sunset, and the last part of the image in the bottom right shows a red fire rounded text made of lava, the colorfull big word made of fire is "FIRE", the background is the closeup eruptive sun',
 ]
 
 DEFAULT_PIXEL_GENERATION = [
     MockPixelGenerationRequest.from_prompt(prompt=prompt, seed=42)
     for prompt in DEFAULT_PIXEL_GENERATION_PROMPTS
+]
+
+# FLUX2-specific fixtures for pipeline verification
+FLUX2_I2I_SOURCE_IMAGE = "s3://modular-bazel-artifacts-public/artifacts/model_testdata/qwen2_5vl_instruct_image.jpg"
+
+FLUX2_PIXEL_GENERATION_I2I = [
+    MockPixelGenerationRequest.from_prompt(
+        prompt="Transform this image into a cinematic nighttime scene with neon reflections, wet streets, and dramatic contrast.",
+        seed=42,
+        input_image=FLUX2_I2I_SOURCE_IMAGE,
+        height=1024,
+        width=1024,
+    ),
+    MockPixelGenerationRequest.from_prompt(
+        prompt="Restyle this image as a watercolor painting with soft edges, visible brush texture, and warm afternoon light.",
+        seed=123,
+        input_image=FLUX2_I2I_SOURCE_IMAGE,
+        height=1024,
+        width=1024,
+    ),
 ]

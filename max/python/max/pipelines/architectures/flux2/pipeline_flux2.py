@@ -111,7 +111,10 @@ class Flux2Pipeline(DiffusionPipeline):
             context.input_image = Image.fromarray(
                 context.input_image.astype(np.uint8)
             )
-        return Flux2ModelInputs.from_context(context)
+        model_inputs = Flux2ModelInputs.from_context(context)
+        # Keep prompt mask internal to avoid changing public input interfaces.
+        setattr(model_inputs, "_prompt_mask", context.mask)
+        return model_inputs
 
     @staticmethod
     def _prepare_image_ids(
@@ -238,6 +241,7 @@ class Flux2Pipeline(DiffusionPipeline):
     def _prepare_prompt_embeddings(
         self,
         tokens: TokenBuffer,
+        mask: np.ndarray | None = None,
         num_images_per_prompt: int = 1,
         hidden_states_layers: list[int] | None = None,
     ) -> tuple[Tensor, Tensor]:
@@ -249,6 +253,9 @@ class Flux2Pipeline(DiffusionPipeline):
 
         Args:
             tokens: TokenBuffer produced by tokenization / chat templating.
+            mask: Optional token mask aligned to `tokens`. If provided, only
+                valid tokens are encoded and outputs are left-padded back to
+                sequence length.
             num_images_per_prompt: Number of image generations per prompt.
             hidden_states_layers: Optional indices of hidden-state layers to use.
 
@@ -258,10 +265,31 @@ class Flux2Pipeline(DiffusionPipeline):
                 - text_ids: Tensor[int64] of shape (B', S, 4)
         """
         layers = hidden_states_layers or [10, 20, 30]
-        max_seq = int(tokens.array.shape[-1])
+        token_ids = np.asarray(tokens.array, dtype=np.int64)
+        max_seq = int(token_ids.shape[-1])
+
+        # Use mask-aware token slicing for FLUX2 so padded tokens do not
+        # participate in encoder attention. Then left-pad back to max_seq.
+        mask_arr: np.ndarray | None = None
+        if mask is not None:
+            mask_arr = np.asarray(mask, dtype=np.bool_)
+            if mask_arr.ndim > 1:
+                mask_arr = mask_arr.reshape(-1)
+            if mask_arr.shape[0] != max_seq:
+                raise ValueError(
+                    "Prompt mask length must match token length. "
+                    f"Got mask={mask_arr.shape[0]}, tokens={max_seq}."
+                )
+            valid_tokens = token_ids[mask_arr]
+            valid_len = int(valid_tokens.shape[0])
+            if valid_len == 0:
+                valid_tokens = token_ids[:1]
+        else:
+            valid_tokens = token_ids
+            valid_len = int(valid_tokens.shape[0])
 
         text_input_ids = Tensor.constant(
-            tokens.array, dtype=DType.int64, device=self.text_encoder.devices[0]
+            valid_tokens, dtype=DType.int64, device=self.text_encoder.devices[0]
         )
         hs_all = self.text_encoder(text_input_ids)
 
@@ -270,27 +298,39 @@ class Flux2Pipeline(DiffusionPipeline):
             hs = hs_all[i]
             hs = hs if isinstance(hs, Tensor) else Tensor.from_dlpack(hs)
 
-            # Ensure [B, S, D]
-            if hs.rank == 2:
-                hs = F.unsqueeze(hs, axis=0)
+            # Ensure [S, D]
+            if hs.rank == 3:
+                hs = F.squeeze(hs, axis=0)
 
-            _, seq_len, _ = map(int, hs.shape)
-            if seq_len < max_seq:
-                hs = F.pad(
-                    hs, pad=((0, 0), (0, max_seq - seq_len), (0, 0))
-                )  # [B, max_seq, D]
-            elif seq_len > max_seq:
-                hs = hs[:, :max_seq, :]
+            seq_len, hidden_dim = map(int, hs.shape)
+            if mask_arr is not None:
+                if valid_len == 0:
+                    hs = Tensor.zeros(
+                        (max_seq, hidden_dim), dtype=hs.dtype, device=hs.device
+                    )
+                elif seq_len < max_seq:
+                    hs = F.pad(
+                        hs, paddings=(max_seq - seq_len, 0, 0, 0)
+                    )  # [max_seq, D], left-padded
+                elif seq_len > max_seq:
+                    hs = hs[seq_len - max_seq :, :]
+            else:
+                if seq_len < max_seq:
+                    hs = F.pad(
+                        hs, paddings=(0, max_seq - seq_len, 0, 0)
+                    )  # [max_seq, D]
+                elif seq_len > max_seq:
+                    hs = hs[:max_seq, :]
 
             selected.append(hs)
 
-        # [B, L, S, D] -> [B, S, L, D] -> [B, S, L*D]
+        # [S, L, D] -> [1, S, L*D]
         stacked = F.stack(selected, axis=1)
-        stacked = F.permute(stacked, [0, 2, 1, 3])
-        batch_size, seq_len, num_layers, hidden_dim = map(int, stacked.shape)
+        seq_len, num_layers, hidden_dim = map(int, stacked.shape)
         prompt_embeds = F.reshape(
-            stacked, [batch_size, seq_len, num_layers * hidden_dim]
+            stacked, [1, seq_len, num_layers * hidden_dim]
         )
+        batch_size = 1
 
         if num_images_per_prompt != 1:
             prompt_embeds = F.tile(prompt_embeds, (1, num_images_per_prompt, 1))
@@ -519,8 +559,10 @@ class Flux2Pipeline(DiffusionPipeline):
             Flux2PipelineOutput containing one output per batch element.
         """
         # 1) Encode prompts.
+        prompt_mask = getattr(model_inputs, "_prompt_mask", None)
         prompt_embeds, text_ids = self._prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
+            mask=prompt_mask,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
         )
         batch_size = int(prompt_embeds.shape[0])
