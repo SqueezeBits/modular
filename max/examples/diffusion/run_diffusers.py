@@ -1,9 +1,10 @@
 import argparse
 import time
 
-from diffusers import Flux2Pipeline
+from diffusers import DiffusionPipeline
+from PIL import Image
 import torch
-from max.examples.diffusion.profiler import profile_execute
+from profiler import profile_execute
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -38,13 +39,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--height",
         type=int,
-        default=None,
+        default=1024,
         help="Height of generated image in pixels. None uses model's native resolution.",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=None,
+        default=1024,
         help="Width of generated image in pixels. None uses model's native resolution.",
     )
     parser.add_argument(
@@ -126,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    pipe = Flux2Pipeline.from_pretrained(
+    pipe = DiffusionPipeline.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
     ).to("cuda")
@@ -135,6 +136,10 @@ def main():
         pipe.text_encoder = torch.compile(
             pipe.text_encoder, mode="max-autotune", fullgraph=True
         )
+    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        pipe.text_encoder_2 = torch.compile(
+            pipe.text_encoder_2, mode="max-autotune", fullgraph=True
+        )
     if hasattr(pipe, "transformer") and pipe.transformer is not None:
         pipe.transformer = torch.compile(
             pipe.transformer, mode="max-autotune", fullgraph=True
@@ -142,11 +147,16 @@ def main():
     if hasattr(pipe, "vae") and pipe.vae is not None:
         pipe.vae = torch.compile(pipe.vae, mode="max-autotune", fullgraph=True)
 
+    image = None
+    if args.input_image is not None:
+        image = Image.open(args.input_image).convert("RGB")
+
     if args.profile_timings:
         for i in range(args.num_warmups):
             print(f"Running warmup {i + 1} of {args.num_warmups}")
             pipe(
                 prompt=args.prompt,
+                image=image,
                 num_inference_steps=args.num_inference_steps,
                 height=args.height,
                 width=args.width,
@@ -161,6 +171,7 @@ def main():
                 )
                 pipe(
                     prompt=args.prompt,
+                    image=image,
                     num_inference_steps=args.num_inference_steps,
                     height=args.height,
                     width=args.width,
@@ -172,6 +183,7 @@ def main():
     else:
         pipe(
             prompt=args.prompt,
+            image=image,
             num_inference_steps=args.num_inference_steps,
             height=args.height,
             width=args.width,
