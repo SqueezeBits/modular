@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import time
 
 from diffusers import DiffusionPipeline
@@ -75,7 +76,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-length",
         type=int,
-        default=None,
+        default=512,
         help="Maximum length of tokenizer",
     )
     parser.add_argument(
@@ -124,6 +125,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _build_call_kwargs(
+    pipe: DiffusionPipeline, args: argparse.Namespace, image: Image.Image | None
+) -> dict[str, object]:
+    signature = inspect.signature(pipe.__call__)
+    supports_image = "image" in signature.parameters or "init_image" in signature.parameters
+    if image is not None and not supports_image:
+        raise ValueError(
+            "Input image provided but this pipeline does not accept an image. "
+            "Use an image-to-image pipeline or a model that supports image inputs."
+        )
+
+    kwargs: dict[str, object] = {
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "num_inference_steps": args.num_inference_steps,
+        "height": args.height,
+        "width": args.width,
+        "guidance_scale": args.guidance_scale,
+        "max_sequence_length": args.max_length,
+        "output_type": "pil",
+    }
+
+    if image is not None:
+        if "image" in signature.parameters:
+            kwargs["image"] = image
+        else:
+            kwargs["init_image"] = image
+
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if value is not None and key in signature.parameters
+    }
+
+
 def main():
     args = parse_args()
 
@@ -152,45 +188,19 @@ def main():
         image = Image.open(args.input_image).convert("RGB")
 
     if args.profile_timings:
+        call_kwargs = _build_call_kwargs(pipe, args, image)
         for i in range(args.num_warmups):
             print(f"Running warmup {i + 1} of {args.num_warmups}")
-            pipe(
-                prompt=args.prompt,
-                image=image,
-                num_inference_steps=args.num_inference_steps,
-                height=args.height,
-                width=args.width,
-                guidance_scale=args.guidance_scale,
-                max_sequence_length=args.max_length,
-                output_type="pil",
-            )
+            pipe(**call_kwargs)
         with profile_execute(pipe, is_diffusers=True) as prof:
             for i in range(args.num_profile_iterations):
                 print(
                     f"Running inference {i + 1} of {args.num_profile_iterations}"
                 )
-                pipe(
-                    prompt=args.prompt,
-                    image=image,
-                    num_inference_steps=args.num_inference_steps,
-                    height=args.height,
-                    width=args.width,
-                    guidance_scale=args.guidance_scale,
-                    max_sequence_length=args.max_length,
-                    output_type="pil",
-                )
+                pipe(**call_kwargs)
         prof.report()
     else:
-        pipe(
-            prompt=args.prompt,
-            image=image,
-            num_inference_steps=args.num_inference_steps,
-            height=args.height,
-            width=args.width,
-            guidance_scale=args.guidance_scale,
-            max_sequence_length=args.max_length,
-            output_type="pil",
-        )
+        pipe(**_build_call_kwargs(pipe, args, image))
 
 
 if __name__ == "__main__":
