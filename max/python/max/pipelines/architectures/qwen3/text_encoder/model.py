@@ -24,9 +24,6 @@ from typing import Any
 from max.driver import Device
 from max.experimental import functional as F
 from max.graph.weights import Weights
-from max.pipelines.architectures.llama3.weight_adapters import (
-    LLAMA_SAFETENSOR_MAPPING as QWEN_SAFETENSOR_MAP,
-)
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
@@ -69,8 +66,12 @@ class Qwen3TextEncoderModel(ComponentModel):
         state_dict = {}
         for key, value in self.weights.items():
             adapted_key = key
-            for before, after in QWEN_SAFETENSOR_MAP.items():
-                adapted_key = adapted_key.replace(before, after)
+            # Diffusers Qwen text encoder shards are usually nested under `model.*`.
+            # The MAX text encoder expects top-level names (`layers.*`, `embed_tokens.*`).
+            if adapted_key.startswith("model."):
+                adapted_key = adapted_key.removeprefix("model.")
+            elif adapted_key.startswith("language_model."):
+                adapted_key = adapted_key.removeprefix("language_model.")
 
             state_dict[adapted_key] = value.data()
 
@@ -81,8 +82,27 @@ class Qwen3TextEncoderModel(ComponentModel):
         self.model = model.compile(*model.input_types(), weights=state_dict)
         return self.model
 
-    def __call__(self, *args, **kwargs):
+    def __call__(
+        self, *args, hidden_state_index: int | None = None, **kwargs
+    ):
         outputs = self.model(*args, **kwargs)
         if isinstance(outputs, list):
-            return tuple(outputs)
-        return outputs
+            outputs = tuple(outputs)
+
+        if hidden_state_index is None:
+            return outputs
+
+        if not isinstance(outputs, tuple):
+            raise ValueError(
+                "`hidden_state_index` requires model outputs to be tuple/list "
+                f"of hidden states, got {type(outputs).__name__}."
+            )
+
+        num_layers = len(outputs)
+        if hidden_state_index < -num_layers or hidden_state_index >= num_layers:
+            raise ValueError(
+                f"`hidden_state_index` out of range: {hidden_state_index}. "
+                f"Valid range is [{-num_layers}, {num_layers - 1}]."
+            )
+
+        return outputs[hidden_state_index]
