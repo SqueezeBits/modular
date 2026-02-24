@@ -43,6 +43,7 @@ from max.interfaces import (
 from max.interfaces.provider_options import (
     ImageProviderOptions,
     ProviderOptions,
+    VideoProviderOptions,
 )
 from max.interfaces.request import OpenResponsesRequest
 from max.interfaces.request.open_responses import (
@@ -138,6 +139,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Maximum length of secondary tokenizer",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Number of frames for video generation (e.g., 81 for Wan T2V).",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=16,
+        help="Frames per second for video output.",
     )
     parser.add_argument(
         "--input-image",
@@ -350,19 +363,31 @@ async def generate_image(args: argparse.Namespace) -> None:
             ),
         )
     else:
-        # Text-to-image: Use simple string prompt
+        # Text-to-image or text-to-video: Use simple string prompt
+        image_opts = ImageProviderOptions(
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+        )
+        video_opts = None
+        if args.num_frames is not None:
+            video_opts = VideoProviderOptions(
+                negative_prompt=args.negative_prompt,
+                height=args.height,
+                width=args.width,
+                steps=args.num_inference_steps,
+                num_frames=args.num_frames,
+                frames_per_second=args.fps,
+            )
         body = OpenResponsesRequestBody(
             model=args.model,
             input=args.prompt,
             seed=args.seed,
             provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                )
+                image=image_opts,
+                video=video_opts,
             ),
         )
 
