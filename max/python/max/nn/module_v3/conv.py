@@ -214,3 +214,210 @@ class Conv2d(Module[[Tensor], Tensor]):
             output = F.permute(output, [0, 3, 1, 2])
 
         return output
+
+
+class Conv3d(Module[[Tensor], Tensor]):
+    """A 3D convolution layer using eager Tensor execution.
+
+    Example:
+        .. code-block:: python
+
+            from max.nn.module_v3 import Conv3d
+            from max.experimental.tensor import Tensor
+
+            conv = Conv3d(
+                kernel_size=3,
+                in_channels=16,
+                out_channels=32,
+                has_bias=True,
+                permute=True,
+            )
+
+            x = Tensor.ones([1, 16, 8, 32, 32])
+            result = conv(x)
+    """
+
+    weight: Tensor
+    """The weight tensor.
+
+    - If `permute=True`: [out_channels, in_channels // num_groups, depth, height, width]
+    - If `permute=False`: [depth, height, width, in_channels // num_groups, out_channels]
+    """
+
+    bias: Tensor | Literal[0]
+    """The bias tensor with shape [out_channels] (or 0 if bias is disabled)."""
+
+    def __init__(
+        self,
+        kernel_size: int | tuple[int, int, int],
+        in_channels: int,
+        out_channels: int,
+        dtype: DType | None = None,
+        stride: int | tuple[int, int, int] = 1,
+        padding: int
+        | tuple[int, int, int]
+        | tuple[int, int, int, int, int, int] = 0,
+        dilation: int | tuple[int, int, int] = 1,
+        num_groups: int = 1,
+        device: DeviceRef | None = None,
+        has_bias: bool = False,
+        permute: bool = False,
+        name: str | None = None,
+    ):
+        """Initialize Conv3d layer.
+
+        Args:
+            kernel_size: Size of the convolving kernel. Can be int or tuple
+                (depth, height, width).
+            in_channels: Number of channels in the input.
+            out_channels: Number of channels produced by the convolution.
+            dtype: Data type for weights and bias.
+            stride: Stride of the convolution (int or tuple of 3 ints).
+            padding: Padding added to input. Can be int, tuple of 3 ints
+                (pad_d, pad_h, pad_w), or tuple of 6 ints in
+                (pad_front, pad_back, pad_top, pad_bottom, pad_left, pad_right).
+            dilation: Dilation of the convolution (int or tuple of 3 ints).
+            num_groups: Number of blocked connections from input channels
+                to output channels.
+            device: Target device for computation.
+            has_bias: If true, adds a learnable bias vector.
+            permute: If true, expects PyTorch-style input/weight layouts.
+                Input: NCDHW, weight: [F, C, Q, R, S].
+                Internally converts to MAX conv3d expected layout.
+            name: Base name for weights (stored for reconstruction).
+        """
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.dtype = dtype
+        self.device = device
+        self.permute = permute
+        self.num_groups = num_groups
+        self.has_bias = has_bias
+        self.name = name
+
+        if isinstance(kernel_size, int):
+            kernel_depth = kernel_height = kernel_width = kernel_size
+            self.kernel_size = (kernel_size, kernel_size, kernel_size)
+        else:
+            kernel_depth, kernel_height, kernel_width = kernel_size
+            self.kernel_size = kernel_size
+
+        self.weight = random.normal(
+            [
+                out_channels,
+                in_channels // num_groups,
+                kernel_depth,
+                kernel_height,
+                kernel_width,
+            ]
+            if self.permute
+            else [
+                kernel_depth,
+                kernel_height,
+                kernel_width,
+                in_channels // num_groups,
+                out_channels,
+            ],
+            dtype=self.dtype,
+            device=self.device.to_device() if self.device is not None else None,
+        )
+
+        if has_bias:
+            self.bias = random.normal(
+                [out_channels],
+                dtype=self.dtype,
+                device=self.device.to_device()
+                if self.device is not None
+                else None,
+            )
+        else:
+            self.bias = 0
+
+        self.stride = (
+            (stride, stride, stride) if isinstance(stride, int) else stride
+        )
+
+        if isinstance(padding, int):
+            padding = (
+                padding,
+                padding,
+                padding,
+                padding,
+                padding,
+                padding,
+            )
+        elif len(padding) == 3:
+            pad_d, pad_h, pad_w = padding
+            padding = (pad_d, pad_d, pad_h, pad_h, pad_w, pad_w)
+        self.padding = padding
+
+        self.dilation = (
+            (dilation, dilation, dilation)
+            if isinstance(dilation, int)
+            else dilation
+        )
+
+        if (
+            isinstance(self.weight, Tensor)
+            and hasattr(self.weight, "quantization_encoding")
+            and self.weight.quantization_encoding is not None
+        ):
+            raise ValueError("Conv3d not implemented with weight quantization.")
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply 3D convolution to input.
+
+        Args:
+            x: Input tensor.
+                - If permute=True: [batch, channels, depth, height, width]
+                - If permute=False: [batch, depth, height, width, channels]
+
+        Returns:
+            Output tensor.
+                - If permute=True: [batch, out_channels, out_depth, out_height, out_width]
+                - If permute=False: [batch, out_depth, out_height, out_width, out_channels]
+        """
+        weight = self.weight.to(x.device)
+
+        is_nvidia_gpu = (
+            isinstance(x.device, Accelerator) and accelerator_api() == "cuda"
+        )
+
+        if self.permute:
+            # Input: NCDHW -> NDHWC
+            x = F.permute(x, [0, 2, 3, 4, 1])
+
+            # GPU supports FCQRS (cuDNN) but CPU doesn't. On CPU, permute
+            # from FCQRS to QRSCF format.
+            if not is_nvidia_gpu:
+                # PyTorch FCQRS -> MAX QRSCF.
+                weight = F.permute(weight, [2, 3, 4, 1, 0])
+                weight = F.transfer_to(weight, x.device)
+
+        bias = (
+            F.transfer_to(self.bias, x.device)
+            if isinstance(self.bias, Tensor)
+            else None
+        )
+
+        output = F.conv3d(
+            x,
+            weight,
+            self.stride,
+            self.dilation,
+            self.padding,
+            self.num_groups,
+            bias,
+            # Use FCRS tag for cuDNN dispatch — MLIR doesn't support FCQRS
+            # but FCRS triggers filter_is_fcrs=True in MOGG, and conv_gpu
+            # dispatches to cuDNN 3D based on tensor rank==5.
+            filter_layout=FilterLayout.FCRS
+            if (self.permute and is_nvidia_gpu)
+            else FilterLayout.QRSCF,
+        )
+
+        if self.permute:
+            # Output: NDHWC -> NCDHW
+            output = F.permute(output, [0, 4, 1, 2, 3])
+
+        return output
