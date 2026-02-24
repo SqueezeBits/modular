@@ -545,7 +545,7 @@ struct cudnnStatus_t(Equatable, TrivialRegisterPassable, Writable):
             return writer.write("CUDNN_STATUS_RUNTIME_FP_OVERFLOW")
         if self is Self.CUDNN_STATUS_VERSION_MISMATCH:
             return writer.write("CUDNN_STATUS_VERSION_MISMATCH")
-        abort("invalid cudnnStatus_t entry")
+        writer.write("UNKNOWN_CUDNN_STATUS(", Int(self._value), ")")
 
     @no_inline
     fn __str__(self) -> String:
@@ -1706,7 +1706,7 @@ struct cudnnConvolutionFwdAlgo_t(Equatable, TrivialRegisterPassable, Writable):
             return writer.write("CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED")
         if self is Self.CUDNN_CONVOLUTION_FWD_ALGO_COUNT:
             return writer.write("CUDNN_CONVOLUTION_FWD_ALGO_COUNT")
-        abort("invalid cudnnConvolutionFwdAlgo_t entry")
+        writer.write("UNKNOWN_CUDNN_FWD_ALGO(", Int(self._value), ")")
 
     @no_inline
     fn __str__(self) -> String:

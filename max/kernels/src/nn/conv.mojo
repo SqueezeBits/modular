@@ -26,14 +26,17 @@ from sys.info import align_of, simd_width_of
 
 from _cudnn.cnn_infer import (
     cudnnConvolutionForward,
+    cudnnConvolutionFwdAlgoPerfStruct,
     cudnnConvolutionMode_t,
     cudnnConvolutionStruct,
     cudnnCreateConvolutionDescriptor,
     cudnnDestroyConvolutionDescriptor,
+    cudnnFindConvolutionForwardAlgorithmEx,
     cudnnGetConvolutionForwardWorkspaceSize,
     cudnnSetConvolution2dDescriptor,
     cudnnSetConvolutionGroupCount,
     cudnnSetConvolutionMathType,
+    cudnnSetConvolutionNdDescriptor,
 )
 from _cudnn.infer import (
     cudnnContext,
@@ -48,8 +51,10 @@ from _cudnn.infer import (
     cudnnFilterStruct,
     cudnnMathType_t,
     cudnnSetFilter4dDescriptor,
+    cudnnSetFilterNdDescriptor,
     cudnnSetStream,
     cudnnSetTensor4dDescriptor,
+    cudnnSetTensorNdDescriptorEx,
     cudnnStatus_t,
     cudnnTensorFormat_t,
     cudnnTensorStruct,
@@ -3399,6 +3404,397 @@ fn conv_cudnn[
         )
 
 
+# ===----------------------------------------------------------------------=== #
+# GPU 3D Convolution using cuDNN (Nd APIs)                                     #
+# ===----------------------------------------------------------------------=== #
+
+
+@fieldwise_init
+struct _Conv3dAlgoCacheEntry(Copyable, Movable):
+    """Cached cuDNN algorithm selection result for a conv3d shape."""
+
+    var algo_value: Int8
+    var workspace_size: Int
+
+    fn algo(self) -> cudnnConvolutionFwdAlgo_t:
+        return rebind[cudnnConvolutionFwdAlgo_t](self.algo_value)
+
+
+fn _conv3d_cudnn[
+    input_type: DType,
+    filter_type: DType,
+    output_type: DType,
+](
+    input: LayoutTensor[input_type, ...],
+    filter: LayoutTensor[filter_type, ...],
+    output: LayoutTensor[output_type, ...],
+    stride: IndexList[3],
+    dilation: IndexList[3],
+    padding: IndexList[3],
+    num_groups: Int,
+    ctx: DeviceContext,
+) raises:
+    """cuDNN 3D convolution using Nd descriptor APIs.
+
+    Expects:
+      - input:  NDHWC layout [N, D, H, W, C]
+      - filter: FCQRS layout [F, C/groups, Q, R, S]
+      - output: NDHWC layout [N, D_out, H_out, W_out, F]
+
+    Algorithm selection is cached per unique shape+params combination so that
+    the expensive FindEx search only runs once per shape.
+    """
+    comptime FIND_WS_CAP = 256 * 1024 * 1024
+
+    var ptr_meta = _get_cudnn_meta(ctx)
+
+    # --- Set up cuDNN descriptors (required every call — shared state) ---
+    # Input: NDHWC in memory, described as NHWC format with dims [N,C,D,H,W].
+    var input_dims = UnsafePointer[Int32].alloc(5)
+    input_dims[0] = Int32(input.dim[0]())  # N
+    input_dims[1] = Int32(input.dim[4]())  # C
+    input_dims[2] = Int32(input.dim[1]())  # D
+    input_dims[3] = Int32(input.dim[2]())  # H
+    input_dims[4] = Int32(input.dim[3]())  # W
+
+    check_cudnn_error(
+        cudnnSetTensorNdDescriptorEx(
+            ptr_meta[].ptr_input_desc,
+            cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
+            get_cudnn_dtype[input_type](),
+            Int16(5),
+            input_dims.bitcast[NoneType](),
+        )
+    )
+
+    # Filter: FCQRS layout [F, C/groups, Q, R, S], described as NCHW format.
+    var filter_dims = UnsafePointer[Int32].alloc(5)
+    filter_dims[0] = Int32(filter.dim[0]())  # F (out_channels)
+    filter_dims[1] = Int32(filter.dim[1]())  # C (in_channels / groups)
+    filter_dims[2] = Int32(filter.dim[2]())  # Q (depth)
+    filter_dims[3] = Int32(filter.dim[3]())  # R (height)
+    filter_dims[4] = Int32(filter.dim[4]())  # S (width)
+
+    check_cudnn_error(
+        cudnnSetFilterNdDescriptor(
+            ptr_meta[].ptr_filter_desc,
+            get_cudnn_dtype[filter_type](),
+            cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,
+            Int16(5),
+            filter_dims.bitcast[NoneType](),
+        )
+    )
+
+    # Convolution: 3 spatial dimensions.
+    var pad_a = UnsafePointer[Int32].alloc(3)
+    pad_a[0] = Int32(padding[0])
+    pad_a[1] = Int32(padding[1])
+    pad_a[2] = Int32(padding[2])
+
+    var stride_a = UnsafePointer[Int32].alloc(3)
+    stride_a[0] = Int32(stride[0])
+    stride_a[1] = Int32(stride[1])
+    stride_a[2] = Int32(stride[2])
+
+    var dilation_a = UnsafePointer[Int32].alloc(3)
+    dilation_a[0] = Int32(dilation[0])
+    dilation_a[1] = Int32(dilation[1])
+    dilation_a[2] = Int32(dilation[2])
+
+    check_cudnn_error(
+        cudnnSetConvolutionNdDescriptor(
+            ptr_meta[].ptr_conv_desc,
+            Int16(3),
+            pad_a.bitcast[NoneType](),
+            stride_a.bitcast[NoneType](),
+            dilation_a.bitcast[NoneType](),
+            cudnnConvolutionMode_t.CUDNN_CROSS_CORRELATION,
+            cudnnDataType_t.CUDNN_DATA_FLOAT,
+        )
+    )
+
+    check_cudnn_error(
+        cudnnSetConvolutionGroupCount(
+            ptr_meta[].ptr_conv_desc, Int16(num_groups)
+        )
+    )
+
+    # Output: NDHWC in memory, described as NHWC format with dims [N,C,D,H,W].
+    var output_dims = UnsafePointer[Int32].alloc(5)
+    output_dims[0] = Int32(output.dim[0]())  # N
+    output_dims[1] = Int32(output.dim[4]())  # C (out_channels)
+    output_dims[2] = Int32(output.dim[1]())  # D_out
+    output_dims[3] = Int32(output.dim[2]())  # H_out
+    output_dims[4] = Int32(output.dim[3]())  # W_out
+
+    check_cudnn_error(
+        cudnnSetTensorNdDescriptorEx(
+            ptr_meta[].ptr_output_desc,
+            cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
+            get_cudnn_dtype[output_type](),
+            Int16(5),
+            output_dims.bitcast[NoneType](),
+        )
+    )
+
+    # Allow tensor-op math with automatic type conversion — required for
+    # bfloat16 3D convolutions on modern cuDNN (matches PR #5988 approach).
+    check_cudnn_error(
+        cudnnSetConvolutionMathType(
+            ptr_meta[].ptr_conv_desc,
+            cudnnMathType_t.CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION,
+        )
+    )
+
+    # --- Algorithm selection (cached per shape) ---
+    var cache_key = String(
+        "CONV3D_ALGO_",
+        ctx.id(),
+        "_",
+        input.dim[0](),
+        "_",
+        input.dim[4](),
+        "_",
+        input.dim[1](),
+        "_",
+        input.dim[2](),
+        "_",
+        input.dim[3](),
+        "_F",
+        filter.dim[0](),
+        "_",
+        filter.dim[1](),
+        "_",
+        filter.dim[2](),
+        "_",
+        filter.dim[3](),
+        "_",
+        filter.dim[4](),
+        "_p",
+        padding[0],
+        "_",
+        padding[1],
+        "_",
+        padding[2],
+        "_s",
+        stride[0],
+        "_",
+        stride[1],
+        "_",
+        stride[2],
+        "_d",
+        dilation[0],
+        "_",
+        dilation[1],
+        "_",
+        dilation[2],
+        "_g",
+        num_groups,
+    )
+
+    var algo: cudnnConvolutionFwdAlgo_t
+    var workspace_size_var: Int
+
+    if ptr_cached := _get_global_or_null(cache_key).bitcast[
+        _Conv3dAlgoCacheEntry
+    ]():
+        # Cache hit — reuse previously selected algorithm.
+        algo = ptr_cached[].algo()
+        workspace_size_var = ptr_cached[].workspace_size
+        print(
+            "conv3d CACHE HIT: algo=",
+            algo,
+            " workspace=",
+            workspace_size_var,
+        )
+    else:
+        # Cache miss — run FindEx to find the fastest algorithm.
+        var find_ws = ctx.enqueue_create_buffer[DType.uint8](FIND_WS_CAP)
+
+        var returned_count = Int16(0)
+        var perf_results = UnsafePointer[
+            cudnnConvolutionFwdAlgoPerfStruct
+        ].alloc(8)
+        var find_status = cudnnFindConvolutionForwardAlgorithmEx(
+            ptr_meta[].ptr_handle,
+            ptr_meta[].ptr_input_desc,
+            rebind[OpaquePointer](input.ptr.bitcast[NoneType]()),
+            ptr_meta[].ptr_filter_desc,
+            rebind[OpaquePointer](filter.ptr.bitcast[NoneType]()),
+            ptr_meta[].ptr_conv_desc,
+            ptr_meta[].ptr_output_desc,
+            rebind[OpaquePointer](output.ptr.bitcast[NoneType]()),
+            Int16(8),
+            UnsafePointer(to=returned_count),
+            perf_results,
+            find_ws.unsafe_ptr().bitcast[NoneType](),
+            FIND_WS_CAP,
+        )
+        _ = find_ws^
+
+        # Diagnostic logging: FindEx results.
+        print(
+            "conv3d FindEx: status=",
+            Int(find_status._value),
+            " returned=",
+            Int(returned_count),
+            " input=[N=",
+            input.dim[0](),
+            " C=",
+            input.dim[4](),
+            " D=",
+            input.dim[1](),
+            " H=",
+            input.dim[2](),
+            " W=",
+            input.dim[3](),
+            "] filter=[F=",
+            filter.dim[0](),
+            " C=",
+            filter.dim[1](),
+            " Q=",
+            filter.dim[2](),
+            " R=",
+            filter.dim[3](),
+            " S=",
+            filter.dim[4](),
+            "]",
+        )
+        for i in range(Int(returned_count)):
+            var p = perf_results[i]
+            print(
+                "  algo[",
+                i,
+                "]: ",
+                p.algo,
+                " status=",
+                Int(p.status._value),
+                " time=",
+                p.time,
+                "ms memory=",
+                p.memory,
+            )
+
+        # Pick the fastest successful algorithm within workspace cap.
+        algo = (
+            cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
+        )
+        workspace_size_var = 0
+        if find_status == cudnnStatus_t.CUDNN_STATUS_SUCCESS:
+            for i in range(Int(returned_count)):
+                var p = perf_results[i]
+                if (
+                    p.status == cudnnStatus_t.CUDNN_STATUS_SUCCESS
+                    and p.memory <= FIND_WS_CAP
+                ):
+                    algo = p.algo
+                    workspace_size_var = p.memory
+                    break
+        perf_results.free()
+
+        # Fallback: if FindEx found nothing, try PRECOMP_GEMM via workspace
+        # query.
+        if (
+            algo
+            == cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
+            and workspace_size_var == 0
+        ):
+            var precomp = (
+                cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+            )
+            var ws_size: Int = 0
+            var ws_st = cudnnGetConvolutionForwardWorkspaceSize(
+                ptr_meta[].ptr_handle,
+                ptr_meta[].ptr_input_desc,
+                ptr_meta[].ptr_filter_desc,
+                ptr_meta[].ptr_conv_desc,
+                ptr_meta[].ptr_output_desc,
+                precomp,
+                UnsafePointer(to=ws_size),
+            )
+            if (
+                ws_st == cudnnStatus_t.CUDNN_STATUS_SUCCESS
+                and ws_size <= FIND_WS_CAP
+            ):
+                algo = precomp
+                workspace_size_var = ws_size
+
+        print(
+            "conv3d SELECTED: algo=",
+            algo,
+            " workspace=",
+            workspace_size_var,
+        )
+
+        # Store result in global cache.
+        var ptr_entry = UnsafePointer[_Conv3dAlgoCacheEntry].alloc(1)
+        ptr_entry.init_pointee_move(
+            _Conv3dAlgoCacheEntry(
+                algo_value=rebind[Int8](algo),
+                workspace_size=workspace_size_var,
+            )
+        )
+        external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+            StringSlice(cache_key),
+            ptr_entry.bitcast[NoneType](),
+        )
+
+    # --- Execute convolution with cached/selected algorithm ---
+    var alpha = Float32(1.0)
+    var beta = Float32(0.0)
+
+    var workspace_buffer = ctx.enqueue_create_buffer[DType.uint8](
+        workspace_size_var
+    )
+    check_cudnn_error(
+        cudnnConvolutionForward(
+            ptr_meta[].ptr_handle,
+            UnsafePointer(to=alpha).bitcast[NoneType](),
+            ptr_meta[].ptr_input_desc,
+            rebind[OpaquePointer](input.ptr.bitcast[NoneType]()),
+            ptr_meta[].ptr_filter_desc,
+            rebind[OpaquePointer](filter.ptr.bitcast[NoneType]()),
+            ptr_meta[].ptr_conv_desc,
+            algo,
+            workspace_buffer.unsafe_ptr().bitcast[NoneType](),
+            workspace_size_var,
+            UnsafePointer(to=beta).bitcast[NoneType](),
+            ptr_meta[].ptr_output_desc,
+            rebind[OpaquePointer](output.ptr.bitcast[NoneType]()),
+        )
+    )
+    _ = workspace_buffer^
+
+    # Free temporary descriptor arrays.
+    input_dims.free()
+    filter_dims.free()
+    pad_a.free()
+    stride_a.free()
+    dilation_a.free()
+    output_dims.free()
+
+
+fn conv3d_cudnn[
+    input_type: DType,
+    filter_type: DType,
+    output_type: DType,
+](
+    input: LayoutTensor[input_type, ...],
+    filter: LayoutTensor[filter_type, ...],
+    output: LayoutTensor[output_type, ...],
+    stride: IndexList[3],
+    dilation: IndexList[3],
+    padding: IndexList[3],
+    num_groups: Int,
+    ctx: DeviceContext,
+) raises:
+    # Set `ctx`'s CUcontext as current to satisfy cudnn's stateful API.
+    with ctx.push_context() as ctx:
+        _conv3d_cudnn(
+            input, filter, output, stride, dilation, padding, num_groups, ctx
+        )
+
+
 fn conv_gpu[
     conv_rank: Int,
     //,
@@ -3697,19 +4093,55 @@ fn conv_gpu[
             )
 
     elif input.rank == 5:
-        var grid_dim_x = ceildiv(
-            output.dim[2]() * output.dim[3](), block_size
-        )  # h * w / block size for 3d
-        ctx.enqueue_function[conv_gpu_3d, conv_gpu_3d](
-            input,
-            filter,
-            output,
-            stride,
-            dilation,
-            symmetric_padding,
-            grid_dim=(grid_dim_x, grid_dim_y, grid_dim_z),
-            block_dim=(block_size, block_size),
-        )
+
+        @parameter
+        if filter_is_fcrs:
+            conv3d_cudnn[input_type, filter_type, output_type](
+                LayoutTensor[
+                    input_type, Layout.row_major[5](), MutAnyOrigin
+                ](
+                    input.ptr,
+                    RuntimeLayout[Layout.row_major[5]()].row_major(
+                        input.runtime_layout.shape.value.canonicalize(),
+                    ),
+                ),
+                LayoutTensor[
+                    filter_type, Layout.row_major[5](), MutAnyOrigin
+                ](
+                    filter.ptr,
+                    RuntimeLayout[Layout.row_major[5]()].row_major(
+                        filter.runtime_layout.shape.value.canonicalize(),
+                    ),
+                ),
+                LayoutTensor[
+                    output_type, Layout.row_major[5](), MutAnyOrigin
+                ](
+                    output.ptr,
+                    RuntimeLayout[Layout.row_major[5]()].row_major(
+                        output.runtime_layout.shape.value.canonicalize(),
+                    ),
+                ),
+                rebind[IndexList[3]](stride),
+                rebind[IndexList[3]](dilation),
+                rebind[IndexList[3]](symmetric_padding),
+                num_groups,
+                ctx,
+            )
+
+        else:
+            var grid_dim_x = ceildiv(
+                output.dim[2]() * output.dim[3](), block_size
+            )  # h * w / block size for 3d
+            ctx.enqueue_function[conv_gpu_3d, conv_gpu_3d](
+                input,
+                filter,
+                output,
+                stride,
+                dilation,
+                symmetric_padding,
+                grid_dim=(grid_dim_x, grid_dim_y, grid_dim_z),
+                block_dim=(block_size, block_size),
+            )
 
 
 fn conv3d_gpu_naive_ndhwc_qrscf[
