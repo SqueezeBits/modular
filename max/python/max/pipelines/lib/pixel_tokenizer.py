@@ -655,6 +655,9 @@ class PixelGenerationTokenizer(
                 "This should not happen as defaults are applied at request creation."
             )
 
+        # Extract optional video provider options
+        video_options = request.body.provider_options.video
+
         if (
             image_options.guidance_scale < 1.0
             or image_options.true_cfg_scale < 1.0
@@ -679,6 +682,13 @@ class PixelGenerationTokenizer(
             image_options.true_cfg_scale > 1.0
             and image_options.negative_prompt is not None
         )
+        if (
+            self._pipeline_class_name == PipelineClassName.WAN
+            and image_options.guidance_scale > 1.0
+            and image_options.negative_prompt is not None
+        ):
+            # Wan uses standard CFG with `guidance_scale`.
+            do_true_cfg = True
         import PIL.Image
 
         # 1. Tokenize prompts
@@ -789,6 +799,9 @@ class PixelGenerationTokenizer(
             num_warmup_steps=num_warmup_steps,
             model_name=request.body.model,
             input_image=preprocessed_image_array,  # Pass numpy array instead of PIL.Image
+            num_frames=video_options.num_frames if video_options else None,
+            frames_per_second=video_options.frames_per_second or 16 if video_options else 16,
+            guidance_scale_2=video_options.guidance_scale_2 if video_options else None,
         )
 
         for validator in self._context_validators:

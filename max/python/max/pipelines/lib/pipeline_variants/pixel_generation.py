@@ -117,10 +117,34 @@ class PixelGenerationPipeline(
 
         images = model_outputs.images
         num_images_per_prompt = model_inputs.num_images_per_prompt
-        expected_images = len(flat_batch) * num_images_per_prompt
 
-        # Handle both numpy array (NHWC) and list of images
+        # Handle both numpy array and list of images
+        if isinstance(images, np.ndarray) and images.ndim == 5:
+            # Video output: shape [B, C, T, H, W]
+            # Denormalize from [-1, 1] to [0, 1] range
+            images = (images * 0.5 + 0.5).clip(min=0.0, max=1.0)
+
+            responses: dict[RequestID, GenerationOutput] = {}
+            for index, (request_id, _context) in enumerate(flat_batch):
+                # video_clip shape: [C, T, H, W]
+                video_clip = images[index]
+                # Transpose to [T, H, W, C] for per-frame PNG encoding
+                frames = np.transpose(video_clip, (1, 2, 3, 0))
+                responses[request_id] = GenerationOutput(
+                    request_id=request_id,
+                    final_status=GenerationStatus.END_OF_SEQUENCE,
+                    output=[
+                        OutputImageContent.from_numpy(
+                            frames[t].astype(np.float32, copy=False),
+                            format="png",
+                        )
+                        for t in range(frames.shape[0])
+                    ],
+                )
+            return responses
+
         if isinstance(images, np.ndarray):
+            expected_images = len(flat_batch) * num_images_per_prompt
             # images shape: (batch_size, H, W, C) or (batch_size, C, H, W)
             # Convert NCHW to NHWC if needed
             if images.ndim == 4 and images.shape[1] in (1, 3, 4):
@@ -130,6 +154,7 @@ class PixelGenerationPipeline(
             images = (images * 0.5 + 0.5).clip(min=0.0, max=1.0)
             image_list = [images[i] for i in range(images.shape[0])]
         else:
+            expected_images = len(flat_batch) * num_images_per_prompt
             # Denormalize each image from [-1, 1] to [0, 1] range
             image_list = [
                 (np.asarray(img, dtype=np.float32) * 0.5 + 0.5).clip(
@@ -144,7 +169,7 @@ class PixelGenerationPipeline(
                 f"expected {expected_images}, got {len(image_list)}."
             )
 
-        responses: dict[RequestID, GenerationOutput] = {}
+        responses = {}
         for index, (request_id, _context) in enumerate(flat_batch):
             offset = index * num_images_per_prompt
             # Select images for this request (already in NHWC format)
