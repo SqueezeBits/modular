@@ -676,6 +676,9 @@ class PixelContext:
     negative_tokens: TokenBuffer | None = field(default=None)
     """Negative tokens for primary encoder."""
 
+    negative_mask: npt.NDArray[np.bool_] | None = field(default=None)
+    """Attention mask for negative prompt tokens."""
+
     negative_tokens_2: TokenBuffer | None = field(default=None)
     """Negative tokens for secondary encoder. None for single-encoder models."""
 
@@ -709,6 +712,15 @@ class PixelContext:
     num_images_per_prompt: int = field(default=1)
     input_image: npt.NDArray[np.uint8] | None = field(default=None)
     """Input image as numpy array (H, W, C) in uint8 format for image-to-image generation."""
+
+    # Video generation fields
+    num_frames: int | None = field(default=None)
+    """Number of frames for video generation. None for image generation."""
+    frames_per_second: int = field(default=16)
+    """Frame rate for video output."""
+    guidance_scale_2: float | None = field(default=None)
+    """Secondary guidance scale for low-noise expert (MoE models)."""
+
     status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
 
     @property

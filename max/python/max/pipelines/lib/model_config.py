@@ -714,12 +714,20 @@ class MAXModelConfig(MAXModelConfigBase):
                 "config_dict": component_configs.get(component_name, {}),
             }
 
-        # Build the final config structure
-        return {
+        # Build the final config structure, including pipeline-level keys
+        # (e.g., boundary_ratio for MoE models).
+        result: dict[str, Any] = {
             "_class_name": class_name,
             "_diffusers_version": diffusers_version,
             "components": components,
         }
+        for key, value in model_index.items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, list):
+                continue  # skip component entries ([library, class_name])
+            result[key] = value
+        return result
 
     @computed_field  # type: ignore[prop-decorator]
     @cached_property
