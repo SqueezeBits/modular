@@ -116,6 +116,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Guidance scale for classifier-free guidance. Set to 1.0 to disable CFG.",
     )
     parser.add_argument(
+        "--strength",
+        type=float,
+        default=0.6,
+        help="Image-to-image strength in (0, 1]. Ignored for text-to-image.",
+    )
+    parser.add_argument(
+        "--cfg-normalization",
+        action="store_true",
+        help="Enable Z-Image CFG renormalization.",
+    )
+    parser.add_argument(
+        "--cfg-truncation",
+        type=float,
+        default=1.0,
+        help="Z-Image CFG truncation threshold in normalized time (> 0).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -174,7 +191,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     assert args.num_inference_steps > 0, (
         "num-inference-steps must be a positive integer."
     )
-    assert args.guidance_scale > 0.0, "guidance-scale must be positive."
+    assert args.guidance_scale >= 0.0, "guidance-scale must be non-negative."
+    assert 0.0 < args.strength <= 1.0, "strength must be in (0, 1]."
+    assert args.cfg_truncation > 0.0, "cfg-truncation must be positive."
 
     return args
 
@@ -272,7 +291,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         max_length = components_config["tokenizer"]["config_dict"].get(
             "model_max_length", None
         )
-        if arch.name == "Flux2Pipeline":
+        if arch.name in ("Flux2Pipeline", "ZImagePipeline"):
             max_length = 512
         print(f"Using max length: {max_length} for tokenizer")
 
@@ -346,6 +365,9 @@ async def generate_image(args: argparse.Namespace) -> None:
                     width=args.width,
                     steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    strength=args.strength,
+                    cfg_normalization=args.cfg_normalization,
+                    cfg_truncation=args.cfg_truncation,
                 )
             ),
         )
@@ -362,6 +384,9 @@ async def generate_image(args: argparse.Namespace) -> None:
                     width=args.width,
                     steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    strength=args.strength,
+                    cfg_normalization=args.cfg_normalization,
+                    cfg_truncation=args.cfg_truncation,
                 )
             ),
         )
@@ -369,7 +394,9 @@ async def generate_image(args: argparse.Namespace) -> None:
     request = OpenResponsesRequest(request_id=RequestID(), body=body)
 
     print(
-        f"Parameters: steps={args.num_inference_steps}, guidance={args.guidance_scale}"
+        "Parameters: "
+        f"steps={args.num_inference_steps}, guidance={args.guidance_scale}, "
+        f"cfg_norm={args.cfg_normalization}, cfg_trunc={args.cfg_truncation}"
     )
 
     # Step 5: Create a PixelContext object from the request
@@ -401,6 +428,9 @@ async def generate_image(args: argparse.Namespace) -> None:
                     width=args.width,
                     steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    strength=args.strength,
+                    cfg_normalization=args.cfg_normalization,
+                    cfg_truncation=args.cfg_truncation,
                 )
             ),
         )

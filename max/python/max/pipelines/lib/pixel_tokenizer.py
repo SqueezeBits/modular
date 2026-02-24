@@ -207,7 +207,10 @@ class PixelGenerationTokenizer(
 
         # Store static model dimensions
         self._default_sample_size = 128
-        self._num_channels_latents = transformer_config["in_channels"] // 4
+        if self._pipeline_class_name == PipelineClassName.ZIMAGE:
+            self._num_channels_latents = transformer_config["in_channels"]
+        else:
+            self._num_channels_latents = transformer_config["in_channels"] // 4
 
         # Create scheduler
         scheduler_class_name = components.get("scheduler", {}).get(
@@ -221,6 +224,7 @@ class PixelGenerationTokenizer(
             class_name=scheduler_class_name,
             config_dict=scheduler_cfg,
         )
+        self._scheduler_shift = float(scheduler_cfg.get("shift", 1.0))
 
         self._max_pixel_size = None
         if self._pipeline_class_name == PipelineClassName.FLUX2:
@@ -433,7 +437,7 @@ class PixelGenerationTokenizer(
         def _encode_fn(prompt_str: str) -> Any:
             assert delegate is not None
 
-            # For Flux2, use apply_chat_template with format_input
+            # For Flux2, use apply_chat_template with format_input.
             if self._pipeline_class_name == PipelineClassName.FLUX2:
                 from max.pipelines.architectures.flux2.system_messages import (
                     SYSTEM_MESSAGE,
@@ -456,6 +460,42 @@ class PixelGenerationTokenizer(
                     max_length=max_sequence_length,
                     return_length=False,
                     return_overflowing_tokens=False,
+                )
+            # For Z-Image, use Qwen chat-template formatting.
+            if self._pipeline_class_name == PipelineClassName.ZIMAGE:
+                messages = [{"role": "user", "content": prompt_str}]
+                kwargs = {
+                    "add_generation_prompt": True,
+                    "tokenize": True,
+                    "return_dict": True,
+                    "padding": "max_length",
+                    "truncation": True,
+                    "max_length": max_sequence_length,
+                    "return_length": False,
+                    "return_overflowing_tokens": False,
+                }
+                try:
+                    return delegate.apply_chat_template(
+                        messages, enable_thinking=True, **kwargs
+                    )
+                except TypeError:
+                    try:
+                        return delegate.apply_chat_template(messages, **kwargs)
+                    except (ImportError, AttributeError):
+                        # Some tokenizer builds don't expose chat templates
+                        # (or miss optional jinja2). Fallback keeps behavior
+                        # non-fatal for shared code paths and tests.
+                        pass
+                except (ImportError, AttributeError):
+                    pass
+                return delegate(
+                    prompt_str,
+                    padding="max_length",
+                    max_length=max_sequence_length,
+                    truncation=True,
+                    return_overflowing_tokens=False,
+                    return_length=False,
+                    return_tensors="np",
                 )
             else:
                 return delegate(
@@ -679,6 +719,10 @@ class PixelGenerationTokenizer(
             image_options.true_cfg_scale > 1.0
             and image_options.negative_prompt is not None
         )
+        do_zimage_cfg = (
+            self._pipeline_class_name == PipelineClassName.ZIMAGE
+            and image_options.guidance_scale > 1.0
+        )
         import PIL.Image
 
         # 1. Tokenize prompts
@@ -703,7 +747,7 @@ class PixelGenerationTokenizer(
             image_options.secondary_prompt,
             image_options.negative_prompt,
             image_options.secondary_negative_prompt,
-            do_true_cfg,
+            do_true_cfg or do_zimage_cfg,
             images=images_for_tokenization,
         )
 
@@ -755,6 +799,34 @@ class PixelGenerationTokenizer(
         timesteps, sigmas = self._scheduler.retrieve_timesteps_and_sigmas(
             image_seq_len, num_inference_steps
         )
+        if (
+            self._pipeline_class_name == PipelineClassName.ZIMAGE
+            and self._scheduler_shift != 1.0
+        ):
+            # Match diffusers FlowMatchEulerDiscreteScheduler static shift behavior.
+            # Z-Image scheduler config uses shift=6.0.
+            shifted_timesteps = (
+                self._scheduler_shift
+                * timesteps
+                / (1.0 + (self._scheduler_shift - 1.0) * timesteps)
+            ).astype(np.float32)
+            timesteps = shifted_timesteps
+            sigmas = np.append(shifted_timesteps, np.float32(0.0))
+
+        # Z-Image img2img follows diffusers strength behavior by starting
+        # denoising from a later timestep.
+        if (
+            self._pipeline_class_name == PipelineClassName.ZIMAGE
+            and input_image is not None
+        ):
+            init_timestep = min(
+                num_inference_steps * image_options.strength,
+                float(num_inference_steps),
+            )
+            t_start = int(max(num_inference_steps - init_timestep, 0.0))
+            timesteps = timesteps[t_start:]
+            sigmas = sigmas[t_start:]
+            num_inference_steps = int(timesteps.shape[0])
 
         num_warmup_steps: int = max(
             len(timesteps) - num_inference_steps * self._scheduler.order, 0
@@ -786,6 +858,9 @@ class PixelGenerationTokenizer(
             guidance_scale=image_options.guidance_scale,
             num_images_per_prompt=image_options.num_images,
             true_cfg_scale=image_options.true_cfg_scale,
+            strength=image_options.strength,
+            cfg_normalization=image_options.cfg_normalization,
+            cfg_truncation=image_options.cfg_truncation,
             num_warmup_steps=num_warmup_steps,
             model_name=request.body.model,
             input_image=preprocessed_image_array,  # Pass numpy array instead of PIL.Image
