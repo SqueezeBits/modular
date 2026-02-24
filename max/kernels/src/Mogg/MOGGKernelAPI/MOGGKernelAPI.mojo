@@ -4814,7 +4814,7 @@ struct Conv:
         )
 
         comptime filter_packed = filter_layout == "FRSCf" or filter_layout == "FQRSCf"
-        comptime filter_is_fcrs = filter_layout == "FCRS"
+        comptime filter_is_fcrs = filter_layout == "FCRS" or filter_layout == "FCQRS"
 
         var input_buf = input.to_layout_tensor()
         var filter_buf = filter.to_layout_tensor()
