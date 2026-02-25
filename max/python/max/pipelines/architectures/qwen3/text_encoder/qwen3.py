@@ -82,7 +82,6 @@ class EncoderTransformerBlock(Module[..., Tensor]):
         Args:
             x: Input hidden states [seq_len, hidden_dim]
             rope: RoPE embedding module
-
         Returns:
             Output hidden states [seq_len, hidden_dim]
         """
@@ -153,7 +152,6 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
 
         Args:
             tokens: Input token IDs [total_seq_len]
-
         Returns:
             Tuple of hidden states from all layers, each with shape [seq_len, hidden_dim]
         """

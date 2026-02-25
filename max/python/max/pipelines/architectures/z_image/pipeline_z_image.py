@@ -39,6 +39,7 @@ class ZImageModelInputs(PixelModelInputs):
     num_inference_steps: int = 50
     num_images_per_prompt: int = 1
     mask: np.ndarray | None = None
+    negative_mask: np.ndarray | None = None
     input_image: np.ndarray | None = None
 
 
@@ -121,9 +122,24 @@ class ZImagePipeline(DiffusionPipeline):
     ) -> Tensor:
         if tokens.ndim == 2:
             tokens = tokens[0]
+        selected_tokens = tokens
+        if mask is not None:
+            if mask.ndim == 2:
+                mask = mask[0]
+            if mask.shape[0] != tokens.shape[0]:
+                raise ValueError(
+                    "Z-Image mask length must match token length after tokenizer preprocessing. "
+                    f"Got mask={mask.shape[0]}, tokens={tokens.shape[0]}."
+                )
+            if not np.all(mask):
+                raise ValueError(
+                    "Z-Image expects tokenizer-pretrimmed tokens with dense attention mask. "
+                    "Received sparse mask, which indicates an unexpected tokenizer/pipeline mismatch."
+                )
+            selected_tokens = tokens[mask]
 
         text_input_ids = Tensor.constant(
-            tokens,
+            selected_tokens,
             dtype=DType.int64,
             device=self.text_encoder.devices[0],
         )
@@ -131,13 +147,6 @@ class ZImagePipeline(DiffusionPipeline):
             text_input_ids,
             hidden_state_index=-2,
         )
-
-        if mask is not None:
-            if mask.ndim == 2:
-                mask = mask[0]
-            seq_len = int(np.count_nonzero(mask))
-            if seq_len > 0:
-                hidden_states = hidden_states[:seq_len]
 
         hidden_states = F.unsqueeze(hidden_states, 0)
 
@@ -334,7 +343,7 @@ class ZImagePipeline(DiffusionPipeline):
         if do_cfg:
             negative_prompt_embeds = self._prepare_prompt_embeddings(
                 tokens=model_inputs.negative_tokens.array,
-                mask=None,
+                mask=model_inputs.negative_mask,
                 num_images_per_prompt=model_inputs.num_images_per_prompt,
             )
             negative_prompt_embeds = self._align_prompt_seq_len(
