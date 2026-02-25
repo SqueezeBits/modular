@@ -16,9 +16,12 @@ from typing import Any
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
+from max.nn.legacy.float8_config import Float8Config
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from pydantic import Field
+
+from ..common_layers.fp8_config_utils import build_dynamic_block_fp8_config
 
 
 class Flux2ConfigBase(MAXModelConfigBase):
@@ -39,6 +42,8 @@ class Flux2ConfigBase(MAXModelConfigBase):
     """If False (Klein/distilled), no guidance embedder weights are expected."""
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
+    quantization_config: dict[str, Any] | None = None
+    float8_config: Float8Config | None = None
 
 
 class Flux2Config(Flux2ConfigBase):
@@ -57,6 +62,16 @@ class Flux2Config(Flux2ConfigBase):
             {
                 "dtype": supported_encoding_dtype(encoding),
                 "device": DeviceRef.from_device(devices[0]),
+                "quantization_config": config_dict.get("quantization_config"),
             }
         )
+        if encoding == "float8_e4m3fn":
+            try:
+                init_dict["float8_config"] = build_dynamic_block_fp8_config(
+                    config_dict, component_name="flux2.transformer"
+                )
+            except ValueError:
+                # Legacy FP8 checkpoints may not provide quantization metadata.
+                # Keep runtime in metadata-less fallback mode in this case.
+                init_dict["float8_config"] = None
         return Flux2ConfigBase(**init_dict)

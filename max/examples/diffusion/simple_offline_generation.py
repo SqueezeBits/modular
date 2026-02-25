@@ -31,7 +31,7 @@ import asyncio
 import base64
 import os
 from io import BytesIO
-from typing import cast
+from typing import cast, get_args
 
 from max.driver import DeviceSpec
 from max.examples.diffusion.profiler import profile_execute
@@ -52,7 +52,12 @@ from max.interfaces.request.open_responses import (
     OutputImageContent,
     UserMessage,
 )
-from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
+from max.pipelines import (
+    PIPELINE_REGISTRY,
+    MAXModelConfig,
+    PipelineConfig,
+    SupportedEncoding,
+)
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import PixelGenerationTokenizer
 from max.pipelines.lib.interfaces import DiffusionPipeline
@@ -61,6 +66,8 @@ from max.pipelines.lib.pipeline_variants.pixel_generation import (
     PixelGenerationPipeline,
 )
 from PIL import Image
+
+SUPPORTED_ENCODING_CHOICES = tuple(get_args(SupportedEncoding))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -183,6 +190,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Number of iterations to run for profiling.",
     )
+    parser.add_argument(
+        "--quantization-encoding",
+        type=str,
+        default=None,
+        choices=SUPPORTED_ENCODING_CHOICES,
+        help=(
+            "Optional weight encoding override (e.g. float8_e4m3fn). "
+            "If not set, encoding is auto-resolved from available weights."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -268,6 +285,11 @@ async def generate_image(args: argparse.Namespace) -> None:
         model=MAXModelConfig(
             model_path=args.model,
             device_specs=[DeviceSpec.accelerator()],
+            quantization_encoding=(
+                cast(SupportedEncoding, args.quantization_encoding)
+                if args.quantization_encoding is not None
+                else None
+            ),
         ),
         runtime=PipelineRuntimeConfig(
             prefer_module_v3=True,

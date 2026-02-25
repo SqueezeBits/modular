@@ -178,6 +178,40 @@ class Flux2Pipeline(DiffusionPipeline):
         if context.sigmas.size == 0:
             raise ValueError(
                 "Flux2Pipeline requires non-empty sigmas in PixelContext"
+        # Convert numpy array back to PIL.Image temporarily for Flux2ModelInputs
+        pil_image = None
+        if context.input_image is not None and isinstance(
+            context.input_image, np.ndarray
+        ):
+            pil_image = Image.fromarray(context.input_image.astype(np.uint8))
+
+        # Temporarily set PIL image for from_context
+        original_input_image = context.input_image
+        if pil_image is not None:
+            context.input_image = pil_image  # type: ignore[assignment]
+
+        result = Flux2ModelInputs.from_context(context)
+
+        # Restore original numpy array
+        context.input_image = original_input_image
+
+        return result
+
+    def build_prepare_prompt_embeddings(self) -> None:
+        # Text encoder outputs bf16 even for fp8-only models (Mistral3 doesn't
+        # quantize activations to fp8). Use bf16 when config dtype is float8 so
+        # the compiled _prepare_prompt_embeddings matches actual text encoder
+        # output and the transformer's expected encoder_hidden_states dtype.
+        input_dtype = (
+            DType.bfloat16
+            if self.text_encoder.config.dtype.is_float8()
+            else self.text_encoder.config.dtype
+        )
+        input_types = [
+            TensorType(
+                input_dtype,
+                shape=["seq_len", "hidden_dim"],
+                device=self.text_encoder.devices[0],
             )
 
         device = self.transformer.devices[0]
@@ -294,7 +328,12 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
     def build_scheduler_step(self) -> None:
-        dtype = self.transformer.config.dtype
+        transformer_dtype = self.transformer.config.dtype
+        dtype = (
+            DType.bfloat16
+            if transformer_dtype.is_float8()
+            else transformer_dtype
+        )
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -592,7 +631,13 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def _patchify_and_pack(self, latents: Tensor) -> Tensor:
         """Patchify (B,C,H,W)->(B,C*4,H//2,W//2) then pack to (B,H//2*W//2,C*4)."""
-        latents = latents.cast(self.transformer.config.dtype)
+        transformer_dtype = self.transformer.config.dtype
+        input_dtype = (
+            DType.bfloat16
+            if transformer_dtype.is_float8()
+            else transformer_dtype
+        )
+        latents = latents.cast(input_dtype)
         batch = latents.shape[0]
         c = latents.shape[1]
         h = latents.shape[2]
@@ -662,7 +707,13 @@ class Flux2Pipeline(DiffusionPipeline):
         sigmas_curr = F.slice_tensor(sigmas, [slice(0, -1)])
         sigmas_next = F.slice_tensor(sigmas, [slice(1, None)])
         all_dt = F.sub(sigmas_next, sigmas_curr)
-        all_timesteps = sigmas_curr.cast(self.transformer.config.dtype)
+        transformer_dtype = self.transformer.config.dtype
+        input_dtype = (
+            DType.bfloat16
+            if transformer_dtype.is_float8()
+            else transformer_dtype
+        )
+        all_timesteps = sigmas_curr.cast(input_dtype)
         return all_timesteps, all_dt
 
     @traced
