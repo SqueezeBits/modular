@@ -67,6 +67,7 @@ async def run_with_default_executor(
 class PipelineClassName(str, Enum):
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
+    FLUX2_KLEIN = "Flux2KleinPipeline"
     ZIMAGE = "ZImagePipeline"
 
     @classmethod
@@ -217,8 +218,9 @@ class PixelGenerationTokenizer(
             "class_name", None
         )
         scheduler_cfg = components.get("scheduler", {}).get("config_dict", {})
-        scheduler_cfg["use_empirical_mu"] = (
-            self._pipeline_class_name == PipelineClassName.FLUX2
+        scheduler_cfg["use_empirical_mu"] = self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
         )
         self._scheduler = SchedulerFactory.create(
             class_name=scheduler_class_name,
@@ -227,13 +229,19 @@ class PixelGenerationTokenizer(
         self._scheduler_shift = float(scheduler_cfg.get("shift", 1.0))
 
         self._max_pixel_size = None
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             self._max_pixel_size = 1024 * 1024
 
     def _prepare_latent_image_ids(
         self, height: int, width: int, batch_size: int = 1
     ) -> npt.NDArray[np.float32]:
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             # Create 4D coordinates using numpy (T=0, H, W, L=0)
             t_coords, h_coords, w_coords, l_coords = np.meshgrid(
                 np.array([0]),  # T dimension
@@ -494,6 +502,33 @@ class PixelGenerationTokenizer(
                     max_length=max_sequence_length,
                     return_length=False,
                     return_overflowing_tokens=False,
+                )
+            if self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
+                from max.pipelines.architectures.flux2.system_messages import (
+                    format_input_klein,
+                )
+
+                if not hasattr(delegate, "apply_chat_template"):
+                    raise ValueError(
+                        "Flux2Klein requires tokenizer.apply_chat_template, "
+                        "but the loaded tokenizer does not provide it."
+                    )
+                messages_batch = format_input_klein(
+                    prompts=[prompt_str],
+                    images=None,
+                )
+                prompt_text = delegate.apply_chat_template(
+                    messages_batch[0],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                return delegate(
+                    prompt_text,
+                    padding="max_length",
+                    max_length=max_sequence_length,
+                    truncation=True,
+                    add_special_tokens=add_special_tokens,
+                    return_attention_mask=True,
                 )
             # For Z-Image, use Qwen chat-template formatting.
             if self._pipeline_class_name == PipelineClassName.ZIMAGE:
@@ -774,10 +809,19 @@ class PixelGenerationTokenizer(
                 "falling back to standard generation."
             )
 
-        do_true_cfg = (
-            image_options.true_cfg_scale > 1.0
-            and image_options.negative_prompt is not None
-        )
+        if self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
+            is_distilled_klein = bool(
+                self.diffusers_config.get("is_distilled", False)
+            )
+            # For non-distilled Klein models, CFG is driven by guidance_scale.
+            do_true_cfg = (
+                image_options.guidance_scale > 1.0 and not is_distilled_klein
+            )
+        else:
+            do_true_cfg = (
+                image_options.true_cfg_scale > 1.0
+                and image_options.negative_prompt is not None
+            )
         do_zimage_cfg = (
             self._pipeline_class_name == PipelineClassName.ZIMAGE
             and image_options.guidance_scale > 1.0

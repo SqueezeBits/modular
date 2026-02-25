@@ -24,6 +24,9 @@ from typing import Any
 from max import functional as F
 from max.driver import Device
 from max.graph.weights import Weights
+from max.pipelines.architectures.llama3.weight_adapters import (
+    LLAMA_SAFETENSOR_MAPPING as QWEN_SAFETENSOR_MAP,
+)
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
@@ -66,6 +69,8 @@ class Qwen3TextEncoderModel(ComponentModel):
         state_dict = {}
         for key, value in self.weights.items():
             adapted_key = key
+            for before, after in QWEN_SAFETENSOR_MAP.items():
+                adapted_key = adapted_key.replace(before, after)
             # Diffusers Qwen text encoder shards are usually nested under `model.*`.
             # The MAX text encoder expects top-level names (`layers.*`, `embed_tokens.*`).
             if adapted_key.startswith("model."):
