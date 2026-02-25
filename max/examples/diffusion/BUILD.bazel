@@ -29,3 +29,19 @@ modular_py_binary(
         requirement("torch"),  # for test
     ],
 )
+
+modular_py_binary(
+    name = "profile_transformer",
+    srcs = ["profile_transformer.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)
