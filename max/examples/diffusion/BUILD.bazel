@@ -29,3 +29,50 @@ modular_py_binary(
         requirement("torch"),  # for test
     ],
 )
+
+modular_py_binary(
+    name = "simple_offline_generation_diffusers_torch_compile",
+    srcs = ["simple_offline_generation_diffusers_torch_compile.py"],
+    tags = ["no-pydeps"],  # TODO: Fix and re-enable
+    deps = [
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+        requirement("transformers"),
+        requirement("accelerate"),
+    ],
+)
+
+modular_py_binary(
+    name = "benchmark_flux2_rope_latency",
+    srcs = ["benchmark_flux2_rope_latency.py"],
+    tags = ["no-pydeps"],  # TODO: Fix and re-enable
+    deps = [
+        ":profiler",
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "benchmark_flux2_full_pipeline_rope_latency",
+    srcs = ["benchmark_flux2_full_pipeline_rope_latency.py"],
+    tags = ["no-pydeps"],  # TODO: Fix and re-enable
+    deps = [
+        ":profiler",
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)

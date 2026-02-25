@@ -16,15 +16,71 @@ from max.dtype import DType
 from max.nn import Linear, Module, module_dataclass
 from max.nn.legacy.attention.mask_config import MHAMaskVariant
 from max.nn.legacy.kernels import flash_attention_gpu as _flash_attention_gpu
+from max.nn.legacy.kernels import (
+    rope_ragged_with_position_ids as _rope_ragged_with_position_ids,
+)
 from max.nn.norm import RMSNorm
-from max.nn.rope import fused_qk_rope_vision
 from max.nn.sequential import ModuleList
 from max.tensor import Tensor
 
 from .embeddings import get_1d_rotary_pos_embed
 
 flash_attention_gpu = F.functional(_flash_attention_gpu)
+rope_ragged_with_position_ids = F.functional(_rope_ragged_with_position_ids)
 
+def _repeat_interleaved_cos_sin_to_freqs_cis(cos: Tensor, sin: Tensor) -> Tensor:
+    # Convert repeat-interleaved cos/sin ([cos, cos], [sin, sin]) into
+    # interleaved complex pairs [cos, sin] expected by ragged kernels.
+    cos_pairs = F.reshape(cos, [cos.shape[0], cos.shape[1] // 2, 2])[..., 0]
+    sin_pairs = F.reshape(sin, [sin.shape[0], sin.shape[1] // 2, 2])[..., 0]
+    freqs_cis = F.stack([cos_pairs, sin_pairs], axis=-1)
+    return F.reshape(freqs_cis, [cos.shape[0], cos.shape[1]])
+
+def _build_rope_position_ids(
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: object,
+) -> Tensor:
+    position_ids = F.arange(0, seq_len, dtype=DType.uint32, device=device)
+    position_ids = F.tile(position_ids[None, :], (batch_size, 1))
+    return F.reshape(position_ids, [batch_size * seq_len])
+
+
+def _apply_flux2_qk_rope(
+    query: Tensor,
+    key: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> tuple[Tensor, Tensor]:
+    batch_size = query.shape[0]
+    seq_len = query.shape[1]
+    num_heads = query.shape[2]
+    head_dim = query.shape[3]
+    query_ragged = F.reshape(query, [batch_size * seq_len, num_heads, head_dim])
+    key_ragged = F.reshape(key, [batch_size * seq_len, num_heads, head_dim])
+    freqs_cis = _repeat_interleaved_cos_sin_to_freqs_cis(cos, sin)
+    position_ids = _build_rope_position_ids(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=query.device,
+    )
+    query_out = rope_ragged_with_position_ids(
+        query_ragged,
+        freqs_cis,
+        position_ids,
+        interleaved=True,
+    )
+    key_out = rope_ragged_with_position_ids(
+        key_ragged,
+        freqs_cis,
+        position_ids,
+        interleaved=True,
+    )
+    return (
+        F.reshape(query_out, [batch_size, seq_len, num_heads, head_dim]),
+        F.reshape(key_out, [batch_size, seq_len, num_heads, head_dim]),
+    )
 
 @module_dataclass
 class Flux2SwiGLU(Module[[Tensor], Tensor]):
@@ -297,14 +353,9 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
             value = F.concat([encoder_value, value], axis=1)
 
         # Apply rotary embeddings if provided
-        # Store original dtype to cast back after RoPE (which may upcast to float32)
-        original_dtype = query.dtype
         if image_rotary_emb is not None:
-            # Use fused kernel for RoPE (GPU-compatible via elementwise)
             cos, sin = image_rotary_emb
-            query, key = fused_qk_rope_vision(
-                query, key, cos, sin, repeat_interleave=True
-            )
+            query, key = _apply_flux2_qk_rope(query, key, cos, sin)
 
         # Scaled dot-product attention
         scale = 1.0 / (self.head_dim**0.5)
@@ -440,14 +491,9 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         key = self.norm_k(key)
 
         # Apply rotary embeddings
-        # Store original dtype to cast back after RoPE (which may upcast to float32)
-        original_dtype = query.dtype
         if image_rotary_emb is not None:
-            # Use fused kernel for RoPE (GPU-compatible via elementwise)
             cos, sin = image_rotary_emb
-            query, key = fused_qk_rope_vision(
-                query, key, cos, sin, repeat_interleave=True
-            )
+            query, key = _apply_flux2_qk_rope(query, key, cos, sin)
 
         # Attention computation
         hidden_states = flash_attention_gpu(
