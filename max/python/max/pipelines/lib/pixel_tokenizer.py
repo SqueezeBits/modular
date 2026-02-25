@@ -796,8 +796,13 @@ class PixelGenerationTokenizer(
         image_seq_len = (latent_height // 2) * (latent_width // 2)
 
         num_inference_steps = image_options.steps
+        sigma_min = (
+            0.0
+            if self._pipeline_class_name == PipelineClassName.ZIMAGE
+            else None
+        )
         timesteps, sigmas = self._scheduler.retrieve_timesteps_and_sigmas(
-            image_seq_len, num_inference_steps
+            image_seq_len, num_inference_steps, sigma_min=sigma_min
         )
         if (
             self._pipeline_class_name == PipelineClassName.ZIMAGE
