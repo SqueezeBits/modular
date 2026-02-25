@@ -24,6 +24,7 @@ modular_py_library(
         # possible.
         requirement("transformers"),
         requirement("typing-extensions"),
+        requirement("diffusers"),
         "//max/python/max:_core",
         "//max/python/max/driver",
         "//max/python/max:tensor",

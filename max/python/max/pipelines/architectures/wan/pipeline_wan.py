@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +28,7 @@ from max.dtype import DType
 from max.graph import TensorType, ops
 from max.graph.weights import load_weights
 from max.interfaces import PixelGenerationContext, TokenBuffer
+from max.pipelines.lib.diffusion_schedulers import UniPCMultistepScheduler
 from max.pipelines.lib.interfaces import (
     CompileWrapper,
     DiffusionPipeline,
@@ -154,61 +154,14 @@ class WanPipeline(DiffusionPipeline):
             transformer_cfg.get("expand_timesteps", False)
         )
 
-        # Compile utility graphs for optimized denoising loop.
-        # In VAE-only mode (WAN_LOAD_LATENTS set), skip compilation to avoid
-        # allocating GPU memory for transformer-related graphs.
-        if not os.environ.get("WAN_LOAD_LATENTS"):
-            self._scheduler_step_model = self._build_scheduler_step_model()
-            self._timestep_model = self._build_all_timesteps_model()
-            self._cfg_model = self._build_cfg_model()
-        else:
-            self._scheduler_step_model = None
-            self._timestep_model = None
-            self._cfg_model = None
+        # Initialize UniPC multistep scheduler for proper 2nd-order stepping.
+        self._scheduler = UniPCMultistepScheduler(**scheduler_cfg)
 
-    def _build_scheduler_step_model(self) -> CompileWrapper:
-        """Compile Euler step: latents + dt * noise_pred."""
-        device = self.transformer.devices[0]
-        dtype = self.transformer.config.dtype
-        input_types = [
-            TensorType(
-                dtype,
-                shape=["batch", "channels", "frames", "height", "width"],
-                device=device,
-            ),
-            TensorType(
-                dtype,
-                shape=["batch", "channels", "frames", "height", "width"],
-                device=device,
-            ),
-            TensorType(dtype, shape=[1], device=device),
-        ]
+        # Compile classifier-free guidance graph.
+        self._guidance_model = self._build_guidance_model()
 
-        def scheduler_step(latents_in, noise_pred_in, dt_in):
-            return latents_in + dt_in * noise_pred_in
-
-        return max_compile(scheduler_step, input_types=input_types)
-
-    def _build_all_timesteps_model(self) -> CompileWrapper:
-        """Compile graph to precompute all timesteps and dt values."""
-        device = self.transformer.devices[0]
-        dtype = self.transformer.config.dtype
-        input_types = [
-            TensorType(DType.float32, ["num_sigmas"], device=device),
-        ]
-
-        def all_timesteps(sigmas):
-            sigmas_curr = ops.slice_tensor(sigmas, [slice(0, -1)])
-            all_t = ops.cast(sigmas_curr, dtype)
-            sigmas_next = ops.slice_tensor(sigmas, [slice(1, None)])
-            dt_f32 = ops.sub(sigmas_next, sigmas_curr)
-            all_dt = ops.cast(dt_f32, dtype)
-            return all_t, all_dt
-
-        return max_compile(all_timesteps, input_types=input_types)
-
-    def _build_cfg_model(self) -> CompileWrapper:
-        """Compile CFG: noise_uncond + scale * (noise_pred - noise_uncond)."""
+    def _build_guidance_model(self) -> CompileWrapper:
+        """Compile guidance: uncond + scale * (cond - uncond)."""
         device = self.transformer.devices[0]
         dtype = self.transformer.config.dtype
         latent_type = TensorType(
@@ -246,191 +199,182 @@ class WanPipeline(DiffusionPipeline):
         del kwargs
         device = self.transformer.devices[0]
 
-        load_path = os.environ.get("WAN_LOAD_LATENTS")
-
-        if load_path:
-            # VAE-only mode: load pre-computed latents, skip denoising.
-            logger.info(
-                "Loading latents from %s (skipping denoising)", load_path
-            )
-            latents_np = np.load(load_path)
-            latents = (
-                Tensor.from_dlpack(latents_np)
-                .to(device)
-                .cast(self.vae.config.dtype)
-            )
-        else:
-            # Full pipeline: text encoding + denoising.
-            prompt_embeds = self._get_t5_prompt_embeds(
-                tokens=model_inputs.tokens,
-                attention_mask=model_inputs.mask,
+        # Text encoding.
+        prompt_embeds = self._get_t5_prompt_embeds(
+            tokens=model_inputs.tokens,
+            attention_mask=model_inputs.mask,
+            num_videos_per_prompt=model_inputs.num_images_per_prompt,
+            max_sequence_length=int(
+                model_inputs.tokens.array.shape[-1]
+            ),
+        )
+        do_cfg = (
+            model_inputs.guidance_scale > 1.0
+            and model_inputs.negative_tokens is not None
+        )
+        negative_prompt_embeds: Tensor | None = None
+        if do_cfg and model_inputs.negative_tokens is not None:
+            negative_prompt_embeds = self._get_t5_prompt_embeds(
+                tokens=model_inputs.negative_tokens,
+                attention_mask=model_inputs.negative_mask,
                 num_videos_per_prompt=model_inputs.num_images_per_prompt,
                 max_sequence_length=int(
                     model_inputs.tokens.array.shape[-1]
                 ),
             )
-            do_cfg = (
-                model_inputs.guidance_scale > 1.0
-                and model_inputs.negative_tokens is not None
+
+        # Keep latents in float32 throughout the denoising loop to avoid
+        # compounding bf16 quantization error over 40+ scheduler steps.
+        # Only cast to bf16 when passing to the transformer (like diffusers).
+        latents = (
+            Tensor.from_dlpack(model_inputs.latents)
+            .to(device)
+            .cast(DType.float32)
+        )
+        transformer_dtype = prompt_embeds.dtype  # bf16 for transformer input
+
+        boundary_timestep = self.compute_boundary_timestep(
+            boundary_ratio=model_inputs.boundary_ratio
+            if model_inputs.boundary_ratio is not None
+            else self.boundary_ratio,
+            num_train_timesteps=self.num_train_timesteps,
+        )
+
+        # Precompute 3D RoPE once (shape is constant across steps)
+        rope_cos, rope_sin = self.transformer.compute_rope(
+            num_frames=int(latents.shape[2]),
+            height=int(latents.shape[3]),
+            width=int(latents.shape[4]),
+        )
+
+        # Initialize UniPC scheduler for this run.
+        num_steps = model_inputs.num_inference_steps
+        self._scheduler.set_timesteps(num_steps)
+        scheduler_timesteps = self._scheduler.timesteps  # int64 array
+        assert scheduler_timesteps is not None
+
+        # Use integer timesteps from the scheduler for the transformer.
+        # CRITICAL: timestep must be created as float32, NOT bf16.
+        # bf16 quantization rounds timesteps (e.g., 999 → 1000) which
+        # causes massive errors in sinusoidal embeddings (Δ > 0.85 per dim).
+        # Diffusers passes int64 scheduler.timesteps → the transformer
+        # casts to float32 internally, preserving exact values.
+
+        batch_size = int(latents.shape[0])
+
+        # Precompute guidance scale tensors
+        guidance_scale_high: Tensor | None = None
+        guidance_scale_low: Tensor | None = None
+        if do_cfg:
+            guidance_scale_high = Tensor.full(
+                [1],
+                float(model_inputs.guidance_scale),
+                dtype=prompt_embeds.dtype,
+                device=device,
             )
-            negative_prompt_embeds: Tensor | None = None
-            if do_cfg and model_inputs.negative_tokens is not None:
-                negative_prompt_embeds = self._get_t5_prompt_embeds(
-                    tokens=model_inputs.negative_tokens,
-                    attention_mask=model_inputs.negative_mask,
-                    num_videos_per_prompt=model_inputs.num_images_per_prompt,
-                    max_sequence_length=int(
-                        model_inputs.tokens.array.shape[-1]
-                    ),
-                )
-
-            latents = (
-                Tensor.from_dlpack(model_inputs.latents)
-                .to(device)
-                .cast(prompt_embeds.dtype)
+            gs2 = (
+                model_inputs.guidance_scale_2
+                if model_inputs.guidance_scale_2 is not None
+                else model_inputs.guidance_scale
+            )
+            guidance_scale_low = Tensor.full(
+                [1],
+                float(gs2),
+                dtype=prompt_embeds.dtype,
+                device=device,
             )
 
-            boundary_timestep = self.compute_boundary_timestep(
-                boundary_ratio=model_inputs.boundary_ratio
-                if model_inputs.boundary_ratio is not None
-                else self.boundary_ratio,
-                num_train_timesteps=self.num_train_timesteps,
+        # Determine the boundary step index for MoE switching.
+        has_moe = (
+            self.transformer_2 is not None
+            and boundary_timestep is not None
+        )
+        boundary_step_idx = num_steps
+        if has_moe:
+            for idx in range(num_steps):
+                if float(scheduler_timesteps[idx]) < boundary_timestep:
+                    boundary_step_idx = idx
+                    break
+
+        # Phase 1: High-noise expert model
+        # compile_model needs bf16 latent shape for the compiled graph.
+        latents_bf16 = latents.cast(transformer_dtype)
+        self.transformer.compile_model(
+            latents_bf16, prompt_embeds, rope_cos
+        )
+        del latents_bf16
+        high_noise_model = self.transformer.model
+        assert high_noise_model is not None
+
+        latents = self._run_denoising_phase(
+            latents=latents,
+            transformer_model=high_noise_model,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            scheduler_timesteps=scheduler_timesteps,
+            batch_size=batch_size,
+            do_cfg=do_cfg,
+            guidance_scale=guidance_scale_high,
+            device=device,
+            step_range=range(boundary_step_idx),
+            desc="Denoising (high-noise)"
+            if has_moe
+            else "Denoising",
+        )
+
+        # Phase 2: Low-noise expert model (MoE only)
+        if has_moe and boundary_step_idx < num_steps:
+            assert self.transformer_2 is not None
+            latents_bf16 = latents.cast(transformer_dtype)
+            self.transformer_2.compile_model(
+                latents_bf16, prompt_embeds, rope_cos
             )
-
-            # Precompute 3D RoPE once (shape is constant across steps)
-            rope_cos, rope_sin = self.transformer.compute_rope(
-                num_frames=int(latents.shape[2]),
-                height=int(latents.shape[3]),
-                width=int(latents.shape[4]),
-            )
-
-            # Precompute all timesteps and dt values on device
-            sigmas_np = model_inputs.sigmas.astype(
-                np.float32, copy=False
-            )
-            sigmas_tensor = Tensor.from_dlpack(
-                np.ascontiguousarray(sigmas_np)
-            ).to(device)
-
-            _all_timesteps, all_dts = self._timestep_model(sigmas_tensor)
-
-            # Denoising loop
-            timesteps_np = model_inputs.timesteps.astype(
-                np.float32, copy=False
-            )
-            num_steps = len(timesteps_np)
-            batch_size = int(latents.shape[0])
-
-            # Precompute guidance scale tensors
-            scale_t_high: Tensor | None = None
-            scale_t_low: Tensor | None = None
-            if do_cfg:
-                scale_t_high = Tensor.full(
-                    [1],
-                    float(model_inputs.guidance_scale),
-                    dtype=prompt_embeds.dtype,
-                    device=device,
-                )
-                gs2 = (
-                    model_inputs.guidance_scale_2
-                    if model_inputs.guidance_scale_2 is not None
-                    else model_inputs.guidance_scale
-                )
-                scale_t_low = Tensor.full(
-                    [1],
-                    float(gs2),
-                    dtype=prompt_embeds.dtype,
-                    device=device,
-                )
-
-            # Determine the boundary step index for MoE switching.
-            has_moe = (
-                self.transformer_2 is not None
-                and boundary_timestep is not None
-            )
-            boundary_step_idx = num_steps
-            if has_moe:
-                for idx in range(num_steps):
-                    if float(timesteps_np[idx]) < boundary_timestep:
-                        boundary_step_idx = idx
-                        break
-
-            # Phase 1: High-noise expert
-            self.transformer.compile_model(
-                latents, prompt_embeds, rope_cos
-            )
-            assert self.transformer.model is not None
+            del latents_bf16
+            low_noise_model = self.transformer_2.model
+            assert low_noise_model is not None
 
             latents = self._run_denoising_phase(
                 latents=latents,
-                transformer_model=self.transformer.model,
+                transformer_model=low_noise_model,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
-                timesteps_np=timesteps_np,
-                all_dts=all_dts,
+                scheduler_timesteps=scheduler_timesteps,
                 batch_size=batch_size,
                 do_cfg=do_cfg,
-                scale_t=scale_t_high,
+                guidance_scale=guidance_scale_low,
                 device=device,
-                step_range=range(boundary_step_idx),
-                desc="Denoising (high-noise)"
-                if has_moe
-                else "Denoising",
+                step_range=range(boundary_step_idx, num_steps),
+                desc="Denoising (low-noise)",
             )
 
-            # Phase 2: Low-noise expert (if MoE)
-            if has_moe and boundary_step_idx < num_steps:
-                assert self.transformer_2 is not None
-                self.transformer_2.compile_model(
-                    latents, prompt_embeds, rope_cos
-                )
-                assert self.transformer_2.model is not None
-
-                latents = self._run_denoising_phase(
-                    latents=latents,
-                    transformer_model=self.transformer_2.model,
-                    prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=negative_prompt_embeds,
-                    rope_cos=rope_cos,
-                    rope_sin=rope_sin,
-                    timesteps_np=timesteps_np,
-                    all_dts=all_dts,
-                    batch_size=batch_size,
-                    do_cfg=do_cfg,
-                    scale_t=scale_t_low,
-                    device=device,
-                    step_range=range(boundary_step_idx, num_steps),
-                    desc="Denoising (low-noise)",
-                )
-
-            # Optionally save denoised latents for later VAE-only runs.
-            save_path = os.environ.get("WAN_SAVE_LATENTS")
-            if save_path:
-                latents_cpu = latents.cast(DType.float32).to(CPU())
-                np.save(save_path, np.from_dlpack(latents_cpu))
-                logger.info(
-                    "Saved denoised latents to %s, shape=%s",
-                    save_path,
-                    latents_cpu.shape,
-                )
-                del latents_cpu
-
         # Free transformer GPU memory before VAE decode.
-        # In VAE-only mode this is a no-op (transformers were never compiled).
         self._offload_transformers()
 
-        # Denormalize and decode
+        # DEBUG: allow loading latent from file for VAE-only testing
+        import os as _os
+        _load_latent = _os.environ.get('WAN_LOAD_LATENT', '')
+        if _load_latent and _os.path.exists(_load_latent):
+            logger.info('DEBUG: Loading latent from %s (skipping transformer output)', _load_latent)
+            _loaded = np.load(_load_latent)
+            latents = Tensor.from_dlpack(np.ascontiguousarray(_loaded)).to(device)
+        # Save final latent for analysis
+        _debug_latent = np.from_dlpack(latents.cast(DType.float32).to(CPU()))
+        np.save('/tmp/wan_t2v_outputs/max_final_latent.npy', _debug_latent)
+        logger.info('DEBUG: latent shape=%s range=[%.4f,%.4f] mean=%.4f', _debug_latent.shape, _debug_latent.min(), _debug_latent.max(), _debug_latent.mean())
+
+        # Denormalize in float32 for precision, then cast to VAE dtype.
         denorm_latents = self.denormalize_vae_latents(
             latents=latents,
             latents_mean=tuple(self.vae.config.latents_mean),
             latents_std=tuple(self.vae.config.latents_std),
             z_dim=int(self.vae.config.z_dim),
         )
-
+        denorm_latents = denorm_latents.cast(transformer_dtype)
         decoded_video = self.vae.decode_5d(denorm_latents)
-
         decoded_video = decoded_video[
             :,
             :,
@@ -448,44 +392,75 @@ class WanPipeline(DiffusionPipeline):
         negative_prompt_embeds: Tensor | None,
         rope_cos: Tensor,
         rope_sin: Tensor,
-        timesteps_np: np.ndarray,
-        all_dts: Tensor,
+        scheduler_timesteps: np.ndarray,
         batch_size: int,
         do_cfg: bool,
-        scale_t: Tensor | None,
+        guidance_scale: Tensor | None,
         device: Device,
         step_range: range,
         desc: str,
     ) -> Tensor:
-        """Run a denoising phase with a single transformer model."""
+        """Run a denoising phase using UniPC multistep scheduler.
+        
+        Latents are kept in float32 throughout the loop (matching diffusers)
+        to avoid compounding bf16 quantization error over 40+ steps.
+        Only the transformer input is cast to bf16. The scheduler step is
+        computed on CPU in float64 (numpy) for numerical precision.
+        """
+        transformer_dtype = prompt_embeds.dtype  # bf16
         for i in tqdm(step_range, desc=desc):
-            step_value = float(timesteps_np[i])
+            # Use integer timestep as float32 to match diffusers exactly.
+            # DO NOT use bf16 — bf16 quantizes 999→1000, causing huge
+            # sinusoidal embedding errors.
+            step_value = float(int(scheduler_timesteps[i]))
 
             dit_timestep = Tensor.full(
                 [batch_size],
                 step_value,
-                dtype=prompt_embeds.dtype,
+                dtype=DType.float32,
                 device=device,
             )
 
+            # Cast latents to bf16 only for transformer input (like diffusers).
+            # Latents themselves stay float32 to avoid compounding error.
+            latent_model_input = latents.cast(transformer_dtype)
             noise_pred = transformer_model(
-                latents, dit_timestep, prompt_embeds,
+                latent_model_input, dit_timestep, prompt_embeds,
                 rope_cos, rope_sin,
             )
 
             if do_cfg and negative_prompt_embeds is not None:
                 noise_uncond = transformer_model(
-                    latents, dit_timestep, negative_prompt_embeds,
+                    latent_model_input, dit_timestep, negative_prompt_embeds,
                     rope_cos, rope_sin,
                 )
-                noise_pred = self._cfg_model(
-                    noise_pred, noise_uncond, scale_t,
+                noise_pred = self._guidance_model(
+                    noise_pred, noise_uncond, guidance_scale,
                 )
                 del noise_uncond
+            del latent_model_input
 
-            dt = all_dts[i : i + 1]
-            latents = self._scheduler_step_model(latents, noise_pred, dt)
+            # Move noise_pred and latents to CPU for scheduler step.
+            noise_pred_np = np.from_dlpack(
+                noise_pred.cast(DType.float32).to(CPU())
+            )
+            latents_np = np.from_dlpack(
+                latents.cast(DType.float32).to(CPU())
+            )
 
+            # UniPC scheduler step (corrector + predictor in float64).
+            timestep_int = int(scheduler_timesteps[i])
+            latents_np = self._scheduler.step(
+                noise_pred_np, timestep_int, latents_np
+            )
+
+            # Move result back to GPU, keeping float32 precision.
+            # DO NOT cast to bf16 here — diffusers keeps latents in float32
+            # throughout the loop. bf16 roundtrip each step compounds error.
+            latents = (
+                Tensor.from_dlpack(np.ascontiguousarray(latents_np))
+                .to(device)
+            )
         return latents
 
     @staticmethod
@@ -513,25 +488,35 @@ class WanPipeline(DiffusionPipeline):
                 continue
             blm = transformer.model
             self._clear_compile_wrapper(blm.pre)
-            for block in blm.blocks:
-                self._clear_compile_wrapper(block)
+            blm.pre = None
+            for i in range(len(blm.blocks)):
+                self._clear_compile_wrapper(blm.blocks[i])
+                blm.blocks[i] = None  # type: ignore[call-overload]
             self._clear_compile_wrapper(blm.post)
+            blm.post = None
             blm.blocks.clear()
             del blm
             transformer.model = None
+            # Also free the CPU state dict (~28GB per transformer)
+            if hasattr(transformer, "_state_dict"):
+                transformer._state_dict = None
 
-        # Free utility compiled models (scheduler step, timestep, CFG).
-        for attr in (
-            "_scheduler_step_model",
-            "_timestep_model",
-            "_cfg_model",
-        ):
-            cw = getattr(self, attr, None)
-            self._clear_compile_wrapper(cw)
+        # Free guidance compiled model.
+        cw = getattr(self, "_guidance_model", None)
+        self._clear_compile_wrapper(cw)
+        self._guidance_model = None
 
         # Free text encoder compiled model.
         if hasattr(self, "text_encoder") and self.text_encoder is not None:
-            self.text_encoder.model = None
+            if hasattr(self.text_encoder, "model"):
+                self.text_encoder.model = None
+            # Also free the text encoder's state dict
+            if hasattr(self.text_encoder, "_state_dict"):
+                self.text_encoder._state_dict = None
+
+        # Force Python GC to break reference cycles
+        gc.collect()
+        gc.collect()
 
     def _get_t5_prompt_embeds(
         self,
@@ -674,7 +659,7 @@ class WanPipeline(DiffusionPipeline):
             .to(latents.device)
             .cast(latents.dtype)
         )
-        return latents / latents_recip_std_t + latents_mean_t
+        return latents * latents_recip_std_t + latents_mean_t
 
     @staticmethod
     def _to_numpy(image: Tensor) -> np.ndarray:

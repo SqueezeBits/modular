@@ -135,9 +135,11 @@ class WanTimeTextImageEmbedding(Module[..., tuple[Tensor, Tensor, Tensor]]):
     def forward(
         self, timestep: Tensor, encoder_hidden_states: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
-        # Sinusoidal timestep embedding
-        timesteps_emb = self.timesteps_proj(timestep)  # [B, freq_dim]
-        timesteps_emb = timesteps_emb.cast(timestep.dtype)
+        # Sinusoidal timestep embedding (computed in float32 for precision).
+        # Cast to the model's working dtype (bf16) for the MLP, matching
+        # diffusers' behavior: float32 embedding → cast to weight dtype → MLP.
+        timesteps_emb = self.timesteps_proj(timestep)  # [B, freq_dim] float32
+        timesteps_emb = timesteps_emb.cast(encoder_hidden_states.dtype)  # → bf16
         temb = self.time_embedder(timesteps_emb)  # [B, dim]
 
         # Timestep projection for modulation: SiLU then linear

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import numpy as np
 import base64
 import os
 from io import BytesIO
@@ -115,6 +116,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=3.5,
         help="Guidance scale for classifier-free guidance. Set to 1.0 to disable CFG.",
+    )
+    parser.add_argument(
+        "--guidance-scale-2",
+        type=float,
+        default=None,
+        help="Secondary guidance scale for low-noise expert (MoE models like Wan). Defaults to guidance-scale if not set.",
     )
     parser.add_argument(
         "--seed",
@@ -287,6 +294,8 @@ async def generate_image(args: argparse.Namespace) -> None:
         )
         if arch.name == "Flux2Pipeline":
             max_length = 512
+        elif arch.name == "WanPipeline":
+            max_length = 512
         print(f"Using max length: {max_length} for tokenizer")
 
     if (
@@ -380,6 +389,7 @@ async def generate_image(args: argparse.Namespace) -> None:
                 steps=args.num_inference_steps,
                 num_frames=args.num_frames,
                 frames_per_second=args.fps,
+                guidance_scale_2=args.guidance_scale_2,
             )
         body = OpenResponsesRequestBody(
             model=args.model,
@@ -469,37 +479,79 @@ async def generate_image(args: argparse.Namespace) -> None:
         return
 
     print("Generation complete!")
-
-    # Step 9: Extract and save images from OutputImageContent
-    # The output now contains a list of OutputImageContent objects with base64-encoded images
+    # Step 9: Extract and save output
     if not output.output:
-        print("ERROR: No images generated")
+        print("ERROR: No output generated")
         return
 
-    # Save each generated image
-    for idx, image_content in enumerate(output.output):
-        # Narrow type for mypy - we expect OutputImageContent for pixel generation
-        if not isinstance(image_content, OutputImageContent):
-            print(
-                f"ERROR: Expected OutputImageContent, got {type(image_content)}"
-            )
-            continue
+    # Check if output is video (mp4) or image
+    is_video = args.output.lower().endswith(".mp4")
 
-        # Determine output filename
-        if len(output.output) > 1:
-            # Multiple images: add index to filename
-            base_name, ext = os.path.splitext(args.output)
-            output_path = f"{base_name}_{idx}{ext}"
-        else:
-            output_path = args.output
+    if is_video:
+        # Collect all frames from output
+        import subprocess
+        import tempfile
 
-        # Save the image
-        if image_content.image_data:
-            save_image(image_content.image_data, output_path)
-        elif image_content.image_url:
-            print(f"Image available at URL: {image_content.image_url}")
+        frames = []
+        for image_content in output.output:
+            if not isinstance(image_content, OutputImageContent):
+                continue
+            if image_content.image_data:
+                image_bytes = base64.b64decode(image_content.image_data)
+                frame = Image.open(BytesIO(image_bytes)).convert("RGB")
+                frames.append(np.array(frame))
+
+        if not frames:
+            print("ERROR: No frames generated for video")
+            return
+
+        print(f"Saving {len(frames)} frames as video to {args.output}")
+        fps = args.fps
+        h, w = frames[0].shape[:2]
+
+        # Use ffmpeg to encode frames to mp4
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}",
+            "-pix_fmt", "rgb24",
+            "-r", str(fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "medium",
+            "-crf", "18",
+            args.output,
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        raw_data = b"".join(
+            frame.astype(np.uint8).tobytes() for frame in frames
+        )
+        _, stderr_bytes = proc.communicate(input=raw_data)
+        if proc.returncode != 0:
+            print(f"WARNING: ffmpeg returned {proc.returncode}: {stderr_bytes.decode()}")
         else:
-            print("ERROR: No image data or URL in output")
+            print(f"Video saved to: {args.output}")
+    else:
+        # Save each generated image
+        for idx, image_content in enumerate(output.output):
+            if not isinstance(image_content, OutputImageContent):
+                print(
+                    f"ERROR: Expected OutputImageContent, got {type(image_content)}"
+                )
+                continue
+            if len(output.output) > 1:
+                base_name, ext = os.path.splitext(args.output)
+                output_path = f"{base_name}_{idx}{ext}"
+            else:
+                output_path = args.output
+            if image_content.image_data:
+                save_image(image_content.image_data, output_path)
+            elif image_content.image_url:
+                print(f"Image available at URL: {image_content.image_url}")
+            else:
+                print("ERROR: No image data or URL in output")
 
 
 def main(argv: list[str] | None = None) -> int:

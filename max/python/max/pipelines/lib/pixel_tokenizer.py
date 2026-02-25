@@ -68,6 +68,7 @@ class PipelineClassName(str, Enum):
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
     ZIMAGE = "ZImagePipeline"
+    WAN = "WanPipeline"
 
     @classmethod
     def from_diffusers_config(
@@ -207,7 +208,11 @@ class PixelGenerationTokenizer(
 
         # Store static model dimensions
         self._default_sample_size = 128
-        self._num_channels_latents = transformer_config["in_channels"] // 4
+        if self._pipeline_class_name == PipelineClassName.WAN:
+            # WAN uses in_channels directly as latent channels.
+            self._num_channels_latents = transformer_config["in_channels"]
+        else:
+            self._num_channels_latents = transformer_config["in_channels"] // 4
 
         # Create scheduler
         scheduler_class_name = components.get("scheduler", {}).get(
@@ -777,6 +782,22 @@ class PixelGenerationTokenizer(
             latent_width,
             request.body.seed,
         )
+
+        # For video generation, expand latents to 5D (batch, channels, frames, H, W)
+        if video_options and video_options.num_frames:
+            vae_scale_factor_temporal = 4  # Wan VAE temporal compression
+            latent_frames = (video_options.num_frames - 1) // vae_scale_factor_temporal + 1
+            latents = np.expand_dims(latents, axis=2)  # add frame dim
+            latents = np.repeat(latents, latent_frames, axis=2)
+            # Re-generate with correct shape for proper noise
+            shape_5d = (
+                image_options.num_images,
+                self._num_channels_latents,
+                latent_frames,
+                latent_height,
+                latent_width,
+            )
+            latents = self._randn_tensor(shape_5d, request.body.seed)
 
         # 5. Build the context
         context = PixelContext(

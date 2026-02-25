@@ -3420,6 +3420,273 @@ struct _Conv3dAlgoCacheEntry(Copyable, Movable):
         return rebind[cudnnConvolutionFwdAlgo_t](self.algo_value)
 
 
+fn _conv3d_cudnn_depth_tiled[
+    input_type: DType,
+    filter_type: DType,
+    output_type: DType,
+](
+    input: LayoutTensor[input_type, ...],
+    filter: LayoutTensor[filter_type, ...],
+    output: LayoutTensor[output_type, ...],
+    stride: IndexList[3],
+    dilation: IndexList[3],
+    padding: IndexList[3],
+    num_groups: Int,
+    ctx: DeviceContext,
+) raises:
+    """Depth-tiled cuDNN 3D convolution for tensors exceeding INT32_MAX elements.
+
+    Splits the computation along the depth dimension (dim[1] in NDHWC) into
+    tiles small enough for cuDNN's internal Int32 stride calculations.
+    Each tile uses a separate set of cuDNN descriptors.
+    """
+    alias INT32_MAX_VAL = 2147483647
+    comptime FIND_WS_CAP = 256 * 1024 * 1024
+
+    var N = input.dim[0]()
+    var D_in = input.dim[1]()
+    var H = input.dim[2]()
+    var W = input.dim[3]()
+    var C = input.dim[4]()
+
+    var K_d = filter.dim[2]()  # kernel depth (Q in FCQRS)
+    var F_out = filter.dim[0]()  # output channels
+    var D_out = output.dim[1]()
+    var H_out = output.dim[2]()
+    var W_out = output.dim[3]()
+
+    var eff_k = (K_d - 1) * dilation[0] + 1  # effective kernel depth
+
+    # Calculate max input depth per tile.
+    var per_frame_in = N * H * W * C
+    var max_d_in = INT32_MAX_VAL // per_frame_in
+
+    # Also ensure output elements per tile fit in INT32.
+    var per_frame_out = N * H_out * W_out * F_out
+    var max_d_out = INT32_MAX_VAL // per_frame_out
+    # Output frames from max_d_in input frames:
+    var tile_d_out_from_in = (
+        max_d_in + 2 * padding[0] - eff_k
+    ) // stride[0] + 1
+    var tile_d_out = min(tile_d_out_from_in, max_d_out)
+    if tile_d_out < 1:
+        raise "conv3d: tensor too large even for single-frame tiling"
+
+    # Input depth needed for tile_d_out output frames.
+    var tile_d_in = (tile_d_out - 1) * stride[0] + eff_k - 2 * padding[0]
+
+    # Strides (in elements) along the depth dimension.
+    var in_d_stride = H * W * C  # elements per depth frame
+    var out_d_stride = H_out * W_out * F_out
+
+
+    var ptr_meta = _get_cudnn_meta(ctx)
+
+    # Descriptor arrays (reused across tiles).
+    var input_dims = UnsafePointer[Int32].alloc(5)
+    var output_dims = UnsafePointer[Int32].alloc(5)
+    var filter_dims = UnsafePointer[Int32].alloc(5)
+    var pad_a = UnsafePointer[Int32].alloc(3)
+    var stride_a = UnsafePointer[Int32].alloc(3)
+    var dilation_a = UnsafePointer[Int32].alloc(3)
+
+    # Filter dims (constant across tiles).
+    filter_dims[0] = Int32(filter.dim[0]())
+    filter_dims[1] = Int32(filter.dim[1]())
+    filter_dims[2] = Int32(filter.dim[2]())
+    filter_dims[3] = Int32(filter.dim[3]())
+    filter_dims[4] = Int32(filter.dim[4]())
+
+    check_cudnn_error(
+        cudnnSetFilterNdDescriptor(
+            ptr_meta[].ptr_filter_desc,
+            get_cudnn_dtype[filter_type](),
+            cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,
+            Int16(5),
+            filter_dims.bitcast[NoneType](),
+        )
+    )
+
+    # Convolution params (constant except padding for first tile).
+    stride_a[0] = Int32(stride[0])
+    stride_a[1] = Int32(stride[1])
+    stride_a[2] = Int32(stride[2])
+    dilation_a[0] = Int32(dilation[0])
+    dilation_a[1] = Int32(dilation[1])
+    dilation_a[2] = Int32(dilation[2])
+
+    var alpha = Float32(1.0)
+    var beta = Float32(0.0)
+
+    var d_out_start = 0
+    while d_out_start < D_out:
+        var this_d_out = min(tile_d_out, D_out - d_out_start)
+
+        # Determine input range for this output tile.
+        # First tile gets front padding, last tile gets back padding.
+        var d_in_start: Int
+        var this_d_in: Int
+        var tile_pad_front: Int
+        var tile_pad_back: Int
+
+        if d_out_start == 0:
+            # First tile: include front padding.
+            tile_pad_front = padding[0]
+            d_in_start = 0
+            this_d_in = (this_d_out - 1) * stride[0] + eff_k - 2 * tile_pad_front
+            # Adjust: no need for more input than available
+            if this_d_in > D_in:
+                this_d_in = D_in
+            tile_pad_back = 0
+        else:
+            tile_pad_front = 0
+            # For stride=1: input frame for output d is at d (with padding=0)
+            d_in_start = d_out_start * stride[0] - padding[0]
+            if d_in_start < 0:
+                tile_pad_front = -d_in_start
+                d_in_start = 0
+            this_d_in = (this_d_out - 1) * stride[0] + eff_k - tile_pad_front
+            # Check if we need back padding
+            if d_in_start + this_d_in > D_in:
+                tile_pad_back = d_in_start + this_d_in - D_in
+                this_d_in = D_in - d_in_start
+            else:
+                tile_pad_back = 0
+
+        # --- Set up tile descriptors ---
+        # Input tile: [N, this_d_in, H, W, C]
+        input_dims[0] = Int32(N)
+        input_dims[1] = Int32(C)
+        input_dims[2] = Int32(this_d_in)
+        input_dims[3] = Int32(H)
+        input_dims[4] = Int32(W)
+
+        check_cudnn_error(
+            cudnnSetTensorNdDescriptorEx(
+                ptr_meta[].ptr_input_desc,
+                cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
+                get_cudnn_dtype[input_type](),
+                Int16(5),
+                input_dims.bitcast[NoneType](),
+            )
+        )
+
+        # Output tile: [N, this_d_out, H_out, W_out, F]
+        output_dims[0] = Int32(N)
+        output_dims[1] = Int32(F_out)
+        output_dims[2] = Int32(this_d_out)
+        output_dims[3] = Int32(H_out)
+        output_dims[4] = Int32(W_out)
+
+        check_cudnn_error(
+            cudnnSetTensorNdDescriptorEx(
+                ptr_meta[].ptr_output_desc,
+                cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
+                get_cudnn_dtype[output_type](),
+                Int16(5),
+                output_dims.bitcast[NoneType](),
+            )
+        )
+
+        # Convolution with tile-specific depth padding.
+        pad_a[0] = Int32(tile_pad_front)
+        pad_a[1] = Int32(padding[1])
+        pad_a[2] = Int32(padding[2])
+
+        check_cudnn_error(
+            cudnnSetConvolutionNdDescriptor(
+                ptr_meta[].ptr_conv_desc,
+                Int16(3),
+                pad_a.bitcast[NoneType](),
+                stride_a.bitcast[NoneType](),
+                dilation_a.bitcast[NoneType](),
+                cudnnConvolutionMode_t.CUDNN_CROSS_CORRELATION,
+                cudnnDataType_t.CUDNN_DATA_FLOAT,
+            )
+        )
+        check_cudnn_error(
+            cudnnSetConvolutionGroupCount(
+                ptr_meta[].ptr_conv_desc, Int16(num_groups)
+            )
+        )
+        check_cudnn_error(
+            cudnnSetConvolutionMathType(
+                ptr_meta[].ptr_conv_desc,
+                cudnnMathType_t.CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION,
+            )
+        )
+
+        # --- Algorithm selection (use GetWorkspaceSize for PRECOMP_GEMM) ---
+        var algo = (
+            cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+        )
+        var ws_size: Int = 0
+        var ws_st = cudnnGetConvolutionForwardWorkspaceSize(
+            ptr_meta[].ptr_handle,
+            ptr_meta[].ptr_input_desc,
+            ptr_meta[].ptr_filter_desc,
+            ptr_meta[].ptr_conv_desc,
+            ptr_meta[].ptr_output_desc,
+            algo,
+            UnsafePointer(to=ws_size),
+        )
+        if ws_st != cudnnStatus_t.CUDNN_STATUS_SUCCESS or ws_size > FIND_WS_CAP:
+            # Fall back to IMPLICIT_GEMM (no workspace needed).
+            algo = (
+                cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
+            )
+            ws_size = 0
+
+
+        # --- Execute tile ---
+        var workspace_buffer = ctx.enqueue_create_buffer[DType.uint8](ws_size)
+
+        # Compute pointer offsets for input and output tiles.
+        var in_offset = d_in_start * in_d_stride
+        var out_offset = d_out_start * out_d_stride
+        var in_ptr = input.ptr + in_offset
+        var out_ptr = output.ptr + out_offset
+
+        var fwd_status = cudnnConvolutionForward(
+            ptr_meta[].ptr_handle,
+            UnsafePointer(to=alpha).bitcast[NoneType](),
+            ptr_meta[].ptr_input_desc,
+            rebind[OpaquePointer](in_ptr.bitcast[NoneType]()),
+            ptr_meta[].ptr_filter_desc,
+            rebind[OpaquePointer](filter.ptr.bitcast[NoneType]()),
+            ptr_meta[].ptr_conv_desc,
+            algo,
+            workspace_buffer.unsafe_ptr().bitcast[NoneType](),
+            ws_size,
+            UnsafePointer(to=beta).bitcast[NoneType](),
+            ptr_meta[].ptr_output_desc,
+            rebind[OpaquePointer](out_ptr.bitcast[NoneType]()),
+        )
+        _ = workspace_buffer^
+
+        if fwd_status != cudnnStatus_t.CUDNN_STATUS_SUCCESS:
+            input_dims.free()
+            output_dims.free()
+            filter_dims.free()
+            pad_a.free()
+            stride_a.free()
+            dilation_a.free()
+            ctx.synchronize()
+            raise String(
+                "conv3d tiled forward failed: ", fwd_status
+            )
+
+        d_out_start += this_d_out
+
+    # Clean up.
+    input_dims.free()
+    output_dims.free()
+    filter_dims.free()
+    pad_a.free()
+    stride_a.free()
+    dilation_a.free()
+
+
 fn _conv3d_cudnn[
     input_type: DType,
     filter_type: DType,
@@ -3443,8 +3710,34 @@ fn _conv3d_cudnn[
 
     Algorithm selection is cached per unique shape+params combination so that
     the expensive FindEx search only runs once per shape.
+
+    When the total number of elements exceeds INT32_MAX (~2.1B), cuDNN's
+    internal stride calculations overflow. In this case we tile along the
+    depth (D) dimension, processing each tile with a separate cuDNN call.
     """
     comptime FIND_WS_CAP = 256 * 1024 * 1024
+    alias INT32_MAX_VAL = 2147483647
+
+    # --- Check if depth tiling is needed (INT32 stride overflow) ---
+    var total_in = (
+        input.dim[0]()
+        * input.dim[1]()
+        * input.dim[2]()
+        * input.dim[3]()
+        * input.dim[4]()
+    )
+    if total_in > INT32_MAX_VAL:
+        _conv3d_cudnn_depth_tiled(
+            input,
+            filter,
+            output,
+            stride,
+            dilation,
+            padding,
+            num_groups,
+            ctx,
+        )
+        return
 
     var ptr_meta = _get_cudnn_meta(ctx)
 
@@ -3601,20 +3894,26 @@ fn _conv3d_cudnn[
         # Cache hit — reuse previously selected algorithm.
         algo = ptr_cached[].algo()
         workspace_size_var = ptr_cached[].workspace_size
-        print(
-            "conv3d CACHE HIT: algo=",
-            algo,
-            " workspace=",
-            workspace_size_var,
-        )
     else:
         # Cache miss — run FindEx to find the fastest algorithm.
         var find_ws = ctx.enqueue_create_buffer[DType.uint8](FIND_WS_CAP)
 
-        var returned_count = Int16(0)
-        var perf_results = UnsafePointer[
-            cudnnConvolutionFwdAlgoPerfStruct
-        ].alloc(8)
+        # CRITICAL: The Mojo cudnnConvolutionFwdAlgoPerfStruct uses Int8 for
+        # enum fields, but the C struct uses int (4 bytes). This causes a
+        # size mismatch: Mojo struct = ~32 bytes, C struct = 48 bytes.
+        # Allocating with the Mojo struct size would cause a buffer overflow
+        # when cuDNN writes 8 * 48 = 384 bytes. We allocate raw bytes with
+        # the correct C struct size and read fields at proper offsets.
+        alias C_PERF_STRUCT_SIZE = 48  # sizeof(cudnnConvolutionFwdAlgoPerf_t)
+        alias MAX_ALGOS = 8
+        var perf_bytes = UnsafePointer[UInt8].alloc(
+            MAX_ALGOS * C_PERF_STRUCT_SIZE
+        )
+
+        # returned_algo_count is int* in C (4 bytes), not Int16*.
+        # Use Int32 and bitcast the pointer.
+        var returned_count_i32 = Int32(0)
+
         var find_status = cudnnFindConvolutionForwardAlgorithmEx(
             ptr_meta[].ptr_handle,
             ptr_meta[].ptr_input_desc,
@@ -3624,76 +3923,59 @@ fn _conv3d_cudnn[
             ptr_meta[].ptr_conv_desc,
             ptr_meta[].ptr_output_desc,
             rebind[OpaquePointer](output.ptr.bitcast[NoneType]()),
-            Int16(8),
-            UnsafePointer(to=returned_count),
-            perf_results,
+            Int16(MAX_ALGOS),
+            UnsafePointer(to=returned_count_i32).bitcast[Int16](),
+            perf_bytes.bitcast[cudnnConvolutionFwdAlgoPerfStruct](),
             find_ws.unsafe_ptr().bitcast[NoneType](),
             FIND_WS_CAP,
         )
         _ = find_ws^
 
-        # Diagnostic logging: FindEx results.
-        print(
-            "conv3d FindEx: status=",
-            Int(find_status._value),
-            " returned=",
-            Int(returned_count),
-            " input=[N=",
-            input.dim[0](),
-            " C=",
-            input.dim[4](),
-            " D=",
-            input.dim[1](),
-            " H=",
-            input.dim[2](),
-            " W=",
-            input.dim[3](),
-            "] filter=[F=",
-            filter.dim[0](),
-            " C=",
-            filter.dim[1](),
-            " Q=",
-            filter.dim[2](),
-            " R=",
-            filter.dim[3](),
-            " S=",
-            filter.dim[4](),
-            "]",
-        )
-        for i in range(Int(returned_count)):
-            var p = perf_results[i]
-            print(
-                "  algo[",
-                i,
-                "]: ",
-                p.algo,
-                " status=",
-                Int(p.status._value),
-                " time=",
-                p.time,
-                "ms memory=",
-                p.memory,
-            )
+        # Read the returned count (C int at offset 0 of returned_count_i32).
+        var returned_count = Int(returned_count_i32)
 
         # Pick the fastest successful algorithm within workspace cap.
+        # Read fields from raw bytes at correct C struct offsets:
+        #   offset  0: algo (int32)
+        #   offset  4: status (int32)
+        #   offset  8: time (float32)
+        #   offset 16: memory (size_t / int64)
         algo = (
             cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
         )
         workspace_size_var = 0
-        if find_status == cudnnStatus_t.CUDNN_STATUS_SUCCESS:
-            for i in range(Int(returned_count)):
-                var p = perf_results[i]
-                if (
-                    p.status == cudnnStatus_t.CUDNN_STATUS_SUCCESS
-                    and p.memory <= FIND_WS_CAP
-                ):
-                    algo = p.algo
-                    workspace_size_var = p.memory
-                    break
-        perf_results.free()
 
-        # Fallback: if FindEx found nothing, try PRECOMP_GEMM via workspace
-        # query.
+        var find_status_val = rebind[Int8](find_status)
+        if find_status_val == 0:  # CUDNN_STATUS_SUCCESS
+            for i in range(returned_count):
+                var base = perf_bytes + i * C_PERF_STRUCT_SIZE
+                var algo_val = base.bitcast[Int32]()[]  # offset 0
+                var status_val = (base + 4).bitcast[Int32]()[]  # offset 4
+                var memory_val = (base + 16).bitcast[Int]()[]  # offset 16
+                if status_val == 0 and memory_val <= FIND_WS_CAP:
+                    algo = rebind[cudnnConvolutionFwdAlgo_t](Int8(algo_val))
+                    workspace_size_var = memory_val
+                    break
+        else:
+            print(
+                "conv3d FindEx FAILED: status=",
+                Int(find_status_val),
+                " input=[N=",
+                input.dim[0](),
+                " C=",
+                input.dim[4](),
+                " D=",
+                input.dim[1](),
+                " H=",
+                input.dim[2](),
+                " W=",
+                input.dim[3](),
+                "]",
+            )
+        perf_bytes.free()
+
+        # Fallback: if FindEx found nothing useful, try PRECOMP_GEMM via
+        # workspace size query (cheaper than FindEx).
         if (
             algo
             == cudnnConvolutionFwdAlgo_t.CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
@@ -3719,12 +4001,6 @@ fn _conv3d_cudnn[
                 algo = precomp
                 workspace_size_var = ws_size
 
-        print(
-            "conv3d SELECTED: algo=",
-            algo,
-            " workspace=",
-            workspace_size_var,
-        )
 
         # Store result in global cache.
         var ptr_entry = UnsafePointer[_Conv3dAlgoCacheEntry].alloc(1)
@@ -3746,23 +4022,22 @@ fn _conv3d_cudnn[
     var workspace_buffer = ctx.enqueue_create_buffer[DType.uint8](
         workspace_size_var
     )
-    check_cudnn_error(
-        cudnnConvolutionForward(
-            ptr_meta[].ptr_handle,
-            UnsafePointer(to=alpha).bitcast[NoneType](),
-            ptr_meta[].ptr_input_desc,
-            rebind[OpaquePointer](input.ptr.bitcast[NoneType]()),
-            ptr_meta[].ptr_filter_desc,
-            rebind[OpaquePointer](filter.ptr.bitcast[NoneType]()),
-            ptr_meta[].ptr_conv_desc,
-            algo,
-            workspace_buffer.unsafe_ptr().bitcast[NoneType](),
-            workspace_size_var,
-            UnsafePointer(to=beta).bitcast[NoneType](),
-            ptr_meta[].ptr_output_desc,
-            rebind[OpaquePointer](output.ptr.bitcast[NoneType]()),
-        )
+    var fwd_status = cudnnConvolutionForward(
+        ptr_meta[].ptr_handle,
+        UnsafePointer(to=alpha).bitcast[NoneType](),
+        ptr_meta[].ptr_input_desc,
+        rebind[OpaquePointer](input.ptr.bitcast[NoneType]()),
+        ptr_meta[].ptr_filter_desc,
+        rebind[OpaquePointer](filter.ptr.bitcast[NoneType]()),
+        ptr_meta[].ptr_conv_desc,
+        algo,
+        workspace_buffer.unsafe_ptr().bitcast[NoneType](),
+        workspace_size_var,
+        UnsafePointer(to=beta).bitcast[NoneType](),
+        ptr_meta[].ptr_output_desc,
+        rebind[OpaquePointer](output.ptr.bitcast[NoneType]()),
     )
+    # Free workspace BEFORE sync to release the buffer back to the pool.
     _ = workspace_buffer^
 
     # Free temporary descriptor arrays.
@@ -3772,6 +4047,15 @@ fn _conv3d_cudnn[
     stride_a.free()
     dilation_a.free()
     output_dims.free()
+
+    if fwd_status != cudnnStatus_t.CUDNN_STATUS_SUCCESS:
+        # Synchronize device to flush any pending GPU operations and free
+        # temporary cuDNN allocations, preventing VRAM accumulation.
+        print("conv3d FORWARD FAILED: ", fwd_status, " algo=", algo)
+        ctx.synchronize()
+        raise String(
+            "cudnnConvolutionForward failed: ", fwd_status
+        )
 
 
 fn conv3d_cudnn[

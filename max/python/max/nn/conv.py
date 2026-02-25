@@ -395,11 +395,12 @@ class Conv3d(Module[[Tensor], Tensor]):
             # Input: NCDHW -> NDHWC
             x = F.permute(x, [0, 2, 3, 4, 1])
 
-            # GPU supports FCQRS (cuDNN) but CPU doesn't. On CPU, permute
-            # from FCQRS to QRSCF format.
+            # Always permute weights from PyTorch FCQRS to MAX QRSCF.
+            # The legacy Conv3D did this unconditionally and was GPU-tested.
+            # The FCRS layout shortcut for cuDNN was untested and produced
+            # wrong results (VAE decoder output diverged from reference).
+            weight = F.permute(weight, [2, 3, 4, 1, 0])
             if not is_nvidia_gpu:
-                # PyTorch FCQRS -> MAX QRSCF.
-                weight = F.permute(weight, [2, 3, 4, 1, 0])
                 # Keep filter and activations on the same device in graph
                 # builds.
                 weight = F.transfer_to(weight, x.device)
@@ -418,14 +419,8 @@ class Conv3d(Module[[Tensor], Tensor]):
             self.padding,
             self.num_groups,
             bias,
-            # Use FCRS tag for cuDNN dispatch — MLIR doesn't support FCQRS
-            # but FCRS triggers filter_is_fcrs=True in MOGG, and conv_gpu
-            # dispatches to cuDNN 3D based on tensor rank==5.
-            filter_layout=FilterLayout.FCRS
-            if (self.permute and is_nvidia_gpu)
-            else FilterLayout.QRSCF,
+            filter_layout=FilterLayout.QRSCF,
         )
-
         if self.permute:
             # Output: NDHWC -> NCDHW
             output = F.permute(output, [0, 4, 1, 2, 3])
