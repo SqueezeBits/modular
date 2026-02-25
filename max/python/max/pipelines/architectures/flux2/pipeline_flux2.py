@@ -142,9 +142,18 @@ class Flux2Pipeline(DiffusionPipeline):
         return result
 
     def build_prepare_prompt_embeddings(self) -> None:
+        # Text encoder outputs bf16 even for fp8-only models (Mistral3 doesn't
+        # quantize activations to fp8). Use bf16 when config dtype is float8 so
+        # the compiled _prepare_prompt_embeddings matches actual text encoder
+        # output and the transformer's expected encoder_hidden_states dtype.
+        input_dtype = (
+            DType.bfloat16
+            if self.text_encoder.config.dtype.is_float8()
+            else self.text_encoder.config.dtype
+        )
         input_types = [
             TensorType(
-                self.text_encoder.config.dtype,
+                input_dtype,
                 shape=["seq_len", "hidden_dim"],
                 device=self.text_encoder.devices[0],
             )
@@ -184,7 +193,12 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
     def build_scheduler_step(self) -> None:
-        dtype = self.transformer.config.dtype
+        transformer_dtype = self.transformer.config.dtype
+        dtype = (
+            DType.bfloat16
+            if transformer_dtype.is_float8()
+            else transformer_dtype
+        )
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -591,7 +605,13 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def _patchify_and_pack(self, latents: Tensor) -> Tensor:
         """Patchify (B,C,H,W)->(B,C*4,H//2,W//2) then pack to (B,H//2*W//2,C*4)."""
-        latents = latents.cast(self.transformer.config.dtype)
+        transformer_dtype = self.transformer.config.dtype
+        input_dtype = (
+            DType.bfloat16
+            if transformer_dtype.is_float8()
+            else transformer_dtype
+        )
+        latents = latents.cast(input_dtype)
         batch = latents.shape[0]
         c = latents.shape[1]
         h2 = latents.shape[2]
@@ -684,7 +704,13 @@ class Flux2Pipeline(DiffusionPipeline):
         sigmas_curr = F.slice_tensor(sigmas, [slice(0, -1)])
         sigmas_next = F.slice_tensor(sigmas, [slice(1, None)])
         all_dt = F.sub(sigmas_next, sigmas_curr)
-        all_timesteps = sigmas_curr.cast(self.transformer.config.dtype)
+        transformer_dtype = self.transformer.config.dtype
+        input_dtype = (
+            DType.bfloat16
+            if transformer_dtype.is_float8()
+            else transformer_dtype
+        )
+        all_timesteps = sigmas_curr.cast(input_dtype)
         return all_timesteps, all_dt
 
     def execute(  # type: ignore[override]

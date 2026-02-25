@@ -662,11 +662,16 @@ class MAXModelConfig(MAXModelConfigBase):
                 "Local Hugging Face repository path does not exist: "
                 f"{repo_root}"
             )
-            repo_files = [
-                path.relative_to(repo_root).as_posix()
-                for path in repo_root.rglob("*")
-                if path.is_file()
-            ]
+            # Follow directory symlinks so local repos can reference shared
+            # components (e.g., `vae -> ~/.cache/huggingface/.../vae`).
+            import os
+
+            repo_files = []
+            for root, _, files in os.walk(repo_root, followlinks=True):
+                root_path = Path(root)
+                for filename in files:
+                    path = root_path / filename
+                    repo_files.append(path.relative_to(repo_root).as_posix())
         else:
             repo_files = list_repo_files(
                 repo_id=repo.repo_id,

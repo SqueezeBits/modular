@@ -133,10 +133,30 @@ class DiffusionPipeline(ABC):
             abs_paths = self._resolve_absolute_paths(
                 weight_paths, relative_paths[name]
             )
+            component_encoding = (
+                self.pipeline_config.model.quantization_encoding
+            )
+            # Allow hybrid diffusion repos where only some components are FP8.
+            # If component config explicitly declares FP8 quantization metadata,
+            # prefer FP8 encoding for that component only.
+            quant_cfg = config_dict.get("quantization_config")
+            if not quant_cfg and isinstance(config_dict.get("text_config"), dict):
+                quant_cfg = config_dict["text_config"].get("quantization_config")
+            if (
+                isinstance(quant_cfg, dict)
+                and quant_cfg.get("quant_method") == "fp8"
+            ):
+                component_encoding = "float8_e4m3fn"
+            # Keep VAE in BF16 even when model-level encoding is FP8.
+            if (
+                name == "vae"
+                and component_encoding == "float8_e4m3fn"
+            ):
+                component_encoding = "bfloat16"
 
             loaded_sub_models[name] = component_cls(
                 config=config_dict,
-                encoding=self.pipeline_config.model.quantization_encoding,
+                encoding=component_encoding,
                 devices=self.devices,
                 weights=load_weights(abs_paths),
             )

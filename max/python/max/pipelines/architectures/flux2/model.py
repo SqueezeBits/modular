@@ -23,6 +23,7 @@ from max.tensor import Tensor
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
+from ..common_layers.fp8_config_utils import validate_fp8_weight_scale_contract
 
 
 class Flux2TransformerModel(ComponentModel):
@@ -48,6 +49,12 @@ class Flux2TransformerModel(ComponentModel):
 
     def load_model(self) -> Callable[..., Any]:
         state_dict = {key: value.data() for key, value in self.weights.items()}
+        if self.config.float8_config is not None:
+            validate_fp8_weight_scale_contract(
+                state_dict,
+                float8_config=self.config.float8_config,
+                component_name="flux2.transformer",
+            )
         with F.lazy():
             flux = Flux2Transformer2DModel(self.config)
             flux.to(self.devices[0])

@@ -13,12 +13,14 @@
 
 from max import functional as F
 from max.dtype import DType
-from max.nn import Linear, Module, module_dataclass
+from max.nn import Module, module_dataclass
+from max.nn.legacy.float8_config import Float8Config
 from max.nn.legacy.attention.mask_config import MHAMaskVariant
 from max.nn.legacy.kernels import flash_attention_gpu as _flash_attention_gpu
 from max.nn.sequential import ModuleList
 from max.tensor import Tensor
 
+from ...common_layers.fp8_linear import FP8Linear
 flash_attention_gpu = F.functional(_flash_attention_gpu)
 
 from max.nn.norm import RMSNorm
@@ -42,9 +44,9 @@ class Flux2SwiGLU(Module[[Tensor], Tensor]):
 
 
 class Flux2FeedForward(Module[[Tensor], Tensor]):
-    linear_in: Linear
+    linear_in: FP8Linear
     act_fn: Flux2SwiGLU
-    linear_out: Linear
+    linear_out: FP8Linear
 
     def __init__(
         self,
@@ -53,6 +55,8 @@ class Flux2FeedForward(Module[[Tensor], Tensor]):
         mult: float = 3.0,
         inner_dim: int | None = None,
         bias: bool = False,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
     ):
         """Initialize Flux2FeedForward.
 
@@ -68,9 +72,21 @@ class Flux2FeedForward(Module[[Tensor], Tensor]):
         dim_out = dim_out or dim
 
         # Flux2SwiGLU will reduce the dimension by half
-        self.linear_in = Linear(dim, inner_dim * 2, bias=bias)
+        self.linear_in = FP8Linear(
+            dim,
+            inner_dim * 2,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
+        )
         self.act_fn = Flux2SwiGLU()
-        self.linear_out = Linear(inner_dim, dim_out, bias=bias)
+        self.linear_out = FP8Linear(
+            inner_dim,
+            dim_out,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         """Apply feedforward transformation.
@@ -149,6 +165,8 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         out_bias: bool = True,
         eps: float = 1e-5,
         out_dim: int | None = None,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
     ):
         """Initialize Flux2Attention.
 
@@ -171,9 +189,27 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         out_dim = out_dim if out_dim is not None else query_dim
 
         # Main Q/K/V projections
-        self.to_q = Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_q = FP8Linear(
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
+        )
+        self.to_k = FP8Linear(
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
+        )
+        self.to_v = FP8Linear(
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
+        )
 
         # QK normalization
         self.norm_q = RMSNorm(dim_head, eps=eps)
@@ -181,34 +217,54 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
 
         # Output projection (skip dropout as it's not supported)
         self.to_out = ModuleList()
-        self.to_out.append(Linear(self.inner_dim, out_dim, bias=out_bias))
+        self.to_out.append(
+            FP8Linear(
+                self.inner_dim,
+                out_dim,
+                bias=out_bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
+        )
 
         # Optional: encoder projections
         self.norm_added_q: RMSNorm | None
         self.norm_added_k: RMSNorm | None
-        self.add_q_proj: Linear | None
-        self.add_k_proj: Linear | None
-        self.add_v_proj: Linear | None
-        self.to_add_out: Linear | None
+        self.add_q_proj: FP8Linear | None
+        self.add_k_proj: FP8Linear | None
+        self.add_v_proj: FP8Linear | None
+        self.to_add_out: FP8Linear | None
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = Linear(
+            self.add_q_proj = FP8Linear(
                 added_kv_proj_dim,
                 self.inner_dim,
                 bias=added_proj_bias if added_proj_bias is not None else False,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
             )
-            self.add_k_proj = Linear(
+            self.add_k_proj = FP8Linear(
                 added_kv_proj_dim,
                 self.inner_dim,
                 bias=added_proj_bias if added_proj_bias is not None else False,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
             )
-            self.add_v_proj = Linear(
+            self.add_v_proj = FP8Linear(
                 added_kv_proj_dim,
                 self.inner_dim,
                 bias=added_proj_bias if added_proj_bias is not None else False,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
             )
-            self.to_add_out = Linear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = FP8Linear(
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
         else:
             self.norm_added_q = None
             self.norm_added_k = None
@@ -370,6 +426,8 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         out_dim: int | None = None,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
     ):
         """Initialize Flux2ParallelSelfAttention.
 
@@ -395,7 +453,13 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
 
         # Fused QKV + MLP input projection
         fused_dim = self.inner_dim * 3 + self.mlp_hidden_dim * mlp_mult_factor
-        self.to_qkv_mlp_proj = Linear(query_dim, fused_dim, bias=bias)
+        self.to_qkv_mlp_proj = FP8Linear(
+            query_dim,
+            fused_dim,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
+        )
 
         # MLP activation
         self.mlp_act_fn = Flux2SwiGLU()
@@ -405,8 +469,12 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Fused output projection (Attention output + MLP output)
-        self.to_out = Linear(
-            self.inner_dim + self.mlp_hidden_dim, out_dim, bias=out_bias
+        self.to_out = FP8Linear(
+            self.inner_dim + self.mlp_hidden_dim,
+            out_dim,
+            bias=out_bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
         )
 
     def forward(

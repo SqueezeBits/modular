@@ -49,7 +49,10 @@ flux2_arch = SupportedArchitecture(
     name="Flux2Pipeline",
     task=PipelineTask.PIXEL_GENERATION,
     default_encoding="bfloat16",
-    supported_encodings={"bfloat16": []},
+    supported_encodings={
+        "bfloat16": [],
+        "float8_e4m3fn": [],
+    },
     example_repo_ids=[
         "black-forest-labs/FLUX.2-dev",
     ],
