@@ -31,6 +31,17 @@ modular_py_binary(
 )
 
 modular_py_binary(
+    name = "bench_adaln_modulate",
+    srcs = ["bench_adaln_modulate.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max:tensor",
+        requirement("numpy"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
     name = "profile_transformer",
     srcs = ["profile_transformer.py"],
     tags = ["no-pydeps"],

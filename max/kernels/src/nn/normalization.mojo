@@ -3093,3 +3093,327 @@ fn group_norm_shape[
     return rebind[IndexList[input.rank]](
         coord_to_index_list(input.layout.shape_coord())
     )
+
+
+# ===-----------------------------------------------------------------------===#
+# AdaLN Modulate: fused LayerNorm + (1 + scale) * x + shift
+# Single-pass kernel: output[i] = (x[i] - mean) / sqrt(var + eps) * (1 + scale[i]) + shift[i]
+# scale and shift are [B, D] (broadcast over sequence dimension)
+# ===-----------------------------------------------------------------------===#
+
+
+fn adaln_modulate_gpu_warp_tiling[
+    dtype: DType,
+    //,
+    simd_width: UInt,
+    input_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[dtype, width],
+    scale_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[dtype, width],
+    shift_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[dtype, width],
+    output_fn: fn[width: Int, alignment: Int](
+        row: Int, col: Int, val: SIMD[dtype, width]
+    ) capturing -> None,
+](
+    shape: IndexList[2],
+    epsilon: Scalar[dtype],
+):
+    comptime align = align_of[SIMD[dtype, Int(simd_width)]]()
+    comptime accum_type = get_accum_type[dtype]()
+
+    var num_cols = shape[1]
+    var tid: UInt = thread_idx.x
+    var row: UInt = block_idx.x
+
+    var vec_data = SIMD[accum_type, Int(simd_width)]()
+
+    var row_mean = Scalar[accum_type]()
+    var row_m2 = Scalar[accum_type]()
+    var row_count = Scalar[accum_type]()
+
+    var idx: UInt = tid * simd_width
+    var thread_mean = Scalar[accum_type]()
+    var thread_m2 = Scalar[accum_type]()
+    var thread_count = Scalar[accum_type]()
+
+    with PDL():
+        if idx < UInt(num_cols):
+            vec_data = input_fn[Int(simd_width)](Int(row), Int(idx)).cast[
+                accum_type
+            ]()
+
+            comptime for i in range(simd_width):
+                welford_update(
+                    vec_data[Int(i)], thread_mean, thread_m2, thread_count
+                )
+
+        welford_block_all_reduce(
+            thread_mean, thread_m2, thread_count, row_mean, row_m2, row_count
+        )
+
+        var row_var = max(row_m2 / row_count, 0.0)
+        var norm_factor = rsqrt(row_var + epsilon.cast[accum_type]())
+
+        if idx < UInt(num_cols):
+            var scale_val = scale_fn[Int(simd_width)](Int(row), Int(idx))
+            var shift_val = shift_fn[Int(simd_width)](Int(row), Int(idx))
+            var norm_val = (
+                (vec_data - row_mean)
+                * norm_factor
+                * (1 + scale_val.cast[accum_type]())
+                + shift_val.cast[accum_type]()
+            )
+            output_fn[Int(simd_width), align](
+                Int(row), Int(idx), norm_val.cast[dtype]()
+            )
+
+
+fn adaln_modulate_gpu_block[
+    dtype: DType,
+    //,
+    simd_width: UInt,
+    input_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[dtype, width],
+    scale_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[dtype, width],
+    shift_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[dtype, width],
+    output_fn: fn[width: Int, alignment: Int](
+        row: Int, col: Int, val: SIMD[dtype, width]
+    ) capturing -> None,
+](
+    shape: IndexList[2],
+    epsilon: Scalar[dtype],
+):
+    comptime align = align_of[SIMD[dtype, Int(simd_width)]]()
+    comptime accum_type = get_accum_type[dtype]()
+
+    var num_cols = UInt(shape[1])
+    var tid = thread_idx.x
+    var row = block_idx.x
+
+    var row_mean = Scalar[accum_type]()
+    var row_m2 = Scalar[accum_type]()
+    var row_count = Scalar[accum_type]()
+
+    with PDL():
+        # Pass 1: compute mean and variance via Welford reduction
+        for x in range(ceildiv(num_cols // simd_width, block_dim.x)):
+            var thread_mean = Scalar[accum_type]()
+            var thread_m2 = Scalar[accum_type]()
+            var thread_count = Scalar[accum_type]()
+
+            var offset = x * block_dim.x * simd_width + tid * simd_width
+
+            if offset < num_cols:
+                var vec_data = input_fn[Int(simd_width)](
+                    Int(row), Int(offset)
+                ).cast[accum_type]()
+
+                comptime for i in range(simd_width):
+                    welford_update(
+                        vec_data[Int(i)], thread_mean, thread_m2, thread_count
+                    )
+
+            welford_block_all_reduce(
+                thread_mean,
+                thread_m2,
+                thread_count,
+                row_mean,
+                row_m2,
+                row_count,
+            )
+
+        var row_var = max(row_m2 / row_count, 0)
+        var norm_factor = rsqrt(row_var + epsilon.cast[accum_type]())
+
+        # Pass 2: normalize and apply scale/shift modulation
+        for x in range(ceildiv(num_cols // simd_width, block_dim.x)):
+            var offset = x * block_dim.x * simd_width + tid * simd_width
+
+            if offset < num_cols:
+                var scale_val = scale_fn[Int(simd_width)](Int(row), Int(offset))
+                var shift_val = shift_fn[Int(simd_width)](Int(row), Int(offset))
+                var vec_data = input_fn[Int(simd_width)](
+                    Int(row), Int(offset)
+                ).cast[accum_type]()
+                var norm_val = (
+                    (vec_data - row_mean)
+                    * norm_factor
+                    * (1 + scale_val.cast[accum_type]())
+                    + shift_val.cast[accum_type]()
+                )
+                output_fn[Int(simd_width), align](
+                    Int(row), Int(offset), norm_val.cast[dtype]()
+                )
+
+
+fn adaln_modulate_gpu[
+    dtype: DType,
+    rank: Int,
+    //,
+    input_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+        dtype, width
+    ],
+    scale_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+        dtype, width
+    ],
+    shift_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+        dtype, width
+    ],
+    output_fn: fn[width: Int, rank: Int, alignment: Int](
+        idx: IndexList[rank], val: SIMD[dtype, width]
+    ) capturing -> None,
+](
+    shape: IndexList[rank, ...],
+    epsilon: Scalar[dtype],
+    *,
+    ctx: DeviceContext,
+) raises:
+    if rank == 0:
+        return
+
+    var last_dim = shape[rank - 1]
+
+    if last_dim == 0:
+        return
+
+    comptime rank_rs = 2
+    var flattened_shape = layer_norm_reshape[rank_rs](shape)
+    var rows = flattened_shape[0]
+    var cols = flattened_shape[1]
+
+    @parameter
+    @always_inline
+    fn input_fn_2d[
+        simd_width: Int
+    ](row: Int, col: Int) -> SIMD[dtype, simd_width]:
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        indices[rank - 1] = col
+        return input_fn[simd_width](indices.canonicalize())
+
+    @parameter
+    @always_inline
+    fn scale_fn_2d[
+        simd_width: Int
+    ](row: Int, col: Int) -> SIMD[dtype, simd_width]:
+        # scale has shape [B, 1, ..., 1, D] — zero out all sequence dims
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        comptime for i in range(1, rank - 1):
+            indices[i] = 0
+        indices[rank - 1] = col
+        return scale_fn[simd_width](indices.canonicalize())
+
+    @parameter
+    @always_inline
+    fn shift_fn_2d[
+        simd_width: Int
+    ](row: Int, col: Int) -> SIMD[dtype, simd_width]:
+        # shift has shape [B, 1, ..., 1, D] — zero out all sequence dims
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        comptime for i in range(1, rank - 1):
+            indices[i] = 0
+        indices[rank - 1] = col
+        return shift_fn[simd_width](indices.canonicalize())
+
+    @parameter
+    @always_inline
+    fn output_fn_2d[
+        simd_width: Int, alignment: Int
+    ](row: Int, col: Int, val: SIMD[dtype, simd_width]):
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        indices[rank - 1] = col
+        output_fn[simd_width, rank, alignment](indices.canonicalize(), val)
+
+    comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime max_warps_per_block = ctx.default_device_info.max_thread_block_size // WARP_SIZE
+
+    var grid_dim = rows
+    var block_dim_val = min(
+        ceildiv(ceildiv(cols, simd_width), WARP_SIZE) * WARP_SIZE,
+        WARP_SIZE * max_warps_per_block,
+    )
+
+    if cols % simd_width == 0:
+        if cols <= (WARP_SIZE * simd_width * max_warps_per_block):
+            comptime kernel = adaln_modulate_gpu_warp_tiling[
+                UInt(simd_width),
+                input_fn_2d,
+                scale_fn_2d,
+                shift_fn_2d,
+                output_fn_2d,
+            ]
+            ctx.enqueue_function[kernel, kernel](
+                flattened_shape,
+                epsilon,
+                grid_dim=grid_dim,
+                block_dim=block_dim_val,
+                attributes=pdl_launch_attributes(),
+            )
+        else:
+            comptime kernel = adaln_modulate_gpu_block[
+                UInt(simd_width),
+                input_fn_2d,
+                scale_fn_2d,
+                shift_fn_2d,
+                output_fn_2d,
+            ]
+            ctx.enqueue_function[kernel, kernel](
+                flattened_shape,
+                epsilon,
+                grid_dim=grid_dim,
+                block_dim=block_dim_val,
+                attributes=pdl_launch_attributes(),
+            )
+    else:
+        comptime kernel = adaln_modulate_gpu_block[
+            1,
+            input_fn_2d,
+            scale_fn_2d,
+            shift_fn_2d,
+            output_fn_2d,
+        ]
+        ctx.enqueue_function[kernel, kernel](
+            flattened_shape,
+            epsilon,
+            grid_dim=grid_dim,
+            block_dim=block_dim_val,
+            attributes=pdl_launch_attributes(),
+        )
+
+
+@register_internal("mo.adaln_modulate")
+@always_inline
+fn adaln_modulate[
+    dtype: DType,
+    rank: Int,
+    input_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+        dtype, width
+    ],
+    scale_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+        dtype, width
+    ],
+    shift_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+        dtype, width
+    ],
+    output_fn: fn[width: Int, rank: Int, alignment: Int](
+        idx: IndexList[rank], val: SIMD[dtype, width]
+    ) capturing -> None,
+    /,
+    target: StaticString = "cpu",
+](
+    shape: IndexList[rank],
+    epsilon: Scalar[dtype],
+    ctx: DeviceContextPtr,
+) raises:
+    @always_inline
+    @parameter
+    fn description_fn() -> String:
+        return trace_arg("input", shape, dtype)
+
+    with Trace[TraceLevel.OP, target=target](
+        "adaln_modulate",
+        Trace[TraceLevel.OP]._get_detail_str[description_fn](),
+        task_id=Int(ctx.get_device_context().id()),
+    ):
+        comptime if is_gpu[target]():
+            adaln_modulate_gpu[input_fn, scale_fn, shift_fn, output_fn](
+                shape, epsilon, ctx=ctx.get_device_context()
+            )
+        else:
+            comptime assert False, "adaln_modulate only supported on GPU, target=" + target

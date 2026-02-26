@@ -219,6 +219,7 @@ from nn.mla_graph import (
 from nn.moe import moe_create_indices, router_group_limited
 from nn.nms import non_max_suppression, non_max_suppression_shape_func
 from nn.normalization import (
+    adaln_modulate,
     group_norm,
     layer_norm,
     rms_norm,
@@ -3389,6 +3390,81 @@ struct LayerNorm:
         input: InputTensor[dtype=dtype, rank=rank],
         gamma: InputTensor[dtype=dtype, rank=1],
         beta: InputTensor[dtype=dtype, rank=1],
+        epsilon: Scalar[dtype=dtype],
+    ) -> IndexList[rank]:
+        return input.shape()
+
+
+@compiler.register("mo.adaln_modulate")
+struct Struct_adaln_modulate:
+    @staticmethod
+    fn execute[
+        dtype: DType,
+        rank: Int,
+        target: StaticString,
+    ](
+        output: FusedOutputTensor[dtype=dtype, rank=rank],
+        input: FusedInputTensor[dtype=dtype, rank=rank],
+        # scale and shift have the same rank as input but size-1 sequence dims, e.g. [B, 1, D]
+        scale: FusedInputTensor[dtype=dtype, rank=rank],
+        shift: FusedInputTensor[dtype=dtype, rank=rank],
+        epsilon: Scalar[dtype=dtype],
+        ctx: DeviceContextPtr,
+    ) capturing raises:
+        if output.shape() != input.shape():
+            raise Error("Input and output buffers are not same shape")
+
+        @parameter
+        @always_inline
+        fn input_fn[
+            width: Int, _rank: Int
+        ](coords: IndexList[_rank]) -> SIMD[dtype, width]:
+            return input._lambda_load[width=width, element_alignment=width](
+                rebind[IndexList[input.rank]](coords)
+            )
+
+        @parameter
+        @always_inline
+        fn scale_fn[
+            width: Int, _rank: Int
+        ](coords: IndexList[_rank]) -> SIMD[dtype, width]:
+            # Pass coords directly; adaln_modulate_gpu zeroes out seq dims before calling here
+            return scale._lambda_load[width=width, element_alignment=width](
+                rebind[IndexList[scale.rank]](coords)
+            )
+
+        @parameter
+        @always_inline
+        fn shift_fn[
+            width: Int, _rank: Int
+        ](coords: IndexList[_rank]) -> SIMD[dtype, width]:
+            # Pass coords directly; adaln_modulate_gpu zeroes out seq dims before calling here
+            return shift._lambda_load[width=width, element_alignment=width](
+                rebind[IndexList[shift.rank]](coords)
+            )
+
+        @parameter
+        @always_inline
+        fn output_fn[
+            width: Int, _rank: Int, alignment: Int
+        ](coords: IndexList[_rank], val: SIMD[dtype, width]):
+            output._lambda_store[width=width, element_alignment=alignment](
+                rebind[IndexList[output.rank]](coords),
+                rebind[SIMD[output.dtype, width]](val),
+            )
+
+        adaln_modulate[dtype, rank, input_fn, scale_fn, shift_fn, output_fn, target=target](
+            input.shape(), epsilon, ctx
+        )
+
+    @staticmethod
+    fn shape[
+        dtype: DType,
+        rank: Int,
+    ](
+        input: InputTensor[dtype=dtype, rank=rank],
+        scale: InputTensor[dtype=dtype, rank=rank],
+        shift: InputTensor[dtype=dtype, rank=rank],
         epsilon: Scalar[dtype=dtype],
     ) -> IndexList[rank]:
         return input.shape()

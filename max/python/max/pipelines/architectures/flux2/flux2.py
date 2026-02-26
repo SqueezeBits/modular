@@ -18,6 +18,7 @@ from max.graph import TensorType
 from max.nn.module_v3 import Linear, Module
 from max.nn.module_v3.norm import LayerNorm
 from max.nn.module_v3.sequential import ModuleList
+from max.nn.norm.adaln_modulate import adaln_modulate
 
 from .layers.embeddings import TimestepEmbedding, Timesteps
 from .layers.flux2_attention import (
@@ -233,14 +234,14 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
         ) = temb_mod_params_txt
 
         # === Image stream - Attention ===
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+        norm_hidden_states = adaln_modulate(
+            hidden_states, scale_msa, shift_msa, eps=self.norm1.eps
+        )
 
         # === Text stream - Attention ===
-        norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            1 + c_scale_msa
-        ) * norm_encoder_hidden_states + c_shift_msa
+        norm_encoder_hidden_states = adaln_modulate(
+            encoder_hidden_states, c_scale_msa, c_shift_msa, eps=self.norm1_context.eps
+        )
 
         # === Dual-stream attention ===
         attn_result = self.attn.forward(
@@ -258,8 +259,9 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
         hidden_states = hidden_states + attn_output
 
         # === Image stream - Feedforward ===
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        norm_hidden_states = adaln_modulate(
+            hidden_states, scale_mlp, shift_mlp, eps=self.norm2.eps
+        )
 
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + gate_mlp * ff_output
@@ -269,9 +271,8 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
         # === Text stream - Feedforward ===
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states = adaln_modulate(
+            encoder_hidden_states, c_scale_mlp, c_shift_mlp, eps=self.norm2_context.eps
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
@@ -369,8 +370,9 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
         # Normalize and modulate
-        norm_hidden_states = self.norm(hidden_states)
-        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
+        norm_hidden_states = adaln_modulate(
+            hidden_states, mod_scale, mod_shift, eps=self.norm.eps
+        )
 
         # Parallel attention+MLP
         attn_output = self.attn.forward(
