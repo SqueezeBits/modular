@@ -15,17 +15,17 @@ from __future__ import annotations
 
 from typing import Literal
 
-from max import random
+from max.experimental import random
 from max.dtype import DType
 from max.graph import Dim, DimLike, TensorValue
-from max import functional as F
-from max.nn import Module
-from max.nn.legacy.float8_config import Float8Config
-from max.nn.legacy.kernels import (
+from max.experimental import functional as F
+from max.nn.module_v3 import Module
+from max.nn.float8_config import Float8Config
+from max.nn.kernels import (
     dynamic_scaled_matmul,
     quantize_dynamic_scaled_float8,
 )
-from max.tensor import Tensor
+from max.experimental.tensor import Tensor
 
 
 class FP8Linear(Module[[Tensor], Tensor]):
