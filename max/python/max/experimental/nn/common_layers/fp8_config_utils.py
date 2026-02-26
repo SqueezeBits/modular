@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from max.dtype import DType
-from max.nn.legacy.float8_config import (
+from max.nn.float8_config import (
     Float8Config,
     Float8InputScaleSpec,
     Float8ScaleGranularity,
