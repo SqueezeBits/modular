@@ -18,7 +18,7 @@ from max.dtype import DType
 from max.graph import DeviceRef
 from max.nn.legacy.float8_config import Float8Config
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
-from max.pipelines.lib.config_enums import supported_encoding_dtype
+from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from pydantic import Field
 
 from ..common_layers.fp8_config_utils import build_dynamic_block_fp8_config

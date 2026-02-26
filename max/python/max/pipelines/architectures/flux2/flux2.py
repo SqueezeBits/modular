@@ -11,14 +11,14 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from max import functional as F
 from max.dtype import DType
+from max.experimental import functional as F
+from max.experimental.tensor import Tensor
 from max.graph import TensorType
-from max.nn import Module
-from max.nn.legacy.float8_config import Float8Config
-from max.nn.norm import LayerNorm
-from max.nn.sequential import ModuleList
-from max.tensor import Tensor
+from max.nn.float8_config import Float8Config
+from max.nn.module_v3 import Module
+from max.nn.module_v3.norm import LayerNorm
+from max.nn.module_v3.sequential import ModuleList
 
 from ..common_layers.fp8_linear import FP8Linear
 from .layers.embeddings import TimestepEmbedding, Timesteps

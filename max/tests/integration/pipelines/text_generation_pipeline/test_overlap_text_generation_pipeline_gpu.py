@@ -34,8 +34,8 @@ from max.graph import (
     ops,
 )
 from max.interfaces import RequestID, TextGenerationInputs, TokenBuffer
-from max.nn.legacy import KVCacheInputs, kernels
-from max.nn.legacy.kv_cache import KVCacheParams
+from max.nn import KVCacheInputs, kernels
+from max.nn.kv_cache import KVCacheParams
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
     ModelInputs,
@@ -152,6 +152,7 @@ class FakePipelineConfig(ConfigFileModel):
     sampling: FakeSamplingConfig
     execute_empty_batches: bool = False
     enable_overlap_scheduler: bool = False
+    debug_verify_replay: bool = False
     max_batch_size: int = 999
 
     def configure_session(self, *args: Any, **kwargs: Any) -> None:

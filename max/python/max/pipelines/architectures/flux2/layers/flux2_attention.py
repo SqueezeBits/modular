@@ -11,19 +11,18 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from max import functional as F
 from max.dtype import DType
-from max.nn import Module, module_dataclass
-from max.nn.legacy.float8_config import Float8Config
-from max.nn.legacy.attention.mask_config import MHAMaskVariant
-from max.nn.legacy.kernels import flash_attention_gpu as _flash_attention_gpu
-from max.nn.sequential import ModuleList
-from max.tensor import Tensor
+from max.experimental import functional as F
+from max.experimental.tensor import Tensor
+from max.nn.attention.mask_config import MHAMaskVariant
+from max.nn.float8_config import Float8Config
+from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
+from max.nn.module_v3 import Module, module_dataclass
+from max.nn.module_v3.norm import RMSNorm
+from max.nn.module_v3.sequential import ModuleList
 
 from ...common_layers.fp8_linear import FP8Linear
 flash_attention_gpu = F.functional(_flash_attention_gpu)
-
-from max.nn.norm import RMSNorm
 
 from .embeddings import apply_rotary_emb, get_1d_rotary_pos_embed
 

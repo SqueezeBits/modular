@@ -14,14 +14,14 @@
 import math
 from collections.abc import Callable
 
-from max import functional as F
 from max.dtype import DType
-from max.nn import Module
-from max.nn.legacy.float8_config import Float8Config
+from max.experimental import functional as F
+from max.experimental.tensor import Tensor
+from max.nn.float8_config import Float8Config
+from max.nn.module_v3 import Module
 from max.pipelines.architectures.common_layers.activation import (
     activation_function_from_name,
 )
-from max.tensor import Tensor
 
 from ...common_layers.fp8_linear import FP8Linear
 
