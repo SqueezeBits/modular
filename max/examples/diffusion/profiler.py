@@ -397,7 +397,7 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
     def _wrap_tensor_ops(self) -> None:
         """Patch Tensor conversion/movement ops (process-wide while active)."""
         try:
-            from max.tensor import Tensor
+            from max.experimental.tensor import Tensor
         except Exception:
             return
 

@@ -21,18 +21,23 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic
 
-from max.driver import Buffer, Device, is_virtual_device_mode
+from max.driver import (
+    Buffer,
+    Device,
+    enable_all_peer_access,
+    is_virtual_device_mode,
+)
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef
 from max.graph.weights import Weights, WeightsAdapter
 from max.interfaces import BaseContextType, LogProbabilities
-from max.nn.legacy.kv_cache import KVCacheInputs, KVCacheParams
-from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
+from max.nn.kv_cache import KVCacheInputs, KVCacheParams
+from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from transformers import AutoConfig
 
-from ..config_enums import supported_encoding_dtype
-from ..kv_cache_config import KVCacheConfig
+from ..config.config_enums import supported_encoding_dtype
+from ..config.kv_cache_config import KVCacheConfig
 from ..lora import LoRAManager
 
 if TYPE_CHECKING:
@@ -77,7 +82,16 @@ class AlwaysSignalBuffersMixin:
         if is_virtual_device_mode():
             return []
 
-        from max.nn.legacy.comm import Signals
+        if len(self.devices) > 1:
+            try:
+                enable_all_peer_access()
+            except RuntimeError:
+                logger.warning(
+                    "Failed to enable peer-to-peer GPU access. "
+                    "Collective operations will fall back to slower paths."
+                )
+
+        from max.nn.comm import Signals
 
         return [
             Buffer.zeros(
@@ -285,25 +299,30 @@ class PipelineModel(ABC, Generic[BaseContextType]):
         if is_virtual_device_mode():
             return []
 
-        # Import here to avoid circular dependency
-        from max.nn.legacy.comm import Signals
+        if len(self.devices) <= 1:
+            return []
 
-        # Initialize state needed for communication collectives.
-        # Contents of signal buffer should be filled with zeros.
-        return (
-            [
-                Buffer.zeros(
-                    shape=(Signals.NUM_BYTES,),
-                    dtype=DType.uint8,
-                    device=dev,
-                )
-                for dev in self.devices
-            ]
-            if len(self.devices) > 1
-            # Skip creating buffers for single-device, where communication
-            # collectives shouldn't be called.
-            else []
-        )
+        # Enable P2P access between all GPUs before any collective operations.
+        # This must happen before the first allreduce/broadcast/etc. executes.
+        try:
+            enable_all_peer_access()
+        except RuntimeError:
+            logger.warning(
+                "Failed to enable peer-to-peer GPU access. "
+                "Collective operations will fall back to slower paths."
+            )
+
+        # Import here to avoid circular dependency
+        from max.nn.comm import Signals
+
+        return [
+            Buffer.zeros(
+                shape=(Signals.NUM_BYTES,),
+                dtype=DType.uint8,
+                device=dev,
+            )
+            for dev in self.devices
+        ]
 
     @property
     def dtype(self) -> DType:
