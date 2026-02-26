@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-import gc
+from max.driver import CPU, Accelerator, Device
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,7 +23,6 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 from max import functional as F
-from max.driver import CPU, Device
 from max.dtype import DType
 from max.graph import TensorType, ops
 from max.graph.weights import load_weights
@@ -354,17 +353,6 @@ class WanPipeline(DiffusionPipeline):
         # Free transformer GPU memory before VAE decode.
         self._offload_transformers()
 
-        # DEBUG: allow loading latent from file for VAE-only testing
-        import os as _os
-        _load_latent = _os.environ.get('WAN_LOAD_LATENT', '')
-        if _load_latent and _os.path.exists(_load_latent):
-            logger.info('DEBUG: Loading latent from %s (skipping transformer output)', _load_latent)
-            _loaded = np.load(_load_latent)
-            latents = Tensor.from_dlpack(np.ascontiguousarray(_loaded)).to(device)
-        # Save final latent for analysis
-        _debug_latent = np.from_dlpack(latents.cast(DType.float32).to(CPU()))
-        np.save('/tmp/wan_t2v_outputs/max_final_latent.npy', _debug_latent)
-        logger.info('DEBUG: latent shape=%s range=[%.4f,%.4f] mean=%.4f', _debug_latent.shape, _debug_latent.min(), _debug_latent.max(), _debug_latent.mean())
 
         # Denormalize in float32 for precision, then cast to VAE dtype.
         denorm_latents = self.denormalize_vae_latents(
@@ -514,9 +502,11 @@ class WanPipeline(DiffusionPipeline):
             if hasattr(self.text_encoder, "_state_dict"):
                 self.text_encoder._state_dict = None
 
-        # Force Python GC to break reference cycles
-        gc.collect()
-        gc.collect()
+        # Synchronize GPU to ensure all pending ops complete, then
+        # the reference releases above can actually free GPU memory.
+        for dev in self.devices:
+            if not dev.is_host:
+                Accelerator(id=dev.id).synchronize()
 
     def _get_t5_prompt_embeds(
         self,
@@ -649,17 +639,18 @@ class WanPipeline(DiffusionPipeline):
         std_arr = np.asarray(latents_std, dtype=dtype_np).reshape(
             1, z_dim, 1, 1, 1
         )
-        recip_std_arr = 1.0 / std_arr
 
         latents_mean_t = (
             Tensor.from_dlpack(mean_arr).to(latents.device).cast(latents.dtype)
         )
-        latents_recip_std_t = (
-            Tensor.from_dlpack(recip_std_arr)
+        # Diffusers computes: latents_std_inv = 1/config.latents_std
+        # then: latents / latents_std_inv + mean = latents * config.latents_std + mean
+        latents_std_t = (
+            Tensor.from_dlpack(std_arr)
             .to(latents.device)
             .cast(latents.dtype)
         )
-        return latents * latents_recip_std_t + latents_mean_t
+        return latents * latents_std_t + latents_mean_t
 
     @staticmethod
     def _to_numpy(image: Tensor) -> np.ndarray:
