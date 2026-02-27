@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 from max.experimental import functional as F
-from max.driver import CPU, Device
+from max.driver import CPU, Accelerator, Device
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType
 from max.graph.buffer_utils import cast_dlpack_to
@@ -34,6 +34,28 @@ from max.experimental.tensor import Tensor
 from .model_config import AutoencoderKLWanConfig
 
 logger = logging.getLogger(__name__)
+
+CACHE_T = 2
+WAN_DECODER_CACHE_SLOTS = 32
+
+
+def _zero_cache_for(x: Tensor) -> Tensor:
+    """Create a zero cache tensor shaped for a causal conv input."""
+    return Tensor.zeros(
+        [x.shape[0], x.shape[1], CACHE_T, x.shape[3], x.shape[4]],
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+
+def _normalize_compiled_outputs(
+    outputs: Tensor | list[Tensor] | tuple[Tensor, ...],
+) -> list[Tensor]:
+    if isinstance(outputs, Tensor):
+        return [outputs]
+    if isinstance(outputs, tuple):
+        return list(outputs)
+    return outputs
 
 
 class WanRMSNorm(Module[[Tensor], Tensor]):
@@ -109,6 +131,72 @@ class WanCausalConv3d(Conv3d):
             permute=True,
         )
 
+
+class WanCausalConv3dCached(Conv3d):
+    """3D causal convolution with explicit cache tensor I/O.
+
+    Uses Conv3d's internal padding for spatial dimensions and handles
+    temporal causal padding separately via concat/pad before calling
+    super().forward().
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int, int],
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] = 0,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+        has_bias: bool = True,
+    ) -> None:
+        if isinstance(padding, int):
+            pad_t = pad_h = pad_w = padding
+        else:
+            pad_t, pad_h, pad_w = padding
+
+        # Temporal causal padding: left=2*pad_t, right=0
+        self._temporal_pad_left = 2 * pad_t
+
+        # Let Conv3d handle spatial padding via F.conv3d internally.
+        # Temporal padding = 0 here; we handle it ourselves.
+        super().__init__(
+            kernel_size=kernel_size,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            dtype=dtype,
+            stride=stride,
+            padding=(0, 0, pad_h, pad_h, pad_w, pad_w),
+            dilation=1,
+            num_groups=1,
+            device=device,
+            has_bias=has_bias,
+            permute=True,
+        )
+
+    def _apply_temporal_pad(self, x: Tensor, pad_left: int) -> Tensor:
+        """Zero-pad the temporal dimension (axis=2) on the left only."""
+        if pad_left <= 0:
+            return x
+        # F.pad expects 2*rank values: [d0_before, d0_after, d1_before, d1_after, ...]
+        # For 5D [B, C, T, H, W]: pad only dim 2 (T) on the left.
+        pad_vals = [0, 0, 0, 0, pad_left, 0, 0, 0, 0, 0]
+        return F.pad(x, pad_vals)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self._apply_temporal_pad(x, self._temporal_pad_left)
+        return super().forward(x)
+
+    def forward_cached(
+        self, x: Tensor, cache_in: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        x = F.concat([cache_in, x], axis=2)
+        cache_out = x[:, :, -CACHE_T:, :, :]
+        # Reduce temporal padding by the amount of context from cache.
+        effective_pad = max(self._temporal_pad_left - int(cache_in.shape[2]), 0)
+        x = self._apply_temporal_pad(x, effective_pad)
+        return super().forward(x), cache_out
 
 class WanResidualBlock(Module[[Tensor], Tensor]):
     """Residual block used in Wan VAE decoder."""
@@ -558,6 +646,562 @@ class WanDecoder3d(Module[[Tensor], Tensor]):
         return x
 
 
+class WanResidualBlockCached(Module[..., tuple[Tensor, Tensor, Tensor]]):
+    """Wan residual block with explicit cache I/O for conv1/conv2."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        self.norm1 = WanRMSNorm(
+            in_dim,
+            images=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.conv1 = WanCausalConv3dCached(
+            in_dim,
+            out_dim,
+            3,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+        self.norm2 = WanRMSNorm(
+            out_dim,
+            images=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.conv2 = WanCausalConv3dCached(
+            out_dim,
+            out_dim,
+            3,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+        self.conv_shortcut = (
+            WanCausalConv3d(
+                in_dim,
+                out_dim,
+                1,
+                padding=0,
+                dtype=dtype,
+                device=device,
+                has_bias=True,
+            )
+            if in_dim != out_dim
+            else None
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        cache1_in: Tensor | None = None,
+        cache2_in: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        residual = (
+            self.conv_shortcut(x) if self.conv_shortcut is not None else x
+        )
+
+        x = F.silu(self.norm1(x))
+        if cache1_in is None:
+            cache1_in = _zero_cache_for(x)
+        x, cache1_out = self.conv1.forward_cached(x, cache1_in)
+
+        x = F.silu(self.norm2(x))
+        if cache2_in is None:
+            cache2_in = _zero_cache_for(x)
+        x, cache2_out = self.conv2.forward_cached(x, cache2_in)
+        return x + residual, cache1_out, cache2_out
+
+
+class WanMidBlockCached(Module[..., tuple[Tensor, ...]]):
+    """Middle decoder block with cache threading."""
+
+    def __init__(
+        self,
+        dim: int,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        self.resnets = ModuleList(
+            [
+                WanResidualBlockCached(dim, dim, dtype=dtype, device=device),
+                WanResidualBlockCached(dim, dim, dtype=dtype, device=device),
+            ]
+        )
+        self.attentions = ModuleList(
+            [WanAttentionBlock(dim, dtype=dtype, device=device)]
+        )
+
+    def forward(
+        self, x: Tensor, *cache_inputs: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        if len(cache_inputs) not in (0, 4):
+            raise ValueError(
+                f"WanMidBlockCached expected 0 or 4 cache tensors, got {len(cache_inputs)}"
+            )
+
+        cache1_in = cache_inputs[0] if len(cache_inputs) == 4 else None
+        cache2_in = cache_inputs[1] if len(cache_inputs) == 4 else None
+        x, cache1_out, cache2_out = self.resnets[0](x, cache1_in, cache2_in)
+        x = self.attentions[0](x)
+
+        cache3_in = cache_inputs[2] if len(cache_inputs) == 4 else None
+        cache4_in = cache_inputs[3] if len(cache_inputs) == 4 else None
+        x, cache3_out, cache4_out = self.resnets[1](x, cache3_in, cache4_in)
+        return x, cache1_out, cache2_out, cache3_out, cache4_out
+
+
+class WanResampleCached(Module[..., tuple[Tensor, Tensor]]):
+    """Wan upsample3d module with explicit cache I/O."""
+
+    def __init__(
+        self,
+        dim: int,
+        mode: str,
+        upsample_out_dim: int | None = None,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        if mode != "upsample3d":
+            raise ValueError(
+                "WanResampleCached only supports mode='upsample3d'"
+            )
+
+        self.dim = dim
+        self.mode = mode
+
+        if upsample_out_dim is None:
+            upsample_out_dim = dim // 2
+        self._out_c = upsample_out_dim
+
+        self.time_conv = WanCausalConv3dCached(
+            in_channels=dim,
+            out_channels=dim * 2,
+            kernel_size=(3, 1, 1),
+            stride=1,
+            padding=(1, 0, 0),
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+        self.resample = ModuleList(
+            [
+                WanUpsample2d(),
+                Conv2d(
+                    kernel_size=3,
+                    in_channels=dim,
+                    out_channels=upsample_out_dim,
+                    dtype=dtype,
+                    stride=1,
+                    padding=1,
+                    has_bias=True,
+                    device=device,
+                    permute=False,
+                ),
+            ]
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        cache_in: Tensor | None = None,
+        first_chunk: bool = False,
+    ) -> tuple[Tensor, Tensor]:
+        b = x.shape[0]
+        t = x.shape[2]
+        h = x.shape[3]
+        w = x.shape[4]
+
+        if cache_in is None:
+            cache_in = _zero_cache_for(x)
+
+        if first_chunk:
+            cache_out = cache_in
+        else:
+            x, cache_out = self.time_conv.forward_cached(x, cache_in)
+            x = F.reshape(x, [b, 2, self.dim, t, h, w])
+            x = F.permute(x, [0, 2, 3, 1, 4, 5])
+            t = t * 2
+            x = F.reshape(x, [b, self.dim, t, h, w])
+
+        x = F.permute(x, [0, 2, 1, 3, 4])
+        x = F.reshape(x, [b * t, self.dim, h, w])
+        x = self.resample[0](x)
+        x = F.permute(x, [0, 2, 3, 1])
+        x = self.resample[1](x)
+        x = F.permute(x, [0, 3, 1, 2])
+        x = F.reshape(x, [b, t, self._out_c, h * 2, w * 2])
+        x = F.permute(x, [0, 2, 1, 3, 4])
+        return x, cache_out
+
+
+class WanUpBlockCached(Module[..., tuple[Tensor, ...]]):
+    """Wan decoder up block with explicit cache threading."""
+
+    cache_slots: int
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_res_blocks: int,
+        upsample_mode: str | None,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        resnets: list[WanResidualBlockCached] = []
+        current_dim = in_dim
+        for _ in range(num_res_blocks + 1):
+            resnets.append(
+                WanResidualBlockCached(
+                    current_dim,
+                    out_dim,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+            current_dim = out_dim
+        self.resnets = ModuleList(resnets)
+
+        self._has_temporal_upsample = upsample_mode == "upsample3d"
+        self.cache_slots = len(resnets) * 2 + (
+            1 if self._has_temporal_upsample else 0
+        )
+
+        self.upsamplers: ModuleList | None = None
+        if upsample_mode is not None:
+            if upsample_mode == "upsample3d":
+                upsampler: Module[..., Any] = WanResampleCached(
+                    out_dim,
+                    mode=upsample_mode,
+                    upsample_out_dim=None,
+                    dtype=dtype,
+                    device=device,
+                )
+            elif upsample_mode == "upsample2d":
+                upsampler = WanResample(
+                    out_dim,
+                    mode=upsample_mode,
+                    upsample_out_dim=None,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported WanUpBlockCached upsample mode: {upsample_mode}"
+                )
+
+            self.upsamplers = ModuleList([upsampler])
+
+    def forward(
+        self,
+        x: Tensor,
+        *cache_inputs: Tensor,
+        first_chunk: bool = False,
+    ) -> tuple[Tensor, ...]:
+        if len(cache_inputs) not in (0, self.cache_slots):
+            raise ValueError(
+                f"WanUpBlockCached expected 0 or {self.cache_slots} cache tensors, got {len(cache_inputs)}"
+            )
+
+        use_cache_inputs = len(cache_inputs) == self.cache_slots
+        cache_outputs: list[Tensor] = []
+        cache_idx = 0
+
+        for resnet in self.resnets:
+            cache1_in = cache_inputs[cache_idx] if use_cache_inputs else None
+            cache2_in = (
+                cache_inputs[cache_idx + 1] if use_cache_inputs else None
+            )
+            x, cache1_out, cache2_out = resnet(x, cache1_in, cache2_in)
+            cache_outputs.extend([cache1_out, cache2_out])
+            cache_idx += 2
+
+        if self.upsamplers is not None:
+            upsampler = self.upsamplers[0]
+            if self._has_temporal_upsample:
+                cache_in = cache_inputs[cache_idx] if use_cache_inputs else None
+                if not isinstance(upsampler, WanResampleCached):
+                    raise TypeError(
+                        "Expected WanResampleCached for temporal upsample"
+                    )
+                x, cache_out = upsampler(
+                    x,
+                    cache_in,
+                    first_chunk=first_chunk,
+                )
+                cache_outputs.append(cache_out)
+            else:
+                x = upsampler(x)
+
+        return (x, *cache_outputs)
+
+
+class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
+    """Wan 3D decoder with explicit cache tensor I/O."""
+
+    def __init__(
+        self,
+        dim: int = 96,
+        z_dim: int = 16,
+        dim_mult: tuple[int, ...] = (1, 2, 4, 4),
+        num_res_blocks: int = 2,
+        temperal_upsample: tuple[bool, ...] = (False, True, True),
+        out_channels: int = 3,
+        is_residual: bool = False,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        del is_residual
+
+        dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
+
+        self.conv_in = WanCausalConv3dCached(
+            z_dim,
+            dims[0],
+            3,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+
+        self.mid_block = WanMidBlockCached(dims[0], dtype=dtype, device=device)
+
+        up_blocks: list[WanUpBlockCached] = []
+        final_out_dim = dims[-1]
+        for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
+            if i > 0:
+                in_dim = in_dim // 2
+
+            up_flag = i != len(dim_mult) - 1
+            upsample_mode: str | None = None
+            if up_flag and temperal_upsample[i]:
+                upsample_mode = "upsample3d"
+            elif up_flag:
+                upsample_mode = "upsample2d"
+
+            up_blocks.append(
+                WanUpBlockCached(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    upsample_mode=upsample_mode,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+            final_out_dim = out_dim
+
+        self.up_blocks = ModuleList(up_blocks)
+        self.norm_out = WanRMSNorm(
+            final_out_dim,
+            images=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.conv_out = WanCausalConv3dCached(
+            final_out_dim,
+            out_channels,
+            3,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        *cache_inputs: Tensor,
+        first_chunk: bool = False,
+    ) -> tuple[Tensor, ...]:
+        if len(cache_inputs) not in (0, WAN_DECODER_CACHE_SLOTS):
+            raise ValueError(
+                "WanDecoder3dCached expected 0 or "
+                f"{WAN_DECODER_CACHE_SLOTS} cache tensors, got {len(cache_inputs)}"
+            )
+
+        use_cache_inputs = len(cache_inputs) == WAN_DECODER_CACHE_SLOTS
+        cache_outputs: list[Tensor] = []
+        cache_idx = 0
+
+        conv_in_cache = cache_inputs[cache_idx] if use_cache_inputs else None
+        if conv_in_cache is None:
+            conv_in_cache = _zero_cache_for(x)
+        x, cache_out = self.conv_in.forward_cached(x, conv_in_cache)
+        cache_outputs.append(cache_out)
+        cache_idx += 1
+
+        mid_cache_inputs: tuple[Tensor, ...] = (
+            tuple(cache_inputs[cache_idx : cache_idx + 4])
+            if use_cache_inputs
+            else ()
+        )
+        mid_outputs = self.mid_block(x, *mid_cache_inputs)
+        x = mid_outputs[0]
+        cache_outputs.extend(mid_outputs[1:])
+        cache_idx += 4
+
+        for up_block in self.up_blocks:
+            block_cache_inputs: tuple[Tensor, ...] = (
+                tuple(
+                    cache_inputs[cache_idx : cache_idx + up_block.cache_slots]
+                )
+                if use_cache_inputs
+                else ()
+            )
+            block_outputs = up_block(
+                x,
+                *block_cache_inputs,
+                first_chunk=first_chunk,
+            )
+            x = block_outputs[0]
+            cache_outputs.extend(block_outputs[1:])
+            cache_idx += up_block.cache_slots
+
+        x = self.norm_out(x)
+        x = F.silu(x)
+        conv_out_cache = cache_inputs[cache_idx] if use_cache_inputs else None
+        if conv_out_cache is None:
+            conv_out_cache = _zero_cache_for(x)
+        x, cache_out = self.conv_out.forward_cached(x, conv_out_cache)
+        cache_outputs.append(cache_out)
+
+        if len(cache_outputs) != WAN_DECODER_CACHE_SLOTS:
+            raise ValueError(
+                "WanDecoder3dCached produced "
+                f"{len(cache_outputs)} cache tensors, expected {WAN_DECODER_CACHE_SLOTS}"
+            )
+        return (x, *cache_outputs)
+
+    def cache_shapes(
+        self,
+        batch_size: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> list[list[int]]:
+        h = latent_height
+        w = latent_width
+        shapes: list[list[int]] = [
+            [batch_size, self.conv_in.in_channels, CACHE_T, h, w]
+        ]
+
+        for resnet in self.mid_block.resnets:
+            shapes.append([batch_size, resnet.conv1.in_channels, CACHE_T, h, w])
+            shapes.append([batch_size, resnet.conv2.in_channels, CACHE_T, h, w])
+
+        for up_block in self.up_blocks:
+            for resnet in up_block.resnets:
+                shapes.append(
+                    [batch_size, resnet.conv1.in_channels, CACHE_T, h, w]
+                )
+                shapes.append(
+                    [batch_size, resnet.conv2.in_channels, CACHE_T, h, w]
+                )
+
+            if up_block.upsamplers is not None:
+                if up_block._has_temporal_upsample:
+                    upsampler = up_block.upsamplers[0]
+                    if not isinstance(upsampler, WanResampleCached):
+                        raise TypeError(
+                            "Expected WanResampleCached for temporal upsample"
+                        )
+                    shapes.append(
+                        [
+                            batch_size,
+                            upsampler.time_conv.in_channels,
+                            CACHE_T,
+                            h,
+                            w,
+                        ]
+                    )
+                h *= 2
+                w *= 2
+
+        shapes.append([batch_size, self.conv_out.in_channels, CACHE_T, h, w])
+        if len(shapes) != WAN_DECODER_CACHE_SLOTS:
+            raise ValueError(
+                f"Expected {WAN_DECODER_CACHE_SLOTS} cache shapes, got {len(shapes)}"
+            )
+        return shapes
+
+
+class _WanVAEPostQuantConv(Module[[Tensor], Tensor]):
+    """Standalone post-quant conv graph (k=1, frame-independent)."""
+
+    def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        self.post_quant_conv = WanCausalConv3d(
+            in_channels=config.z_dim,
+            out_channels=config.z_dim,
+            kernel_size=1,
+            padding=0,
+            dtype=config.dtype,
+            device=config.device,
+            has_bias=True,
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.post_quant_conv(z)
+
+
+class _WanVAEDecoderFirstFrameCached(Module[[Tensor], tuple[Tensor, ...]]):
+    """First-frame decoder graph returning pixels + initialized caches."""
+
+    def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        self.decoder = WanDecoder3dCached(
+            dim=config.base_dim,
+            z_dim=config.z_dim,
+            dim_mult=tuple(config.dim_mult),
+            num_res_blocks=config.num_res_blocks,
+            temperal_upsample=tuple(reversed(config.temperal_downsample)),
+            out_channels=config.out_channels,
+            is_residual=config.is_residual,
+            dtype=config.dtype,
+            device=config.device,
+        )
+
+    def forward(self, z: Tensor) -> tuple[Tensor, ...]:
+        outputs = self.decoder(z, first_chunk=True)
+        x = outputs[0]
+        x = F.max(x, -1.0)
+        x = F.min(x, 1.0)
+        return (x, *outputs[1:])
+
+
+class _WanVAEDecoderRestFrameCached(Module[..., tuple[Tensor, ...]]):
+    """Per-frame decoder graph with cache feedback for frames 1..T-1."""
+
+    def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        self.decoder = WanDecoder3dCached(
+            dim=config.base_dim,
+            z_dim=config.z_dim,
+            dim_mult=tuple(config.dim_mult),
+            num_res_blocks=config.num_res_blocks,
+            temperal_upsample=tuple(reversed(config.temperal_downsample)),
+            out_channels=config.out_channels,
+            is_residual=config.is_residual,
+            dtype=config.dtype,
+            device=config.device,
+        )
+
+    def forward(self, z: Tensor, *cache_inputs: Tensor) -> tuple[Tensor, ...]:
+        outputs = self.decoder(z, *cache_inputs, first_chunk=False)
+        x = outputs[0]
+        x = F.max(x, -1.0)
+        x = F.min(x, 1.0)
+        return (x, *outputs[1:])
+
+
 class WanVAEDecoder(Module[[Tensor], Tensor]):
     """Wan VAE decoder graph used by AutoencoderKLWanModel."""
 
@@ -592,85 +1236,173 @@ class WanVAEDecoder(Module[[Tensor], Tensor]):
         return x
 
 
-class _VAEPreStage(Module[[Tensor], Tensor]):
-    """VAE pre-processing: post_quant_conv + conv_in + mid_block."""
+class _WanVAEDecoderFirstFrame(Module[[Tensor], Tensor]):
+    """Wan VAE decoder for the FIRST latent frame.
+
+    Identical to WanVAEDecoder but ALL temporal upsamples are replaced
+    with spatial-only upsample2d (time_conv is omitted).  This means
+    T=1 in -> T=1 out, matching the diffusers feat_cache behavior where
+    the first frame skips temporal upsampling.
+    """
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
-        dim_mult = tuple(config.dim_mult)
-        dims = [config.base_dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
+        self._config = config
         self.post_quant_conv = WanCausalConv3d(
-            config.z_dim, config.z_dim, 1, padding=0,
-            dtype=config.dtype, device=config.device, has_bias=True,
+            in_channels=config.z_dim,
+            out_channels=config.z_dim,
+            kernel_size=1,
+            padding=0,
+            dtype=config.dtype,
+            device=config.device,
+            has_bias=True,
         )
-        self.conv_in = WanCausalConv3d(
-            config.z_dim, dims[0], 3, padding=1,
-            dtype=config.dtype, device=config.device, has_bias=True,
-        )
-        self.mid_block = WanMidBlock(
-            dims[0], dtype=config.dtype, device=config.device,
+        # Force all temporal upsamples to spatial-only.
+        self.decoder = WanDecoder3d(
+            dim=config.base_dim,
+            z_dim=config.z_dim,
+            dim_mult=tuple(config.dim_mult),
+            num_res_blocks=config.num_res_blocks,
+            temperal_upsample=(False,) * len(config.temperal_downsample),
+            out_channels=config.out_channels,
+            is_residual=config.is_residual,
+            dtype=config.dtype,
+            device=config.device,
         )
 
     def forward(self, z: Tensor) -> Tensor:
         x = self.post_quant_conv(z)
-        x = self.conv_in(x)
-        return self.mid_block(x)
-
-
-class _VAEPostStage(Module[[Tensor], Tensor]):
-    """VAE post-processing: last up_block + norm_out + silu + conv_out + clamp."""
-
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        num_res_blocks: int,
-        out_channels: int,
-        config: AutoencoderKLWanConfig,
-    ) -> None:
-        self.up_block = WanUpBlock(
-            in_dim, out_dim, num_res_blocks, upsample_mode=None,
-            dtype=config.dtype, device=config.device,
-        )
-        self.norm_out = WanRMSNorm(
-            out_dim, images=False, dtype=config.dtype, device=config.device,
-        )
-        self.conv_out = WanCausalConv3d(
-            out_dim, out_channels, 3, padding=1,
-            dtype=config.dtype, device=config.device, has_bias=True,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.up_block(x)
-        x = self.norm_out(x)
-        x = F.silu(x)
-        x = self.conv_out(x)
+        x = self.decoder(x)
         x = F.max(x, -1.0)
-        return F.min(x, 1.0)
+        x = F.min(x, 1.0)
+        return x
 
 
-class _BlockLevelVAEDecoder:
-    """Executes VAE decode as separate compiled stages.
-
-    Each stage is compiled independently so only one stage's workspace
-    is live at a time.  In sync mode, GPU memory is returned between
-    stage executions.
-    """
+class _PerFrameDecoder:
+    """Per-frame VAE decode with cache feedback through graph I/O."""
 
     def __init__(
         self,
-        pre: CompileWrapper,
-        up_blocks: list[CompileWrapper],
-        post: CompileWrapper,
+        post_quant_conv: CompileWrapper,
+        first_decoder: CompileWrapper,
+        rest_decoder: CompileWrapper,
     ) -> None:
-        self.pre = pre
-        self.up_blocks = up_blocks
-        self.post = post
+        self.post_quant_conv = post_quant_conv
+        self.first_decoder = first_decoder
+        self.rest_decoder = rest_decoder
 
-    def __call__(self, latents: Tensor) -> Tensor:
-        x = self.pre(latents)
-        for block in self.up_blocks:
-            x = block(x)
-        return self.post(x)
+    def __call__(self, latents_5d: Tensor) -> Tensor:
+        import time as _time
+
+        t_total = int(latents_5d.shape[2])
+        t0 = _time.perf_counter()
+
+        accelerator: Accelerator | None = None
+        if isinstance(latents_5d.device, Accelerator):
+            accelerator = latents_5d.device
+
+        post_quant_outputs = self.post_quant_conv(latents_5d)
+        if isinstance(post_quant_outputs, (list, tuple)):
+            if len(post_quant_outputs) != 1:
+                raise ValueError(
+                    "post_quant_conv returned "
+                    f"{len(post_quant_outputs)} outputs, expected 1"
+                )
+            z = post_quant_outputs[0]
+        else:
+            z = post_quant_outputs
+
+        if accelerator is not None:
+            accelerator.synchronize()
+        t_post = _time.perf_counter()
+
+        logger.info(
+            "post_quant_conv: input T=%d completed in %.1fs",
+            t_total,
+            t_post - t0,
+        )
+
+        first_outputs = _normalize_compiled_outputs(
+            self.first_decoder(z[:, :, 0:1, :, :])
+        )
+        if len(first_outputs) != WAN_DECODER_CACHE_SLOTS + 1:
+            raise ValueError(
+                "first_decoder returned "
+                f"{len(first_outputs)} outputs, expected {WAN_DECODER_CACHE_SLOTS + 1}"
+            )
+        first_pixels = first_outputs[0]
+        caches = first_outputs[1:]
+
+        if accelerator is not None:
+            accelerator.synchronize()
+        t_first_done = _time.perf_counter()
+
+        first_np = np.from_dlpack(first_pixels.cast(DType.float32).to(CPU()))
+        frames_np = [np.ascontiguousarray(first_np)]
+        t_first_cpu = _time.perf_counter()
+
+        logger.info(
+            "first frame decode: exec=%.1fs D2H=%.1fs output T=%d",
+            t_first_done - t_post,
+            t_first_cpu - t_first_done,
+            first_np.shape[2],
+        )
+
+        rest_exec_total = 0.0
+        rest_cpu_total = 0.0
+
+        for frame_idx in range(1, t_total):
+            t_exec_start = _time.perf_counter()
+            rest_outputs = _normalize_compiled_outputs(
+                self.rest_decoder(
+                    z[:, :, frame_idx : frame_idx + 1, :, :], *caches
+                )
+            )
+            if len(rest_outputs) != WAN_DECODER_CACHE_SLOTS + 1:
+                raise ValueError(
+                    "rest_decoder returned "
+                    f"{len(rest_outputs)} outputs, expected {WAN_DECODER_CACHE_SLOTS + 1}"
+                )
+
+            pixels = rest_outputs[0]
+            caches = rest_outputs[1:]
+            if accelerator is not None:
+                accelerator.synchronize()
+            t_exec_end = _time.perf_counter()
+
+            frame_np = np.from_dlpack(pixels.cast(DType.float32).to(CPU()))
+            frames_np.append(np.ascontiguousarray(frame_np))
+            t_cpu_end = _time.perf_counter()
+
+            rest_exec_total += t_exec_end - t_exec_start
+            rest_cpu_total += t_cpu_end - t_exec_end
+
+        result = np.concatenate(frames_np, axis=2)
+
+
+        total = _time.perf_counter() - t0
+        logger.info(
+            "rest frames decode: frames=%d exec=%.1fs D2H=%.1fs",
+            max(t_total - 1, 0),
+            rest_exec_total,
+            rest_cpu_total,
+        )
+        logger.info(
+            "VAE output: shape=%s range=[%.4f,%.4f]",
+            result.shape,
+            result.min(),
+            result.max(),
+        )
+        logger.info(
+            "VAE decode: %d latent -> %d video frames in %.1fs",
+            t_total,
+            result.shape[2],
+            total,
+        )
+
+        result_contiguous = np.ascontiguousarray(result).astype(
+            np.float32, copy=False
+        )
+        return Tensor.from_dlpack(result_contiguous)
 
 
 class AutoencoderKLWanModel(ComponentModel):
@@ -685,15 +1417,17 @@ class AutoencoderKLWanModel(ComponentModel):
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = AutoencoderKLWanConfig.generate(config, encoding, devices)
-        self.decoder_model: CompileWrapper | None = None
-        self._block_decoder: _BlockLevelVAEDecoder | None = None
+        self._per_frame_decoder: _PerFrameDecoder | None = None
         self.load_model()
 
     def load_model(self) -> Callable[[Tensor], Tensor]:
-        decoder_state_dict: dict[str, object] = {}
+        decoder_state_dict: dict[str, Any] = {}
         target_dtype = self.config.dtype
 
-        for key, value in self.weights.items():
+        assert self.weights is not None
+        weights_obj: Any = self.weights
+
+        for key, value in weights_obj.items():
             if not (
                 key.startswith("decoder.") or key.startswith("post_quant_conv.")
             ):
@@ -730,304 +1464,147 @@ class AutoencoderKLWanModel(ComponentModel):
         # dimensions.  This avoids symbolic-dim verification failures in
         # reshape ops that merge / redistribute spatial dimensions.
         self._decoder_state_dict = decoder_state_dict
-        self.decoder_model = None
-        self._block_decoder = None
+        self._per_frame_decoder = None
         # Free the raw Weights object now that we have the state dict.
         self.weights = None  # type: ignore[assignment]
 
         return self.decode_4d
 
-    def _compile_decoder(self, shape: tuple[int, ...]) -> None:
-        """Compile the VAE decoder graph for a concrete input shape."""
-        input_type = TensorType(
-            self.config.dtype,
-            shape=list(shape),
-            device=self.config.device,
-        )
-        with F.lazy():
-            model = WanVAEDecoder(self.config)
-            model.to(self.devices[0])
+    def _compile_per_frame_decoder(
+        self,
+        shape: tuple[int, ...],
+    ) -> None:
+        """Compile post-quant, first-frame, and rest-frame decoder graphs."""
+        import time as _time
 
-        # Verify weight key alignment between model and state dict.
-        model_keys = {name for name, _ in model.parameters}
-        sd_keys = set(self._decoder_state_dict.keys())
-        only_model = sorted(model_keys - sd_keys)
-        only_sd = sorted(sd_keys - model_keys)
-        if only_model:
-            logger.warning(
-                "VAE weights MISSING from state dict (%d): %s",
-                len(only_model),
-                only_model[:20],
-            )
-        if only_sd:
-            logger.warning(
-                "VAE state dict keys NOT in model (%d): %s",
-                len(only_sd),
-                only_sd[:20],
-            )
-        if not only_model and not only_sd:
-            logger.warning(
-                "VAE weight keys match: %d parameters", len(model_keys)
-            )
-
-        self.decoder_model = CompileWrapper(
-            model, input_types=[input_type], weights=self._decoder_state_dict
-        )
-        # Free state dict after compilation – weights are baked into the graph.
-        del self._decoder_state_dict
-
-    def _compile_decoder_block_level(self, shape: tuple[int, ...]) -> None:
-        """Compile the VAE decoder as separate stages (block-level).
-
-        Each stage is a separate compiled graph so only one stage's
-        workspace is live at a time.  In sync mode, GPU memory is
-        returned between stage executions.
-        """
         cfg = self.config
-        dtype = cfg.dtype
-        dev = cfg.device
-        device_obj = self.devices[0]
-        dim = cfg.base_dim
-        dim_mult = tuple(cfg.dim_mult)
-        num_res = cfg.num_res_blocks
-        temperal_upsample = tuple(reversed(cfg.temperal_downsample))
-        dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
-
         sd = self._decoder_state_dict
+        device_obj = self.devices[0]
+        B, C, T_total, H, W = (int(s) for s in shape)
 
-        # --- Split state dict by stage ---
-        pre_weights: dict[str, object] = {}
-        up_block_weights: list[dict[str, object]] = [
-            {} for _ in range(len(dim_mult))
-        ]
-        post_weights: dict[str, object] = {}
-
-        for key, value in sd.items():
-            if key.startswith("post_quant_conv."):
-                pre_weights[key] = value
-            elif key.startswith("decoder.conv_in."):
-                pre_weights["conv_in." + key[len("decoder.conv_in."):]] = value
-            elif key.startswith("decoder.mid_block."):
-                pre_weights["mid_block." + key[len("decoder.mid_block."):]] = value
-            elif key.startswith("decoder.up_blocks."):
-                rest = key[len("decoder.up_blocks."):]
-                dot = rest.index(".")
-                idx = int(rest[:dot])
-                sub_key = rest[dot + 1:]
-                if idx < len(dim_mult) - 1:
-                    # Up blocks 0..N-2 → separate stages
-                    up_block_weights[idx]["up_block." + sub_key] = value
-                else:
-                    # Last up block → post stage
-                    post_weights["up_block." + sub_key] = value
-            elif key.startswith("decoder.norm_out."):
-                post_weights["norm_out." + key[len("decoder.norm_out."):]] = value
-            elif key.startswith("decoder.conv_out."):
-                post_weights["conv_out." + key[len("decoder.conv_out."):]] = value
-
-        B, C, T, H, W = (int(s) for s in shape)
-
-        # --- Stage 0: pre (post_quant_conv + conv_in + mid_block) ---
-        pre_input = TensorType(dtype, list(shape), device=dev)
-        with F.lazy():
-            pre_mod = _VAEPreStage(cfg)
-            pre_mod.to(device_obj)
-        pre_model = CompileWrapper(
-            pre_mod, input_types=[pre_input], weights=pre_weights,
-        )
-        logger.info("Compiled pre stage (%d weights)", len(pre_weights))
-
-        # Track shape through stages
-        cur_C = dims[0]
-        cur_T, cur_H, cur_W = T, H, W
-
-        # --- Stages 1..N-2: up_blocks ---
-        up_models: list[CompileWrapper] = []
-        for i, (in_d, out_d) in enumerate(pairwise(dims)):
-            if i >= len(dim_mult) - 1:
-                break  # last up_block goes to post stage
-            if i > 0:
-                in_d = in_d // 2
-
-            up_flag = i != len(dim_mult) - 1
-            upsample_mode: str | None = None
-            if up_flag and temperal_upsample[i]:
-                upsample_mode = "upsample3d"
-            elif up_flag:
-                upsample_mode = "upsample2d"
-
-            block_input = TensorType(
-                dtype, [B, cur_C, cur_T, cur_H, cur_W], device=dev,
-            )
-            with F.lazy():
-                up_mod = WanUpBlock(
-                    in_d, out_d, num_res, upsample_mode,
-                    dtype=dtype, device=dev,
-                )
-                up_mod.to(device_obj)
-            # Remap weights: "up_block.X" → "X" (WanUpBlock direct params)
-            block_weights = {
-                k[len("up_block."):]: v
-                for k, v in up_block_weights[i].items()
-            }
-            up_models.append(CompileWrapper(
-                up_mod, input_types=[block_input], weights=block_weights,
-            ))
-            logger.info(
-                "Compiled up_block_%d (%d weights) input=[%d,%d,%d,%d,%d]",
-                i, len(block_weights), B, cur_C, cur_T, cur_H, cur_W,
-            )
-
-            # Update shape for next stage
-            if upsample_mode == "upsample3d":
-                cur_T *= 2
-                cur_H *= 2
-                cur_W *= 2
-                cur_C = out_d // 2
-            elif upsample_mode == "upsample2d":
-                cur_H *= 2
-                cur_W *= 2
-                cur_C = out_d // 2
-            else:
-                cur_C = out_d
-
-        # --- Final stage: last up_block + norm_out + conv_out + clamp ---
-        last_idx = len(dim_mult) - 1
-        last_in_d = dims[last_idx]
-        if last_idx > 0:
-            last_in_d = last_in_d // 2
-        last_out_d = dims[last_idx + 1]
-
-        post_input = TensorType(
-            dtype, [B, cur_C, cur_T, cur_H, cur_W], device=dev,
-        )
-        with F.lazy():
-            post_mod = _VAEPostStage(
-                last_in_d, last_out_d, num_res, cfg.out_channels, cfg,
-            )
-            post_mod.to(device_obj)
-        # Remap weights: "up_block.X" → "up_block.X", "norm_out.X" → "norm_out.X"
-        post_model = CompileWrapper(
-            post_mod, input_types=[post_input], weights=post_weights,
-        )
         logger.info(
-            "Compiled post stage (%d weights) input=[%d,%d,%d,%d,%d]",
-            len(post_weights), B, cur_C, cur_T, cur_H, cur_W,
+            "Compiling per-frame VAE decoders: T_total=%d",
+            T_total,
         )
 
-        self._block_decoder = _BlockLevelVAEDecoder(
-            pre_model, up_models, post_model,
+        # --- post_quant_conv graph (k=1, all frames) ---
+        t0 = _time.perf_counter()
+        post_quant_input = TensorType(
+            cfg.dtype,
+            [B, C, T_total, H, W],
+            device=cfg.device,
+        )
+        with F.lazy():
+            post_quant_model = _WanVAEPostQuantConv(cfg)
+            post_quant_model.to(device_obj)
+        post_quant_keys = {name for name, _ in post_quant_model.parameters}
+        post_quant_weights = {
+            k: v for k, v in sd.items() if k in post_quant_keys
+        }
+        missing = sorted(post_quant_keys - set(post_quant_weights.keys()))
+        if missing:
+            logger.warning(
+                "post_quant_conv: %d missing weights: %s",
+                len(missing),
+                missing[:10],
+            )
+        post_quant_compiled = CompileWrapper(
+            post_quant_model,
+            input_types=[post_quant_input],
+            weights=post_quant_weights,
+        )
+        t1 = _time.perf_counter()
+        logger.info(
+            "Compiled post_quant_conv in %.1fs, %d weights",
+            t1 - t0,
+            len(post_quant_weights),
+        )
+
+        # --- first-frame decoder (T=1 -> T=1 + cache init) ---
+        first_input = TensorType(cfg.dtype, [B, C, 1, H, W], device=cfg.device)
+        with F.lazy():
+            first_model = _WanVAEDecoderFirstFrameCached(cfg)
+            first_model.to(device_obj)
+        first_model_keys = {name for name, _ in first_model.parameters}
+        first_weights = {k: v for k, v in sd.items() if k in first_model_keys}
+        missing = sorted(first_model_keys - set(first_weights.keys()))
+        if missing:
+            logger.warning(
+                "First-frame decoder: %d missing weights: %s",
+                len(missing),
+                missing[:10],
+            )
+        first_compiled = CompileWrapper(
+            first_model,
+            input_types=[first_input],
+            weights=first_weights,
+        )
+        t2 = _time.perf_counter()
+        logger.info(
+            "Compiled first-frame decoder (cached, spatial-only path) in %.1fs, %d weights",
+            t2 - t1,
+            len(first_weights),
+        )
+
+        # --- rest-frame decoder (T=1 + 32 cache inputs -> T=4 + 32 cache outputs) ---
+        rest_input = TensorType(
+            cfg.dtype,
+            [B, C, 1, H, W],
+            device=cfg.device,
+        )
+        with F.lazy():
+            rest_model = _WanVAEDecoderRestFrameCached(cfg)
+            rest_model.to(device_obj)
+        cache_shapes = rest_model.decoder.cache_shapes(B, H, W)
+        cache_inputs = [
+            TensorType(cfg.dtype, cache_shape, device=cfg.device)
+            for cache_shape in cache_shapes
+        ]
+
+        rest_model_keys = {name for name, _ in rest_model.parameters}
+        rest_weights = {k: v for k, v in sd.items() if k in rest_model_keys}
+        missing = sorted(rest_model_keys - set(rest_weights.keys()))
+        if missing:
+            logger.warning(
+                "Rest-frame decoder: %d missing weights: %s",
+                len(missing),
+                missing[:10],
+            )
+        rest_compiled = CompileWrapper(
+            rest_model,
+            input_types=[rest_input, *cache_inputs],
+            weights=rest_weights,
+        )
+        t3 = _time.perf_counter()
+        logger.info(
+            "Compiled rest-frame decoder (per-frame cached) in %.1fs, %d weights, %d cache inputs",
+            t3 - t2,
+            len(rest_weights),
+            len(cache_inputs),
+        )
+
+        self._per_frame_decoder = _PerFrameDecoder(
+            post_quant_conv=post_quant_compiled,
+            first_decoder=first_compiled,
+            rest_decoder=rest_compiled,
         )
         # Free state dict after compilation.
         del self._decoder_state_dict
 
-    @staticmethod
-    def upsample_temporal_linear(
-        x: np.ndarray,
-        scale_factor_temporal: int,
-    ) -> np.ndarray:
-        """Upsample [B, C, T, H, W] latents along time with linear interpolation."""
-        if scale_factor_temporal <= 1 or x.shape[2] <= 1:
-            return x
-
-        num_frames = x.shape[2]
-        out_frames = (num_frames - 1) * scale_factor_temporal + 1
-        dst_idx = (
-            np.arange(out_frames, dtype=np.float32) / scale_factor_temporal
-        )
-        left = np.floor(dst_idx).astype(np.int64)
-        right = np.minimum(left + 1, num_frames - 1)
-        alpha = (
-            (dst_idx - left).reshape(1, 1, out_frames, 1, 1).astype(np.float32)
-        )
-
-        x_left = x[:, :, left, :, :]
-        x_right = x[:, :, right, :, :]
-        return ((1.0 - alpha) * x_left + alpha * x_right).astype(
-            np.float32, copy=False
-        )
-
-    _TEMPORAL_SCALE: int = 4  # two upsample3d layers → ×4
-    _OVERLAP: int = 1  # latent-frame overlap between chunks
-    _MAX_LATENT_FRAMES: int = 6  # max latent frames per chunk
-
     def decode_5d(self, latents_5d: Tensor) -> Tensor:
-        """Decode 5D latents using block-level compilation with temporal tiling.
+        """Decode 5D latents [B, C, T, H, W] frame-by-frame."""
+        import time as _time
 
-        Each decoder stage (pre, up_blocks, post) is compiled and
-        executed separately.  Window attention in the mid-block keeps
-        memory bounded regardless of spatial resolution.  Temporal
-        tiling keeps conv3d/upsample workspace bounded.
-        """
-        latents_5d = latents_5d.to(self.devices[0]).cast(self.config.dtype)
-        total_t = int(latents_5d.shape[2])
+        shape = tuple(int(s) for s in latents_5d.shape)
         logger.info(
-            "VAE decode input: shape=%s dtype=%s",
-            tuple(int(s) for s in latents_5d.shape),
-            latents_5d.dtype,
+            'VAE decode input: shape=%s dtype=%s', shape, latents_5d.dtype
         )
-
-        chunk_t = min(total_t, self._MAX_LATENT_FRAMES)
-
-        # Compile block-level decoder on first call.
-        if self._block_decoder is None:
-            compile_shape = [int(s) for s in latents_5d.shape]
-            compile_shape[2] = chunk_t
-            logger.info(
-                "Compiling block-level decoder for shape %s",
-                tuple(compile_shape),
-            )
-            self._compile_decoder_block_level(tuple(compile_shape))
-        assert self._block_decoder is not None
-
-        # One-shot decode if input fits in a single chunk.
-        if total_t <= self._MAX_LATENT_FRAMES:
-            return self._block_decoder(latents_5d)
-
-        # --- Temporal tiling ---
-        overlap = min(self._OVERLAP, self._MAX_LATENT_FRAMES - 1)
-        stride = max(1, self._MAX_LATENT_FRAMES - overlap)
-        ts = self._TEMPORAL_SCALE
-        overlap_out = overlap * ts
-
-        chunk_starts: list[int] = []
-        start = 0
-        while start < total_t:
-            chunk_starts.append(start)
-            if start + self._MAX_LATENT_FRAMES >= total_t:
-                break
-            start += stride
-
-        logger.info(
-            "Temporal tiling: %d latent frames, chunk=%d, overlap=%d, "
-            "stride=%d, chunks=%d",
-            total_t, self._MAX_LATENT_FRAMES, overlap, stride,
-            len(chunk_starts),
-        )
-
-        output_chunks: list[Tensor] = []
-        for chunk_idx, start in enumerate(chunk_starts):
-            end = min(start + self._MAX_LATENT_FRAMES, total_t)
-            chunk = latents_5d[:, :, start:end, :, :]
-            actual = end - start
-
-            if actual < self._MAX_LATENT_FRAMES:
-                pad_n = self._MAX_LATENT_FRAMES - actual
-                last = chunk[:, :, -1:, :, :]
-                chunk = F.concat([chunk] + [last] * pad_n, axis=2)
-
-            logger.info("VAE chunk %d/%d (frames %d-%d)", chunk_idx + 1, len(chunk_starts), start, end - 1)
-            decoded = self._block_decoder(chunk)
-
-            if actual < self._MAX_LATENT_FRAMES:
-                decoded = decoded[:, :, : actual * ts, :, :]
-
-            if chunk_idx > 0:
-                decoded = decoded[:, :, overlap_out:, :, :]
-
-            output_chunks.append(decoded)
-
-        return F.concat(output_chunks, axis=2)
+        if self._per_frame_decoder is None:
+            t0 = _time.perf_counter()
+            self._compile_per_frame_decoder(shape)
+            logger.info('VAE compile total: %.1fs', _time.perf_counter() - t0)
+        assert self._per_frame_decoder is not None
+        return self._per_frame_decoder(latents_5d)
 
     def decode_4d(self, latents_4d: Tensor) -> Tensor:
         z5d = F.unsqueeze(latents_4d, axis=2)

@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-import gc
+
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -327,7 +327,7 @@ class WanTransformerModel(ComponentModel):
         # --- Compile pre-processing ---
         pre_input_types = (
             TensorType(dtype, hs_shape, device=dev),
-            TensorType(dtype, ts_shape, device=dev),
+            TensorType(DType.float32, ts_shape, device=dev),  # float32 to avoid bf16 timestep quantization
             TensorType(dtype, enc_shape, device=dev),
         )
         with F.lazy():

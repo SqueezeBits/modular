@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 import numpy as np
 import numpy.typing as npt
 from max._core.driver import Device
-from max.driver import CPU, Accelerator
+from max.driver import CPU, Accelerator, DLPackArray
 from max.engine import InferenceSession, Model
 from max.experimental.tensor import Tensor
 from max.graph import Graph, TensorType
@@ -441,12 +441,15 @@ class CompileWrapper:
         self,
         compile_target: CompileTarget,
         input_types: Iterable[TensorType] | None = None,
+        weights: Mapping[str, DLPackArray] | None = None,
     ) -> None:
         """Initialize the CompileWrapper.
 
         Args:
             compile_target: The function or module to be compiled.
             input_types: A list of input types (TensorTypes) required for compilation.
+            weights: Optional weight mapping passed to Module.compile().
+                Only used when compile_target is a Module.
 
         Raises:
             ValueError: If input_types is not provided.
@@ -466,7 +469,9 @@ class CompileWrapper:
         self._compiled_model: Model | None = None
 
         if isinstance(compile_target, Module):
-            self._compiled_module = compile_target.compile(*input_types_tuple)
+            self._compiled_module = compile_target.compile(
+                *input_types_tuple, weights=weights
+            )
             return
 
         with Graph(

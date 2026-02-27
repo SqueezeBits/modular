@@ -176,7 +176,7 @@ class AutoencoderKLWanConfig(AutoencoderKLWanConfigBase):
         }
         init_dict.update(
             {
-                "dtype": encoding.dtype,
+                "dtype": supported_encoding_dtype(encoding),
                 "device": DeviceRef.from_device(devices[0]),
             }
         )
