@@ -13,7 +13,7 @@
 
 from typing import Any
 
-from max import functional as F
+from max.experimental import functional as F
 from max.driver import Device
 from max.engine import Model
 from max.graph.weights import Weights

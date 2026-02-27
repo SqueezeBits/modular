@@ -19,7 +19,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.nn import Conv3d
+from max.nn.module_v3 import Conv3d
 from max.pipelines.architectures.autoencoders.autoencoder_kl_wan import (
     AutoencoderKLWanModel,
     WanCausalConv3d,
@@ -29,7 +29,7 @@ from max.pipelines.architectures.autoencoders.model_config import (
     AutoencoderKLWanConfigBase,
 )
 from max.pipelines.architectures.wan.pipeline_wan import WanPipeline
-from max.tensor import Tensor
+from max.experimental.tensor import Tensor
 from torch.utils.dlpack import from_dlpack
 
 

@@ -15,13 +15,13 @@ from __future__ import annotations
 
 from math import prod
 
-from max import functional as F
+from max.experimental import functional as F
 from max.dtype import DType
-from max.nn import Conv3d, Linear, Module
-from max.nn.legacy.attention.mask_config import MHAMaskVariant
-from max.nn.legacy.kernels import flash_attention_gpu as _flash_attention_gpu
-from max.nn.sequential import ModuleList
-from max.tensor import Tensor
+from max.nn.module_v3 import Conv3d, Linear, Module
+from max.nn.attention.mask_config import MHAMaskVariant
+from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
+from max.nn.module_v3.sequential import ModuleList
+from max.experimental.tensor import Tensor
 
 from ..flux2.layers.embeddings import (
     TimestepEmbedding,

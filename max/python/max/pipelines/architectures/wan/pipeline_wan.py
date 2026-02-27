@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-from max import functional as F
+from max.experimental import functional as F
 from max.dtype import DType
 from max.graph import TensorType, ops
 from max.graph.weights import load_weights
@@ -35,7 +35,7 @@ from max.pipelines.lib.interfaces import (
     max_compile,
 )
 from max.pipelines.lib.interfaces.component_model import ComponentModel
-from max.tensor import Tensor
+from max.experimental.tensor import Tensor
 from tqdm import tqdm
 
 from ..autoencoders import AutoencoderKLWanModel

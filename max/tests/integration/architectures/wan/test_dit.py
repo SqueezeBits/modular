@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 from max.pipelines.architectures.wan.model_config import WanDiTConfigBase
 from max.pipelines.architectures.wan.pipeline_wan import WanPipeline
-from max.tensor import Tensor
+from max.experimental.tensor import Tensor
 from torch.utils.dlpack import from_dlpack
 
 

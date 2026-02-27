@@ -19,7 +19,7 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-from max import functional as F
+from max.experimental import functional as F
 from max.driver import CPU, Device
 from max.dtype import DType
 from max.graph import TensorType
@@ -28,7 +28,7 @@ from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces import CompileWrapper
 from max.pipelines.lib.interfaces.component_model import ComponentModel
-from max.tensor import Tensor
+from max.experimental.tensor import Tensor
 
 from .model_config import WanConfig
 from .wan_transformer import (

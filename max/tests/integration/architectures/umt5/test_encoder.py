@@ -18,13 +18,13 @@ from collections.abc import Callable
 import max.driver as md
 import pytest
 import torch
-from max import functional as F
+from max.experimental import functional as F
 from max.driver import Accelerator
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.pipelines.architectures.umt5.model_config import UMT5ConfigBase
 from max.pipelines.architectures.umt5.umt5 import UMT5EncoderModel
-from max.tensor import Tensor
+from max.experimental.tensor import Tensor
 from torch.utils.dlpack import from_dlpack
 from transformers import UMT5Config
 from transformers.models.umt5.modeling_umt5 import UMT5EncoderModel as HfUMT5
