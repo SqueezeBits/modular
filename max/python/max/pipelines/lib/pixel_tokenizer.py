@@ -546,13 +546,10 @@ class PixelGenerationTokenizer(
                 f"{input_ids_array.shape} vs {attention_mask_array.shape}."
             )
 
-        # Encoder implementations in MAX diffusion text encoders currently do
-        # not consume an explicit attention mask. For Flux2/Z-Image, strip
-        # padded tokens here and keep a dense all-ones mask over valid tokens.
-        if self._pipeline_class_name in (
-            PipelineClassName.FLUX2,
-            PipelineClassName.ZIMAGE,
-        ):
+        # Flux2 text encoder path currently does not consume an explicit
+        # attention mask. Strip padded tokens here and keep a dense mask.
+        # Z-Image (Qwen3 text encoder) consumes attention_mask directly.
+        if self._pipeline_class_name == PipelineClassName.FLUX2:
             token_row = input_ids_array[0]
             mask_row = attention_mask_array[0]
             real_token_ids = token_row[mask_row]

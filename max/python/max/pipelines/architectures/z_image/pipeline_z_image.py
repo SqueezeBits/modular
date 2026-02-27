@@ -206,6 +206,7 @@ class ZImagePipeline(DiffusionPipeline):
         if tokens.ndim == 2:
             tokens = tokens[0]
         selected_tokens = tokens
+        selected_mask = None
         if mask is not None:
             if mask.ndim == 2:
                 mask = mask[0]
@@ -214,20 +215,23 @@ class ZImagePipeline(DiffusionPipeline):
                     "Z-Image mask length must match token length after tokenizer preprocessing. "
                     f"Got mask={mask.shape[0]}, tokens={tokens.shape[0]}."
                 )
-            if not np.all(mask):
-                raise ValueError(
-                    "Z-Image expects tokenizer-pretrimmed tokens with dense attention mask. "
-                    "Received sparse mask, which indicates an unexpected tokenizer/pipeline mismatch."
-                )
-            selected_tokens = tokens[mask]
+            selected_mask = mask.astype(np.bool_, copy=False)
+        else:
+            selected_mask = np.ones_like(tokens, dtype=np.bool_)
 
         text_input_ids = Tensor.constant(
             selected_tokens,
             dtype=DType.int64,
             device=self.text_encoder.devices[0],
         )
+        attention_mask = Tensor.constant(
+            selected_mask,
+            dtype=DType.bool,
+            device=self.text_encoder.devices[0],
+        )
         hidden_states = self.text_encoder(
             text_input_ids,
+            attention_mask=attention_mask,
             hidden_state_index=-2,
         )
 
