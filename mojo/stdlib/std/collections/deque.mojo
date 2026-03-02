@@ -17,14 +17,14 @@ You can import these APIs from the `collections` package.
 Examples:
 
 ```mojo
-from collections import Deque
+from std.collections import Deque
 ```
 """
 
 
-from bit import next_power_of_two
-from builtin.constrained import _constrained_conforms_to
-import format._utils as fmt
+from std.bit import next_power_of_two
+from std.builtin.constrained import _constrained_conforms_to
+import std.format._utils as fmt
 
 # ===-----------------------------------------------------------------------===#
 # Deque
@@ -35,9 +35,7 @@ struct Deque[ElementType: Copyable & ImplicitlyDestructible](
     Boolable,
     Copyable,
     Iterable,
-    Representable,
     Sized,
-    Stringable,
     Writable,
 ):
     """Implements a double-ended queue.
@@ -159,9 +157,7 @@ struct Deque[ElementType: Copyable & ImplicitlyDestructible](
         """
         self = Self(elements=values^)
 
-    fn __init__(
-        out self, *, var elements: VariadicListMem[Self.ElementType, _]
-    ):
+    fn __init__(out self, *, var elements: VariadicList[Self.ElementType, _]):
         """Constructs a deque from the given values.
 
         Args:
@@ -450,6 +446,7 @@ struct Deque[ElementType: Copyable & ImplicitlyDestructible](
             fmt.TypeNames[Self.ElementType](),
         ).fields[FieldsFn=write_fields]()
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     @no_inline
     fn __str__(self) -> String:
         """Returns a string representation of a `Deque`.
@@ -461,6 +458,7 @@ struct Deque[ElementType: Copyable & ImplicitlyDestructible](
         self.write_to(output)
         return output^
 
+    @deprecated("Representable is deprecated. Use Writable instead.")
     @no_inline
     fn __repr__(self) -> String:
         """Returns a string representation of a `Deque`.

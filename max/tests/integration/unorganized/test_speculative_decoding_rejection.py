@@ -27,9 +27,9 @@ from max.interfaces import (
 )
 from max.pipelines import PIPELINE_REGISTRY, PipelineConfig
 from max.pipelines.core import TextContext
-from max.pipelines.lib.kv_cache_config import KVCacheConfig
-from max.pipelines.lib.model_config import MAXModelConfig
-from max.pipelines.lib.speculative_config import SpeculativeConfig
+from max.pipelines.lib.config.kv_cache_config import KVCacheConfig
+from max.pipelines.lib.config.model_config import MAXModelConfig
+from max.pipelines.lib.config.speculative_config import SpeculativeConfig
 from max.pipelines.lib.speculative_decoding import (
     StandaloneSpeculativeDecodingPipeline,
 )
@@ -54,7 +54,6 @@ def setup_speculative_decoding_pipeline(num_steps: int = 10):  # noqa: ANN201
     """Fixture to set up a speculative decoding pipeline with common configuration."""
     model_name = "hf-internal-testing/tiny-random-LlamaForCausalLM"
     kv_cache_config = KVCacheConfig(
-        cache_strategy="paged",
         kv_cache_page_size=128,
         device_memory_utilization=0.3,
     )

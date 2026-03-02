@@ -21,7 +21,7 @@ from max.graph import DeviceRef
 from max.interfaces import TextGenerationContext
 from max.kv_cache import PagedKVCacheManager
 from max.kv_cache.connectors.local_connector import LocalConnector
-from max.nn.legacy.kv_cache import KVCacheParams
+from max.nn.kv_cache import KVCacheParams
 from test_common.context_utils import create_text_context
 
 
@@ -37,7 +37,6 @@ async def test_kv_cache_multi_gpu() -> None:
             head_dim=128,
             dtype=DType.bfloat16,
             num_layers=32,
-            cache_strategy="paged",
             page_size=128,
             devices=[DeviceRef.GPU(i) for i in range(num_devices)],
         )
@@ -55,7 +54,8 @@ async def test_kv_cache_multi_gpu() -> None:
         list_of_kv_tuples = kv_manager.runtime_inputs([batch])
         for i in range(num_devices):
             kv_tuple = list_of_kv_tuples[i]
-            assert len(kv_tuple) == 5
+            assert len(kv_tuple) == 6
+            assert kv_tuple.mha_decode_dispatch_metadata is not None
 
 
 def create_kv_cache(
@@ -75,7 +75,6 @@ def create_kv_cache(
         n_kv_heads=4,
         head_dim=1,
         num_layers=1,
-        cache_strategy="paged",
         page_size=page_size,
         enable_prefix_caching=enable_prefix_caching,
         enable_kvcache_swapping_to_host=enable_kvcache_swapping_to_host,
@@ -123,7 +122,6 @@ async def test_swapping_to_host_multi_gpu(
         # Evictions should be scheduled on auxiliary stream (via connector)
         connector = replica_manager.connector
         assert isinstance(connector, LocalConnector)
-        assert connector._block_copy_engine.supports_multistream()
 
     def gen_prompt(length: int) -> np.ndarray:
         # returns a binary sequence of length `length`

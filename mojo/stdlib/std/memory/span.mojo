@@ -16,22 +16,23 @@
 You can import these APIs from the `memory` module. For example:
 
 ```mojo
-from memory import Span
+from std.memory import Span
 ```
 """
-from builtin.builtin_slice import ContiguousSlice
-from reflection import call_location
-from bit._mask import splat
-from bit import pop_count
-from memory import pack_bits, uninit_copy_n
-from collections._index_normalization import normalize_index
-from builtin.rebind import downcast
-from sys import align_of
-from sys.info import simd_width_of
+from std.builtin.builtin_slice import ContiguousSlice
+from std.reflection import call_location
+from std.bit._mask import splat
+from std.bit import pop_count
+from std.memory import pack_bits, uninit_copy_n
+from std.collections._index_normalization import normalize_index
+from std.builtin.rebind import downcast
+from std.sys import align_of
+from std.sys.info import simd_width_of
 
-from algorithm import vectorize
-from builtin.device_passable import DevicePassable
-from compile import get_type_name
+from std.algorithm import vectorize
+from std.builtin.device_passable import DevicePassable
+from std.compile import get_type_name
+import std.format._utils as fmt
 
 
 # ===-----------------------------------------------------------------------===#
@@ -127,6 +128,7 @@ struct Span[
     Iterable,
     Sized,
     TrivialRegisterPassable,
+    Writable,
 ):
     """A non-owning view of contiguous data.
 
@@ -374,6 +376,7 @@ struct Span[
                 return True
         return False
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     @no_inline
     fn __str__[U: Representable, //](self: Span[U]) -> String:
         """Returns a string representation of a `Span`.
@@ -405,24 +408,53 @@ struct Span[
         self.write_to(output)
         return output^
 
-    @no_inline
-    fn write_to[U: Representable, //](self: Span[U], mut writer: Some[Writer]):
-        """Write `my_span.__str__()` to a `Writer`.
+    fn _write_self_to[
+        f: fn(Self.T, mut Some[Writer])
+    ](self, mut writer: Some[Writer]):
+        fmt.constrained_conforms_to_writable[Self.T, Parent=Self]()
 
-        Parameters:
-            U: The type of the Span elements. Must have the trait
-                `Representable`.
+        var iterator = self.__iter__()
+
+        @parameter
+        fn iterate(mut w: Some[Writer]) raises StopIteration:
+            f(iterator.__next__(), w)
+
+        fmt.write_sequence_to[ElementFn=iterate](writer)
+        _ = iterator^
+
+    @no_inline
+    fn write_to(self, mut writer: Some[Writer]):
+        """Write this span to a `Writer`.
+
+        Constraints:
+            `T` must conform to `Writable`.
 
         Args:
             writer: The object to write to.
         """
-        writer.write("[")
-        for i in range(len(self)):
-            writer.write(repr(self[i]))
-            if i < len(self) - 1:
-                writer.write(", ")
-        writer.write("]")
+        self._write_self_to[f = fmt.write_to[Self.T]](writer)
 
+    @no_inline
+    fn write_repr_to(self, mut writer: Some[Writer]):
+        """Write this span to a `Writer`.
+
+        Constraints:
+            `T` must conform to `Writable`.
+
+        Args:
+            writer: The object to write to.
+        """
+
+        @parameter
+        fn write_fields(mut w: Some[Writer]):
+            self._write_self_to[f = fmt.write_repr_to[Self.T]](w)
+
+        fmt.FormatStruct(writer, "Span").params(
+            fmt.Named("mut", Self.mut),
+            fmt.TypeNames[Self.T](),
+        ).fields[FieldsFn=write_fields]()
+
+    @deprecated("Representable is deprecated. Use Writable instead.")
     @no_inline
     fn __repr__[U: Representable, //](self: Span[U]) -> String:
         """Returns a string representation of a `Span`.
@@ -447,7 +479,7 @@ struct Span[
             When the compiler supports conditional methods, then a simple
             `repr(my_span)` will be enough.
         """
-        return self.__str__()
+        return String.write(self)
 
     # ===------------------------------------------------------------------===#
     # Methods
@@ -806,13 +838,16 @@ struct Span[
     fn count[
         dtype: DType,
         //,
-        func: fn[w: Int](SIMD[dtype, w]) capturing -> SIMD[DType.bool, w],
-    ](self: Span[Scalar[dtype]]) -> UInt:
+        F: fn[w: Int](v: SIMD[dtype, w]) unified -> SIMD[DType.bool, w],
+    ](self: Span[Scalar[dtype]], func: F) -> UInt:
         """Count the amount of times the function returns `True`.
 
         Parameters:
             dtype: The DType.
-            func: The function to evaluate.
+            F: The function type to evaluate.
+
+        Args:
+            func: The function value to evaluate.
 
         Returns:
             The amount of times the function returns `True`.
@@ -823,8 +858,10 @@ struct Span[
         var length = len(self)
         var count = 0
 
-        fn do_count[width: Int](idx: Int) unified {mut count, read ptr}:
-            var mask = func(ptr.load[width=width](idx))
+        fn do_count[
+            width: Int
+        ](idx: Int) unified {mut count, read ptr, read func}:
+            var mask = func[width](ptr.load[width=width](idx))
             count += mask.reduce_bit_count()
 
         vectorize[simdwidth](length, do_count)

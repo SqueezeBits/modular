@@ -12,16 +12,16 @@
 # ===----------------------------------------------------------------------=== #
 """This module includes utilities for working with the SM100 MMA instructions."""
 
-from os import abort
-from sys import size_of
-from sys._assembly import inlined_assembly
-from sys.info import _has_blackwell_tcgen05
+from std.os import abort
+from std.sys import size_of
+from std.sys._assembly import inlined_assembly
+from std.sys.info import _has_blackwell_tcgen05
 
-from gpu.host.nvidia.tma import TensorMapSwizzle
-from gpu.compute.mma_operand_descriptor import MMAOperandDescriptor
+from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from std.gpu.compute.mma_operand_descriptor import MMAOperandDescriptor
 
-from utils.index import IndexList
-from hashlib.hasher import Hasher
+from std.utils.index import IndexList
+from std.hashlib.hasher import Hasher
 
 # ===----------------------------------------------------------------------=== #
 # MMA Instruction Descriptor
@@ -29,9 +29,7 @@ from hashlib.hasher import Hasher
 
 
 @fieldwise_init("implicit")
-struct UMMAKind(
-    Equatable, Hashable, Stringable, TrivialRegisterPassable, Writable
-):
+struct UMMAKind(Equatable, Hashable, TrivialRegisterPassable, Writable):
     """Struct for UMMA instruction types.
 
     This struct defines the different types of UMMA instructions that is supported by BlackWell.
@@ -93,6 +91,7 @@ struct UMMAKind(
         """
         return self._value != other._value
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     @no_inline
     fn __str__(self) -> String:
         """Convert UMMA kind to a string, this can be used as the instruction qualifier.
@@ -243,8 +242,6 @@ fn _get_f16_mma_shape[
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
 
-            abort("MMA shape not supported.")
-
     else:
         _constrained_mma_m[
             mma_m,
@@ -275,8 +272,6 @@ fn _get_f16_mma_shape[
             return IndexList[3, element_type = DType.uint32](mma_m, mma_n, 16)
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
-
-            abort("MMA shape not supported.")
 
 
 @always_inline
@@ -324,8 +319,6 @@ fn _get_tf32_mma_shape[
             return IndexList[3, element_type = DType.uint32](mma_m, mma_n, 8)
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
-
-            abort("MMA shape not supported.")
     else:
         _constrained_mma_m[
             mma_m,
@@ -356,8 +349,6 @@ fn _get_tf32_mma_shape[
             return IndexList[3, element_type = DType.uint32](mma_m, mma_n, 8)
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
-
-            abort("MMA shape not supported.")
 
 
 @always_inline
@@ -407,8 +398,6 @@ fn _get_f8f6f4_mma_shape[
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
 
-            abort("MMA shape not supported.")
-
     else:
         _constrained_mma_m[
             mma_m,
@@ -439,8 +428,6 @@ fn _get_f8f6f4_mma_shape[
             return IndexList[3, element_type = DType.uint32](mma_m, mma_n, 32)
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
-
-            return IndexList[3, element_type = DType.uint32](0, 0, 0)
 
 
 @always_inline
@@ -480,8 +467,6 @@ fn _get_mxf8f6f4_mma_shape[
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
 
-            abort("MMA shape not supported.")
-
     else:
         _constrained_mma_m[
             mma_m,
@@ -512,8 +497,6 @@ fn _get_mxf8f6f4_mma_shape[
             return IndexList[3, element_type = DType.uint32](mma_m, mma_n, 32)
         else:
             comptime assert False, String("Invalid MMA shape: ", mma_m, mma_n)
-
-            return IndexList[3, element_type = DType.uint32](0, 0, 0)
 
 
 struct UMMAInsDescriptor[
@@ -889,7 +872,6 @@ struct UMMAInsDescriptor[
             comptime assert False, String(
                 "Unsupported UMMA kind: ", Self.mma_kind
             )
-            return Self(0x0)
 
     @staticmethod
     fn create[
@@ -955,7 +937,6 @@ struct UMMAInsDescriptor[
             comptime assert False, String(
                 "Unsupported UMMA kind: ", Self.mma_kind
             )
-            return Self(0x0)
 
     @staticmethod
     fn update_desc_with_sf_id[
@@ -1083,7 +1064,6 @@ struct MMASmemDescriptor(MMAOperandDescriptor, TrivialRegisterPassable):
                 comptime assert False, String(
                     "Unsupported swizzle mode: ", mode
                 )
-                return 0
 
         comptime swizzle = _convert_swizzle_enum[swizzle_mode._value]()
 
@@ -1244,7 +1224,6 @@ struct MMASmemDescriptorPair(TrivialRegisterPassable):
                 comptime assert False, String(
                     "Unsupported swizzle mode: ", mode
                 )
-                return 0
 
         comptime swizzle = _convert_swizzle_enum[swizzle_mode._value]()
 

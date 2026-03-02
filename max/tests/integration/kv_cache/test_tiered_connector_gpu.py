@@ -24,7 +24,7 @@ from max.driver import Accelerator, Buffer, accelerator_count
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.kv_cache.connectors.tiered_connector import TieredConnector
-from max.nn.legacy.kv_cache import KVCacheParams
+from max.nn.kv_cache import KVCacheBuffer, KVCacheParams
 from test_common.context_utils import create_text_context
 
 
@@ -51,7 +51,6 @@ def create_tiered_connector(
         num_layers=num_layers,
         n_kv_heads=n_kv_heads,
         head_dim=head_dim,
-        cache_strategy="paged",
         enable_prefix_caching=True,
         enable_kvcache_swapping_to_host=True,
         host_kvcache_swap_space_gb=999,
@@ -59,7 +58,7 @@ def create_tiered_connector(
         devices=[DeviceRef.GPU()],
     )
 
-    device_tensors = [
+    device_buffers = [
         Buffer(
             shape=[num_device_blocks, *kv_params.shape_per_block],
             dtype=kv_params.dtype,
@@ -70,8 +69,9 @@ def create_tiered_connector(
     return TieredConnector(
         params=kv_params,
         devices=[device],
-        device_tensors=device_tensors,
-        device_scale_tensors=None,
+        device_buffer=KVCacheBuffer(
+            total_num_pages=num_device_blocks, values=device_buffers
+        ),
         total_num_host_blocks=num_host_blocks,
         disk_cache_dir=disk_cache_dir,
         max_disk_size_gb=max_disk_size_gb,
@@ -89,8 +89,8 @@ def test_connector_name() -> None:
 
 def test_host_tensors_are_pinned() -> None:
     connector = create_tiered_connector()
-    assert connector._host_tensors
-    for tensor in connector._host_tensors:
+    assert connector._host_buffer
+    for tensor in connector._host_buffer.all_buffers:
         assert tensor.pinned, "Host tensors should be pinned memory"
     connector.shutdown()
 

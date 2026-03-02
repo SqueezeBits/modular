@@ -32,14 +32,14 @@ print(d)  # prints 2
 ```
 """
 
-from os import abort
+from std.os import abort
 
-from utils import Variant
+from std.utils import Variant
 
-from builtin.constrained import _constrained_conforms_to
-from builtin.device_passable import DevicePassable
-from compile import get_type_name
-from format._utils import FormatStruct, TypeNames, write_to, write_repr_to
+from std.builtin.constrained import _constrained_conforms_to
+from std.builtin.device_passable import DevicePassable
+from std.compile import get_type_name
+from std.format._utils import FormatStruct, TypeNames, write_to, write_repr_to
 
 
 # TODO(27780): NoneType can't currently conform to traits
@@ -88,8 +88,6 @@ struct Optional[T: Movable](
     ImplicitlyCopyable,
     Iterable,
     Iterator,
-    Representable,
-    Stringable,
     Writable,
 ):
     """A type modeling a value which may or may not be present.
@@ -416,39 +414,26 @@ struct Optional[T: Movable](
             raise EmptyOptionalError[Self.T]()
         return self.unsafe_value()
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     fn __str__(self: Self) -> String:
         """Return the string representation of the value of the `Optional`.
 
         Returns:
             A string representation of the `Optional`.
         """
-        _constrained_conforms_to[
-            conforms_to(Self.T, Stringable),
-            Parent=Self,
-            Element = Self.T,
-            ParentConformsTo="Stringable",
-        ]()
+        var output = String()
+        self.write_to(output)
+        return output^
 
-        if self:
-            return trait_downcast[Stringable](self.value()).__str__()
-        else:
-            return "None"
-
+    @deprecated("Representable is deprecated. Use Writable instead.")
     fn __repr__(self: Self) -> String:
         """Returns the verbose string representation of the `Optional`.
 
         Returns:
             A verbose string representation of the `Optional`.
         """
-        _constrained_conforms_to[
-            conforms_to(Self.T, Representable),
-            Parent=Self,
-            Element = Self.T,
-            ParentConformsTo="Representable",
-        ]()
-
         var output = String()
-        output.write("Optional(", self, ")")
+        self.write_repr_to(output)
         return output^
 
     @always_inline("nodebug")
@@ -747,7 +732,7 @@ struct OptionalReg[T: __TypeOfAllTypes](
         Returns:
             A string representation of the type, e.g. `OptionalReg[Int]`.
         """
-        return String("OptionalReg[", get_type_name[Self.T](), "]")
+        return t"OptionalReg[{get_type_name[Self.T]()}]"
 
     # ===-------------------------------------------------------------------===#
     # Life cycle methods

@@ -45,16 +45,16 @@ Supported Matrix Shapes:
 - AMD: 16x16x4, 16x16x16, 32x32x8
 """
 
-from math import align_down
-from collections import OptionalReg
-from sys import (
+from std.math import align_down
+from std.collections import OptionalReg
+from std.sys import (
     has_nvidia_gpu_accelerator,
     is_nvidia_gpu,
     simd_width_of,
     size_of,
 )
 
-from sys.info import (
+from std.sys.info import (
     _is_amd_rdna,
     _is_amd_rdna2,
     _is_amd_rdna2_or_earlier,
@@ -64,9 +64,14 @@ from sys.info import (
 )
 
 
-from gpu import WARP_SIZE, lane_id, thread_idx
-from gpu.intrinsics import lop, ds_read_tr16_b64
-from gpu.compute.mma import get_amd_bf8_dtype, get_amd_fp8_dtype, ld_matrix, mma
+from std.gpu import WARP_SIZE, lane_id, thread_idx
+from std.gpu.intrinsics import lop, ds_read_tr16_b64
+from std.gpu.compute.mma import (
+    get_amd_bf8_dtype,
+    get_amd_fp8_dtype,
+    ld_matrix,
+    mma,
+)
 from layout._utils import load_to_simd, idx2crd
 from layout.int_tuple import product
 from layout.layout import Layout
@@ -77,11 +82,11 @@ from layout.swizzle import (
     eval_composed,
     make_ldmatrix_swizzle,
 )
-from memory.unsafe import bitcast
+from std.memory.unsafe import bitcast
 from std.builtin.simd import _has_native_f8_support
 
-from utils import IndexList
-from utils.index import Index
+from std.utils import IndexList
+from std.utils.index import Index
 
 
 fn num_matrix_reg[dim_1: Int, dim_2: Int]() -> Int:
@@ -286,7 +291,6 @@ struct TensorCore[
             return [shape_8x8x4, shape_16x8x4, shape_16x8x8, shape_16x8x16]
         else:
             comptime assert False, "No valid shape of mma"
-            return [shape_null]
 
     # need always_inline, otherwise the stack allocated LayoutTensor will not be valid
 
@@ -1411,7 +1415,6 @@ fn get_mma_shape[
             return shape_16x8x32
         else:
             comptime assert False, "Unsupported mma shape."
-            return shape_null
     else:
         comptime if _is_amd_rdna():
             comptime if _is_amd_rdna2_or_earlier():
@@ -1419,14 +1422,12 @@ fn get_mma_shape[
                     "RDNA1/RDNA2 tensor core support requires fallback"
                     " paths (not yet implemented)"
                 )
-                return shape_null
 
             comptime if accum_type == DType.float32 and input_type == DType.float32:
                 comptime assert False, (
                     "RDNA WMMA does not support FP32 inputs (only FP16/BF16"
                     " -> FP32)"
                 )
-                return shape_null
             elif accum_type == DType.float32 and input_type.is_half_float():
                 return shape_16x16x16
             elif (
@@ -1443,7 +1444,6 @@ fn get_mma_shape[
                 return shape_16x16x16
             else:
                 comptime assert False, "Unsupported RDNA mma shape."
-                return shape_null
         else:
             comptime if accum_type == DType.float32 and input_type == DType.float32:
                 return shape_16x16x4
@@ -1453,7 +1453,6 @@ fn get_mma_shape[
                 return shape_16x16x32
             else:
                 comptime assert False, "Unsupported CDNA mma shape."
-                return shape_null
 
 
 @always_inline

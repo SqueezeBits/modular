@@ -20,8 +20,8 @@ from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Dim, Graph, TensorType, TensorValue, ops
 from max.kv_cache import PagedKVCacheManager
-from max.nn.legacy.kernels import rms_norm_key_cache
-from max.nn.legacy.kv_cache import (
+from max.nn.kernels import rms_norm_key_cache
+from max.nn.kv_cache import (
     KVCacheParams,
     PagedCacheValues,
     RaggedKVCacheInputs,
@@ -93,7 +93,6 @@ def test_rms_norm_key_cache(session: InferenceSession, dtype: DType) -> None:
         n_kv_heads=8,
         head_dim=128,
         num_layers=1,
-        cache_strategy="paged",
         page_size=128,
         devices=[DeviceRef.CPU()],
     )
@@ -170,7 +169,6 @@ def test_partial_rms_norm_key_cache(
         n_kv_heads=1,
         head_dim=576,
         num_layers=1,
-        cache_strategy="paged",
         page_size=128,
         devices=[DeviceRef.CPU()],
     )
@@ -261,7 +259,6 @@ def test_rms_norm_new_key_cache(
         n_kv_heads=8,
         head_dim=128,
         num_layers=1,
-        cache_strategy="paged",
         page_size=128,
         devices=[DeviceRef.CPU()],
     )
@@ -362,7 +359,6 @@ def test_rms_norm_key_cache_dtype_mismatch(
         n_kv_heads=8,
         head_dim=128,
         num_layers=1,
-        cache_strategy="paged",
         page_size=128,
         devices=[DeviceRef.CPU()],
     )
@@ -404,7 +400,6 @@ def test_rms_norm_key_cache_per_token_norm(session: InferenceSession) -> None:
         n_kv_heads=n_kv_heads,
         head_dim=head_dim,
         num_layers=1,
-        cache_strategy="paged",
         page_size=128,
         devices=[DeviceRef.CPU()],
     )

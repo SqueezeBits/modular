@@ -11,11 +11,17 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import InlineArray
-from sys import env_get_bool, env_get_dtype, env_get_int, size_of, simd_width_of
-from utils.numerics import get_accum_type
+from std.collections import InlineArray
+from std.sys import (
+    env_get_bool,
+    env_get_dtype,
+    env_get_int,
+    size_of,
+    simd_width_of,
+)
+from std.utils.numerics import get_accum_type
 
-from benchmark import (
+from std.benchmark import (
     Bench,
     Bencher,
     BenchId,
@@ -24,17 +30,17 @@ from benchmark import (
 )
 from buffer import NDBuffer
 from buffer.dimlist import DimList
-from comm.sync import can_enable_p2p
+from comm.sync import enable_p2p
 from comm.allreduce import allreduce
 from comm import MAX_GPUS, Signal
 import comm.vendor.ccl as vendor_ccl
-from gpu.host import (
+from std.gpu.host import (
     DeviceBuffer,
     DeviceContext,
     DeviceMulticastBuffer,
     get_gpu_target,
 )
-from gpu.primitives.grid_controls import PDLLevel
+from std.gpu.primitives.grid_controls import PDLLevel
 from internal_utils import (
     CacheBustingBuffer,
     InitializationType,
@@ -43,9 +49,9 @@ from internal_utils import (
     human_readable_size,
 )
 
-from testing import assert_almost_equal, assert_true
+from std.testing import assert_almost_equal, assert_true
 
-from utils.index import IndexList, StaticTuple
+from std.utils.index import IndexList, StaticTuple
 
 
 @always_inline
@@ -78,7 +84,7 @@ fn bench_reduce[
 
     var name = String(
         _get_test_str[dtype, use_multimem, use_vendor_ccl, cache_busting](
-            ngpus, num_bytes, ragged
+            ngpus, num_bytes, max_num_blocks.or_else(0), ragged
         )
     )
 
@@ -175,7 +181,7 @@ fn bench_reduce[
         # All GPUs use the same multicast pointer
         in_bufs[0] = NDBuffer[dtype, rank](
             multicast_buf.multicast_buffer_for(list_of_ctx[0]).unsafe_ptr(),
-            DimList(length),
+            IndexList[rank](length),
         )
         multi_ptr = multicast_buf.multicast_buffer_for(
             list_of_ctx[0]
@@ -183,12 +189,12 @@ fn bench_reduce[
     else:
         comptime for i in range(ngpus):
             in_bufs[i] = NDBuffer[dtype, rank](
-                cb_inputs[i].unsafe_ptr(), DimList(length)
+                cb_inputs[i].unsafe_ptr(), IndexList[rank](length)
             )
 
     for i in range(ngpus):
         out_bufs[i] = NDBuffer[dtype, rank](
-            out_bufs_list[i].unsafe_ptr(), DimList(length)
+            out_bufs_list[i].unsafe_ptr(), IndexList[rank](length)
         )
         # Ensure setup has propagated.
         list_of_ctx[i].synchronize()
@@ -205,7 +211,7 @@ fn bench_reduce[
 
     comptime for i in range(ngpus):
         out_bufs_capture[i] = NDBuffer[dtype, rank](
-            out_bufs_list[i].unsafe_ptr(), DimList(length)
+            out_bufs_list[i].unsafe_ptr(), IndexList[rank](length)
         )
 
     # Pre-initialize vendor CCL communicators from the main thread.
@@ -226,12 +232,12 @@ fn bench_reduce[
                 comptime for i in range(ngpus):
                     in_bufs[i] = NDBuffer[dtype, rank](
                         cb_inputs[i].offset_ptr(cache_iter),
-                        DimList(length),
+                        IndexList[rank](length),
                     )
             else:
                 in_bufs[0] = NDBuffer[dtype, rank](
                     multi_ptr + cb_template.offset(cache_iter),
-                    DimList(length),
+                    IndexList[rank](length),
                 )
             # Run allreduce
             comptime allreduce_kernel = vendor_ccl.allreduce if use_vendor_ccl else allreduce
@@ -311,8 +317,11 @@ fn bench_reduce[
 
 
 fn _get_test_str[
-    dtype: DType, use_multimem: Bool, use_vendorccl: Bool, cache_busting: Bool
-](ngpus: Int, num_bytes: Int, ragged: Bool) -> String:
+    dtype: DType,
+    use_multimem: Bool,
+    use_vendorccl: Bool,
+    cache_busting: Bool,
+](ngpus: Int, num_bytes: Int, max_num_blocks: Int, ragged: Bool) -> String:
     var multimem_tag = "-multimem" if use_multimem else ""
     var vendorccl_tag = "-vendorccl" if use_vendorccl else ""
     var cache_tag = "-cachebust" if cache_busting else ""
@@ -322,6 +331,8 @@ fn _get_test_str[
         dtype,
         "-",
         ngpus,
+        "-max_num_blocks-",
+        max_num_blocks,
         multimem_tag,
         vendorccl_tag,
         cache_tag,
@@ -331,7 +342,7 @@ fn _get_test_str[
     )
 
 
-def main():
+def main() raises:
     var num_bytes = arg_parse("num_bytes", 16 * 1024)
 
     comptime dtype = env_get_dtype["dtype", DType.bfloat16]()
@@ -367,7 +378,7 @@ def main():
     for i in range(num_gpus):
         ctx.append(DeviceContext(device_id=i))
 
-    if not can_enable_p2p():
+    if not enable_p2p():
         # Don't benchmark the naive allreduce.
         print("P2P not enabled, skipping benchmark.")
         return

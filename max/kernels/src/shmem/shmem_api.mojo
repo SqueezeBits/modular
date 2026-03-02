@@ -19,9 +19,9 @@ http://openshmem.org/site/sites/default/site_files/OpenSHMEM-1.6.pdf
 The headings below corrosspond to section 9: OpenSHMEM Library API.
 """
 
-from collections.optional import OptionalReg
-from os import getenv, setenv
-from sys import (
+from std.collections.optional import OptionalReg
+from std.os import getenv, setenv
+from std.sys import (
     CompilationTarget,
     argv,
     has_nvidia_gpu_accelerator,
@@ -30,9 +30,9 @@ from sys import (
     is_nvidia_gpu,
     size_of,
 )
-from ffi import c_int, c_size_t, external_call
+from std.ffi import c_int, c_size_t, external_call
 
-from gpu.host import (
+from std.gpu.host import (
     ConstantMemoryMapping,
     DeviceAttribute,
     DeviceContext,
@@ -42,15 +42,18 @@ from gpu.host import (
     FuncAttribute,
     LaunchAttribute,
 )
-from gpu.host._nvidia_cuda import CUDA, CUDA_MODULE
-from gpu.host._amdgpu_hip import HIP, HIP_MODULE
-from gpu.host.device_context import (
+from std.gpu.host._nvidia_cuda import CUDA, CUDA_MODULE
+from std.gpu.host._amdgpu_hip import HIP, HIP_MODULE
+from std.gpu.host.device_context import (
     _ConstCharPtr,
     _checked,
     _DeviceContextPtr,
     _DumpPath,
 )
-from gpu.host.launch_attribute import LaunchAttributeID, LaunchAttributeValue
+from std.gpu.host.launch_attribute import (
+    LaunchAttributeID,
+    LaunchAttributeValue,
+)
 
 from ._mpi import (
     MPI_Comm_rank,
@@ -80,8 +83,8 @@ from ._rocshmem import (
     rocshmem_signal_wait_until,
     rocshmemx_hipmodule_init,
     rocshmemx_signal_op,
-    rocshmem_init_thread,
-    ROCSHMEMUniqueID,
+    rocshmem_init_thread_tcp,
+    rocshmem_create_uniqueid,
 )
 from ._nvshmem import (
     NVSHMEM_CMP_EQ,
@@ -173,6 +176,25 @@ comptime SHMEM_CMP_SENTINEL: c_int = NVSHMEM_CMP_SENTINEL
 comptime SHMEM_SIGNAL_SET: c_int = NVSHMEM_SIGNAL_SET
 comptime SHMEM_SIGNAL_ADD: c_int = NVSHMEM_SIGNAL_ADD
 
+
+# ===----------------------------------------------------------------------=== #
+# Shared Structs
+# ===----------------------------------------------------------------------=== #
+
+
+struct SHMEMUniqueID(ImplicitlyCopyable):
+    """Unique ID that must be identical across all threads and nodes to establish
+    communication."""
+
+    var data: InlineArray[Byte, 128]
+
+    fn __init__(out self):
+        self.data = InlineArray[Byte, 128](fill=0)
+
+    fn __copyinit__(out self, copy: Self):
+        self.data = copy.data.copy()
+
+
 # ===----------------------------------------------------------------------=== #
 # 1: Library Setup, Exit, and Query Routines
 # ===----------------------------------------------------------------------=== #
@@ -208,7 +230,7 @@ fn shmem_init() raises:
         ]()
 
 
-fn shmem_init_thread(ctx: DeviceContext, gpus_per_node: Int = -1) raises:
+fn shmem_init_thread_mpi(ctx: DeviceContext, gpus_per_node: Int = -1) raises:
     """Modular-specific init that enables initializing SHMEM on one GPU per
     thread.
 
@@ -230,40 +252,112 @@ fn shmem_init_thread(ctx: DeviceContext, gpus_per_node: Int = -1) raises:
         ]()
 
 
-fn shmem_init_thread(
+fn shmem_create_uniqueid(
+    server_ip: String, server_port: c_int
+) raises -> SHMEMUniqueID:
+    """Create a unique ID for rocSHMEM TCP bootstrap.
+
+    Generates a `SHMEMUniqueID` that must be identical across all participating
+    PEs to establish communication. If using the same Server IP and Port, it will
+    be identical.
+
+    Arguments:
+        server_ip: the TCP bootstrap server that participating nodes connect to.
+        server_port: the TCP bootstrap server port that participating nodes communicate over.
+
+    Returns:
+        A `SHMEMUniqueID` to be passed to `shmem_init_thread_tcp`.
+    """
+
+    comptime if has_amd_gpu_accelerator():
+        return rocshmem_create_uniqueid(server_ip, server_port)
+    else:
+        return CompilationTarget.unsupported_target_error[
+            SHMEMUniqueID,
+            operation = __get_current_function_name(),
+        ]()
+
+
+fn shmem_init_thread_tcp(
     ctx: DeviceContext,
-    uid: UnsafePointer[ROCSHMEMUniqueID, MutAnyOrigin],
-    node_id: Int = -1,
-    total_nodes: Int = -1,
-    gpus_per_node: Int = -1,
+    var node_id: Int = -1,
+    var total_nodes: Int = -1,
+    var gpus_per_node: Int = -1,
+    var server_ip: String = "-1",
+    var server_port: Int = -1,
 ) raises:
     """Modular-specific init that enables initializing SHMEM on one GPU per
     thread using TCP bootstrapping, without mpirun or other launchers. The
     bootstrap will wait until `total_nodes * gpus_per_node` have completed
     the exchange of information before moving on from this function call.
 
-    By default it will run in single node mode with all attached GPUS.
-    If the default arguments are not overridden, you can override with
-    environment variables:
+    By default it will run in single node mode with all attached GPUS,
+    which you can change with environment variables:
+
         export SHMEM_NODE_ID=0              # 0-3 on 4 separate nodes
         export SHMEM_TOTAL_NODES=4          # 4 nodes participating
         export SHMEM_GPUS_PER_NODE=8        # 8 GPUs per node participating
         export SHMEM_SERVER_IP=10.24.8.107  # IP of the network interface e.g. `ip addr show eno0`
-        export SHMEM_SERVER_PORT            # Port for TCP bootstrapping
+        export SHMEM_SERVER_PORT=44434      # Port for TCP bootstrapping
+
+    If using environment variables, simply pass the device context with the
+    given device id for the thread:
+
+    ```mojo
+    var ctx = DeviceContext(device_id=device_id)
+    shmem_init_thread_tcp(ctx)
+    ```
+
+    You can also explicitly pass arguments, for example if you have a CLI for your
+    shmem application:
+
+    ```mojo
+
+    var ctx = DeviceContext(device_id=device_id)
+    shmem_init_thread_tcp(
+        ctx,
+        node_id=0,
+        total_nodes=2,
+        server_ip="10.24.8.107",
+        server_port=44434
+    )
+    ```
 
     Arguments:
         ctx: the `DeviceContext` to associate with this thread.
-        uid: encodes the server IP, and port, and validation data for TCP bootstrapping,
         node_id: a number from 0..N where N is the amount of `total_nodes - 1`.
         gpus_per_node: the number of GPUs participating on this node.
         total_nodes: the amount of nodes participating.
+        server_ip: the TCP bootstrap server that participating nodes connect to.
+        server_port: the TCP bootstrap server port that participating nodes communicate over.
 
     Raises:
         If SHMEM initialization fails on any thread.
     """
+    # Check env vars if the defaults are not overridden
+    if node_id == -1:
+        node_id = atol(getenv("SHMEM_NODE_ID", "0"))
+    if total_nodes == -1:
+        total_nodes = atol(getenv("SHMEM_TOTAL_NODES", "1"))
+    if gpus_per_node == -1:
+        gpus_per_node = atol(getenv("SHMEM_GPUS_PER_NODE", "-1"))
+        # If not defined by argument or env var, use the number of attached GPUs
+        if gpus_per_node == -1:
+            gpus_per_node = DeviceContext.number_of_devices()
+    if server_ip == "-1":
+        server_ip = getenv("SHMEM_SERVER_IP", "0.0.0.0")
+    if server_port == -1:
+        server_port = atol(getenv("SHMEM_SERVER_PORT", "44434"))
 
     comptime if has_amd_gpu_accelerator():
-        rocshmem_init_thread(ctx, uid, node_id, total_nodes, gpus_per_node)
+        var uid = shmem_create_uniqueid(server_ip, c_int(server_port))
+        rocshmem_init_thread_tcp(
+            ctx,
+            UnsafePointer(to=uid),
+            node_id=node_id,
+            total_nodes=total_nodes,
+            gpus_per_node=gpus_per_node,
+        )
     else:
         CompilationTarget.unsupported_target_error[
             operation = __get_current_function_name()

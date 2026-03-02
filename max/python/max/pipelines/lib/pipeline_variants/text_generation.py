@@ -50,8 +50,8 @@ from max.interfaces import (
     TextGenerationRequest,
 )
 from max.kv_cache import PagedKVCacheManager, load_kv_manager
-from max.nn.legacy import ReturnLogits
-from max.nn.legacy.kv_cache import KVCacheInputsSequence
+from max.nn import ReturnLogits
+from max.nn.kv_cache import KVCacheInputsSequence, KVCacheParams
 from max.profiler import Tracer, traced
 from max.support.algorithm import flatten2d
 from transformers import PreTrainedTokenizerFast
@@ -210,8 +210,10 @@ class TextGenerationPipeline(
             else ReturnLogits.LAST_TOKEN,
         )
 
+        kv_params = self._pipeline_model.kv_params
+        assert isinstance(kv_params, KVCacheParams)
         self._kv_manager: PagedKVCacheManager = load_kv_manager(
-            params=self._pipeline_model.kv_params,
+            params=kv_params,
             max_batch_size=pipeline_config.max_batch_size,
             max_seq_len=self._pipeline_model.max_seq_len,
             session=session,
@@ -624,7 +626,7 @@ class TextGenerationPipeline(
             # Allocate a pinned tensor on the host for faster async d2h transfer
             # speeds. If the model is on host, then fall back to normal pageable
             # memory.
-            # Note that we do not want to `disable_auto_sync()` here.
+            # Note that we do not want to use `DevicePinnedBuffer` here.
             generated_tokens_host = Buffer(
                 shape=generated_tokens_device.shape,
                 dtype=generated_tokens_device.dtype,
@@ -656,11 +658,14 @@ class TextGenerationPipeline(
     def release(self, request_id: RequestID) -> None:
         """Mark the context as complete, releasing the cache slot from the KV manager.
 
-        Note: KV cache lifecycle is now managed by the scheduler. This method
-        is kept for interface compatibility but is a no-op for regular pipelines.
+        Note: Primary KV cache lifecycle is managed by the scheduler. This method
+        handles extra KV caches managed by the pipeline model (e.g., indexer cache
+        for DeepSeekV3.2).
         """
-        # KV cache release is handled by the scheduler via batch_constructor
-        pass
+        # Primary KV cache release is handled by the scheduler via batch_constructor.
+        # Pipeline model may have extra KV caches to release.
+        if hasattr(self._pipeline_model, "release"):
+            self._pipeline_model.release(request_id)
 
     @property
     def kv_manager(self) -> PagedKVCacheManager:
