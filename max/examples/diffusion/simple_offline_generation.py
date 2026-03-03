@@ -175,7 +175,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rdt",
         type=float,
         default=None,
-        help="Relative-difference threshold for step cache (Flux1 default: 0.05, Flux2 default: 0.08).",
+        help="Relative-difference threshold for step cache.",
     )
 
     args = parser.parse_args(argv)

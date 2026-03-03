@@ -43,9 +43,20 @@ def get_can_use_cache(
     ):
         return F.constant(False, DType.bool, device=dev)
 
-    diff = F.abs(prev_intermediate_residual - intermediate_residual)
-    mean_diff = F.mean(diff, axis=None)
-    mean_prev = F.mean(F.abs(prev_intermediate_residual), axis=None)
+    reduced_last_dim_shape = [*intermediate_residual.shape[:-1], 1]
+    reduced_last_dim_type = TensorType(
+        intermediate_residual.dtype,
+        shape=reduced_last_dim_shape,
+        device=dev,
+    )
+    mean_diff_rows, mean_prev_rows = F.custom(
+        "mo.step_cache.mean_abs_pair_lastdim",
+        device=dev,
+        values=[intermediate_residual, prev_intermediate_residual],
+        out_types=[reduced_last_dim_type, reduced_last_dim_type],
+    )
+    mean_diff = F.mean(mean_diff_rows, axis=None)
+    mean_prev = F.mean(mean_prev_rows, axis=None)
     eps = 1e-9
     relative_diff = mean_diff / (mean_prev + eps)
     pred = relative_diff < F.cast(rdt, relative_diff.dtype)
