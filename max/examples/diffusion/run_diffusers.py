@@ -74,18 +74,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output filename for the generated image.",
     )
     parser.add_argument(
-        "--max-length",
-        type=int,
-        default=512,
-        help="Maximum length of tokenizer",
-    )
-    parser.add_argument(
-        "--secondary-max-length",
-        type=int,
-        default=None,
-        help="Maximum length of secondary tokenizer",
-    )
-    parser.add_argument(
         "--input-image",
         type=str,
         default=None,
@@ -143,7 +131,6 @@ def _build_call_kwargs(
         "height": args.height,
         "width": args.width,
         "guidance_scale": args.guidance_scale,
-        "max_sequence_length": args.max_length,
         "output_type": "pil",
     }
 
