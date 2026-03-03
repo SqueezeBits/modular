@@ -75,6 +75,7 @@ class ZImagePipeline(DiffusionPipeline):
 
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
+        self._cached_img_ids: dict[str, Tensor] = {}
 
     def prepare_inputs(self, context: PixelContext) -> ZImageModelInputs:  # type: ignore[override]
         return ZImageModelInputs.from_context(context)
@@ -479,11 +480,22 @@ class ZImagePipeline(DiffusionPipeline):
         text_seq_len_padded = text_seq_len + (-text_seq_len % 32)
 
         device = self.transformer.devices[0]
-        img_ids_np = model_inputs.latent_image_ids.astype(np.int64, copy=True)
-        if img_ids_np.ndim == 3:
-            img_ids_np = img_ids_np[0]
-        img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
-        img_ids = Tensor.from_dlpack(img_ids_np).to(device)
+        image_seq_len = int(model_inputs.latent_image_ids.shape[-2])
+        img_ids_key = (
+            f"{text_seq_len_padded}_{image_seq_len}_"
+            f"{model_inputs.height}_{model_inputs.width}"
+        )
+        if img_ids_key in self._cached_img_ids:
+            img_ids = self._cached_img_ids[img_ids_key]
+        else:
+            img_ids_np = model_inputs.latent_image_ids.astype(
+                np.int64, copy=True
+            )
+            if img_ids_np.ndim == 3:
+                img_ids_np = img_ids_np[0]
+            img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
+            img_ids = Tensor.from_dlpack(img_ids_np).to(device)
+            self._cached_img_ids[img_ids_key] = img_ids
         text_ids_key = f"{text_seq_len}"
         if text_ids_key in self._cached_text_ids:
             txt_ids = self._cached_text_ids[text_ids_key]
@@ -509,22 +521,26 @@ class ZImagePipeline(DiffusionPipeline):
         dts_seq: Any = all_dts
         if hasattr(dts_seq, "driver_tensor"):
             dts_seq = dts_seq.driver_tensor
-        timesteps_np = np.broadcast_to(timesteps[:, None], (num_timesteps, batch_size))
+
+        # Precompute transformed timesteps and CFG activity outside loop.
+        transformed_timesteps = (1.0 - timesteps).astype(np.float32, copy=False)
+        timesteps_np = np.broadcast_to(
+            transformed_timesteps[:, None], (num_timesteps, batch_size)
+        )
         timesteps_batched = Tensor.from_dlpack(timesteps_np).to(device)
+        cfg_active: np.ndarray | None = None
+        if do_cfg:
+            if model_inputs.cfg_truncation <= 1.0:
+                cfg_active = transformed_timesteps <= model_inputs.cfg_truncation
+            else:
+                cfg_active = np.ones(num_timesteps, dtype=np.bool_)
 
         for i in tqdm(range(num_timesteps), desc="Denoising"):
             timestep = timesteps_batched[i]
-            # Tokenizer scheduler stores normalized timesteps in [0, 1] (sigma domain).
-            # Z-Image expects time-aware config value equivalent to (1000 - t_raw) / 1000.
-            # Since t_raw = timestep * 1000 here, this reduces to (1 - timestep).
-            timestep = 1.0 - timestep
-            t_norm = 1.0 - float(timesteps[i])
-
-            current_guidance_scale = model_inputs.guidance_scale
-            if do_cfg and model_inputs.cfg_truncation <= 1.0:
-                if t_norm > model_inputs.cfg_truncation:
-                    current_guidance_scale = 0.0
-            apply_cfg = do_cfg and current_guidance_scale > 0.0
+            apply_cfg = bool(do_cfg and cfg_active is not None and cfg_active[i])
+            current_guidance_scale = (
+                model_inputs.guidance_scale if apply_cfg else 0.0
+            )
 
             noise_pred = self.transformer(
                 latents,
@@ -560,6 +576,8 @@ class ZImagePipeline(DiffusionPipeline):
             latents = self.scheduler_step(latents, noise_pred, dt)
 
             if callback_queue is not None:
+                if hasattr(device, "synchronize"):
+                    device.synchronize()
                 image = self._decode_latents(
                     latents,
                     model_inputs.height,
