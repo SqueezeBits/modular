@@ -2695,6 +2695,157 @@ fn group_norm_reshape[
     }
 
 
+fn group_norm_gpu_partial_stats[
+    dtype: DType,
+    accum_type: DType,
+    //,
+    simd_width: Int,
+    threads_per_block: Int,
+    input_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[
+        dtype, width
+    ],
+](
+    partial_sum: NDBuffer[mut=True, accum_type, 1, MutAnyOrigin],
+    partial_sum_sq: NDBuffer[mut=True, accum_type, 1, MutAnyOrigin],
+    partial_count: NDBuffer[mut=True, accum_type, 1, MutAnyOrigin],
+    num_cols: Int,
+    tiles_per_row: Int,
+    tile_cols: Int,
+):
+    var linear_block = Int(block_idx.x)
+    var row = linear_block // tiles_per_row
+    var tile = linear_block % tiles_per_row
+    var tid = Int(thread_idx.x)
+
+    var tile_start = tile * tile_cols
+    var tile_end = min(tile_start + tile_cols, num_cols)
+
+    var thread_sum = Scalar[accum_type](0)
+    var thread_sum_sq = Scalar[accum_type](0)
+    var thread_count = Scalar[accum_type](0)
+
+    with PDL():
+        for col in range(
+            tile_start + tid * simd_width,
+            tile_end,
+            threads_per_block * simd_width,
+        ):
+            if col + simd_width <= tile_end:
+                var vec_data = input_fn[simd_width](row, col).cast[accum_type]()
+                thread_sum += vec_data.reduce_add()
+                thread_sum_sq += (vec_data * vec_data).reduce_add()
+                thread_count += Scalar[accum_type](simd_width)
+
+        var block_sum = block.sum[block_size=threads_per_block, broadcast=True](
+            thread_sum
+        )
+        var block_sum_sq = block.sum[
+            block_size=threads_per_block, broadcast=True
+        ](thread_sum_sq)
+        var block_count = block.sum[
+            block_size=threads_per_block, broadcast=True
+        ](thread_count)
+
+        if tid == 0:
+            var idx = row * tiles_per_row + tile
+            partial_sum.data[idx] = block_sum
+            partial_sum_sq.data[idx] = block_sum_sq
+            partial_count.data[idx] = block_count
+
+
+fn group_norm_gpu_tile_finalize[
+    LayoutType: TensorLayout,
+    origin: MutOrigin,
+    //,
+    dtype: DType,
+    accum_type: DType,
+    simd_width: Int,
+    threads_per_block: Int,
+    input_fn: fn[width: Int](row: Int, col: Int) capturing -> SIMD[
+        dtype, width
+    ],
+    gamma_fn: fn[width: Int](IndexList[1]) capturing -> SIMD[dtype, width],
+    beta_fn: fn[width: Int](IndexList[1]) capturing -> SIMD[dtype, width],
+](
+    output: TileTensor[dtype, LayoutType, origin],
+    partial_sum: NDBuffer[mut=True, accum_type, 1, MutAnyOrigin],
+    partial_sum_sq: NDBuffer[mut=True, accum_type, 1, MutAnyOrigin],
+    partial_count: NDBuffer[mut=True, accum_type, 1, MutAnyOrigin],
+    epsilon: Scalar[dtype],
+    num_cols: Int,
+    num_groups: Int,
+    channels_per_group: Int,
+    spatial: Int,
+    tiles_per_row: Int,
+    tile_cols: Int,
+):
+    comptime assert output.rank == 2, "output.rank must be 2"
+    comptime align = align_of[SIMD[dtype, simd_width]]()
+
+    var linear_block = Int(block_idx.x)
+    var row = linear_block // tiles_per_row
+    var tile = linear_block % tiles_per_row
+    var tid = Int(thread_idx.x)
+
+    var thread_sum = Scalar[accum_type](0)
+    var thread_sum_sq = Scalar[accum_type](0)
+    var thread_count = Scalar[accum_type](0)
+
+    with PDL():
+        for t in range(tid, tiles_per_row, threads_per_block):
+            var idx = row * tiles_per_row + t
+            thread_sum += partial_sum.data[idx]
+            thread_sum_sq += partial_sum_sq.data[idx]
+            thread_count += partial_count.data[idx]
+
+        var row_sum = block.sum[block_size=threads_per_block, broadcast=True](
+            thread_sum
+        )
+        var row_sum_sq = block.sum[
+            block_size=threads_per_block, broadcast=True
+        ](thread_sum_sq)
+        var row_count = block.sum[block_size=threads_per_block, broadcast=True](
+            thread_count
+        )
+
+        var row_mean = row_sum / row_count
+        var row_var = max(row_sum_sq / row_count - row_mean * row_mean, 0.0)
+        var norm_factor = rsqrt(row_var + epsilon.cast[accum_type]())
+
+        var tile_start = tile * tile_cols
+        var tile_end = min(tile_start + tile_cols, num_cols)
+
+        for col in range(
+            tile_start + tid * simd_width,
+            tile_end,
+            threads_per_block * simd_width,
+        ):
+            if col + simd_width <= tile_end:
+                var vec_data = input_fn[simd_width](row, col).cast[accum_type]()
+
+                var g = row % num_groups
+                var c_base = g * channels_per_group
+
+                var norm_val = SIMD[accum_type, simd_width]()
+                for i in range(simd_width):
+                    var offset_c = (col + i) // spatial
+                    var c = UInt(c_base + offset_c)
+                    var gamma_val = gamma_fn[1](Index(c))
+                    var beta_val = beta_fn[1](Index(c))
+                    norm_val[i] = (
+                        vec_data[i] - row_mean
+                    ) * norm_factor * gamma_val.cast[
+                        accum_type
+                    ]() + beta_val.cast[
+                        accum_type
+                    ]()
+
+                var output_idx = output.layout(Coord(Idx(row), Idx(col)))
+                output.ptr.store[alignment=align](
+                    output_idx, norm_val.cast[dtype]()
+                )
+
+
 fn group_norm_gpu_warp_tiling[
     LayoutType: TensorLayout,
     origin: MutOrigin,
@@ -2951,6 +3102,83 @@ fn group_norm_gpu[
     )
 
     if num_cols % OutputLinearIdxType(simd_width) == 0:
+        # For very long rows and small row counts (common in VAE group norm),
+        # use a tiled two-kernel path to expose more parallelism than 1-CTA/row.
+        comptime threads_per_block_tiled = 256
+        var num_rows_i = Int(num_rows)
+        var num_cols_i = Int(num_cols)
+        var tile_cols = threads_per_block_tiled * simd_width * 8
+        var tiles_per_row = ceildiv(num_cols_i, tile_cols)
+        if num_rows_i <= 64 and tiles_per_row > 1:
+            var partial_size = num_rows_i * tiles_per_row
+            var partial_sum_buf = ctx.enqueue_create_buffer[accum_type](
+                partial_size
+            )
+            var partial_sum_sq_buf = ctx.enqueue_create_buffer[accum_type](
+                partial_size
+            )
+            var partial_count_buf = ctx.enqueue_create_buffer[accum_type](
+                partial_size
+            )
+
+            var partial_sum = NDBuffer[mut=True, accum_type, 1, MutAnyOrigin](
+                partial_sum_buf.unsafe_ptr(), Index(partial_size)
+            )
+            var partial_sum_sq = NDBuffer[
+                mut=True, accum_type, 1, MutAnyOrigin
+            ](partial_sum_sq_buf.unsafe_ptr(), Index(partial_size))
+            var partial_count = NDBuffer[mut=True, accum_type, 1, MutAnyOrigin](
+                partial_count_buf.unsafe_ptr(), Index(partial_size)
+            )
+
+            comptime stats_kernel = group_norm_gpu_partial_stats[
+                dtype=dtype,
+                accum_type=accum_type,
+                simd_width=simd_width,
+                threads_per_block=threads_per_block_tiled,
+                input_fn=input_fn_2d,
+            ]
+            ctx.enqueue_function[stats_kernel, stats_kernel](
+                partial_sum,
+                partial_sum_sq,
+                partial_count,
+                num_cols_i,
+                tiles_per_row,
+                tile_cols,
+                grid_dim=num_rows_i * tiles_per_row,
+                block_dim=threads_per_block_tiled,
+                attributes=pdl_launch_attributes(),
+            )
+
+            comptime finalize_kernel = group_norm_gpu_tile_finalize[
+                LayoutType = output_rs.LayoutType,
+                origin = output_rs.origin,
+                dtype=dtype,
+                accum_type=accum_type,
+                simd_width=simd_width,
+                threads_per_block=threads_per_block_tiled,
+                input_fn=input_fn_2d,
+                gamma_fn=gamma_fn,
+                beta_fn=beta_fn,
+            ]
+            ctx.enqueue_function[finalize_kernel, finalize_kernel](
+                output_rs,
+                partial_sum,
+                partial_sum_sq,
+                partial_count,
+                epsilon,
+                num_cols_i,
+                num_groups,
+                channels_per_group,
+                spatial,
+                tiles_per_row,
+                tile_cols,
+                grid_dim=num_rows_i * tiles_per_row,
+                block_dim=threads_per_block_tiled,
+                attributes=pdl_launch_attributes(),
+            )
+            return
+
         # When the number of columns is small enough that they can be placed in
         # registers, we do warp tiling, which is a single pass to do mean/var
         # computation and normalization.
