@@ -15,7 +15,7 @@ from std.python import PythonObject, Python
 from std.python.bindings import PythonModuleBuilder
 from std.python._cpython import GILAcquired, GILReleased
 from std.os import abort
-import math
+import std.math
 from std.algorithm.functional import parallelize
 from std.sys.info import num_physical_cores
 
@@ -30,7 +30,7 @@ fn PyInit_mojo_module() -> PythonObject:
         )
         return m.finalize()
     except e:
-        abort(String("failed to create Python module: ", e))
+        abort(t"failed to create Python module: {e}")
 
 
 fn plus_one(arg: PythonObject) raises -> PythonObject:

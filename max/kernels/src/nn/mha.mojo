@@ -17,7 +17,7 @@ from std.collections import OptionalReg
 from std.sys import (
     CompilationTarget,
     align_of,
-    env_get_bool,
+    get_defined_bool,
     has_amd_gpu_accelerator,
     has_nvidia_gpu_accelerator,
     is_amd_gpu,
@@ -26,7 +26,7 @@ from std.sys import (
     size_of,
 )
 from std.sys.info import _cdna_4_or_newer, _is_amd_rdna
-import gpu.primitives.warp as warp
+import std.gpu.primitives.warp as warp
 from std.algorithm import elementwise
 from std.algorithm.functional import tile_and_unswitch, unswitch, vectorize
 from std.bit import next_power_of_two
@@ -52,7 +52,7 @@ from std.gpu.memory import (
     external_memory,
 )
 from kv_cache.types import KVCacheT
-from layout import Layout
+from layout import Layout, TileTensor
 from layout.int_tuple import IntTuple, UNKNOWN_VALUE
 from layout.layout import *
 from layout.layout_tensor import (
@@ -592,7 +592,7 @@ fn flash_attention_dispatch[
                 else:
                     comptime assert is_sm100
 
-                    comptime if depth == 256 or not env_get_bool[
+                    comptime if depth == 256 or not get_defined_bool[
                         "ENABLE_FA4", True
                     ]():
                         mha_sm100_1q_dispatch[
@@ -1679,6 +1679,7 @@ fn mha_single_batch[
     comptime IteratorTypeQ = LayoutTensorIter[
         q_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         alignment=alignment,
     ]
@@ -1703,6 +1704,7 @@ fn mha_single_batch[
     comptime IteratorTypeK = LayoutTensorIter[
         k_type,
         Layout.row_major(Int(BN), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -1715,6 +1717,7 @@ fn mha_single_batch[
     comptime IteratorTypeV = LayoutTensorIter[
         v_type,
         Layout.row_major(Int(BK), Int(BN)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -1829,6 +1832,7 @@ fn mha_single_batch[
     comptime IteratorTypeP = LayoutTensorIter[
         v_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -2415,6 +2419,7 @@ fn mha_single_batch_pipelined[
     comptime IteratorTypeQ = LayoutTensorIter[
         q_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         alignment=alignment,
     ]
@@ -2439,6 +2444,7 @@ fn mha_single_batch_pipelined[
     comptime IteratorTypeK = LayoutTensorIter[
         k_type,
         Layout.row_major(Int(BN), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -2559,6 +2565,7 @@ fn mha_single_batch_pipelined[
     comptime IteratorTypeP = LayoutTensorIter[
         v_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -3308,7 +3315,7 @@ fn scale_and_mask_helper[
     simd_width: Int,
 ](
     p_reg_tile: LayoutTensor[
-        mut=True, p_type, p_layout, address_space = AddressSpace.LOCAL
+        mut=True, p_type, p_layout, _, address_space = AddressSpace.LOCAL
     ],
     scale_log2e: Float32,
     num_keys: UInt,
@@ -3464,6 +3471,7 @@ fn mha_decoding_single_batch[
     comptime IteratorTypeQ = LayoutTensorIter[
         q_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         alignment=alignment,
     ]
@@ -3487,6 +3495,7 @@ fn mha_decoding_single_batch[
     comptime IteratorTypeK = LayoutTensorIter[
         k_type,
         Layout.row_major(Int(BN), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -3499,6 +3508,7 @@ fn mha_decoding_single_batch[
     comptime IteratorTypeV = LayoutTensorIter[
         v_type,
         Layout.row_major(Int(BK), Int(BN)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -3583,6 +3593,7 @@ fn mha_decoding_single_batch[
     comptime IteratorTypeP = LayoutTensorIter[
         v_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
     ]
     var p_smem_iter = IteratorTypeP(
@@ -3906,6 +3917,7 @@ fn mha_decoding_single_batch[
             comptime IteratorTypeVSub = LayoutTensorIter[
                 v_type,
                 Layout.row_major(Int(WN), Int(BN)),
+                _,
                 address_space = AddressSpace.SHARED,
                 circular=True,
             ]
@@ -4155,6 +4167,7 @@ fn mha_decoding_single_batch_pipelined[
     comptime IteratorTypeQ = LayoutTensorIter[
         q_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         alignment=alignment,
     ]
@@ -4277,6 +4290,7 @@ fn mha_decoding_single_batch_pipelined[
     comptime IteratorTypeP = LayoutTensorIter[
         v_type,
         Layout.row_major(Int(BM), Int(BK)),
+        _,
         address_space = AddressSpace.SHARED,
         circular=True,
     ]
@@ -5521,9 +5535,10 @@ fn _naive_attention[
         score_lt.runtime_layout.shape.value.canonicalize()
     )
 
+    var score_tt = TileTensor(score)
     softmax[dtype, simd_size, 4](
-        score_lt,
-        score_lt,
+        score_tt,
+        score_tt,
         axis=3,
     )
 

@@ -48,8 +48,8 @@ comptime out_fp8_dtype = DType.float8_e4m3fnuz if is_amd_gpu() else DType.float8
 fn _assert_fp8_close[
     out_dtype: DType,
 ](
-    ref_host: UnsafePointer[Scalar[out_dtype]],
-    fused_host: UnsafePointer[Scalar[out_dtype]],
+    ref_host: UnsafePointer[Scalar[out_dtype], _],
+    fused_host: UnsafePointer[Scalar[out_dtype], _],
     length: Int,
     *,
     max_error_rate: Float32 = 0.05,
@@ -72,14 +72,7 @@ fn _assert_fp8_close[
                 num_ulp_errors += 1
 
     if num_ulp_errors > 0:
-        raise Error(
-            String(
-                "FP8 mismatches exceed 1 ULP: ",
-                num_ulp_errors,
-                " / ",
-                length,
-            )
-        )
+        raise Error(t"FP8 mismatches exceed 1 ULP: {num_ulp_errors} / {length}")
 
     var error_rate = Float32(num_errors) / Float32(length)
     if error_rate > max_error_rate:
@@ -100,21 +93,14 @@ fn _assert_fp8_close[
                 )
                 printed += 1
         raise Error(
-            String(
-                "Too many FP8 mismatches: ",
-                num_errors,
-                " / ",
-                length,
-                " (",
-                error_rate * 100.0,
-                "%)",
-            )
+            t"Too many FP8 mismatches: {num_errors} /"
+            t" {length} ({error_rate * 100.0}%)"
         )
 
 
 fn _assert_scales_close(
-    ref_host: UnsafePointer[Scalar[DType.float32]],
-    fused_host: UnsafePointer[Scalar[DType.float32]],
+    ref_host: UnsafePointer[Scalar[DType.float32], _],
+    fused_host: UnsafePointer[Scalar[DType.float32], _],
     rows: Int,
     *,
     max_rel_diff: Float32 = 0.005,
@@ -145,14 +131,7 @@ fn _assert_scales_close(
                 )
 
     if scale_errors > 0:
-        raise Error(
-            String(
-                "Scale factor mismatches: ",
-                scale_errors,
-                " / ",
-                rows,
-            )
-        )
+        raise Error(t"Scale factor mismatches: {scale_errors} / {rows}")
 
 
 # --- Test: fully fused allreduce + RMSNorm + FP8 ---
@@ -578,14 +557,7 @@ fn test_fused_allreduce_residual_rmsnorm_fp8[
                 )
 
     if res_errors > 0:
-        raise Error(
-            String(
-                "Residual output mismatches: ",
-                res_errors,
-                " / ",
-                length,
-            )
-        )
+        raise Error(t"Residual output mismatches: {res_errors} / {length}")
 
     # --- Compare FP8 output: fused vs reference ---
     var ref_fp8_host = alloc[Scalar[out_dtype]](length)

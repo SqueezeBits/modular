@@ -65,7 +65,7 @@ from std.memory import LegacyUnsafePointer
 from layout.swizzle import make_swizzle
 from std.algorithm import elementwise
 from std.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
-from std.sys import env_get_bool
+from std.sys import get_defined_bool
 from linalg.matmul.gpu.sm100.block_scaled_dispatch import (
     heuristic_and_outliers_dispatch,
 )
@@ -1295,7 +1295,7 @@ fn block_scaled_matmul[
     comptime static_K = a.layout.shape[1].value()
     comptime static_NK = Index(static_N, static_K)
 
-    comptime if env_get_bool[
+    comptime if get_defined_bool[
         "ENABLE_EXPERIMENTAL_SM100_BLOCK_SCALED_MATMUL", False
     ]():
         var status = heuristic_and_outliers_dispatch[

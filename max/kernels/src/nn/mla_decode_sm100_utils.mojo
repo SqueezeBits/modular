@@ -14,7 +14,7 @@
 from std.math import exp2, recip, align_up, log2, ceildiv
 from std.math.constants import log2e
 from std.sys import size_of, _RegisterPackType
-import gpu.primitives.warp as warp
+import std.gpu.primitives.warp as warp
 from std.gpu import (
     barrier,
     thread_idx,
@@ -115,7 +115,7 @@ fn tma_tile_qo[
     depth: Int,
 ](
     ctx: DeviceContext,
-    ptr: UnsafePointer[Scalar[dtype]],
+    ptr: UnsafePointer[Scalar[dtype], _],
     rows: Int,
     out res: QOTMATile[dtype, BM, BK, swizzle_mode],
 ) raises:

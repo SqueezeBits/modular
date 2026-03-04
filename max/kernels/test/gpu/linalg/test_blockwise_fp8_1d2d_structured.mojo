@@ -37,7 +37,7 @@ from layout._fillers import random
 from layout._ndbuffer_stub import from_ndbuffer_row_major
 from layout._utils import ManagedLayoutTensor
 from layout._layout import row_major
-from linalg.matmul.gpu.sm100_structured.structured_kernels.tile_types import (
+from structured_kernels.tile_types import (
     GMEMLayout1D,
 )
 from linalg.fp8_quantization import naive_blockwise_scaled_fp8_grouped_matmul
@@ -402,7 +402,7 @@ def test_blockwise_fp8_1d2d_structured[
             assert_almost_equal(
                 c_host[mi, ni][0],
                 c_host_ref[mi, ni][0],
-                msg=String("m: ", mi, " n: ", ni),
+                msg=t"m: {mi} n: {ni}",
                 rtol=rtol,
                 atol=atol,
             )

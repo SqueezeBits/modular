@@ -11,8 +11,13 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-import random
-from std.sys import env_get_bool, env_get_dtype, env_get_int, size_of
+import std.random
+from std.sys import (
+    get_defined_bool,
+    get_defined_dtype,
+    get_defined_int,
+    size_of,
+)
 
 from std.benchmark import (
     Bench,
@@ -256,15 +261,15 @@ fn bench_matmul_all_reduce[
 
 
 def main() raises:
-    comptime dtype = env_get_dtype["dtype", DType.bfloat16]()
+    comptime dtype = get_defined_dtype["dtype", DType.bfloat16]()
 
     var M = Int(arg_parse("M", 8192))
-    comptime N = env_get_int["N", 8192]()
-    comptime K = env_get_int["K", 2048]()
-    comptime num_gpus = env_get_int["NUM_GPUS", 4]()
-    comptime partition_dim = env_get_int["DIM", 1]()
-    comptime num_partitions = env_get_int["PARTITIONS", 1]()
-    comptime overlap_with_dpl = env_get_bool["OVERLAP", False]()
+    comptime N = get_defined_int["N", 8192]()
+    comptime K = get_defined_int["K", 2048]()
+    comptime num_gpus = get_defined_int["NUM_GPUS", 4]()
+    comptime partition_dim = get_defined_int["DIM", 1]()
+    comptime num_partitions = get_defined_int["PARTITIONS", 1]()
+    comptime overlap_with_dpl = get_defined_bool["OVERLAP", False]()
 
     var m = Bench()
 

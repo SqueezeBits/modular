@@ -107,7 +107,7 @@ class Module(Generic[_P, _R]):
 
         linear = Linear(Tensor.zeros([5, 4]))
         print(linear)
-        print(linear(Tensor.constant([1, 2, 3, 4])))
+        print(linear(Tensor([1, 2, 3, 4])))
     """
 
     def forward(self, *args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -632,13 +632,7 @@ class Module(Generic[_P, _R]):
             #   when passing weights to compilation
             # - Instead, if a parameter is not real we reset it to _after_ the move
             #   to CPU
-            weight_tensors = {k: t.to(CPU()) for k, t in self.parameters}
-            self.apply_to_parameters(
-                lambda name, data: data
-                if data.real
-                else weight_tensors[name].to(data.device)
-            )
-            weights = weight_tensors
+            weights = {k: t for k, t in self.parameters}
         else:
             for name, existing in self.parameters:
                 if name not in weights:
@@ -650,6 +644,7 @@ class Module(Generic[_P, _R]):
                     existing,
                     Tensor.from_dlpack(weights[name]),
                 )
+
         session_model = session.load(graph, weights_registry=weights)
 
         # Wrap the compiled session model with lightweight input/output conversion.

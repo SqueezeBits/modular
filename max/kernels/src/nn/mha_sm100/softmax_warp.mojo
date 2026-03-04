@@ -15,7 +15,7 @@
 from std.math import exp2, recip, align_up
 from std.math.constants import log2e
 from std.sys import size_of
-import gpu.primitives.warp as warp
+import std.gpu.primitives.warp as warp
 from std.gpu import thread_idx
 from std.gpu.globals import WARPGROUP_SIZE, WARP_SIZE
 from std.gpu.memory import AddressSpace, CacheEviction, fence_async_view_proxy
@@ -30,7 +30,7 @@ from std.gpu.compute.arch.tcgen05 import (
     tcgen05_ld,
     tcgen05_store_wait,
 )
-from linalg.matmul.gpu.sm100_structured.structured_kernels.barriers import (
+from structured_kernels.barriers import (
     WarpGroupBarrier,
 )
 from linalg.matmul.gpu.sm100_structured.structured_kernels.tmem import (

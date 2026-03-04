@@ -13,7 +13,7 @@
 from std.hashlib import default_comp_time_hasher
 from std.math import align_up
 from std.sys import argv, size_of
-import itertools
+import std.itertools
 import linalg.matmul.vendor.blas as vendor_blas
 from buffer.buffer import NDBuffer
 from buffer.dimlist import DimList, Dim
@@ -26,7 +26,7 @@ from internal_utils import assert_almost_equal
 from std.random import rand
 from internal_utils._utils import ValOrDim, dynamic, static
 from layout._ndbuffer_stub import from_ndbuffer_row_major
-from linalg.matmul.gpu.sm100_structured.structured_kernels.tile_types import (
+from structured_kernels.tile_types import (
     lt_to_tt,
 )
 from linalg.matmul.gpu.sm100_structured.block_scaled.block_scaled_matmul import (
@@ -82,43 +82,11 @@ def test_blackwell_block_scaled_matmul_tma_umma_warp_specialized[
     var K = k.value
 
     print(
-        String(
-            "in/out dtypes=(",
-            a_type,
-            ", ",
-            b_type,
-            ", ",
-            c_type,
-            ", ",
-            scales_dtype,
-            ") ",
-            " problem shape=(",
-            M,
-            ", ",
-            N,
-            ", ",
-            K,
-            ") ",
-            "mma_shape=",
-            mma_shape,
-            " block_tile_shape=",
-            block_tile_shape,
-            " cta_group=",
-            cta_group,
-            " cluster_shape=(",
-            cluster_shape[0],
-            ", ",
-            cluster_shape[1],
-            ", ",
-            cluster_shape[2],
-            ")",
-            " swapAB=",
-            swapAB,
-            " k_group_size=",
-            k_group_size,
-            " SF_VECTOR_SIZE=",
-            SF_VECTOR_SIZE,
-        )
+        t"in/out dtypes=({a_type}, {b_type}, {c_type}, {scales_dtype})  problem"
+        t" shape=({M}, {N}, {K})"
+        t" mma_shape={mma_shape} block_tile_shape={block_tile_shape} cta_group={cta_group} cluster_shape=({cluster_shape[0]},"
+        t" {cluster_shape[1]}, {cluster_shape[2]})"
+        t" swapAB={swapAB} k_group_size={k_group_size} SF_VECTOR_SIZE={SF_VECTOR_SIZE}"
     )
 
     comptime static_a_shape = DimList(m.dim, k.dim)

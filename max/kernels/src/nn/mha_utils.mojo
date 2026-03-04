@@ -16,8 +16,8 @@ from std.collections import OptionalReg
 from std.sys import (
     CompilationTarget,
     align_of,
-    env_get_int,
-    env_get_bool,
+    get_defined_int,
+    get_defined_bool,
     has_amd_gpu_accelerator,
     has_nvidia_gpu_accelerator,
     is_amd_gpu,
@@ -76,9 +76,7 @@ fn as_dynamic_row_major_1d[
     )
 
 
-struct FlashAttentionAlgorithm(
-    Defaultable, Stringable, TrivialRegisterPassable, Writable
-):
+struct FlashAttentionAlgorithm(Defaultable, TrivialRegisterPassable, Writable):
     var _value: Int32
 
     comptime NAIVE = Self(0)
@@ -105,6 +103,7 @@ struct FlashAttentionAlgorithm(
         return self._value != other._value
 
     @always_inline
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     fn __str__(self) -> String:
         return String.write(self)
 
@@ -228,7 +227,7 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
             return 0
 
         comptime persistent = (
-            env_get_int["USE_EXPERIMENTAL_KERNELS", 0]() != 0
+            get_defined_int["USE_EXPERIMENTAL_KERNELS", 0]() != 0
         ) and sm_90
         sm_90_fa3 = sm_90 and (self.algorithm == 3)
 
@@ -303,7 +302,7 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
                 # BN <= (4*reg_per - 2*depth - 16)//3
                 reg_upper_bound = (4 * reg_per - 2 * Int(depth) - 16) // 3
                 comptime persistent = (
-                    env_get_int["USE_EXPERIMENTAL_KERNELS", 0]() != 0
+                    get_defined_int["USE_EXPERIMENTAL_KERNELS", 0]() != 0
                 )
                 smem_total = 227000
                 # smem_total >= 2*(BN * depth * pipeline_stages + BM*depth*(1+persistent))
@@ -333,7 +332,7 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
             self.BK = BK.or_else(64)
             self.WN = WN.or_else(min(self.num_keys_per_block, 256))
         else:
-            comptime use_experimental_cdna4_kernel = env_get_bool[
+            comptime use_experimental_cdna4_kernel = get_defined_bool[
                 "USE_EXPERIMENTAL_CDNA4_MHA_KERNEL", False
             ]()
             # BN
@@ -423,7 +422,7 @@ fn _copy_frag_to_smem_nvidia[
         type0, layout0, address_space = AddressSpace.SHARED, ...
     ],
     p_reg_tile: LayoutTensor[
-        type1, layout1, address_space = AddressSpace.LOCAL
+        type1, layout1, _, address_space = AddressSpace.LOCAL
     ],
     warp_x: UInt32,
     warp_y: UInt32,
@@ -522,7 +521,7 @@ fn _copy_frag_to_smem_amd[
         type0, layout0, address_space = AddressSpace.SHARED, ...
     ],
     p_reg_tile: LayoutTensor[
-        type1, layout1, address_space = AddressSpace.LOCAL
+        type1, layout1, _, address_space = AddressSpace.LOCAL
     ],
     warp_x: UInt32,
     warp_y: UInt32,
@@ -602,7 +601,7 @@ fn _copy_frag_to_smem[
         type0, layout0, address_space = AddressSpace.SHARED, ...
     ],
     p_reg_tile: LayoutTensor[
-        type1, layout1, address_space = AddressSpace.LOCAL
+        type1, layout1, _, address_space = AddressSpace.LOCAL
     ],
     warp_x: UInt32,
     warp_y: UInt32,

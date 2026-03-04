@@ -33,10 +33,7 @@ from max.graph.weights import (
     WeightsAdapter,
 )
 from max.nn.comm import Signals
-from max.nn.kv_cache import (
-    KVCacheInputs,
-    KVCacheParams,
-)
+from max.nn.kv_cache import KVCacheInputs, KVCacheParams
 from max.nn.transformer import ReturnLogits
 from max.pipelines.core import TextAndVisionContext
 from max.pipelines.lib import (
@@ -297,7 +294,7 @@ class InternVLModel(
         # Maximum number of images that can be processed is limited by
         # how many image tokens fit in the target new tokens
         max_images = (
-            pipeline_config.max_batch_input_tokens
+            pipeline_config.runtime.max_batch_input_tokens
             // image_config.num_image_token
         )
         # Ensure at least 1 image worth of memory.
@@ -319,7 +316,8 @@ class InternVLModel(
         # ~100KB per token for intermediate activations
         llm_memory_per_token = 100 * 1024  # 100 KiB
         llm_activation_memory = (
-            pipeline_config.max_batch_input_tokens * llm_memory_per_token
+            pipeline_config.runtime.max_batch_input_tokens
+            * llm_memory_per_token
         )
 
         total_activation_memory = (
@@ -337,11 +335,14 @@ class InternVLModel(
             A tuple of (vision_model, language_model).
         """
         # Pre-allocation for multi-step execution
-        assert self.pipeline_config.max_batch_size, (
+        assert self.pipeline_config.runtime.max_batch_size, (
             "Expected max_batch_size to be set"
         )
         input_row_offsets_prealloc_host = Buffer.from_numpy(
-            np.arange(self.pipeline_config.max_batch_size + 1, dtype=np.uint32)
+            np.arange(
+                self.pipeline_config.runtime.max_batch_size + 1,
+                dtype=np.uint32,
+            )
         )
         self._input_row_offsets_prealloc = [
             input_row_offsets_prealloc_host.to(dev) for dev in self.devices
@@ -723,7 +724,6 @@ class InternVLModel(
 
         # Prepare KV cache inputs as list of tensors
         assert model_inputs.kv_cache_inputs
-        kv_cache_inputs_list = list(model_inputs.kv_cache_inputs)
 
         # Execute language model with text and image embeddings
         language_outputs = self.language_model.execute(
@@ -733,7 +733,7 @@ class InternVLModel(
             *image_embeddings,
             *image_token_indices,
             *model_inputs.signal_buffers,
-            *kv_cache_inputs_list,
+            *model_inputs.kv_cache_inputs,
         )
 
         # Return model outputs based on what the language model returns

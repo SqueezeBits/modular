@@ -12,11 +12,11 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.random import random_float64
-from std.sys import env_get_dtype
+from std.sys import get_defined_dtype
 
 from std.benchmark import Bench, BenchConfig, Bencher, BenchId
 from std.gpu.host import DeviceContext
-from internal_utils import env_get_shape, int_list_to_tuple
+from internal_utils import get_defined_shape, int_list_to_tuple
 from layout import Coord, Idx, TileTensor, coord_to_index_list
 from layout._layout import row_major
 from nn.normalization import layer_norm_gpu, rms_norm_gpu
@@ -194,8 +194,10 @@ fn bench_rms_norm_gpu[
 
 
 def main() raises:
-    comptime dtype = env_get_dtype["dtype", DType.bfloat16]()
-    comptime shape = int_list_to_tuple[env_get_shape["shape", "256x256"]()]()
+    comptime dtype = get_defined_dtype["dtype", DType.bfloat16]()
+    comptime shape = int_list_to_tuple[
+        get_defined_shape["shape", "256x256"]()
+    ]()
 
     var m = Bench(BenchConfig(num_repetitions=1))
     with DeviceContext() as ctx:
