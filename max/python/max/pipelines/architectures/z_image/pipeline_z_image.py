@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from queue import Queue
 from typing import Any, Literal
@@ -76,6 +77,7 @@ class ZImagePipeline(DiffusionPipeline):
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
         self._cached_img_ids: dict[str, Tensor] = {}
+        self._cached_timesteps_batched: dict[str, Tensor] = {}
 
     def prepare_inputs(self, context: PixelContext) -> ZImageModelInputs:  # type: ignore[override]
         return ZImageModelInputs.from_context(context)
@@ -520,10 +522,20 @@ class ZImagePipeline(DiffusionPipeline):
 
         # Precompute transformed timesteps and CFG activity outside loop.
         transformed_timesteps = (1.0 - timesteps).astype(np.float32, copy=False)
-        timesteps_np = np.broadcast_to(
-            transformed_timesteps[:, None], (num_timesteps, batch_size)
-        )
-        timesteps_batched = Tensor.from_dlpack(timesteps_np).to(device)
+        timesteps_digest = hashlib.sha1(
+            transformed_timesteps.tobytes()
+        ).hexdigest()
+        timesteps_key = f"{num_timesteps}_{batch_size}_{timesteps_digest}"
+        if timesteps_key in self._cached_timesteps_batched:
+            timesteps_batched = self._cached_timesteps_batched[timesteps_key]
+        else:
+            timesteps_np = np.broadcast_to(
+                transformed_timesteps[:, None], (num_timesteps, batch_size)
+            )
+            timesteps_batched = Tensor.from_dlpack(
+                np.ascontiguousarray(timesteps_np)
+            ).to(device)
+            self._cached_timesteps_batched[timesteps_key] = timesteps_batched
         cfg_active: np.ndarray | None = None
         if do_cfg:
             if model_inputs.cfg_truncation <= 1.0:
