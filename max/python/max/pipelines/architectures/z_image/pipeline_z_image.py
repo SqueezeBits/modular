@@ -206,6 +206,7 @@ class ZImagePipeline(DiffusionPipeline):
     ) -> Tensor:
         if tokens.ndim == 2:
             tokens = tokens[0]
+        selected_tokens = tokens
 
         if mask is not None:
             if mask.ndim == 2:
@@ -216,23 +217,17 @@ class ZImagePipeline(DiffusionPipeline):
                     f"Got mask={mask.shape[0]}, tokens={tokens.shape[0]}."
                 )
             selected_mask = mask.astype(np.bool_, copy=False)
-        else:
-            selected_mask = np.ones_like(tokens, dtype=np.bool_)
+            if not np.any(selected_mask):
+                raise ValueError("Z-Image mask cannot mask out all tokens.")
+            if not np.all(selected_mask):
+                selected_tokens = tokens[selected_mask]
 
         text_input_ids = Tensor.constant(
-            tokens,
+            selected_tokens,
             dtype=DType.int64,
             device=self.text_encoder.devices[0],
         )
-        attention_mask = Tensor.constant(
-            selected_mask,
-            dtype=DType.bool,
-            device=self.text_encoder.devices[0],
-        )
-        prompt_embeds = self.text_encoder(
-            text_input_ids,
-            attention_mask=attention_mask,
-        )
+        prompt_embeds = self.text_encoder(text_input_ids)
         if prompt_embeds.rank == 2:
             prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
         elif prompt_embeds.rank != 3:
