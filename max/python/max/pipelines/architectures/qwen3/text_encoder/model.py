@@ -40,6 +40,8 @@ from .qwen3 import Qwen3TextEncoderTransformer
 class Qwen3TextEncoderModel(ComponentModel):
     """Qwen3 text encoder ComponentModel wrapper."""
 
+    default_hidden_state_layers: tuple[int, ...] | None = None
+
     def __init__(
         self,
         config: dict[str, Any],
@@ -61,7 +63,44 @@ class Qwen3TextEncoderModel(ComponentModel):
             encoding,
             devices,
         )
+        self.config.hidden_state_layers = self._resolve_hidden_state_layers()
         self.load_model()
+
+    def _resolve_hidden_state_layers(self) -> list[int]:
+        raw_layers = list(self.config.hidden_state_layers)
+        if not raw_layers:
+            if self.default_hidden_state_layers is not None:
+                raw_layers = list(self.default_hidden_state_layers)
+            else:
+                raw_layers = list(range(self.config.num_hidden_layers))
+        return self._normalize_hidden_state_layers(
+            raw_layers,
+            self.config.num_hidden_layers,
+        )
+
+    @staticmethod
+    def _normalize_hidden_state_layers(
+        layers: list[int], num_hidden_layers: int
+    ) -> list[int]:
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for layer in layers:
+            idx = int(layer)
+            if idx < 0:
+                idx += num_hidden_layers
+            if idx < 0 or idx >= num_hidden_layers:
+                raise ValueError(
+                    "Invalid `hidden_state_layers` index "
+                    f"{layer} for num_hidden_layers={num_hidden_layers}."
+                )
+            if idx not in seen:
+                normalized.append(idx)
+                seen.add(idx)
+
+        if not normalized:
+            raise ValueError("`hidden_state_layers` cannot be empty.")
+
+        return normalized
 
     def load_model(self) -> Callable[..., Any]:
         """Load and compile the Qwen3 text encoder.
@@ -136,6 +175,8 @@ class Qwen3TextEncoderModel(ComponentModel):
             outputs = tuple(outputs)
 
         if hidden_state_index is None:
+            if isinstance(outputs, tuple) and len(outputs) == 1:
+                return outputs[0]
             return outputs
 
         if not isinstance(outputs, tuple):
@@ -152,3 +193,15 @@ class Qwen3TextEncoderModel(ComponentModel):
             )
 
         return outputs[hidden_state_index]
+
+
+class Qwen3TextEncoderKleinModel(Qwen3TextEncoderModel):
+    """Qwen3 text encoder tuned for Flux2 Klein prompt layers."""
+
+    default_hidden_state_layers = (9, 18, 27)
+
+
+class Qwen3TextEncoderZImageModel(Qwen3TextEncoderModel):
+    """Qwen3 text encoder tuned for Z-Image prompt layers."""
+
+    default_hidden_state_layers = (-2,)

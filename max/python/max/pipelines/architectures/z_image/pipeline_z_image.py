@@ -29,7 +29,7 @@ from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from tqdm import tqdm
 
 from ..autoencoders import AutoencoderKLModel
-from ..qwen3.text_encoder import Qwen3TextEncoderModel
+from ..qwen3.text_encoder import Qwen3TextEncoderZImageModel
 from .model import ZImageTransformerModel
 
 
@@ -52,12 +52,12 @@ class ZImagePipelineOutput:
 
 class ZImagePipeline(DiffusionPipeline):
     vae: AutoencoderKLModel
-    text_encoder: Qwen3TextEncoderModel
+    text_encoder: Qwen3TextEncoderZImageModel
     transformer: ZImageTransformerModel
 
     components = {
         "vae": AutoencoderKLModel,
-        "text_encoder": Qwen3TextEncoderModel,
+        "text_encoder": Qwen3TextEncoderZImageModel,
         "transformer": ZImageTransformerModel,
     }
 
@@ -206,8 +206,7 @@ class ZImagePipeline(DiffusionPipeline):
     ) -> Tensor:
         if tokens.ndim == 2:
             tokens = tokens[0]
-        selected_tokens = tokens
-        selected_mask = None
+
         if mask is not None:
             if mask.ndim == 2:
                 mask = mask[0]
@@ -221,7 +220,7 @@ class ZImagePipeline(DiffusionPipeline):
             selected_mask = np.ones_like(tokens, dtype=np.bool_)
 
         text_input_ids = Tensor.constant(
-            selected_tokens,
+            tokens,
             dtype=DType.int64,
             device=self.text_encoder.devices[0],
         )
@@ -230,18 +229,20 @@ class ZImagePipeline(DiffusionPipeline):
             dtype=DType.bool,
             device=self.text_encoder.devices[0],
         )
-        hidden_states = self.text_encoder(
+        prompt_embeds = self.text_encoder(
             text_input_ids,
             attention_mask=attention_mask,
-            hidden_state_index=-2,
         )
-
-        hidden_states = F.unsqueeze(hidden_states, 0)
-
+        if prompt_embeds.rank == 2:
+            prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
+        elif prompt_embeds.rank != 3:
+            raise ValueError(
+                f"Unexpected prompt_embeds rank={prompt_embeds.rank}; expected 2 or 3."
+            )
         if num_images_per_prompt > 1:
-            hidden_states = F.tile(hidden_states, (num_images_per_prompt, 1, 1))
+            prompt_embeds = F.tile(prompt_embeds, (num_images_per_prompt, 1, 1))
 
-        return hidden_states
+        return prompt_embeds
 
     @staticmethod
     def _align_prompt_seq_len(
