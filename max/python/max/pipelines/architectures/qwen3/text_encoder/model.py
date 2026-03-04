@@ -21,8 +21,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from max.driver import Device
+import numpy as np
+from max.driver import CPU, Device
+from max.dtype import DType
 from max.experimental import functional as F
+from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
 from max.pipelines.architectures.llama3.weight_adapters import (
     LLAMA_SAFETENSOR_MAPPING as QWEN_SAFETENSOR_MAP,
@@ -83,8 +86,69 @@ class Qwen3TextEncoderModel(ComponentModel):
         self.model = model.compile(*model.input_types(), weights=state_dict)
         return self.model
 
-    def __call__(self, *args, **kwargs):
-        outputs = self.model(*args, **kwargs)
+    def __call__(
+        self,
+        tokens: Tensor,
+        attention_mask: Tensor | None = None,
+        *,
+        hidden_state_index: int | None = None,
+    ):
+        if tokens.rank == 2:
+            if int(tokens.shape[0]) != 1:
+                raise ValueError(
+                    "Qwen3TextEncoderModel expects batch_size=1 for 2D token input."
+                )
+            tokens = tokens[0]
+
+        if attention_mask is not None:
+            if attention_mask.rank == 2:
+                if int(attention_mask.shape[0]) != 1:
+                    raise ValueError(
+                        "Qwen3TextEncoderModel expects batch_size=1 for 2D attention_mask input."
+                    )
+                attention_mask = attention_mask[0]
+
+            if int(attention_mask.shape[0]) != int(tokens.shape[0]):
+                raise ValueError(
+                    "attention_mask length must match tokens length. "
+                    f"Got mask={attention_mask.shape[0]}, tokens={tokens.shape[0]}."
+                )
+
+            mask_np = np.from_dlpack(attention_mask.cast(DType.bool).to(CPU()))
+            if mask_np.ndim != 1:
+                raise ValueError(
+                    f"attention_mask must be rank-1 after squeeze, got rank={mask_np.ndim}."
+                )
+            if not np.any(mask_np):
+                raise ValueError("attention_mask masks out all tokens.")
+
+            if not np.all(mask_np):
+                tokens_np = np.from_dlpack(tokens.to(CPU()))
+                tokens_np = tokens_np[mask_np]
+                tokens = Tensor.constant(
+                    tokens_np.astype(np.int64, copy=False),
+                    dtype=DType.int64,
+                    device=self.devices[0],
+                )
+
+        outputs = self.model(tokens)
         if isinstance(outputs, list):
-            return tuple(outputs)
-        return outputs
+            outputs = tuple(outputs)
+
+        if hidden_state_index is None:
+            return outputs
+
+        if not isinstance(outputs, tuple):
+            raise ValueError(
+                "`hidden_state_index` requires model outputs to be tuple/list "
+                f"of hidden states, got {type(outputs).__name__}."
+            )
+
+        num_layers = len(outputs)
+        if hidden_state_index < -num_layers or hidden_state_index >= num_layers:
+            raise ValueError(
+                f"`hidden_state_index` out of range: {hidden_state_index}. "
+                f"Valid range is [{-num_layers}, {num_layers - 1}]."
+            )
+
+        return outputs[hidden_state_index]
