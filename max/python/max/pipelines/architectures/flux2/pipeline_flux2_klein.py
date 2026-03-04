@@ -28,7 +28,7 @@ from max.pipelines.lib.interfaces import PixelModelInputs
 from PIL import Image
 from tqdm import tqdm
 
-from ..qwen3.text_encoder import Qwen3TextEncoderModel
+from ..qwen3.text_encoder import Qwen3TextEncoderKleinModel
 from .pipeline_flux2 import Flux2Pipeline
 
 logger = logging.getLogger("max.pipelines")
@@ -60,11 +60,9 @@ class Flux2KleinPipelineOutput:
 class Flux2KleinPipeline(Flux2Pipeline):
     """Flux2 Klein diffusion pipeline with Qwen3 text encoder."""
 
-    prompt_embedding_hidden_states_layers: tuple[int, ...] = (9, 18, 27)
-
     components = {
         "vae": Flux2Pipeline.components["vae"],
-        "text_encoder": Qwen3TextEncoderModel,
+        "text_encoder": Qwen3TextEncoderKleinModel,
         "transformer": Flux2Pipeline.components["transformer"],
     }
 
@@ -87,59 +85,29 @@ class Flux2KleinPipeline(Flux2Pipeline):
         self,
         tokens: TokenBuffer,
         num_images_per_prompt: int = 1,
-        hidden_states_layers: list[int] | None = None,
     ) -> tuple[Tensor, Tensor]:
-        layers = hidden_states_layers or list(
-            self.prompt_embedding_hidden_states_layers
-        )
         token_ids = np.asarray(tokens.array, dtype=np.int64)
         if token_ids.ndim != 1:
             raise ValueError(
                 f"Flux2Klein expects 1D tokens, got shape {token_ids.shape}."
             )
-        target_seq_len = int(token_ids.shape[0])
 
         text_input_ids = Tensor.constant(
             token_ids,
             dtype=DType.int64,
             device=self.text_encoder.devices[0],
         )
-        hidden_states_all = self.text_encoder(text_input_ids)
+        prompt_embeds = self.text_encoder(text_input_ids)
+        if prompt_embeds.rank == 2:
+            prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
+        elif prompt_embeds.rank != 3:
+            raise ValueError(
+                f"Unexpected prompt_embeds rank={prompt_embeds.rank}; expected 2 or 3."
+            )
 
-        hidden_states_raw: list[Tensor] = []
-        all_match_target_seq_len = True
-        for i in layers:
-            hs = hidden_states_all[i - 1]
-            if hs.rank == 3:
-                hs = hs[0]
-            hidden_states_raw.append(hs)
-            if all_match_target_seq_len and int(hs.shape[0]) != target_seq_len:
-                all_match_target_seq_len = False
-
-        if all_match_target_seq_len:
-            hidden_states_selected = hidden_states_raw
-        else:
-            hidden_states_selected = []
-            for hs in hidden_states_raw:
-                seq_len = int(hs.shape[0])
-                hidden_dim = int(hs.shape[1])
-                if seq_len < target_seq_len:
-                    hs = F.concat(
-                        [
-                            hs,
-                            Tensor.zeros(
-                                [target_seq_len - seq_len, hidden_dim],
-                                dtype=hs.dtype,
-                                device=hs.device,
-                            ),
-                        ],
-                        axis=0,
-                    )
-                elif seq_len > target_seq_len:
-                    hs = hs[:target_seq_len]
-                hidden_states_selected.append(hs)
-
-        prompt_embeds = self._prepare_prompt_embeddings(*hidden_states_selected)
+        prompt_embeds = prompt_embeds.to(
+            self.transformer.devices[0]
+        ).cast(self.transformer.config.dtype)
         batch_size = int(prompt_embeds.shape[0])
         seq_len = int(prompt_embeds.shape[1])
 
@@ -300,7 +268,6 @@ class Flux2KleinPipeline(Flux2Pipeline):
                         np.ndarray,
                         self.decode_latents(
                             latents,
-                            latent_image_ids,
                             model_inputs.height,
                             model_inputs.width,
                             output_type=output_type,
@@ -311,11 +278,9 @@ class Flux2KleinPipeline(Flux2Pipeline):
         image_list = []
         for b in range(batch_size):
             latents_b = latents[b : b + 1]
-            latent_image_ids_b = latent_image_ids[b : b + 1]
             image_list.append(
                 self.decode_latents(
                     latents_b,
-                    latent_image_ids_b,
                     model_inputs.height,
                     model_inputs.width,
                     output_type=output_type,

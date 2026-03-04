@@ -88,7 +88,6 @@ class EncoderAttention(Module[..., Tensor]):
         Args:
             x: Input tensor with shape [total_seq_len, hidden_dim]
             rope: RotaryEmbedding module
-
         Returns:
             Output tensor with shape [total_seq_len, hidden_dim]
         """
@@ -106,7 +105,7 @@ class EncoderAttention(Module[..., Tensor]):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # common_layers RotaryEmbedding.forward expects 4D (B, S, H, D); add batch dim
+        # module_v3.common_layers RotaryEmbedding.forward expects 4D (B, S, H, D); add batch dim
         q = F.squeeze(rope(F.unsqueeze(q, 0)), 0)
         k = F.squeeze(rope(F.unsqueeze(k, 0)), 0)
 
