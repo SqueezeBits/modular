@@ -68,6 +68,40 @@ class Flux2KleinPipeline(Flux2Pipeline):
         "transformer": Flux2Pipeline.components["transformer"],
     }
 
+    def _prepare_prompt_embeddings(self, *hidden_states: Tensor) -> Tensor:
+        """Fuse selected hidden states into transformer text conditioning.
+
+        Qwen3 text encoder returns per-layer tensors shaped (S, D). Klein
+        consumes a single tensor shaped (B, S, L*D), where selected layers are
+        concatenated on the hidden dimension and B=1 for a single prompt.
+        """
+        if len(hidden_states) == 0:
+            raise ValueError("At least one hidden state is required.")
+
+        first = hidden_states[0]
+        if first.rank != 2:
+            raise ValueError(
+                f"Expected hidden state rank 2, got rank {first.rank}."
+            )
+        seq_len = int(first.shape[0])
+        cast_dtype = self.transformer.config.dtype
+        cast_device = self.transformer.devices[0]
+
+        prepared: list[Tensor] = []
+        for hs in hidden_states:
+            if hs.rank != 2:
+                raise ValueError(
+                    f"Expected hidden state rank 2, got rank {hs.rank}."
+                )
+            if int(hs.shape[0]) != seq_len:
+                raise ValueError(
+                    "Hidden states must have matching sequence lengths."
+                )
+            prepared.append(hs.to(cast_device).cast(cast_dtype))
+
+        fused = prepared[0] if len(prepared) == 1 else F.concat(prepared, axis=1)
+        return F.reshape(fused, (1, seq_len, -1))
+
     def prepare_inputs(self, context: PixelContext) -> Flux2KleinModelInputs:  # type: ignore[override]
         pil_image = None
         if context.input_image is not None and isinstance(
@@ -300,7 +334,6 @@ class Flux2KleinPipeline(Flux2Pipeline):
                         np.ndarray,
                         self.decode_latents(
                             latents,
-                            latent_image_ids,
                             model_inputs.height,
                             model_inputs.width,
                             output_type=output_type,
@@ -311,11 +344,9 @@ class Flux2KleinPipeline(Flux2Pipeline):
         image_list = []
         for b in range(batch_size):
             latents_b = latents[b : b + 1]
-            latent_image_ids_b = latent_image_ids[b : b + 1]
             image_list.append(
                 self.decode_latents(
                     latents_b,
-                    latent_image_ids_b,
                     model_inputs.height,
                     model_inputs.width,
                     output_type=output_type,
