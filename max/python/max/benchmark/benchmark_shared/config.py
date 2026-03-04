@@ -338,10 +338,11 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
     )
     """Number of multiturn chat sessions."""
 
-    delay_between_chat_turns: int | None = field(
+    delay_between_chat_turns: int | str | None = field(
         default=None, metadata={"group": "Workload Configuration"}
     )
-    """Delay between chat turns in ms."""
+    """Delay between chat turns in ms. Accepts an integer for a constant delay,
+    or a distribution string: 'N(mean,std)' for normal, 'U(lower,upper)' for uniform or 'G(shape,scale)' for gamma."""
 
     # Output control (serving-specific extensions)
     output_lengths: str | None = field(
@@ -731,6 +732,15 @@ class SweepServingBenchmarkConfig(ServingBenchmarkConfig):
         },
     )
     """Number of iterations to run per configuration."""
+
+    # Whether or not to flush prefix cache between iterations
+    flush_prefix_cache: bool = field(
+        default=True,
+        metadata={
+            "group": "Sweep Configuration",
+        },
+    )
+    """Flush the prefix cache between iterations"""
 
     @classmethod
     def get_default_required_fields(cls) -> set[str]:
