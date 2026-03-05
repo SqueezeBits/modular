@@ -739,11 +739,13 @@ class T5Stack(Module[..., Tensor]):
         if attention_mask is not None:
             if attention_mask.rank == 1:
                 attention_mask = F.unsqueeze(attention_mask, 0)
-            dtype_np = (
-                hidden_states.dtype.to_numpy()
-                if hasattr(hidden_states.dtype, "to_numpy")
-                else np.float32
-            )
+            dtype_np = np.float32
+            if hasattr(hidden_states.dtype, "to_numpy"):
+                try:
+                    dtype_np = hidden_states.dtype.to_numpy()
+                except ValueError:
+                    # bfloat16 has no direct numpy counterpart.
+                    dtype_np = np.float32
             mask_multiplier = F.constant(
                 float(np.finfo(dtype_np).min),
                 dtype=hidden_states.dtype,
@@ -829,6 +831,11 @@ class T5EncoderModel(Module[..., Tensor]):
         return (
             TensorType(
                 DType.int64,
+                shape=["batch_size", "sequence_length"],
+                device=self.device,
+            ),
+            TensorType(
+                DType.bool,
                 shape=["batch_size", "sequence_length"],
                 device=self.device,
             ),

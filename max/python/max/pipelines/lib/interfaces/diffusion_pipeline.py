@@ -205,6 +205,11 @@ class PixelModelInputs:
     Required for all models.
     """
 
+    mask: npt.NDArray[np.bool_] | None = None
+    """
+    Optional text attention mask aligned with ``tokens``.
+    """
+
     tokens_2: TokenBuffer | None = None
     """
     Secondary encoder token buffer (for dual-encoder models).
@@ -217,6 +222,11 @@ class PixelModelInputs:
     Negative prompt tokens for the primary encoder.
     Used for classifier-free guidance (CFG) or similar conditioning schemes.
     If your pipeline does not use negative prompts, leave as None.
+    """
+
+    negative_mask: npt.NDArray[np.bool_] | None = None
+    """
+    Optional attention mask aligned with ``negative_tokens``.
     """
 
     negative_tokens_2: TokenBuffer | None = None
@@ -345,6 +355,27 @@ class PixelModelInputs:
     - Must be > 0.
     - For video generation, the naming may still be used for historical compatibility.
     """
+
+    num_frames: int | None = None
+    """
+    Number of frames to generate for video pipelines.
+    """
+
+    frames_per_second: int | None = None
+    """
+    Output frame-rate for video pipelines.
+    """
+
+    decode_timestep: float | None = None
+    """
+    Optional decode timestep for timestep-aware video decoders.
+    """
+
+    decode_noise_scale: float | None = None
+    """
+    Optional interpolation factor between denoised latents and random noise during decode.
+    """
+
     input_image: Image.Image | None = None
     """
     Optional input image for image-to-image generation (PIL.Image.Image).
@@ -386,6 +417,14 @@ class PixelModelInputs:
         ):
             raise ValueError(
                 f"num_images_per_prompt must be > 0. Got {self.num_images_per_prompt!r}"
+            )
+
+        if self.num_frames is not None and self.num_frames <= 0:
+            raise ValueError(f"num_frames must be > 0. Got {self.num_frames!r}")
+
+        if self.frames_per_second is not None and self.frames_per_second <= 0:
+            raise ValueError(
+                f"frames_per_second must be > 0. Got {self.frames_per_second!r}"
             )
 
         required_arrays = {

@@ -38,7 +38,10 @@ from max.interfaces import (
     VLMTextGenerationContext,
 )
 from max.interfaces.generation import GenerationOutput
-from max.interfaces.request.open_responses import OutputImageContent
+from max.interfaces.request.open_responses import (
+    OutputImageContent,
+    OutputVideoContent,
+)
 
 CHUNK_SIZE = 128
 FUTURE_TOKEN = -999
@@ -676,6 +679,9 @@ class PixelContext:
     negative_tokens: TokenBuffer | None = field(default=None)
     """Negative tokens for primary encoder."""
 
+    negative_mask: npt.NDArray[np.bool_] | None = field(default=None)
+    """Mask for negative prompt attention."""
+
     negative_tokens_2: TokenBuffer | None = field(default=None)
     """Negative tokens for secondary encoder. None for single-encoder models."""
 
@@ -707,6 +713,12 @@ class PixelContext:
     true_cfg_scale: float = field(default=1.0)
     num_warmup_steps: int = field(default=0)
     num_images_per_prompt: int = field(default=1)
+    num_frames: int | None = field(default=None)
+    frames_per_second: int | None = field(default=None)
+    decode_timestep: float | None = field(default=None)
+    decode_noise_scale: float | None = field(default=None)
+    denoise_strength: float | None = field(default=None)
+    image_cond_noise_scale: float | None = field(default=None)
     input_image: npt.NDArray[np.uint8] | None = field(default=None)
     """Input image as numpy array (H, W, C) in uint8 format for image-to-image generation."""
     status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
@@ -733,6 +745,42 @@ class PixelContext:
 
     def to_generation_output(self) -> GenerationOutput:
         """Convert this context to a GenerationOutput object."""
+        is_video = (
+            (self.num_frames is not None and self.num_frames > 1)
+            or self.latents.ndim == 5
+        )
+        if is_video:
+            frames = self.latents
+            if frames.ndim == 5:
+                # [B, F, H, W, C] -> take first sample for single-request output.
+                frames = frames[0]
+            if frames.ndim == 4 and frames.shape[0] in (1, 3, 4):
+                # [C, F, H, W] -> [F, H, W, C]
+                frames = np.transpose(frames, (1, 2, 3, 0))
+            if frames.min() < 0.0 or frames.max() > 1.0:
+                frames = (frames * 0.5 + 0.5).clip(0.0, 1.0)
+            else:
+                frames = frames.clip(0.0, 1.0)
+            frames_f32 = frames.astype(np.float32, copy=False)
+            fps = self.frames_per_second or 25
+            try:
+                output_video = OutputVideoContent.from_numpy_frames(
+                    frames_f32,
+                    format="mp4",
+                    frames_per_second=fps,
+                )
+            except ValueError:
+                output_video = OutputVideoContent.from_numpy_frames(
+                    frames_f32,
+                    format="gif",
+                    frames_per_second=fps,
+                )
+            return GenerationOutput(
+                request_id=self.request_id,
+                final_status=self.status,
+                output=[output_video],
+            )
+
         return GenerationOutput(
             request_id=self.request_id,
             final_status=self.status,

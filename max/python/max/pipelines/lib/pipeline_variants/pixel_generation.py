@@ -29,7 +29,10 @@ from max.interfaces import (
     RequestID,
 )
 from max.interfaces.generation import GenerationOutput
-from max.interfaces.request.open_responses import OutputImageContent
+from max.interfaces.request.open_responses import (
+    OutputImageContent,
+    OutputVideoContent,
+)
 
 from ..interfaces.diffusion_pipeline import (
     DiffusionPipeline,
@@ -115,22 +118,84 @@ class PixelGenerationPipeline(
             )
             raise
 
-        images = model_outputs.images
+        images = getattr(model_outputs, "images", None)
+        videos = getattr(model_outputs, "videos", None)
+        frames_per_second = getattr(model_outputs, "frames_per_second", None)
         num_images_per_prompt = model_inputs.num_images_per_prompt
         expected_images = len(flat_batch) * num_images_per_prompt
 
-        # Handle both numpy array (NHWC) and list of images
+        # Video path: model returned [N, F, H, W, C] (or [N, C, F, H, W]).
+        if videos is not None or (
+            isinstance(images, np.ndarray) and images.ndim == 5
+        ):
+            video_tensor = videos if videos is not None else images
+            if not isinstance(video_tensor, np.ndarray):
+                video_tensor = np.asarray(video_tensor, dtype=np.float32)
+
+            if video_tensor.ndim != 5:
+                raise ValueError(
+                    "Unexpected video tensor shape from pipeline. "
+                    f"Expected 5D tensor, got {video_tensor.shape}."
+                )
+
+            # Convert [N, C, F, H, W] -> [N, F, H, W, C] when needed.
+            if video_tensor.shape[1] in (1, 3, 4) and video_tensor.shape[-1] not in (
+                1,
+                3,
+                4,
+            ):
+                video_tensor = np.transpose(video_tensor, (0, 2, 3, 4, 1))
+
+            if video_tensor.min() < 0.0 or video_tensor.max() > 1.0:
+                video_tensor = (video_tensor * 0.5 + 0.5).clip(0.0, 1.0)
+            else:
+                video_tensor = video_tensor.clip(0.0, 1.0)
+
+            if video_tensor.shape[0] != expected_images:
+                raise ValueError(
+                    "Unexpected number of videos returned from pipeline: "
+                    f"expected {expected_images}, got {video_tensor.shape[0]}."
+                )
+
+            responses: dict[RequestID, GenerationOutput] = {}
+            for index, (request_id, context) in enumerate(flat_batch):
+                offset = index * num_images_per_prompt
+                request_videos = video_tensor[
+                    offset : offset + num_images_per_prompt
+                ]
+
+                fps = (
+                    frames_per_second
+                    or context.frames_per_second
+                    or model_inputs.frames_per_second
+                    or 25
+                )
+                fps = int(fps)
+                output_content: list[OutputVideoContent] = []
+                for video_frames in request_videos:
+                    output_content.append(
+                        self._to_output_video_content(video_frames, fps)
+                    )
+
+                responses[request_id] = GenerationOutput(
+                    request_id=request_id,
+                    final_status=GenerationStatus.END_OF_SEQUENCE,
+                    output=output_content,
+                )
+
+            return responses
+
+        # Image path: existing behavior.
+        if images is None:
+            raise ValueError(
+                "Pipeline returned neither image nor video outputs."
+            )
         if isinstance(images, np.ndarray):
-            # images shape: (batch_size, H, W, C) or (batch_size, C, H, W)
-            # Convert NCHW to NHWC if needed
             if images.ndim == 4 and images.shape[1] in (1, 3, 4):
-                # Likely NCHW format, convert to NHWC
                 images = np.transpose(images, (0, 2, 3, 1))
-            # Denormalize from [-1, 1] to [0, 1] range
             images = (images * 0.5 + 0.5).clip(min=0.0, max=1.0)
             image_list = [images[i] for i in range(images.shape[0])]
         else:
-            # Denormalize each image from [-1, 1] to [0, 1] range
             image_list = [
                 (np.asarray(img, dtype=np.float32) * 0.5 + 0.5).clip(
                     min=0.0, max=1.0
@@ -162,6 +227,26 @@ class PixelGenerationPipeline(
             )
 
         return responses
+
+    @staticmethod
+    def _to_output_video_content(
+        frames: np.ndarray, frames_per_second: int
+    ) -> OutputVideoContent:
+        """Convert video frames ``[F, H, W, C]`` to OutputVideoContent."""
+        frames = np.asarray(frames, dtype=np.float32)
+        try:
+            return OutputVideoContent.from_numpy_frames(
+                frames,
+                format="mp4",
+                frames_per_second=frames_per_second,
+            )
+        except Exception:
+            # Fallback without external video codec dependencies.
+            return OutputVideoContent.from_numpy_frames(
+                frames,
+                format="gif",
+                frames_per_second=frames_per_second,
+            )
 
     def prepare_batch(
         self,

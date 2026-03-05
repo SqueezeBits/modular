@@ -11,6 +11,11 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .autoencoder_kl import AutoencoderKLModel
-from .autoencoder_kl_flux2 import AutoencoderKLFlux2Model
-from .autoencoder_kl_ltx_video import AutoencoderKLLTXVideoModel
+from max.graph.weights import WeightData
+
+
+def convert_safetensor_state_dict(
+    state_dict: dict[str, WeightData],
+) -> dict[str, WeightData]:
+    """Identity adapter for LTX safetensor checkpoints in MVP mode."""
+    return state_dict

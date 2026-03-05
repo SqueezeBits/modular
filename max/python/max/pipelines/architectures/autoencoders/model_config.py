@@ -34,8 +34,8 @@ class AutoencoderKLConfigBase(MAXModelConfigBase):
     sample_size: int = 32
     scaling_factor: float = 0.18215
     shift_factor: float | None = None
-    latents_mean: tuple[float] | None = None
-    latents_std: tuple[float] | None = None
+    latents_mean: tuple[float, ...] | None = None
+    latents_std: tuple[float, ...] | None = None
     force_upcast: bool = True
     use_quant_conv: bool = True
     use_post_quant_conv: bool = True
@@ -104,3 +104,163 @@ class AutoencoderKLFlux2Config(AutoencoderKLConfigBase):
             }
         )
         return AutoencoderKLFlux2Config(**init_dict)
+
+
+class AutoencoderKLLTXVideoConfig(AutoencoderKLConfigBase):
+    """Configuration for the LTX video VAE component."""
+
+    latent_channels: int = 128
+    patch_size: int = 4
+    patch_size_t: int = 1
+    layers_per_block: tuple[int, ...] = (4, 3, 3, 3, 4)
+    decoder_layers_per_block: tuple[int, ...] | None = None
+    spatio_temporal_scaling: tuple[bool, ...] = (True, True, True, False)
+    decoder_spatio_temporal_scaling: tuple[bool, ...] | None = None
+    decoder_inject_noise: tuple[bool, ...] | None = None
+    upsample_residual: tuple[bool, ...] | None = None
+    upsample_factor: tuple[int, ...] | None = None
+    decoder_block_out_channels: tuple[int, ...] | None = None
+    resnet_norm_eps: float = 1e-6
+    encoder_causal: bool = True
+    decoder_causal: bool = False
+    spatial_compression_ratio: int | None = None
+    temporal_compression_ratio: int | None = None
+    timestep_conditioning: bool = False
+    sample_height: int = 512
+    sample_width: int = 704
+    sample_num_frames: int = 161
+
+    @staticmethod
+    def generate(
+        config_dict: dict[str, Any],
+        encoding: SupportedEncoding,
+        devices: list[Device],
+    ) -> "AutoencoderKLLTXVideoConfig":
+        init_dict = {
+            key: value
+            for key, value in config_dict.items()
+            if key in AutoencoderKLConfigBase.__annotations__
+            or key in AutoencoderKLLTXVideoConfig.__annotations__
+        }
+
+        # Normalize list inputs to tuples for strict pydantic typing.
+        if "latents_mean" in init_dict and isinstance(
+            init_dict["latents_mean"], list
+        ):
+            init_dict["latents_mean"] = tuple(init_dict["latents_mean"])
+        if "latents_std" in init_dict and isinstance(
+            init_dict["latents_std"], list
+        ):
+            init_dict["latents_std"] = tuple(init_dict["latents_std"])
+
+        if "layers_per_block" in init_dict and isinstance(
+            init_dict["layers_per_block"], list
+        ):
+            init_dict["layers_per_block"] = tuple(init_dict["layers_per_block"])
+
+        if "spatio_temporal_scaling" in init_dict and isinstance(
+            init_dict["spatio_temporal_scaling"], list
+        ):
+            init_dict["spatio_temporal_scaling"] = tuple(
+                bool(x) for x in init_dict["spatio_temporal_scaling"]
+            )
+
+        if "decoder_layers_per_block" in init_dict and isinstance(
+            init_dict["decoder_layers_per_block"], list
+        ):
+            init_dict["decoder_layers_per_block"] = tuple(
+                init_dict["decoder_layers_per_block"]
+            )
+
+        if "decoder_spatio_temporal_scaling" in init_dict and isinstance(
+            init_dict["decoder_spatio_temporal_scaling"], list
+        ):
+            init_dict["decoder_spatio_temporal_scaling"] = tuple(
+                bool(x) for x in init_dict["decoder_spatio_temporal_scaling"]
+            )
+
+        if "decoder_inject_noise" in init_dict and isinstance(
+            init_dict["decoder_inject_noise"], list
+        ):
+            init_dict["decoder_inject_noise"] = tuple(
+                bool(x) for x in init_dict["decoder_inject_noise"]
+            )
+
+        if "upsample_residual" in init_dict and isinstance(
+            init_dict["upsample_residual"], list
+        ):
+            init_dict["upsample_residual"] = tuple(
+                bool(x) for x in init_dict["upsample_residual"]
+            )
+
+        if "upsample_factor" in init_dict and isinstance(
+            init_dict["upsample_factor"], list
+        ):
+            init_dict["upsample_factor"] = tuple(
+                int(x) for x in init_dict["upsample_factor"]
+            )
+
+        if "decoder_block_out_channels" in init_dict and isinstance(
+            init_dict["decoder_block_out_channels"], list
+        ):
+            init_dict["decoder_block_out_channels"] = tuple(
+                int(x) for x in init_dict["decoder_block_out_channels"]
+            )
+
+        block_out_channels = init_dict.get("block_out_channels", [128, 256, 512, 512])
+        num_blocks = len(block_out_channels)
+
+        layers_per_block = init_dict.get(
+            "layers_per_block", (4, 3, 3, 3, 4)
+        )
+        if isinstance(layers_per_block, int):
+            layers_per_block = tuple([layers_per_block] * (num_blocks + 1))
+        init_dict["layers_per_block"] = tuple(int(x) for x in layers_per_block)
+
+        if init_dict.get("decoder_layers_per_block") is None:
+            init_dict["decoder_layers_per_block"] = init_dict["layers_per_block"]
+
+        if init_dict.get("decoder_block_out_channels") is not None:
+            init_dict["block_out_channels"] = list(
+                init_dict["decoder_block_out_channels"]
+            )
+            block_out_channels = init_dict["block_out_channels"]
+            num_blocks = len(block_out_channels)
+
+        if init_dict.get("decoder_spatio_temporal_scaling") is None:
+            init_dict["decoder_spatio_temporal_scaling"] = init_dict.get(
+                "spatio_temporal_scaling",
+                (True, True, True, False),
+            )
+
+        if init_dict.get("decoder_inject_noise") is None:
+            init_dict["decoder_inject_noise"] = tuple(
+                False for _ in range(len(init_dict["layers_per_block"]))
+            )
+
+        if init_dict.get("upsample_residual") is None:
+            init_dict["upsample_residual"] = tuple(
+                False for _ in range(num_blocks)
+            )
+
+        if init_dict.get("upsample_factor") is None:
+            init_dict["upsample_factor"] = tuple(1 for _ in range(num_blocks))
+
+        if init_dict.get("spatial_compression_ratio") is None:
+            init_dict["spatial_compression_ratio"] = int(
+                init_dict.get("patch_size", 4)
+            ) * (2 ** sum(bool(x) for x in init_dict["spatio_temporal_scaling"]))
+
+        if init_dict.get("temporal_compression_ratio") is None:
+            init_dict["temporal_compression_ratio"] = int(
+                init_dict.get("patch_size_t", 1)
+            ) * (2 ** sum(bool(x) for x in init_dict["spatio_temporal_scaling"]))
+
+        init_dict.update(
+            {
+                # LTX video VAE is currently tuned for bf16 execution in MAX.
+                "dtype": DType.bfloat16,
+                "device": DeviceRef.from_device(devices[0]),
+            }
+        )
+        return AutoencoderKLLTXVideoConfig(**init_dict)

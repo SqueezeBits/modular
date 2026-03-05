@@ -30,6 +30,10 @@ class FlowMatchEulerDiscreteScheduler:
         max_image_seq_len: int = 4096,
         base_shift: float = 0.5,
         max_shift: float = 1.15,
+        shift: float = 1.0,
+        invert_sigmas: bool = False,
+        shift_terminal: float | None = None,
+        time_shift_type: str = "exponential",
         use_flow_sigmas: bool = False,
         use_dynamic_shifting: bool = False,
         use_empirical_mu: bool = False,
@@ -43,6 +47,10 @@ class FlowMatchEulerDiscreteScheduler:
             max_image_seq_len: Maximum image sequence length.
             base_shift: Base shift.
             max_shift: Maximum shift.
+            shift: Static shift factor for sigma schedule.
+            invert_sigmas: Whether to invert sigma schedule before terminal append.
+            shift_terminal: Optional terminal sigma value after schedule stretching.
+            time_shift_type: Dynamic shift type ("exponential" or "linear").
             use_flow_sigmas: Whether to use flow sigmas.
             use_dynamic_shifting: Whether to use dynamic shifting.
             use_empirical_mu: Whether to use empirical mu.
@@ -53,6 +61,10 @@ class FlowMatchEulerDiscreteScheduler:
         self.max_image_seq_len = max_image_seq_len
         self.base_shift = base_shift
         self.max_shift = max_shift
+        self.shift = shift
+        self.invert_sigmas = invert_sigmas
+        self.shift_terminal = shift_terminal
+        self.time_shift_type = time_shift_type
         self.use_flow_sigmas = use_flow_sigmas
         self.use_dynamic_shifting = use_dynamic_shifting
         self.use_empirical_mu = use_empirical_mu
@@ -76,6 +88,23 @@ class FlowMatchEulerDiscreteScheduler:
         t_safe = np.clip(t.astype(np.float64), 1e-7, 1.0)
         out = np.exp(mu) / (np.exp(mu) + (1.0 / t_safe - 1.0) ** sigma_param)
         return out.astype(np.float32)
+
+    @staticmethod
+    def _time_shift_linear(
+        mu: float, sigma_param: float, t: npt.NDArray[np.float32]
+    ) -> npt.NDArray[np.float32]:
+        t_safe = np.clip(t.astype(np.float64), 1e-7, 1.0)
+        out = mu / (mu + (1.0 / t_safe - 1.0) ** sigma_param)
+        return out.astype(np.float32)
+
+    @staticmethod
+    def _stretch_shift_to_terminal(
+        t: npt.NDArray[np.float32], shift_terminal: float
+    ) -> npt.NDArray[np.float32]:
+        one_minus_z = 1.0 - t
+        scale_factor = one_minus_z[-1] / (1.0 - shift_terminal)
+        stretched_t = 1.0 - (one_minus_z / scale_factor)
+        return stretched_t.astype(np.float32)
 
     @staticmethod
     def _compute_empirical_mu(
@@ -136,6 +165,7 @@ class FlowMatchEulerDiscreteScheduler:
             Tuple of timesteps and sigmas.
         """
         if not self._use_flow_sigmas:
+            # Match diffusers LTX path: custom sigmas provided to set_timesteps.
             sigmas = np.linspace(
                 1.0,
                 1.0 / num_inference_steps,
@@ -144,14 +174,30 @@ class FlowMatchEulerDiscreteScheduler:
             )
             if self._use_dynamic_shifting:
                 mu = self._calculate_mu(image_seq_len, num_inference_steps)
-                sigmas = self._time_shift_exponential(mu, 1.0, sigmas)
-            timesteps = sigmas * 1000.0
-            if reverse:
-                timesteps = ((1000.0 - timesteps) / 1000.0).astype(np.float32)
+                if self.time_shift_type == "linear":
+                    sigmas = self._time_shift_linear(mu, 1.0, sigmas)
+                else:
+                    sigmas = self._time_shift_exponential(mu, 1.0, sigmas)
             else:
-                timesteps = (timesteps / 1000.0).astype(np.float32)
-            # Append final sigma of 0.0 for the last scheduler step
-            sigmas = np.append(sigmas, np.float32(0.0))
+                sigmas = (
+                    self.shift * sigmas / (1.0 + (self.shift - 1.0) * sigmas)
+                ).astype(np.float32)
+
+            if self.shift_terminal is not None:
+                sigmas = self._stretch_shift_to_terminal(
+                    sigmas, float(self.shift_terminal)
+                )
+
+            timesteps = sigmas.copy()
+            if reverse:
+                timesteps = (1.0 - timesteps).astype(np.float32)
+
+            if self.invert_sigmas:
+                sigmas = (1.0 - sigmas).astype(np.float32)
+                timesteps = sigmas.copy()
+                sigmas = np.append(sigmas, np.float32(1.0))
+            else:
+                sigmas = np.append(sigmas, np.float32(0.0))
         else:
             # Generate default timesteps
             if reverse:

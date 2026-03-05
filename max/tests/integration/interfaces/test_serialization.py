@@ -20,7 +20,10 @@ import numpy as np
 import numpy.typing as npt
 from max.interfaces import RequestID
 from max.interfaces.generation import GenerationOutput
-from max.interfaces.request.open_responses import OutputImageContent
+from max.interfaces.request.open_responses import (
+    OutputImageContent,
+    OutputVideoContent,
+)
 from max.interfaces.status import GenerationStatus
 from max.interfaces.utils.serialization import (
     msgpack_numpy_decoder,
@@ -305,3 +308,33 @@ def test_generation_output_serialization_with_multiple_images() -> None:
     assert decoded_image_1.format == "jpeg"
     assert decoded_image_0.image_data == test_image_0.image_data
     assert decoded_image_1.image_data == test_image_1.image_data
+
+
+def test_generation_output_serialization_with_video() -> None:
+    """Test serialization of GenerationOutput with OutputVideoContent."""
+    frames = np.random.rand(6, 32, 32, 3).astype(np.float32)
+    test_output = GenerationOutput(
+        request_id=RequestID(),
+        final_status=GenerationStatus.END_OF_SEQUENCE,
+        output=[
+            OutputVideoContent.from_numpy_frames(
+                frames,
+                format="gif",
+                frames_per_second=12,
+            ),
+        ],
+    )
+
+    encoder = msgpack_numpy_encoder()
+    encoded_data = encoder(test_output)
+
+    decoder = msgpack_numpy_decoder(GenerationOutput, copy=True)
+    decoded_output = decoder(encoded_data)
+
+    assert len(decoded_output.output) == 1
+    decoded_video = decoded_output.output[0]
+    assert isinstance(decoded_video, OutputVideoContent)
+    assert decoded_video.type == "output_video"
+    assert decoded_video.format == "gif"
+    assert decoded_video.frames_per_second == 12
+    assert decoded_video.num_frames == 6

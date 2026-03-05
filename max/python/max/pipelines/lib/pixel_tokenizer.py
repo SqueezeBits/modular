@@ -67,6 +67,7 @@ async def run_with_default_executor(
 class PipelineClassName(str, Enum):
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
+    LTX = "LTXPipeline"
     ZIMAGE = "ZImagePipeline"
 
     @classmethod
@@ -204,10 +205,66 @@ class PixelGenerationTokenizer(
         self._vae_scale_factor = (
             2 ** (len(block_out_channels) - 1) if block_out_channels else 8
         )
+        spatial_compression_ratio = vae_config.get("spatial_compression_ratio")
+        temporal_compression_ratio = vae_config.get(
+            "temporal_compression_ratio"
+        )
+        self._vae_spatial_compression_ratio = (
+            int(spatial_compression_ratio)
+            if spatial_compression_ratio is not None
+            else self._vae_scale_factor
+        )
+        self._vae_temporal_compression_ratio = (
+            int(temporal_compression_ratio)
+            if temporal_compression_ratio is not None
+            else 1
+        )
+        spatio_temporal_scaling = vae_config.get("spatio_temporal_scaling", [])
+        if (
+            self._pipeline_class_name == PipelineClassName.LTX
+            and self._vae_spatial_compression_ratio == self._vae_scale_factor
+            and isinstance(spatio_temporal_scaling, list)
+            and spatio_temporal_scaling
+        ):
+            # Keep default-friendly fallbacks for LTX when explicit ratios are
+            # not present in serialized configs.
+            self._vae_spatial_compression_ratio = max(
+                1, 2 ** len(spatio_temporal_scaling)
+            )
+            self._vae_temporal_compression_ratio = max(
+                1, 2 ** max(len(spatio_temporal_scaling) - 2, 0)
+            )
+
+        if self._pipeline_class_name == PipelineClassName.LTX:
+            self._vae_spatial_compression_ratio = (
+                int(spatial_compression_ratio)
+                if spatial_compression_ratio is not None
+                else 32
+            )
+            self._vae_temporal_compression_ratio = (
+                int(temporal_compression_ratio)
+                if temporal_compression_ratio is not None
+                else 8
+            )
 
         # Store static model dimensions
         self._default_sample_size = 128
-        self._num_channels_latents = transformer_config["in_channels"] // 4
+        if self._pipeline_class_name == PipelineClassName.LTX:
+            self._num_channels_latents = int(transformer_config["in_channels"])
+        else:
+            self._num_channels_latents = int(transformer_config["in_channels"]) // 4
+
+        self._transformer_patch_size = int(
+            transformer_config.get("patch_size", 1)
+        )
+        self._transformer_patch_size_t = int(
+            transformer_config.get("patch_size_t", 1)
+        )
+
+        self._default_height = 512
+        self._default_width = 704
+        self._default_num_frames = 161
+        self._default_frames_per_second = 25
 
         # Create scheduler
         scheduler_class_name = components.get("scheduler", {}).get(
@@ -229,6 +286,9 @@ class PixelGenerationTokenizer(
     def _prepare_latent_image_ids(
         self, height: int, width: int, batch_size: int = 1
     ) -> npt.NDArray[np.float32]:
+        if self._pipeline_class_name == PipelineClassName.LTX:
+            return np.zeros((batch_size, 0, 3), dtype=np.float32)
+
         if self._pipeline_class_name == PipelineClassName.FLUX2:
             # Create 4D coordinates using numpy (T=0, H, W, L=0)
             t_coords, h_coords, w_coords, l_coords = np.meshgrid(
@@ -258,6 +318,35 @@ class PixelGenerationTokenizer(
             return latent_image_ids.reshape(
                 -1, latent_image_ids.shape[-1]
             ).astype(np.float32)
+
+    def _pack_video_latents(
+        self,
+        latents: npt.NDArray[np.float32],
+        patch_size: int,
+        patch_size_t: int,
+    ) -> npt.NDArray[np.float32]:
+        """Pack [B, C, F, H, W] latents into [B, S, D] tokens."""
+        batch_size, channels, num_frames, height, width = latents.shape
+        post_patch_num_frames = num_frames // patch_size_t
+        post_patch_height = height // patch_size
+        post_patch_width = width // patch_size
+        latents = latents.reshape(
+            batch_size,
+            channels,
+            post_patch_num_frames,
+            patch_size_t,
+            post_patch_height,
+            patch_size,
+            post_patch_width,
+            patch_size,
+        )
+        latents = np.transpose(latents, (0, 2, 4, 6, 1, 3, 5, 7))
+        latents = latents.reshape(
+            batch_size,
+            post_patch_num_frames * post_patch_height * post_patch_width,
+            channels * patch_size_t * patch_size * patch_size,
+        )
+        return latents.astype(np.float32, copy=False)
 
     def _randn_tensor(
         self,
@@ -343,19 +432,43 @@ class PixelGenerationTokenizer(
 
         return latents, latent_image_ids
 
+    def _prepare_video_latents(
+        self,
+        batch_size: int,
+        num_channels_latents: int,
+        latent_num_frames: int,
+        latent_height: int,
+        latent_width: int,
+        seed: int | None,
+    ) -> npt.NDArray[np.float32]:
+        shape = (
+            batch_size,
+            num_channels_latents,
+            latent_num_frames,
+            latent_height,
+            latent_width,
+        )
+        latents = self._randn_tensor(shape, seed)
+        return self._pack_video_latents(
+            latents,
+            patch_size=self._transformer_patch_size,
+            patch_size_t=self._transformer_patch_size_t,
+        )
+
     async def _generate_tokens_ids(
         self,
         prompt: str,
         prompt_2: str | None = None,
         negative_prompt: str | None = None,
         negative_prompt_2: str | None = None,
-        do_true_cfg: bool = False,
+        do_negative_prompt_encoding: bool = False,
         images: list[PIL.Image.Image] | None = None,
     ) -> tuple[
         npt.NDArray[np.int64],
         npt.NDArray[np.bool_],
         npt.NDArray[np.int64] | None,
         npt.NDArray[np.int64] | None,
+        npt.NDArray[np.bool_] | None,
         npt.NDArray[np.int64] | None,
     ]:
         """Tokenize prompt(s) with encoder model(s).
@@ -365,12 +478,13 @@ class PixelGenerationTokenizer(
             prompt_2: Secondary prompt (optional).
             negative_prompt: Negative prompt (optional).
             negative_prompt_2: Secondary negative prompt (optional).
-            do_true_cfg: Whether to use true classifier-free guidance.
+            do_negative_prompt_encoding: Whether to encode negative prompt tokens.
             images: Optional list of images for image-to-image generation (Flux2 only).
 
         Returns:
-            Tuple of (token_ids, attn_mask, token_ids_2, negative_token_ids, negative_token_ids_2).
-            token_ids_2 and negative_token_ids_2 are None if no secondary tokenizer is configured.
+            Tuple of
+            (token_ids, attn_mask, token_ids_2, negative_token_ids, negative_attn_mask, negative_token_ids_2).
+            Secondary outputs are None if no secondary tokenizer is configured.
         """
         token_ids, attn_mask = await self.encode(prompt, images=images)
 
@@ -382,9 +496,10 @@ class PixelGenerationTokenizer(
             )
 
         negative_token_ids: npt.NDArray[np.int64] | None = None
+        negative_attn_mask: npt.NDArray[np.bool_] | None = None
         negative_token_ids_2: npt.NDArray[np.int64] | None = None
-        if do_true_cfg:
-            negative_token_ids, _attn_mask_neg = await self.encode(
+        if do_negative_prompt_encoding:
+            negative_token_ids, negative_attn_mask = await self.encode(
                 negative_prompt or ""
             )
             if self.delegate_2 is not None:
@@ -398,6 +513,7 @@ class PixelGenerationTokenizer(
             attn_mask,
             token_ids_2,
             negative_token_ids,
+            negative_attn_mask,
             negative_token_ids_2,
         )
 
@@ -647,15 +763,35 @@ class PixelGenerationTokenizer(
         # Extract input image from request content (takes precedence over input_image parameter)
         input_image = self._retrieve_image(request) or input_image
 
-        # Extract image provider options (always available via defaults)
         image_options = request.body.provider_options.image
-        if image_options is None:
+        video_options = request.body.provider_options.video
+
+        is_ltx = self._pipeline_class_name == PipelineClassName.LTX
+        if image_options is None and not is_ltx:
             raise ValueError(
-                "Image provider options are required for pixel generation. "
-                "This should not happen as defaults are applied at request creation."
+                "Image provider options are required for non-video pixel generation pipelines."
             )
 
-        if (
+        secondary_prompt = (
+            image_options.secondary_prompt if image_options is not None else None
+        )
+        negative_prompt = (
+            image_options.negative_prompt if image_options is not None else None
+        )
+        secondary_negative_prompt = (
+            image_options.secondary_negative_prompt
+            if image_options is not None
+            else None
+        )
+        guidance_scale = (
+            image_options.guidance_scale
+            if image_options is not None
+            else (3.0 if is_ltx else 3.5)
+        )
+        true_cfg_scale = image_options.true_cfg_scale if image_options else 1.0
+        num_images = image_options.num_images if image_options else 1
+
+        if image_options is not None and (
             image_options.guidance_scale < 1.0
             or image_options.true_cfg_scale < 1.0
         ):
@@ -666,7 +802,8 @@ class PixelGenerationTokenizer(
             )
 
         if (
-            image_options.true_cfg_scale > 1.0
+            image_options is not None
+            and image_options.true_cfg_scale > 1.0
             and image_options.negative_prompt is None
         ):
             logger.warning(
@@ -675,10 +812,9 @@ class PixelGenerationTokenizer(
                 "falling back to standard generation."
             )
 
-        do_true_cfg = (
-            image_options.true_cfg_scale > 1.0
-            and image_options.negative_prompt is not None
-        )
+        do_true_cfg = true_cfg_scale > 1.0 and negative_prompt is not None
+        ltx_do_cfg = is_ltx and guidance_scale > 1.0
+        do_negative_prompt_encoding = do_true_cfg or ltx_do_cfg
         import PIL.Image
 
         # 1. Tokenize prompts
@@ -697,13 +833,14 @@ class PixelGenerationTokenizer(
             attn_mask,
             token_ids_2,
             negative_token_ids,
+            negative_attn_mask,
             negative_token_ids_2,
         ) = await self._generate_tokens_ids(
             prompt,
-            image_options.secondary_prompt,
-            image_options.negative_prompt,
-            image_options.secondary_negative_prompt,
-            do_true_cfg,
+            secondary_prompt,
+            negative_prompt,
+            secondary_negative_prompt,
+            do_negative_prompt_encoding,
             images=images_for_tokenization,
         )
 
@@ -720,6 +857,11 @@ class PixelGenerationTokenizer(
             negative_token_buffer = TokenBuffer(
                 array=negative_token_ids.astype(np.int64, copy=False),
             )
+        negative_attn_mask_arr = None
+        if negative_attn_mask is not None:
+            negative_attn_mask_arr = negative_attn_mask.astype(
+                np.bool_, copy=False
+            )
         negative_token_buffer_2 = None
         if negative_token_ids_2 is not None:
             negative_token_buffer_2 = TokenBuffer(
@@ -729,8 +871,56 @@ class PixelGenerationTokenizer(
         default_sample_size = self._default_sample_size
         vae_scale_factor = self._vae_scale_factor
 
-        height = image_options.height or default_sample_size * vae_scale_factor
-        width = image_options.width or default_sample_size * vae_scale_factor
+        if is_ltx:
+            height = (
+                (video_options.height if video_options else None)
+                or (image_options.height if image_options else None)
+                or self._default_height
+            )
+            width = (
+                (video_options.width if video_options else None)
+                or (image_options.width if image_options else None)
+                or self._default_width
+            )
+            num_frames = (
+                (video_options.num_frames if video_options else None)
+                or self._default_num_frames
+            )
+            frames_per_second = (
+                (video_options.frames_per_second if video_options else None)
+                or self._default_frames_per_second
+            )
+            decode_timestep = (
+                (video_options.decode_timestep if video_options else None) or 0.0
+            )
+            decode_noise_scale = (
+                video_options.decode_noise_scale if video_options else None
+            )
+            denoise_strength = (
+                video_options.denoise_strength if video_options else None
+            )
+            image_cond_noise_scale = (
+                video_options.image_cond_noise_scale
+                if video_options
+                else None
+            )
+            if video_options is not None and video_options.steps is not None:
+                num_inference_steps = video_options.steps
+            elif image_options is not None:
+                num_inference_steps = image_options.steps
+            else:
+                num_inference_steps = 50
+            num_images = 1
+        else:
+            height = image_options.height or default_sample_size * vae_scale_factor  # type: ignore[union-attr]
+            width = image_options.width or default_sample_size * vae_scale_factor  # type: ignore[union-attr]
+            num_frames = None
+            frames_per_second = None
+            decode_timestep = None
+            decode_noise_scale = None
+            denoise_strength = None
+            image_cond_noise_scale = None
+            num_inference_steps = image_options.steps  # type: ignore[union-attr]
 
         # 2. Preprocess input image if provided
         preprocessed_image_array = None
@@ -743,15 +933,26 @@ class PixelGenerationTokenizer(
             # Convert PIL.Image to numpy array for serialization
             # Use .copy() to ensure no references to the PIL.Image object are retained
             preprocessed_image_array = np.array(
-                preprocessed_image, dtype=np.uint8
+                preprocessed_image.convert("RGB"), dtype=np.uint8
             ).copy()
 
-        # 3. Resolve image dimensions using cached static values
-        latent_height = 2 * (int(height) // (self._vae_scale_factor * 2))
-        latent_width = 2 * (int(width) // (self._vae_scale_factor * 2))
-        image_seq_len = (latent_height // 2) * (latent_width // 2)
+        # 3. Resolve latent dimensions using cached static values
+        if is_ltx:
+            latent_height = int(height) // self._vae_spatial_compression_ratio
+            latent_width = int(width) // self._vae_spatial_compression_ratio
+            latent_num_frames = (
+                (int(num_frames) - 1) // self._vae_temporal_compression_ratio
+            ) + 1
+            image_seq_len = (
+                (latent_num_frames // self._transformer_patch_size_t)
+                * (latent_height // self._transformer_patch_size)
+                * (latent_width // self._transformer_patch_size)
+            )
+        else:
+            latent_height = 2 * (int(height) // (self._vae_scale_factor * 2))
+            latent_width = 2 * (int(width) // (self._vae_scale_factor * 2))
+            image_seq_len = (latent_height // 2) * (latent_width // 2)
 
-        num_inference_steps = image_options.steps
         timesteps, sigmas = self._scheduler.retrieve_timesteps_and_sigmas(
             image_seq_len, num_inference_steps
         )
@@ -760,13 +961,24 @@ class PixelGenerationTokenizer(
             len(timesteps) - num_inference_steps * self._scheduler.order, 0
         )
 
-        latents, latent_image_ids = self._prepare_latents(
-            image_options.num_images,
-            self._num_channels_latents,
-            latent_height,
-            latent_width,
-            request.body.seed,
-        )
+        if is_ltx:
+            latents = self._prepare_video_latents(
+                num_images,
+                self._num_channels_latents,
+                latent_num_frames,
+                latent_height,
+                latent_width,
+                request.body.seed,
+            )
+            latent_image_ids = np.array([], dtype=np.float32)
+        else:
+            latents, latent_image_ids = self._prepare_latents(
+                num_images,
+                self._num_channels_latents,
+                latent_height,
+                latent_width,
+                request.body.seed,
+            )
 
         # 5. Build the context
         context = PixelContext(
@@ -775,6 +987,7 @@ class PixelGenerationTokenizer(
             mask=attn_mask,
             tokens_2=token_buffer_2,
             negative_tokens=negative_token_buffer,
+            negative_mask=negative_attn_mask_arr,
             negative_tokens_2=negative_token_buffer_2,
             timesteps=timesteps,
             sigmas=sigmas,
@@ -783,10 +996,16 @@ class PixelGenerationTokenizer(
             height=height,
             width=width,
             num_inference_steps=num_inference_steps,
-            guidance_scale=image_options.guidance_scale,
-            num_images_per_prompt=image_options.num_images,
-            true_cfg_scale=image_options.true_cfg_scale,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images,
+            true_cfg_scale=true_cfg_scale,
             num_warmup_steps=num_warmup_steps,
+            num_frames=num_frames,
+            frames_per_second=frames_per_second,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            denoise_strength=denoise_strength,
+            image_cond_noise_scale=image_cond_noise_scale,
             model_name=request.body.model,
             input_image=preprocessed_image_array,  # Pass numpy array instead of PIL.Image
         )

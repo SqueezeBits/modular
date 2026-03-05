@@ -66,3 +66,40 @@ class VideoProviderOptions(BaseModel):
         ),
         gt=0,
     )
+
+    decode_timestep: float | None = Field(
+        None,
+        description=(
+            "Optional decode timestep used by timestep-aware video VAE decoders. "
+            "If omitted, model default is used."
+        ),
+        ge=0.0,
+    )
+
+    decode_noise_scale: float | None = Field(
+        None,
+        description=(
+            "Optional interpolation factor between denoised latents and random noise "
+            "during decode when timestep conditioning is enabled."
+        ),
+        ge=0.0,
+    )
+
+    denoise_strength: float | None = Field(
+        None,
+        description=(
+            "Strength of denoising for latent-to-latent refinement. "
+            "Values in [0, 1], where lower values keep more of the input latent."
+        ),
+        ge=0.0,
+        le=1.0,
+    )
+
+    image_cond_noise_scale: float | None = Field(
+        None,
+        description=(
+            "Timestep-scaled noise amount injected into hard image/video-conditioning "
+            "latents during denoising."
+        ),
+        ge=0.0,
+    )

@@ -42,7 +42,7 @@ from std.sys import (
     _RegisterPackType,
 )
 from std.sys._assembly import inlined_assembly
-from std.sys.info import _is_sm_100x_or_newer, _cdna_4_or_newer
+from std.sys.info import _cdna_4_or_newer
 
 from std.bit import log2_floor
 from std.math.math import max as _max, min as _min
@@ -1117,7 +1117,20 @@ fn prefix_sum[
 
 @always_inline("nodebug")
 fn _has_redux_f32_support[dtype: DType, simd_width: Int]() -> Bool:
-    return _is_sm_100x_or_newer() and dtype == DType.float32 and simd_width == 1
+    # NOTE:
+    # `redux.sync.*.f32` is not accepted by ptxas for some newer Blackwell
+    # targets (e.g. sm_120a). Restrict this fast path to architectures known
+    # to support it and fall back to shuffle-based reduction otherwise.
+    return (
+        (
+            is_nvidia_gpu["sm_100"]()
+            or is_nvidia_gpu["sm_100a"]()
+            or is_nvidia_gpu["sm_101"]()
+            or is_nvidia_gpu["sm_101a"]()
+        )
+        and dtype == DType.float32
+        and simd_width == 1
+    )
 
 
 @always_inline("nodebug")

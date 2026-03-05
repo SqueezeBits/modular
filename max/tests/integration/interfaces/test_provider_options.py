@@ -19,6 +19,7 @@ from max.interfaces.provider_options import (
     ImageProviderOptions,
     MaxProviderOptions,
     ProviderOptions,
+    VideoProviderOptions,
 )
 from pydantic import ValidationError
 
@@ -28,6 +29,7 @@ def test_import_provider_options() -> None:
     # If we get here, all imports succeeded
     assert MaxProviderOptions is not None
     assert ImageProviderOptions is not None
+    assert VideoProviderOptions is not None
     assert ProviderOptions is not None
 
 
@@ -104,17 +106,42 @@ def test_provider_options_with_image_only() -> None:
     assert opts.video is None
 
 
+def test_video_provider_options_with_params() -> None:
+    """Test creating VideoProviderOptions with LTX-related parameters."""
+    opts = VideoProviderOptions(
+        width=704,
+        height=512,
+        steps=50,
+        num_frames=161,
+        frames_per_second=25,
+        decode_timestep=0.0,
+        decode_noise_scale=0.1,
+    )
+    assert opts.width == 704
+    assert opts.height == 512
+    assert opts.steps == 50
+    assert opts.num_frames == 161
+    assert opts.frames_per_second == 25
+    assert opts.decode_timestep == 0.0
+    assert opts.decode_noise_scale == 0.1
+
+
 def test_provider_options_with_all_fields() -> None:
     """Test creating ProviderOptions with both MAX and modality options."""
     opts = ProviderOptions(
         max=MaxProviderOptions(target_endpoint="instance-123"),
         image=ImageProviderOptions(width=512, height=512),
+        video=VideoProviderOptions(width=704, height=512, num_frames=161),
     )
     assert opts.max is not None
     assert opts.max.target_endpoint == "instance-123"
     assert opts.image is not None
     assert opts.image.width == 512
     assert opts.image.height == 512
+    assert opts.video is not None
+    assert opts.video.width == 704
+    assert opts.video.height == 512
+    assert opts.video.num_frames == 161
 
 
 def test_provider_options_frozen() -> None:
@@ -132,6 +159,12 @@ def test_provider_options_json_serialization() -> None:
     opts = ProviderOptions(
         max=MaxProviderOptions(target_endpoint="instance-123"),
         image=ImageProviderOptions(width=1024, height=768),
+        video=VideoProviderOptions(
+            width=704,
+            height=512,
+            num_frames=161,
+            frames_per_second=25,
+        ),
     )
 
     json_str = opts.model_dump_json()
@@ -140,6 +173,10 @@ def test_provider_options_json_serialization() -> None:
     assert json_data["max"]["target_endpoint"] == "instance-123"
     assert json_data["image"]["width"] == 1024
     assert json_data["image"]["height"] == 768
+    assert json_data["video"]["width"] == 704
+    assert json_data["video"]["height"] == 512
+    assert json_data["video"]["num_frames"] == 161
+    assert json_data["video"]["frames_per_second"] == 25
 
 
 def test_provider_options_json_deserialization() -> None:

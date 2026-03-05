@@ -31,7 +31,7 @@ import asyncio
 import base64
 import os
 from io import BytesIO
-from typing import cast
+from typing import Any, cast
 
 from max.driver import DeviceSpec
 from max.examples.diffusion.profiler import profile_execute
@@ -43,6 +43,7 @@ from max.interfaces import (
 from max.interfaces.provider_options import (
     ImageProviderOptions,
     ProviderOptions,
+    VideoProviderOptions,
 )
 from max.interfaces.request import OpenResponsesRequest
 from max.interfaces.request.open_responses import (
@@ -50,6 +51,7 @@ from max.interfaces.request.open_responses import (
     InputTextContent,
     OpenResponsesRequestBody,
     OutputImageContent,
+    OutputVideoContent,
     UserMessage,
 )
 from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
@@ -61,6 +63,91 @@ from max.pipelines.lib.pipeline_variants.pixel_generation import (
     PixelGenerationPipeline,
 )
 from PIL import Image
+
+
+ENV_FILES = ("/root/.env", "/workspace/.env")
+
+
+def apply_env_overrides() -> None:
+    """Load runtime environment overrides from local .env files."""
+    for env_path in ENV_FILES:
+        if not os.path.isfile(env_path):
+            continue
+
+        with open(env_path, encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[len("export ") :].strip()
+                if not key:
+                    continue
+
+                value = value.strip()
+                if (
+                    len(value) >= 2
+                    and value[0] == value[-1]
+                    and value[0] in {'"', "'"}
+                ):
+                    value = value[1:-1]
+                os.environ[key] = value
+
+
+def resolve_local_model_snapshot(model_path: str) -> str:
+    """Resolve a local HF snapshot path when available.
+
+    This keeps runs deterministic in offline/cached environments and avoids
+    online metadata dependence for quantization detection.
+    """
+    if os.path.isdir(model_path):
+        return model_path
+
+    # Prefer explicit HF cache roots from env, before asking huggingface_hub.
+    model_cache_name = "models--" + model_path.replace("/", "--")
+    cache_roots = [
+        os.environ.get("HF_HUB_CACHE"),
+        os.environ.get("HUGGINGFACE_HUB_CACHE"),
+    ]
+    for cache_root in cache_roots:
+        if not cache_root:
+            continue
+
+        repo_cache_dir = os.path.join(cache_root, model_cache_name)
+        snapshots_dir = os.path.join(repo_cache_dir, "snapshots")
+        refs_main = os.path.join(repo_cache_dir, "refs", "main")
+
+        revision: str | None = None
+        if os.path.isfile(refs_main):
+            with open(refs_main, encoding="utf-8") as f:
+                revision = f.read().strip() or None
+
+        if revision is not None:
+            resolved = os.path.join(snapshots_dir, revision)
+            if os.path.isdir(resolved):
+                return resolved
+
+        if os.path.isdir(snapshots_dir):
+            candidates = [
+                os.path.join(snapshots_dir, name)
+                for name in os.listdir(snapshots_dir)
+                if os.path.isdir(os.path.join(snapshots_dir, name))
+            ]
+            if candidates:
+                return max(candidates, key=os.path.getmtime)
+
+    try:
+        import huggingface_hub
+
+        return huggingface_hub.snapshot_download(
+            repo_id=model_path,
+            local_files_only=True,
+        )
+    except Exception:
+        return model_path
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -111,6 +198,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of denoising steps. More steps = higher quality but slower.",
     )
     parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=161,
+        help="Number of frames for video generation models (e.g., LTX).",
+    )
+    parser.add_argument(
+        "--frames-per-second",
+        type=int,
+        default=25,
+        help="FPS for video generation models (e.g., LTX).",
+    )
+    parser.add_argument(
+        "--decode-timestep",
+        type=float,
+        default=None,
+        help="Decode timestep for timestep-aware video VAE decode.",
+    )
+    parser.add_argument(
+        "--decode-noise-scale",
+        type=float,
+        default=None,
+        help="Decode noise scale for timestep-aware video VAE decode.",
+    )
+    parser.add_argument(
+        "--denoise-strength",
+        type=float,
+        default=None,
+        help="Denoise strength in [0,1] for latent refinement.",
+    )
+    parser.add_argument(
+        "--image-cond-noise-scale",
+        type=float,
+        default=None,
+        help="Noise scale injected into hard image-conditioning latents.",
+    )
+    parser.add_argument(
         "--guidance-scale",
         type=float,
         default=3.5,
@@ -152,6 +275,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Profile timings of the pipeline.",
     )
     parser.add_argument(
+        "--save-packed-latents-npy",
+        type=str,
+        default=None,
+        help=(
+            "LTX only: save packed denoised latents ([B,S,D], float32) to this "
+            ".npy path before VAE decode."
+        ),
+    )
+    parser.add_argument(
+        "--load-packed-latents-npy",
+        type=str,
+        default=None,
+        help=(
+            "LTX only: override initial packed latents ([B,S,D], float32) from "
+            "this .npy path."
+        ),
+    )
+    parser.add_argument(
         "--num-warmups",
         type=int,
         default=0,
@@ -178,6 +319,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     assert args.num_inference_steps > 0, (
         "num-inference-steps must be a positive integer."
     )
+    assert args.num_frames > 0, "num-frames must be a positive integer."
+    assert args.frames_per_second > 0, (
+        "frames-per-second must be a positive integer."
+    )
+    if args.denoise_strength is not None:
+        assert 0.0 <= args.denoise_strength <= 1.0, (
+            "denoise-strength must be in [0, 1]."
+        )
+    if args.image_cond_noise_scale is not None:
+        assert args.image_cond_noise_scale >= 0.0, (
+            "image-cond-noise-scale must be >= 0."
+        )
     assert args.guidance_scale > 0.0, "guidance-scale must be positive."
 
     return args
@@ -203,6 +356,42 @@ def save_image(image_data: str, output_path: str) -> None:
     except ImportError:
         print("WARNING: PIL not available, cannot save image")
         print(f"Base64 data length: {len(image_data)} chars")
+
+
+def save_video(video_data: str, output_path: str) -> None:
+    """Save base64-encoded video data to a file."""
+    video_bytes = base64.b64decode(video_data)
+    actual_output_path = output_path
+    if video_bytes.startswith((b"GIF87a", b"GIF89a")) and not output_path.lower().endswith(".gif"):
+        base, _ = os.path.splitext(output_path)
+        actual_output_path = f"{base}.gif"
+        print(
+            "WARNING: Encoded output is GIF data but output path had a non-GIF extension. "
+            f"Saving as: {actual_output_path}"
+        )
+
+    with open(actual_output_path, "wb") as f:
+        f.write(video_bytes)
+    print(f"Video saved to: {actual_output_path}")
+
+
+def save_pil_frames_as_gif(
+    frames: list[Image.Image], output_path: str, fps: int
+) -> None:
+    """Save PIL frames to GIF."""
+    if not frames:
+        raise ValueError("No frames to save.")
+    duration_ms = max(1, int(1000 / fps))
+    first, rest = frames[0], frames[1:]
+    first.save(
+        output_path,
+        format="GIF",
+        save_all=True,
+        append_images=rest,
+        duration=duration_ms,
+        loop=0,
+    )
+    print(f"Video saved to: {output_path}")
 
 
 def load_image_as_data_uri(image_path: str | None) -> str | None:
@@ -245,11 +434,23 @@ async def generate_image(args: argparse.Namespace) -> None:
     print(f"Loading model: {args.model}")
 
     # Step 1: Initialize pipeline configuration
+    resolved_model_path = resolve_local_model_snapshot(args.model)
+    if resolved_model_path != args.model:
+        print(f"Resolved local model snapshot: {resolved_model_path}")
+
+    model_kwargs: dict[str, Any] = {
+        "model_path": resolved_model_path,
+        "device_specs": [DeviceSpec.accelerator()],
+    }
+    if "ltx" in args.model.lower():
+        # Public LTX checkpoints are fp32 safetensors. Request bf16 runtime
+        # and allow fp32<->bf16 safetensors casting during model loading.
+        model_kwargs["quantization_encoding"] = "bfloat16"
+        model_kwargs[
+            "allow_safetensors_weights_fp32_bf6_bidirectional_cast"
+        ] = True
     config = PipelineConfig(
-        model=MAXModelConfig(
-            model_path=args.model,
-            device_specs=[DeviceSpec.accelerator()],
-        ),
+        model=MAXModelConfig(**model_kwargs),
         runtime=PipelineRuntimeConfig(
             prefer_module_v3=True,
         ),
@@ -320,6 +521,33 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     print(f"Generating image for prompt: '{args.prompt}'")
 
+    is_ltx = arch.name == "LTXPipeline"
+    provider_options = ProviderOptions(
+        image=ImageProviderOptions(
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+        ),
+        video=(
+            VideoProviderOptions(
+                negative_prompt=args.negative_prompt,
+                height=args.height,
+                width=args.width,
+                steps=args.num_inference_steps,
+                num_frames=args.num_frames,
+                frames_per_second=args.frames_per_second,
+                decode_timestep=args.decode_timestep,
+                decode_noise_scale=args.decode_noise_scale,
+                denoise_strength=args.denoise_strength,
+                image_cond_noise_scale=args.image_cond_noise_scale,
+            )
+            if is_ltx
+            else None
+        ),
+    )
+
     # Step 4: Create an OpenResponsesRequest
     # Load input image if provided and convert to data URI
     input_image_data_uri = load_image_as_data_uri(args.input_image)
@@ -345,15 +573,7 @@ async def generate_image(args: argparse.Namespace) -> None:
                 )
             ],
             seed=args.seed,
-            provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                )
-            ),
+            provider_options=provider_options,
         )
     else:
         # Text-to-image: Use simple string prompt
@@ -361,15 +581,7 @@ async def generate_image(args: argparse.Namespace) -> None:
             model=args.model,
             input=args.prompt,
             seed=args.seed,
-            provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                )
-            ),
+            provider_options=provider_options,
         )
 
     request = OpenResponsesRequest(request_id=RequestID(), body=body)
@@ -401,15 +613,7 @@ async def generate_image(args: argparse.Namespace) -> None:
             model=args.model,
             input=args.prompt,
             seed=args.seed,
-            provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                )
-            ),
+            provider_options=provider_options,
         )
         request_warmup = OpenResponsesRequest(
             request_id=RequestID(), body=body_warmup
@@ -428,6 +632,11 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
+    if args.save_packed_latents_npy:
+        os.environ["MAX_LTX_SAVE_PACKED_LATENTS"] = args.save_packed_latents_npy
+    if args.load_packed_latents_npy:
+        os.environ["MAX_LTX_OVERRIDE_PACKED_LATENTS"] = args.load_packed_latents_npy
+
     if args.profile_timings:
         with profile_execute(pipeline) as prof:
             for i in range(args.num_profile_iterations):
@@ -450,36 +659,37 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     print("Generation complete!")
 
-    # Step 9: Extract and save images from OutputImageContent
-    # The output now contains a list of OutputImageContent objects with base64-encoded images
+    # Step 9: Extract and save generated media from output content
     if not output.output:
-        print("ERROR: No images generated")
+        print("ERROR: No media generated")
         return
 
-    # Save each generated image
-    for idx, image_content in enumerate(output.output):
-        # Narrow type for mypy - we expect OutputImageContent for pixel generation
-        if not isinstance(image_content, OutputImageContent):
-            print(
-                f"ERROR: Expected OutputImageContent, got {type(image_content)}"
-            )
-            continue
-
+    # Save each generated item (image/video)
+    for idx, media_content in enumerate(output.output):
         # Determine output filename
         if len(output.output) > 1:
-            # Multiple images: add index to filename
+            # Multiple outputs: add index to filename
             base_name, ext = os.path.splitext(args.output)
             output_path = f"{base_name}_{idx}{ext}"
         else:
             output_path = args.output
 
-        # Save the image
-        if image_content.image_data:
-            save_image(image_content.image_data, output_path)
-        elif image_content.image_url:
-            print(f"Image available at URL: {image_content.image_url}")
+        if isinstance(media_content, OutputImageContent):
+            if media_content.image_data:
+                save_image(media_content.image_data, output_path)
+            elif media_content.image_url:
+                print(f"Image available at URL: {media_content.image_url}")
+            else:
+                print("ERROR: No image data or URL in output")
+        elif isinstance(media_content, OutputVideoContent):
+            if media_content.video_data:
+                save_video(media_content.video_data, output_path)
+            elif media_content.video_url:
+                print(f"Video available at URL: {media_content.video_url}")
+            else:
+                print("ERROR: No video data or URL in output")
         else:
-            print("ERROR: No image data or URL in output")
+            print(f"ERROR: Unsupported output content type: {type(media_content)}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -492,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Process exit code. 0 indicates success.
     """
+    apply_env_overrides()
     args = parse_args(argv)
 
     try:

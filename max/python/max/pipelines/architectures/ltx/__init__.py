@@ -11,6 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .autoencoder_kl import AutoencoderKLModel
-from .autoencoder_kl_flux2 import AutoencoderKLFlux2Model
-from .autoencoder_kl_ltx_video import AutoencoderKLLTXVideoModel
+from .arch import ltx_arch
+from .model import LTXTransformer3DModel
+
+__all__ = ["LTXTransformer3DModel", "ltx_arch"]

@@ -83,6 +83,30 @@ class PixelGenerationRequest:
     """
     Number of images/videos to generate per prompt.
     """
+    num_frames: int | None = None
+    """
+    Number of video frames to generate. ``None`` uses model defaults.
+    """
+    frames_per_second: int | None = None
+    """
+    Output video frame-rate. ``None`` uses model defaults.
+    """
+    decode_timestep: float | None = None
+    """
+    Optional decode timestep for timestep-aware video VAE decode.
+    """
+    decode_noise_scale: float | None = None
+    """
+    Optional decode noise interpolation factor for timestep-aware decode.
+    """
+    denoise_strength: float | None = None
+    """
+    Optional denoise strength for latent refinement in video pipelines.
+    """
+    image_cond_noise_scale: float | None = None
+    """
+    Optional noise scale injected into hard image/video-conditioning latents.
+    """
     seed: int | None = None
     """
     Optional random number generator seed for reproducible generation.
@@ -106,6 +130,21 @@ class PixelGenerationRequest:
 
         if self.num_images_per_prompt <= 0:
             raise ValueError("Number of images per prompt must be positive.")
+
+        if self.num_frames is not None and self.num_frames <= 0:
+            raise ValueError("num_frames must be positive.")
+
+        if self.frames_per_second is not None and self.frames_per_second <= 0:
+            raise ValueError("frames_per_second must be positive.")
+        if self.denoise_strength is not None and not (
+            0.0 <= self.denoise_strength <= 1.0
+        ):
+            raise ValueError("denoise_strength must be in [0, 1].")
+        if (
+            self.image_cond_noise_scale is not None
+            and self.image_cond_noise_scale < 0.0
+        ):
+            raise ValueError("image_cond_noise_scale must be >= 0.")
 
 
 @runtime_checkable
@@ -149,6 +188,36 @@ class PixelGenerationContext(BaseContext, Protocol):
     @property
     def num_images_per_prompt(self) -> int:
         """Number of images to generate."""
+        ...
+
+    @property
+    def num_frames(self) -> int | None:
+        """Number of video frames to generate."""
+        ...
+
+    @property
+    def frames_per_second(self) -> int | None:
+        """Output video frame-rate."""
+        ...
+
+    @property
+    def decode_timestep(self) -> float | None:
+        """Decode timestep for timestep-aware VAE decode."""
+        ...
+
+    @property
+    def decode_noise_scale(self) -> float | None:
+        """Decode noise interpolation factor."""
+        ...
+
+    @property
+    def denoise_strength(self) -> float | None:
+        """Denoise strength for latent refinement."""
+        ...
+
+    @property
+    def image_cond_noise_scale(self) -> float | None:
+        """Conditioning-latent noise scale."""
         ...
 
 

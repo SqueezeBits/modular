@@ -23,7 +23,10 @@ from max.interfaces.request import (
     OpenResponsesRequest,
     OpenResponsesRequestBody,
 )
-from max.interfaces.request.open_responses import OutputImageContent
+from max.interfaces.request.open_responses import (
+    OutputImageContent,
+    OutputVideoContent,
+)
 from max.serve.pipelines.general_handler import GeneralPipelineHandler
 
 
@@ -203,3 +206,36 @@ def test_next_streaming() -> None:
     assert streamed_chunks[0].final_status == GenerationStatus.ACTIVE
     assert streamed_chunks[1].final_status == GenerationStatus.END_OF_SEQUENCE
     assert streamed_chunks[1].is_done is True
+
+
+def test_next_single_video_chunk() -> None:
+    """Test next with a single video output chunk."""
+    frames = np.random.rand(4, 16, 16, 3).astype(np.float32)
+    chunks = [
+        GenerationOutput(
+            request_id=RequestID("test-request-video"),
+            final_status=GenerationStatus.END_OF_SEQUENCE,
+            output=[
+                OutputVideoContent.from_numpy_frames(
+                    frames,
+                    format="gif",
+                    frames_per_second=8,
+                )
+            ],
+        ),
+    ]
+
+    pipeline = MockGeneralPipelineHandler(chunks)
+    request = create_test_request()
+
+    async def collect_chunks() -> list[GenerationOutput]:
+        result = []
+        async for chunk in pipeline.next(request):
+            result.append(chunk)
+        return result
+
+    streamed_chunks = asyncio.run(collect_chunks())
+    assert len(streamed_chunks) == 1
+    assert streamed_chunks[0].is_done is True
+    assert len(streamed_chunks[0].output) == 1
+    assert streamed_chunks[0].output[0].type == "output_video"

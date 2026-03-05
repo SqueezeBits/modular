@@ -1,0 +1,62 @@
+diff --git a/max/kernels/src/linalg/matmul/gpu/__init__.mojo b/max/kernels/src/linalg/matmul/gpu/__init__.mojo
+index 55627b06ae..4559584cb3 100644
+--- a/max/kernels/src/linalg/matmul/gpu/__init__.mojo
++++ b/max/kernels/src/linalg/matmul/gpu/__init__.mojo
+@@ -23,7 +23,7 @@ from std.sys import (
+     simd_width_of,
+     size_of,
+ )
+-from std.sys.info import _accelerator_arch
++from std.sys.info import _accelerator_arch, _has_blackwell_tcgen05
+ 
+ from std.algorithm.functional import elementwise, tile_and_unswitch
+ from buffer.buffer import NDBuffer
+@@ -496,10 +496,9 @@ fn _matmul_gpu[
+     comptime bf16_or_fp16 = (DType.bfloat16, DType.float16)
+     comptime bf16_or_fp16_fp32 = (DType.bfloat16, DType.float16, DType.float32)
+ 
+-    comptime if (
+-        has_nvidia_gpu_accelerator()
+-        and ctx.default_device_info.compute > H100.compute
+-    ):
++    # SM100 structured kernels use tcgen05 instructions, which are only
++    # available on Blackwell "a" targets (sm_100a/sm_101a).
++    comptime if has_nvidia_gpu_accelerator() and _has_blackwell_tcgen05():
+         return matmul_dispatch_sm100[
+             transpose_b=transpose_b,
+             elementwise_lambda_fn=elementwise_lambda_fn,
+diff --git a/mojo/stdlib/std/gpu/primitives/warp.mojo b/mojo/stdlib/std/gpu/primitives/warp.mojo
+index 7c0c597748..22b1ec23c4 100644
+--- a/mojo/stdlib/std/gpu/primitives/warp.mojo
++++ b/mojo/stdlib/std/gpu/primitives/warp.mojo
+@@ -42,7 +42,7 @@ from std.sys import (
+     _RegisterPackType,
+ )
+ from std.sys._assembly import inlined_assembly
+-from std.sys.info import _is_sm_100x_or_newer, _cdna_4_or_newer
++from std.sys.info import _cdna_4_or_newer
+ 
+ from std.bit import log2_floor
+ from std.math.math import max as _max, min as _min
+@@ -1117,7 +1117,20 @@ fn prefix_sum[
+ 
+ @always_inline("nodebug")
+ fn _has_redux_f32_support[dtype: DType, simd_width: Int]() -> Bool:
+-    return _is_sm_100x_or_newer() and dtype == DType.float32 and simd_width == 1
++    # NOTE:
++    # `redux.sync.*.f32` is not accepted by ptxas for some newer Blackwell
++    # targets (e.g. sm_120a). Restrict this fast path to architectures known
++    # to support it and fall back to shuffle-based reduction otherwise.
++    return (
++        (
++            is_nvidia_gpu["sm_100"]()
++            or is_nvidia_gpu["sm_100a"]()
++            or is_nvidia_gpu["sm_101"]()
++            or is_nvidia_gpu["sm_101a"]()
++        )
++        and dtype == DType.float32
++        and simd_width == 1
++    )
+ 
+ 
+ @always_inline("nodebug")

@@ -1083,6 +1083,25 @@ class MAXModelConfig(MAXModelConfigBase):
                 encoding=self.quantization_encoding
             )
 
+            # Diffusers repos can contain extra top-level checkpoints that are
+            # not used by the active pipeline (e.g. standalone training weights).
+            # Restrict defaults to component-scoped files so we only download
+            # and load the weights required by the selected pipeline.
+            if diff_cfg := self.diffusers_config:
+                component_names = set(diff_cfg.get("components", {}).keys())
+                filtered_weight_files: dict[WeightsFormat, list[Path]] = {}
+                for fmt, files in weight_files.items():
+                    filtered = [
+                        file_path
+                        for file_path in files
+                        if file_path.parts
+                        and file_path.parts[0] in component_names
+                    ]
+                    if filtered:
+                        filtered_weight_files[fmt] = filtered
+                if filtered_weight_files:
+                    weight_files = filtered_weight_files
+
             if not weight_files and self._applied_dtype_cast_from:
                 # We allow ourselves to load float32 safetensors weights as bfloat16.
                 weight_files = self.huggingface_weight_repo.files_for_encoding(
