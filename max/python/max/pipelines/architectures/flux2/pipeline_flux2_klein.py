@@ -24,26 +24,20 @@ from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.interfaces import TokenBuffer
 from max.pipelines.core import PixelContext
-from max.pipelines.lib.interfaces import PixelModelInputs
-from PIL import Image
 from tqdm import tqdm
 
 from ..qwen3.text_encoder import Qwen3TextEncoderModel
-from .pipeline_flux2 import Flux2Pipeline
+from .pipeline_flux2 import Flux2ModelInputs, Flux2Pipeline
 
 logger = logging.getLogger("max.pipelines")
 
 
 @dataclass(kw_only=True)
-class Flux2KleinModelInputs(PixelModelInputs):
+class Flux2KleinModelInputs(Flux2ModelInputs):
     """Flux2 Klein-specific model inputs."""
 
-    width: int = 1024
-    height: int = 1024
     guidance_scale: float = 4.0
-    num_inference_steps: int = 50
-    num_images_per_prompt: int = 1
-    input_image: Image.Image | None = None
+    negative_tokens: TokenBuffer | None = None
 
     @property
     def do_classifier_free_guidance(self) -> bool:
@@ -69,19 +63,40 @@ class Flux2KleinPipeline(Flux2Pipeline):
     }
 
     def prepare_inputs(self, context: PixelContext) -> Flux2KleinModelInputs:  # type: ignore[override]
-        pil_image = None
-        if context.input_image is not None and isinstance(
-            context.input_image, np.ndarray
-        ):
-            pil_image = Image.fromarray(context.input_image.astype(np.uint8))
+        base_inputs = super().prepare_inputs(context)
 
-        original_input_image = context.input_image
-        if pil_image is not None:
-            context.input_image = pil_image  # type: ignore[assignment]
+        # Klein/distilled path uses zero guidance embedding in the hot path.
+        batch_size = context.num_images_per_prompt
+        guidance_key = f"zero_{batch_size}"
+        if guidance_key in self._cached_guidance:
+            guidance = self._cached_guidance[guidance_key]
+        else:
+            guidance = Tensor.zeros(
+                [batch_size],
+                device=self.transformer.devices[0],
+                dtype=self.transformer.config.dtype,
+            )
+            self._cached_guidance[guidance_key] = guidance
 
-        result = Flux2KleinModelInputs.from_context(context)
-        context.input_image = original_input_image
-        return result
+        return Flux2KleinModelInputs(
+            tokens=base_inputs.tokens,
+            latents=base_inputs.latents,
+            latent_image_ids=base_inputs.latent_image_ids,
+            sigmas=base_inputs.sigmas,
+            guidance=guidance,
+            latent_h=base_inputs.latent_h,
+            latent_w=base_inputs.latent_w,
+            image_seq_len=base_inputs.image_seq_len,
+            h_carrier=base_inputs.h_carrier,
+            w_carrier=base_inputs.w_carrier,
+            height=base_inputs.height,
+            width=base_inputs.width,
+            num_inference_steps=base_inputs.num_inference_steps,
+            num_images_per_prompt=base_inputs.num_images_per_prompt,
+            input_image=base_inputs.input_image,
+            negative_tokens=context.negative_tokens,
+            guidance_scale=context.guidance_scale,
+        )
 
     def _fuse_hidden_states(self, hidden_states: list[Tensor]) -> Tensor:
         """Concatenate selected layer hidden states into a fused prompt embedding.
@@ -113,7 +128,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
 
     def encode_prompt(
         self,
-        tokens: TokenBuffer,
+        tokens: TokenBuffer | Tensor,
         num_images_per_prompt: int = 1,
         hidden_states_layers: list[int] | None = None,
     ) -> tuple[Tensor, Tensor]:
@@ -134,18 +149,29 @@ class Flux2KleinPipeline(Flux2Pipeline):
         layers = hidden_states_layers or list(
             self.prompt_embedding_hidden_states_layers
         )
-        token_ids = np.asarray(tokens.array, dtype=np.int64)
-        if token_ids.ndim != 1:
-            raise ValueError(
-                f"Flux2Klein expects 1D tokens, got shape {token_ids.shape}."
+        if isinstance(tokens, TokenBuffer):
+            token_ids = np.asarray(tokens.array, dtype=np.int64)
+            if token_ids.ndim != 1:
+                raise ValueError(
+                    f"Flux2Klein expects 1D tokens, got shape {token_ids.shape}."
+                )
+            target_seq_len = int(token_ids.shape[0])
+            text_input_ids = Tensor.constant(
+                token_ids,
+                dtype=DType.int64,
+                device=self.text_encoder.devices[0],
             )
-        target_seq_len = int(token_ids.shape[0])
+        else:
+            text_input_ids = (
+                tokens.to(self.text_encoder.devices[0]).cast(DType.int64)
+            )
+            if text_input_ids.rank != 1:
+                raise ValueError(
+                    "Flux2Klein expects 1D token tensor, "
+                    f"got rank {text_input_ids.rank}."
+                )
+            target_seq_len = int(text_input_ids.shape[0])
 
-        text_input_ids = Tensor.constant(
-            token_ids,
-            dtype=DType.int64,
-            device=self.text_encoder.devices[0],
-        )
         hidden_states_all = self.text_encoder(text_input_ids)
 
         hidden_states_raw: list[Tensor] = []
@@ -239,7 +265,6 @@ class Flux2KleinPipeline(Flux2Pipeline):
             do_cfg = False
 
         batch_size = int(prompt_embeds.shape[0])
-        dtype = prompt_embeds.dtype
 
         image_latents = None
         image_latent_ids = None
@@ -254,30 +279,17 @@ class Flux2KleinPipeline(Flux2Pipeline):
             )
 
         device = self.transformer.devices[0]
-        latents_tensor = Tensor.from_dlpack(model_inputs.latents).to(device)
-        latents = self.preprocess_latents(latents_tensor)
-        latent_image_ids = Tensor.from_dlpack(model_inputs.latent_image_ids).to(
-            device
-        )
+        latents = self.preprocess_latents(model_inputs.latents)
+        latent_image_ids = model_inputs.latent_image_ids
+        guidance = model_inputs.guidance
 
-        guidance_key = f"zero_{batch_size}"
-        if guidance_key in self._cached_guidance:
-            guidance = self._cached_guidance[guidance_key]
-        else:
-            guidance = Tensor.zeros(
-                [latents.shape[0]],
-                device=device,
-                dtype=dtype,
-            )
-            self._cached_guidance[guidance_key] = guidance
-
-        image_seq_len = int(latents.shape[1])
+        image_seq_len = model_inputs.image_seq_len
         num_inference_steps = model_inputs.num_inference_steps
         sigmas_key = f"{num_inference_steps}_{image_seq_len}"
         if sigmas_key in self._cached_sigmas:
             sigmas = self._cached_sigmas[sigmas_key]
         else:
-            sigmas = Tensor.from_dlpack(model_inputs.sigmas).to(device)
+            sigmas = model_inputs.sigmas.to(device)
             self._cached_sigmas[sigmas_key] = sigmas
         all_timesteps, all_dts = self.prepare_scheduler(sigmas)
 
@@ -296,9 +308,13 @@ class Flux2KleinPipeline(Flux2Pipeline):
             if is_img2img:
                 assert image_latents is not None
                 assert image_latent_ids is not None
-                latents_concat = F.concat([latents, image_latents], axis=1)
-                latent_image_ids_concat = F.concat(
-                    [latent_image_ids, image_latent_ids], axis=1
+                latents_concat, latent_image_ids_concat = (
+                    self.concat_image_latents(
+                        latents,
+                        image_latents,
+                        latent_image_ids,
+                        image_latent_ids,
+                    )
                 )
             else:
                 latents_concat = latents
@@ -312,7 +328,6 @@ class Flux2KleinPipeline(Flux2Pipeline):
                 text_ids,
                 guidance,
             )[0]
-            noise_pred = Tensor.from_dlpack(noise_pred)
 
             if do_cfg:
                 assert negative_prompt_embeds is not None
@@ -325,7 +340,6 @@ class Flux2KleinPipeline(Flux2Pipeline):
                     negative_text_ids,
                     guidance,
                 )[0]
-                neg_noise_pred = Tensor.from_dlpack(neg_noise_pred)
                 noise_pred = neg_noise_pred + model_inputs.guidance_scale * (
                     noise_pred - neg_noise_pred
                 )
