@@ -246,6 +246,7 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
                 ("execute", "E2E execute"),
                 ("prepare_prompt_embeddings", "prepare_embeddings"),
                 ("decode_latents", "decode_latents"),
+                ("_postprocess_and_decode", "_postprocess_and_decode"),
                 ("prepare_scheduler", "prepare_scheduler"),
                 ("scheduler_step", "scheduler_step"),
                 ("preprocess_latents", "preprocess_latents"),

@@ -31,6 +31,7 @@ import asyncio
 import base64
 import os
 from io import BytesIO
+import time
 from typing import cast
 
 from max.driver import DeviceSpec
@@ -165,6 +166,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=3,
         help="Number of iterations to run for profiling.",
+    )
+    parser.add_argument(
+        "--warmup-prompt",
+        type=str,
+        default=None,
+        help="Text prompt to use during warmup runs. Defaults to the main --prompt.",
+    )
+    parser.add_argument(
+        "--warmup-height",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Height(s) of generated image during warmup. Multiple values run one warmup per resolution. Defaults to --height.",
+    )
+    parser.add_argument(
+        "--warmup-width",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Width(s) of generated image during warmup. Multiple values run one warmup per resolution. Defaults to --width.",
+    )
+    parser.add_argument(
+        "--warmup-num-inference-steps",
+        type=int,
+        default=None,
+        help="Number of inference steps during warmup. Defaults to --num-inference-steps.",
     )
 
     args = parser.parse_args(argv)
@@ -397,44 +424,74 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Step 6-1: Warmup — run before profiling or timed execution so that JIT
     # compilation completes and steady-state performance can be measured.
     if args.num_warmups > 0:
-        body_warmup = OpenResponsesRequestBody(
-            model=args.model,
-            input=args.prompt,
-            seed=args.seed,
-            provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                )
-            ),
-        )
-        request_warmup = OpenResponsesRequest(
-            request_id=RequestID(), body=body_warmup
+        warmup_prompt = args.warmup_prompt or args.prompt
+        warmup_steps = args.warmup_num_inference_steps if args.warmup_num_inference_steps is not None else args.num_inference_steps
+        warmup_heights = args.warmup_height if args.warmup_height is not None else [args.height]
+        warmup_widths = args.warmup_width if args.warmup_width is not None else [args.width]
+        assert len(warmup_heights) == len(warmup_widths), (
+            f"--warmup-height and --warmup-width must have the same number of values, "
+            f"got {len(warmup_heights)} heights and {len(warmup_widths)} widths."
         )
         input_image = Image.open(args.input_image) if args.input_image else None
-        context_warmup = await tokenizer.new_context(
-            request_warmup, input_image=input_image
-        )
-        inputs_warmup = PixelGenerationInputs[PixelContext](
-            batch={context_warmup.request_id: context_warmup}
-        )
-        for i in range(args.num_warmups):
-            print(f"Running warmup {i + 1} of {args.num_warmups}")
-            pipeline.execute(inputs_warmup)
+        warmup_idx = 0
+        for h, w in zip(warmup_heights, warmup_widths):
+            body_warmup = OpenResponsesRequestBody(
+                model=args.model,
+                input=warmup_prompt,
+                seed=args.seed,
+                provider_options=ProviderOptions(
+                    image=ImageProviderOptions(
+                        negative_prompt=args.negative_prompt,
+                        height=h,
+                        width=w,
+                        steps=warmup_steps,
+                        guidance_scale=args.guidance_scale,
+                    )
+                ),
+            )
+            request_warmup = OpenResponsesRequest(
+                request_id=RequestID(), body=body_warmup
+            )
+            context_warmup = await tokenizer.new_context(
+                request_warmup, input_image=input_image
+            )
+            inputs_warmup = PixelGenerationInputs[PixelContext](
+                batch={context_warmup.request_id: context_warmup}
+            )
+            for i in range(args.num_warmups):
+                warmup_idx += 1
+                print(f"Running warmup {warmup_idx} ({h}x{w}, {warmup_steps} steps)")
+                start_time = time.perf_counter()
+                pipeline.execute(inputs_warmup)
+                print(f"Time taken for warmup {warmup_idx}: {time.perf_counter() - start_time} seconds")
         print("Warmup complete")
 
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
     if args.profile_timings:
         with profile_execute(pipeline) as prof:
+            prev_stats: dict[str, float] = {}
+            prev_comp_stats: dict[str, float] = {}
             for i in range(args.num_profile_iterations):
                 print(
                     f"Running inference {i + 1} of {args.num_profile_iterations}"
                 )
+                start_time = time.perf_counter()
                 outputs = pipeline.execute(inputs)
+                print(f"Time taken for iteration {i + 1}: {time.perf_counter() - start_time} seconds")
+
+                # Report per-iteration delta for each method/component
+                print(f"  --- Iteration {i + 1} breakdown (ms) ---")
+                for label, stat in sorted(prof.stats.items(), key=lambda kv: kv[1].total_s, reverse=True):
+                    cur = stat.total_s * 1000.0
+                    delta = cur - prev_stats.get(label, 0.0)
+                    prev_stats[label] = cur
+                    print(f"    {label:<30} {delta:>10.3f}")
+                for label, stat in sorted(prof.component_stats.items(), key=lambda kv: kv[1].total_s, reverse=True):
+                    cur = stat.total_s * 1000.0
+                    delta = cur - prev_comp_stats.get(label, 0.0)
+                    prev_comp_stats[label] = cur
+                    print(f"    {label:<30} {delta:>10.3f}")
         prof.report(unit="ms")
     else:
         outputs = pipeline.execute(inputs)
