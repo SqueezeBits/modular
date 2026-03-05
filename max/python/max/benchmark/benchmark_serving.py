@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import json
@@ -69,11 +71,11 @@ from max.benchmark.benchmark_shared.datasets import (
     ChatSession,
     CodeDebugBenchmarkDataset,
     ObfuscatedConversationsBenchmarkDataset,
+    PixelBenchmarkDataset,
     RandomBenchmarkDataset,
     SampledRequest,
     ShareGPTBenchmarkDataset,
     SonnetBenchmarkDataset,
-    SyntheticPixelBenchmarkDataset,
     VisionArenaBenchmarkDataset,
 )
 from max.benchmark.benchmark_shared.datasets.types import (
@@ -94,6 +96,7 @@ from max.benchmark.benchmark_shared.metrics import (
 from max.benchmark.benchmark_shared.request import (
     BaseRequestFuncInput,
     BaseRequestFuncOutput,
+    GeneratedOutputImage,
     PixelGenerationRequestFuncInput,
     PixelGenerationRequestFuncOutput,
     ProgressBarRequestDriver,
@@ -161,6 +164,152 @@ def get_default_trace_path() -> str:
     if workspace_path:
         return os.path.join(workspace_path, "profile.nsys-rep")
     return "./profile.nsys-rep"
+
+
+def _detect_image_extension_from_bytes(image_bytes: bytes) -> str:
+    """Infer file extension from image magic bytes."""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if image_bytes.startswith(b"GIF87a") or image_bytes.startswith(b"GIF89a"):
+        return "gif"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return "webp"
+    return "bin"
+
+
+def _decode_output_image(
+    image: GeneratedOutputImage,
+) -> tuple[bytes, str] | None:
+    """Decode a generated image payload into bytes plus file extension."""
+    if image.image_data:
+        try:
+            image_bytes = base64.b64decode(image.image_data, validate=True)
+        except binascii.Error:
+            logger.warning("Skipping image: invalid base64 image_data payload")
+            return None
+        extension = _detect_image_extension_from_bytes(image_bytes)
+        return image_bytes, extension
+
+    if not image.image_url:
+        return None
+
+    if not image.image_url.startswith("data:"):
+        logger.warning(
+            "Skipping image save for non-data URL output_image: %s",
+            image.image_url[:128],
+        )
+        return None
+
+    if "," not in image.image_url:
+        logger.warning("Skipping image: malformed data URI in image_url")
+        return None
+
+    header, encoded_data = image.image_url.split(",", 1)
+    if ";base64" not in header:
+        logger.warning(
+            "Skipping image: image_url data URI is not base64 encoded"
+        )
+        return None
+
+    try:
+        image_bytes = base64.b64decode(encoded_data, validate=True)
+    except binascii.Error:
+        logger.warning("Skipping image: invalid base64 data URI payload")
+        return None
+    extension = _detect_image_extension_from_bytes(image_bytes)
+    return image_bytes, extension
+
+
+def _image_options_to_dict(
+    request: PixelGenerationSampledRequest,
+) -> dict[str, Any]:
+    if request.image_options is None:
+        return {}
+    return {
+        "width": request.image_options.width,
+        "height": request.image_options.height,
+        "steps": request.image_options.steps,
+        "guidance_scale": request.image_options.guidance_scale,
+        "negative_prompt": request.image_options.negative_prompt,
+        "seed": request.image_options.seed,
+    }
+
+
+def save_generated_pixel_images(
+    *,
+    save_dir: str,
+    requests: Sequence[SampledRequest],
+    outputs: Sequence[PixelGenerationRequestFuncOutput],
+) -> dict[str, Any]:
+    output_dir = Path(save_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "manifest.jsonl"
+
+    saved_images = 0
+    skipped_images = 0
+    total_images = 0
+
+    with manifest_path.open("w", encoding="utf-8") as manifest:
+        for req_idx, output in enumerate(outputs):
+            if req_idx >= len(requests):
+                logger.warning(
+                    "Skipping output[%d]: no matching sampled request", req_idx
+                )
+                continue
+            request = requests[req_idx]
+            if not isinstance(request, PixelGenerationSampledRequest):
+                logger.warning(
+                    "Skipping output[%d]: expected PixelGenerationSampledRequest",
+                    req_idx,
+                )
+                continue
+            prompt = request.prompt_formatted
+            request_meta = {
+                "request_idx": req_idx,
+                "prompt": prompt,
+                "image_options": _image_options_to_dict(request),
+                "request_success": output.success,
+                "request_error": output.error,
+                "request_latency_s": output.latency,
+                "num_generated_outputs": output.num_generated_outputs,
+            }
+
+            for image_idx, image in enumerate(output.generated_images):
+                total_images += 1
+                record: dict[str, Any] = {
+                    **request_meta,
+                    "image_idx": image_idx,
+                }
+                decoded_image = _decode_output_image(image)
+                if decoded_image is None:
+                    skipped_images += 1
+                    record["status"] = "skipped"
+                    record["file_name"] = None
+                    record["file_path"] = None
+                    record["image_url"] = image.image_url
+                    manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    continue
+
+                image_bytes, extension = decoded_image
+                file_name = f"req_{req_idx:06d}_img_{image_idx:02d}.{extension}"
+                file_path = output_dir / file_name
+                file_path.write_bytes(image_bytes)
+                saved_images += 1
+
+                record["status"] = "saved"
+                record["file_name"] = file_name
+                record["file_path"] = str(file_path.resolve())
+                manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return {
+        "saved_images_dir": str(output_dir.resolve()),
+        "saved_images_manifest": str(manifest_path.resolve()),
+        "saved_images_count": saved_images,
+        "skipped_images_count": skipped_images,
+        "total_extracted_images": total_images,
+    }
 
 
 def assert_nvidia_gpu() -> None:
@@ -1410,6 +1559,7 @@ async def benchmark(
     lora_manager: LoRABenchmarkManager | None,
     trace_path: str | None = None,
     trace_session: str | None = None,
+    save_generated_images_dir: str | None = None,
 ) -> tuple[dict[str, Any], BenchmarkMetrics | PixelGenerationBenchmarkMetrics]:
     if ignore_first_turn_stats and skip_first_n_requests:
         logger.warning(
@@ -1723,6 +1873,27 @@ async def benchmark(
             metrics=pixel_metrics,
             lora_manager=lora_manager,
         )
+
+        if save_generated_images_dir:
+            if not isinstance(samples, RequestSamples):
+                logger.warning(
+                    "Cannot save generated images: expected RequestSamples, got %s",
+                    type(samples).__name__,
+                )
+            else:
+                image_save_summary = save_generated_pixel_images(
+                    save_dir=save_generated_images_dir,
+                    requests=samples.requests,
+                    outputs=pixel_generation_outputs,
+                )
+                result.update(image_save_summary)
+                logger.info(
+                    "Saved %d/%d generated images to %s (manifest: %s)",
+                    image_save_summary["saved_images_count"],
+                    image_save_summary["total_extracted_images"],
+                    image_save_summary["saved_images_dir"],
+                    image_save_summary["saved_images_manifest"],
+                )
 
         return result, pixel_metrics
 
@@ -2083,9 +2254,11 @@ def main_with_parsed_args(args: ServingBenchmarkConfig) -> None:
             dataset_name=args.dataset_name,
             dataset_path=args.dataset_path,
         )
-        if not isinstance(benchmark_dataset, SyntheticPixelBenchmarkDataset):
+        if not isinstance(benchmark_dataset, PixelBenchmarkDataset):
             raise ValueError(
-                "text-to-image currently supports only --dataset-name synthetic-pixel"
+                "text-to-image requires a pixel dataset. "
+                "Supported dataset names include synthetic-pixel, "
+                "text-file-pixel, and vbench-pixel."
             )
         logger.info("sampling requests")
         samples = benchmark_dataset.sample_requests(
@@ -2210,6 +2383,7 @@ def main_with_parsed_args(args: ServingBenchmarkConfig) -> None:
             lora_manager=lora_manager,
             trace_path=trace_path,
             trace_session=args.trace_session,
+            save_generated_images_dir=args.save_generated_images_dir,
         )
     )
 

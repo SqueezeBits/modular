@@ -25,7 +25,12 @@ from .huggingface import HuggingFaceBenchmarkDataset
 from .interface import BenchmarkDataset
 from .local import LocalBenchmarkDataset
 from .obfuscated_conversations import ObfuscatedConversationsBenchmarkDataset
-from .pixel import PixelBenchmarkDataset, SyntheticPixelBenchmarkDataset
+from .pixel import (
+    PixelBenchmarkDataset,
+    SyntheticPixelBenchmarkDataset,
+    TextFilePixelBenchmarkDataset,
+    VBenchPixelBenchmarkDataset,
+)
 from .random import RandomBenchmarkDataset, SyntheticBenchmarkDataset
 from .registry import DATASET_REGISTRY, DatasetRegistryEntry
 from .sharegpt import ShareGPTBenchmarkDataset
@@ -67,5 +72,7 @@ __all__ = [
     "SonnetBenchmarkDataset",
     "SyntheticBenchmarkDataset",
     "SyntheticPixelBenchmarkDataset",
+    "TextFilePixelBenchmarkDataset",
+    "VBenchPixelBenchmarkDataset",
     "VisionArenaBenchmarkDataset",
 ]

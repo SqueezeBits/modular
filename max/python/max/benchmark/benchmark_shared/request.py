@@ -134,6 +134,15 @@ class PixelGenerationRequestFuncOutput(BaseRequestFuncOutput):
     """Request function output for text-to-image benchmarks."""
 
     num_generated_outputs: int = 0
+    generated_images: list[GeneratedOutputImage] = field(default_factory=list)
+
+
+@dataclass
+class GeneratedOutputImage:
+    """Image payload returned by a text-to-image request."""
+
+    image_data: str | None = None
+    image_url: str | None = None
 
 
 @dataclass
@@ -593,16 +602,16 @@ class OpenAIChatCompletionsRequestDriver(RequestDriver):
         )
 
 
-def _count_output_images(data: dict[str, Any]) -> int:
+def _extract_output_images(data: dict[str, Any]) -> list[GeneratedOutputImage]:
     output = data.get("output")
     if not isinstance(output, list):
         logger.warning(
             f"OpenResponses response has unexpected 'output' type: "
             f"{type(output).__name__}"
         )
-        return 0
+        return []
 
-    count = 0
+    images: list[GeneratedOutputImage] = []
 
     for message_idx, message in enumerate(output):
         if not isinstance(message, dict):
@@ -622,10 +631,33 @@ def _count_output_images(data: dict[str, Any]) -> int:
                     f"Skipping output[{message_idx}].content[{item_idx}]: expected dict, got {type(item)}."
                 )
                 continue
-            if item.get("type") == "output_image":
-                count += 1
+            if item.get("type") != "output_image":
+                continue
+            image_data = item.get("image_data")
+            if image_data is not None and not isinstance(image_data, str):
+                logger.warning(
+                    f"Skipping output[{message_idx}].content[{item_idx}].image_data: expected str or None, got {type(image_data)}."
+                )
+                image_data = None
+            image_url = item.get("image_url")
+            if image_url is not None and not isinstance(image_url, str):
+                logger.warning(
+                    f"Skipping output[{message_idx}].content[{item_idx}].image_url: expected str or None, got {type(image_url)}."
+                )
+                image_url = None
+            if image_data is None and image_url is None:
+                logger.warning(
+                    f"Skipping output[{message_idx}].content[{item_idx}]: output_image has neither image_data nor image_url."
+                )
+                continue
+            images.append(
+                GeneratedOutputImage(
+                    image_data=image_data,
+                    image_url=image_url,
+                )
+            )
 
-    return count
+    return images
 
 
 def _build_pixel_generation_payload(
@@ -704,7 +736,8 @@ class OpenResponsesRequestDriver(RequestDriver):
                         return output
 
                     body = await response.json()
-                    output.num_generated_outputs = _count_output_images(body)
+                    output.generated_images = _extract_output_images(body)
+                    output.num_generated_outputs = len(output.generated_images)
                     if output.num_generated_outputs <= 0:
                         output.error = (
                             "No output_image content found in OpenResponses "

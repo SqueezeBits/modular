@@ -112,4 +112,12 @@ DATASET_REGISTRY: Mapping[str, DatasetRegistryEntry] = {
         class_name="SyntheticPixelBenchmarkDataset",
         has_multiturn_chat_support=False,
     ),
+    "text-file-pixel": DatasetRegistryEntry(
+        class_name="TextFilePixelBenchmarkDataset",
+        has_multiturn_chat_support=False,
+    ),
+    "vbench-pixel": DatasetRegistryEntry(
+        class_name="VBenchPixelBenchmarkDataset",
+        has_multiturn_chat_support=False,
+    ),
 }

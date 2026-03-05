@@ -548,6 +548,11 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
     )
     """JSON filename for results. If None, no results are saved. Can include directory path."""
 
+    save_generated_images_dir: str | None = field(
+        default=None, metadata={"group": "Result Saving"}
+    )
+    """Directory to save generated images and manifest.jsonl for text-to-image benchmarks."""
+
     metadata: list[str] = field(
         default_factory=list, metadata={"group": "Result Saving"}
     )
@@ -638,6 +643,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
             "trace_file": "Path to save nsys trace. Default: $MODULAR_PATH/profile.nsys-rep or ./profile.nsys-rep.",
             "trace_session": "Optional session name to trace. If not specified, nsys traces the default session.",
             "result_filename": "JSON filename for results. If None, no results are saved. Can include directory path.",
+            "save_generated_images_dir": "Directory to save generated images and manifest.jsonl for text-to-image benchmarks.",
             "record_output_lengths": "Path to save output lengths in YAML format.",
             "metadata": 'Key-value pairs for metadata (format: ["key=value", ...]).',
             "lora_paths": "Paths to existing LoRA adapters. Format: 'path' or 'name=path'.",
