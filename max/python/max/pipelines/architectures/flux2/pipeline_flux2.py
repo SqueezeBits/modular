@@ -23,6 +23,7 @@ from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph import DeviceRef, TensorType
 from max.interfaces import TokenBuffer
+from max.pipelines.cache import StepCacheController, StepCacheRuntime
 from max.pipelines.core import PixelContext
 from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
@@ -736,41 +737,25 @@ class Flux2Pipeline(DiffusionPipeline):
                 dts_seq = dts_seq.driver_tensor
 
         # Step cache setup (only when compiled with cache support).
-        prev_residual = None
-        prev_output = None
-        step_cache_flag = None
-        rdt_tensor = None
-        if self._step_cache_compiled:
-            cfg = self._transformer_config
-            inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
-            out_dim = (
-                cfg.patch_size
-                * cfg.patch_size
-                * (cfg.out_channels or cfg.in_channels)
-            )
-            step_cache_flag = Tensor.constant(
-                np.array([model_inputs.step_cache], dtype=np.bool_),
-                dtype=DType.bool,
-                device=device,
-            )
-            rdt_tensor = Tensor.constant(
-                np.array([model_inputs.rdt], dtype=np.float32),
-                dtype=DType.float32,
-                device=device,
-            )
-            seq_len_for_cache = image_seq_len
-            if image_latents is not None:
-                seq_len_for_cache += int(image_latents.shape[1])
-            prev_residual = Tensor.zeros(
-                (batch_size, seq_len_for_cache, inner_dim),
-                dtype=dtype,
-                device=device,
-            )
-            prev_output = Tensor.zeros(
-                (batch_size, seq_len_for_cache, out_dim),
-                dtype=dtype,
-                device=device,
-            )
+        cfg = self._transformer_config
+        seq_len_for_cache = image_seq_len
+        if image_latents is not None:
+            seq_len_for_cache += int(image_latents.shape[1])
+        step_cache_runtime = StepCacheRuntime.create(
+            compiled_with_step_cache=self._step_cache_compiled,
+            step_cache_enabled=model_inputs.step_cache,
+            rdt=model_inputs.rdt,
+            context_names=("cond",),
+            device=device,
+            dtype=dtype,
+            batch_size=batch_size,
+            image_seq_len=seq_len_for_cache,
+            inner_dim=cfg.num_attention_heads * cfg.attention_head_dim,
+            out_dim=cfg.patch_size
+            * cfg.patch_size
+            * (cfg.out_channels or cfg.in_channels),
+        )
+        step_cache_controller = StepCacheController(step_cache_runtime)
 
         # 4) Denoising loop.
         num_noise_tokens = int(latents.shape[1])
@@ -797,31 +782,47 @@ class Flux2Pipeline(DiffusionPipeline):
                         latents_concat = latents
                         latent_image_ids_concat = latent_image_ids
 
+                    def cond_cache_call(
+                        state: Any,
+                        step_cache_flag: Tensor,
+                        rdt_tensor: Tensor,
+                        _latents_concat: Tensor = latents_concat,
+                        _timestep: Any = timestep,
+                        _latent_image_ids_concat: Tensor = latent_image_ids_concat,
+                    ) -> tuple[Tensor, Tensor]:
+                        return self.transformer(
+                            _latents_concat,
+                            prompt_embeds,
+                            _timestep,
+                            _latent_image_ids_concat,
+                            text_ids,
+                            guidance,
+                            state.prev_residual,
+                            state.prev_output,
+                            step_cache_flag,
+                            rdt_tensor,
+                        )
+
+                    def cond_no_cache_call(
+                        _latents_concat: Tensor = latents_concat,
+                        _timestep: Any = timestep,
+                        _latent_image_ids_concat: Tensor = latent_image_ids_concat,
+                    ) -> Tensor:
+                        return self.transformer(
+                            _latents_concat,
+                            prompt_embeds,
+                            _timestep,
+                            _latent_image_ids_concat,
+                            text_ids,
+                            guidance,
+                        )[0]
+
                     with Tracer("transformer"):
-                        if self._step_cache_compiled:
-                            noise_pred, new_residual = self.transformer(
-                                latents_concat,
-                                prompt_embeds,
-                                timestep,
-                                latent_image_ids_concat,
-                                text_ids,
-                                guidance,
-                                prev_residual,
-                                prev_output,
-                                step_cache_flag,
-                                rdt_tensor,
-                            )
-                            prev_residual = new_residual
-                            prev_output = noise_pred
-                        else:
-                            noise_pred = self.transformer(
-                                latents_concat,
-                                prompt_embeds,
-                                timestep,
-                                latent_image_ids_concat,
-                                text_ids,
-                                guidance,
-                            )[0]
+                        noise_pred = step_cache_controller.run_step_cache_step(
+                            context_name="cond",
+                            cache_call=cond_cache_call,
+                            no_cache_call=cond_no_cache_call,
+                        )
 
                     with Tracer("scheduler_step"):
                         latents = self.scheduler_step(

@@ -1,0 +1,14 @@
+load("//bazel:api.bzl", "modular_py_library", "requirement")
+
+package(default_visibility = ["//max:consumers"])
+
+modular_py_library(
+    name = "cache",
+    srcs = glob(["**/*.py"]),
+    deps = [
+        "//max/python/max:tensor",
+        "//max/python/max/dtype",
+        "//max/python/max/graph",
+        requirement("numpy"),
+    ],
+)

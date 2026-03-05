@@ -17,10 +17,16 @@ from collections.abc import Sequence
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
-from max.graph import TensorType, TensorValue
+from max.graph import TensorType
 from max.nn.module_v3 import Linear, Module
 from max.nn.module_v3.norm import LayerNorm
 from max.nn.module_v3.sequential import ModuleList
+from max.pipelines.cache import (
+    compute_can_reuse,
+    resolve_step_cache_adapter,
+    run_step_cache_branch,
+    step_cache_input_types,
+)
 
 from .layers.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -35,40 +41,6 @@ from .layers.normalizations import (
 from .model_config import FluxConfigBase
 
 logger = logging.getLogger(__name__)
-
-
-def get_can_use_cache(
-    intermediate_residual: Tensor,
-    prev_intermediate_residual: Tensor | None,
-    rdt: Tensor,
-) -> Tensor:
-    """Return whether previous residual cache is reusable."""
-    dev = intermediate_residual.device
-    if (
-        prev_intermediate_residual is None
-        or intermediate_residual.shape != prev_intermediate_residual.shape
-    ):
-        return F.constant(False, DType.bool, device=dev)
-
-    reduced_last_dim_shape = tuple(intermediate_residual.shape[:-1]) + (1,)
-    reduced_last_dim_type = TensorType(
-        intermediate_residual.dtype,
-        shape=reduced_last_dim_shape,
-        device=dev,
-    )
-    mean_diff_rows, mean_prev_rows = F.custom(
-        "mo.step_cache.mean_abs_pair_lastdim",
-        device=dev,
-        values=[intermediate_residual, prev_intermediate_residual],
-        out_types=[reduced_last_dim_type, reduced_last_dim_type],
-    )
-    mean_diff = F.mean(mean_diff_rows, axis=None)
-    mean_prev = F.mean(mean_prev_rows, axis=None)
-    eps = 1e-9
-    relative_diff = mean_diff / (mean_prev + eps)
-    pred = relative_diff < F.cast(rdt, relative_diff.dtype)
-    # cond predicate must be scalar bool.
-    return F.squeeze(pred, 0)
 
 
 class FluxSingleTransformerBlock(Module[..., tuple[Tensor, Tensor]]):
@@ -390,6 +362,21 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.in_channels = in_channels
         self.joint_attention_dim = joint_attention_dim
         self.pooled_projection_dim = pooled_projection_dim
+        self.step_cache_output_type = TensorType(
+            self.max_dtype,
+            shape=[
+                "batch_size",
+                "image_seq_len",
+                self.patch_size * self.patch_size * self.out_channels,
+            ],
+            device=self.max_device,
+        )
+        self.step_cache_residual_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", self.inner_dim],
+            device=self.max_device,
+        )
+        self.step_cache_adapter_cls = resolve_step_cache_adapter("flux1")
 
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the model.
@@ -438,36 +425,11 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
         if not self.step_cache:
             return base_types
 
-        prev_residual_type = TensorType(
-            self.max_dtype,
-            shape=["batch_size", "image_seq_len", self.inner_dim],
+        return base_types + step_cache_input_types(
+            dtype=self.max_dtype,
             device=self.max_device,
-        )
-        prev_output_type = TensorType(
-            self.max_dtype,
-            shape=[
-                "batch_size",
-                "image_seq_len",
-                self.patch_size * self.patch_size * self.out_channels,
-            ],
-            device=self.max_device,
-        )
-        cache_enabled_type = TensorType(
-            DType.bool,
-            shape=[1],
-            device=self.max_device,
-        )
-        rdt_type = TensorType(
-            DType.float32,
-            shape=[1],
-            device=self.max_device,
-        )
-
-        return base_types + (
-            prev_residual_type,
-            prev_output_type,
-            cache_enabled_type,
-            rdt_type,
+            inner_dim=self.inner_dim,
+            out_dim=self.patch_size * self.patch_size * self.out_channels,
         )
 
     def forward(
@@ -569,7 +531,7 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
                     new_hidden_states - hidden_states
                 )
                 first_block_residual = intermediate_hidden_states_residual
-                can_use_cache = get_can_use_cache(
+                can_use_cache = compute_can_reuse(
                     intermediate_hidden_states_residual,
                     prev_residual,
                     rdt,
@@ -580,63 +542,21 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
                     * F.cast(can_use_cache, DType.int32),
                     DType.bool,
                 )
-                output_type = TensorType(
-                    self.max_dtype,
-                    shape=[
-                        "batch_size",
-                        "image_seq_len",
-                        self.patch_size * self.patch_size * self.out_channels,
-                    ],
-                    device=self.max_device,
-                )
-                residual_type = TensorType(
-                    self.max_dtype,
-                    shape=["batch_size", "image_seq_len", self.inner_dim],
-                    device=self.max_device,
-                )
-
-                def then_fn(
-                    _prev_output: Tensor = prev_output_tensor,
-                    _first_block_residual: Tensor = first_block_residual,
-                ) -> tuple[TensorValue, TensorValue]:
-                    return (
-                        TensorValue(_prev_output),
-                        TensorValue(_first_block_residual),
-                    )
-
-                def else_fn(
-                    _new_hidden_states: Tensor = new_hidden_states,
-                    _new_encoder_hidden_states: Tensor = new_encoder_hidden_states,
-                    _first_block_residual: Tensor = first_block_residual,
-                ) -> tuple[TensorValue, TensorValue]:
-                    h = _new_hidden_states
-                    enc = _new_encoder_hidden_states
-                    for rem_block in self.transformer_blocks[1:]:
-                        enc, h = rem_block(
-                            hidden_states=h,
-                            encoder_hidden_states=enc,
-                            temb=temb,
-                            image_rotary_emb=image_rotary_emb,
-                        )
-                    for single_block in self.single_transformer_blocks:
-                        enc, h = single_block(
-                            hidden_states=h,
-                            encoder_hidden_states=enc,
-                            temb=temb,
-                            image_rotary_emb=image_rotary_emb,
-                        )
-                    h = self.norm_out(h, temb)
-                    out = self.proj_out(h)
-                    return (
-                        TensorValue(out),
-                        TensorValue(_first_block_residual),
-                    )
-
-                result = F.cond(
-                    can_use_cache,
-                    [output_type, residual_type],
-                    then_fn,
-                    else_fn,
+                result = run_step_cache_branch(
+                    model_or_config="flux1",
+                    adapter_cls=self.step_cache_adapter_cls,
+                    can_use_cache=can_use_cache,
+                    output_type=self.step_cache_output_type,
+                    residual_type=self.step_cache_residual_type,
+                    prev_output=prev_output_tensor,
+                    first_block_residual=first_block_residual,
+                    adapter_kwargs={
+                        "model": self,
+                        "new_hidden_states": new_hidden_states,
+                        "new_encoder_hidden_states": new_encoder_hidden_states,
+                        "temb": temb,
+                        "image_rotary_emb": image_rotary_emb,
+                    },
                 )
                 return (result[0], result[1])
 

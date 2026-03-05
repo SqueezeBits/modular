@@ -11,12 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-import os
 from typing import Any
 
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
+from max.pipelines.cache import is_step_cache_enabled_from_env
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from pydantic import Field
@@ -57,7 +57,7 @@ class Flux2Config(Flux2ConfigBase):
             {
                 "dtype": supported_encoding_dtype(encoding),
                 "device": DeviceRef.from_device(devices[0]),
-                "step_cache": os.environ.get("MAX_STEP_CACHE", "0") == "1",
+                "step_cache": is_step_cache_enabled_from_env(),
             }
         )
         return Flux2ConfigBase(**init_dict)
