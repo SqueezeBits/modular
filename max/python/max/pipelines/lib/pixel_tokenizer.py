@@ -68,6 +68,7 @@ class PipelineClassName(str, Enum):
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
     ZIMAGE = "ZImagePipeline"
+    QWENIMAGE = "QwenImagePipeline"
 
     @classmethod
     def from_diffusers_config(
@@ -201,9 +202,13 @@ class PixelGenerationTokenizer(
 
         # Compute static VAE scale factor
         block_out_channels = vae_config.get("block_out_channels", None)
-        self._vae_scale_factor = (
-            2 ** (len(block_out_channels) - 1) if block_out_channels else 8
-        )
+        if block_out_channels:
+            self._vae_scale_factor = 2 ** (len(block_out_channels) - 1)
+        elif self._pipeline_class_name == PipelineClassName.QWENIMAGE:
+            # QwenImage VAE: dim_mult [1,2,4,4] with 3 spatial downsample stages = 2^3 = 8
+            self._vae_scale_factor = 8
+        else:
+            self._vae_scale_factor = 8
 
         # Store static model dimensions
         self._default_sample_size = 128
@@ -242,6 +247,30 @@ class PixelGenerationTokenizer(
                 [t_coords, h_coords, w_coords, l_coords], axis=-1
             )
             latent_image_ids = latent_image_ids.reshape(-1, 4)
+
+            latent_image_ids = np.tile(
+                latent_image_ids[np.newaxis, :, :], (batch_size, 1, 1)
+            )
+            return latent_image_ids
+        elif self._pipeline_class_name == PipelineClassName.QWENIMAGE:
+            # QwenImage uses centered RoPE (scale_rope=True in diffusers).
+            # H positions: [-(h - h//2), ..., -1, 0, 1, ..., h//2 - 1]
+            # W positions: [-(w - w//2), ..., -1, 0, 1, ..., w//2 - 1]
+            # T positions: frame index (0 for single image)
+            t_coords = np.zeros((height, width), dtype=np.int64)
+            h_centered = np.arange(height, dtype=np.int64) - (
+                height - height // 2
+            )
+            w_centered = np.arange(width, dtype=np.int64) - (
+                width - width // 2
+            )
+            h_coords, w_coords = np.meshgrid(
+                h_centered, w_centered, indexing="ij"
+            )
+            latent_image_ids = np.stack(
+                [t_coords, h_coords, w_coords], axis=-1
+            )
+            latent_image_ids = latent_image_ids.reshape(-1, 3)
 
             latent_image_ids = np.tile(
                 latent_image_ids[np.newaxis, :, :], (batch_size, 1, 1)
@@ -456,6 +485,26 @@ class PixelGenerationTokenizer(
                     max_length=max_sequence_length,
                     return_length=False,
                     return_overflowing_tokens=False,
+                )
+            elif self._pipeline_class_name == PipelineClassName.QWENIMAGE:
+                # QwenImage wraps prompts in a Qwen2 chat template.
+                # The template adds a system message prefix (~34 tokens)
+                # which is dropped after text encoding.
+                template = (
+                    "<|im_start|>system\n"
+                    "Describe the image by detailing the color, shape, "
+                    "size, texture, quantity, text, spatial relationships "
+                    "of the objects and background:<|im_end|>\n"
+                    "<|im_start|>user\n{}<|im_end|>\n"
+                    "<|im_start|>assistant\n"
+                )
+                formatted = template.format(prompt_str)
+                return delegate(
+                    formatted,
+                    padding=False,
+                    max_length=max_sequence_length,
+                    truncation=True,
+                    add_special_tokens=add_special_tokens,
                 )
             else:
                 return delegate(

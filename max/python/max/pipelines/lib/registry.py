@@ -752,13 +752,23 @@ class PipelineRegistry:
                     "tokenizer_2" in diffusers_config["components"]
                 )
 
-            # Standard max_length for CLIP tokenizer (primary)
-            # and T5 tokenizer (secondary, if present)
+            # Determine tokenizer max_length based on pipeline type
+            pipeline_class_name = (
+                diffusers_config.get("_class_name", "")
+                if diffusers_config
+                else ""
+            )
+            if pipeline_class_name == "QwenImagePipeline":
+                # QwenImage uses Qwen2 tokenizer with chat template (34 prefix tokens)
+                primary_max_length = 1024 + 34
+            else:
+                primary_max_length = 77  # Standard for CLIP
+
             tokenizer_kwargs = {
                 "model_path": pipeline_config.model.model_path,
                 "pipeline_config": pipeline_config,
                 "subfolder": "tokenizer",
-                "max_length": 77,  # Standard for CLIP
+                "max_length": primary_max_length,
                 "revision": pipeline_config.model.huggingface_model_revision,
                 "trust_remote_code": pipeline_config.model.trust_remote_code,
             }
