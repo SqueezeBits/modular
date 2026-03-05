@@ -280,6 +280,8 @@ async def generate_image(args: argparse.Namespace) -> None:
         )
         if arch.name == "Flux2Pipeline":
             max_length = 512
+        elif arch.name == "QwenImagePipeline":
+            max_length = 512
         print(f"Using max length: {max_length} for tokenizer")
 
     if (
@@ -324,6 +326,12 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Load input image if provided and convert to data URI
     input_image_data_uri = load_image_as_data_uri(args.input_image)
 
+    # For QwenImage, guidance_scale maps to true_cfg_scale (two-pass CFG)
+    # since QwenImage doesn't use guidance embeddings.
+    true_cfg_scale = 1.0
+    if arch.name == "QwenImagePipeline":
+        true_cfg_scale = args.guidance_scale
+
     # Create request with structured message if image is provided
     if input_image_data_uri:
         # Image-to-image: Use structured message with InputImageContent + InputTextContent
@@ -352,6 +360,7 @@ async def generate_image(args: argparse.Namespace) -> None:
                     width=args.width,
                     steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    true_cfg_scale=true_cfg_scale,
                 )
             ),
         )
@@ -368,6 +377,7 @@ async def generate_image(args: argparse.Namespace) -> None:
                     width=args.width,
                     steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    true_cfg_scale=true_cfg_scale,
                 )
             ),
         )
