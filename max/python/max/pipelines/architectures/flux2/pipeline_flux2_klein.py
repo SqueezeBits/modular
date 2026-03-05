@@ -22,8 +22,10 @@ import numpy as np
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
+from max.graph import TensorType
 from max.interfaces import TokenBuffer
 from max.pipelines.core import PixelContext
+from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from tqdm import tqdm
 
 from ..qwen3.text_encoder import Qwen3TextEncoderModel
@@ -61,6 +63,33 @@ class Flux2KleinPipeline(Flux2Pipeline):
         "text_encoder": Qwen3TextEncoderModel,
         "transformer": Flux2Pipeline.components["transformer"],
     }
+
+    def _ensure_prompt_embedding_postprocess_compiled(self) -> None:
+        if "_postprocess_prompt_embeddings" in self.__dict__:
+            return
+        device = self.text_encoder.devices[0]
+        dtype = self.text_encoder.config.dtype
+        input_types = [
+            TensorType(dtype, shape=["seq", "d0"], device=device),
+            TensorType(dtype, shape=["seq", "d1"], device=device),
+            TensorType(dtype, shape=["seq", "d2"], device=device),
+        ]
+        self.__dict__["_postprocess_prompt_embeddings"] = max_compile(
+            self._postprocess_prompt_embeddings,
+            input_types=input_types,
+        )
+
+    def _postprocess_prompt_embeddings(
+        self,
+        hidden_state_0: Tensor,
+        hidden_state_1: Tensor,
+        hidden_state_2: Tensor,
+    ) -> Tensor:
+        prompt_embeds = F.concat(
+            [hidden_state_0, hidden_state_1, hidden_state_2], axis=-1
+        )
+        prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
+        return prompt_embeds
 
     def prepare_inputs(self, context: PixelContext) -> Flux2KleinModelInputs:  # type: ignore[override]
         base_inputs = super().prepare_inputs(context)
@@ -207,17 +236,33 @@ class Flux2KleinPipeline(Flux2Pipeline):
                     hs = hs[:target_seq_len]
                 hidden_states_selected.append(hs)
 
-        prompt_embeds = self._fuse_hidden_states(hidden_states_selected)
-        batch_size = int(prompt_embeds.shape[0])
-        seq_len = int(prompt_embeds.shape[1])
+        if (
+            len(hidden_states_selected) == 3
+            and all(h.rank == 2 for h in hidden_states_selected)
+            and num_images_per_prompt == 1
+        ):
+            self._ensure_prompt_embedding_postprocess_compiled()
+            prompt_embeds = self._postprocess_prompt_embeddings(
+                hidden_states_selected[0],
+                hidden_states_selected[1],
+                hidden_states_selected[2],
+            )
+        else:
+            prompt_embeds = F.concat(hidden_states_selected, axis=-1)
+            if prompt_embeds.rank == 2:
+                prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
 
         if num_images_per_prompt != 1:
-            prompt_embeds = F.tile(prompt_embeds, (1, num_images_per_prompt, 1))
+            prompt_embeds = F.tile(
+                prompt_embeds, (1, num_images_per_prompt, 1)
+            )
             prompt_embeds = prompt_embeds.reshape(
-                (batch_size * num_images_per_prompt, seq_len, -1)
+                (num_images_per_prompt, target_seq_len, -1)
             )
 
-        batch_size_final = batch_size * num_images_per_prompt
+        batch_size = int(prompt_embeds.shape[0])
+        seq_len = int(prompt_embeds.shape[1])
+        batch_size_final = batch_size
         text_ids_key = f"{batch_size_final}_{seq_len}"
         if text_ids_key in self._cached_text_ids:
             text_ids = self._cached_text_ids[text_ids_key]
