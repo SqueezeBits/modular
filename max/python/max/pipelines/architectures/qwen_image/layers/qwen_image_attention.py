@@ -130,6 +130,7 @@ class QwenImageAttention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.added_kv_proj_dim = added_kv_proj_dim
+        self.scale = 1.0 / (self.head_dim**0.5)
         out_dim = out_dim if out_dim is not None else query_dim
 
         self.to_q = Linear(query_dim, self.inner_dim, bias=bias)
@@ -246,16 +247,17 @@ class QwenImageAttention(Module[..., Tensor | tuple[Tensor, Tensor]]):
                 use_real_unbind_dim=-1,
                 sequence_dim=1,
             )
-            query = query.cast(original_dtype)
-            key = key.cast(original_dtype)
+            if query.dtype != original_dtype:
+                query = query.cast(original_dtype)
+            if key.dtype != original_dtype:
+                key = key.cast(original_dtype)
 
-        scale = 1.0 / (self.head_dim**0.5)
         hidden_states = flash_attention_gpu(
             query,
             key,
             value,
             mask_variant=MHAMaskVariant.NULL_MASK,
-            scale=scale,
+            scale=self.scale,
         )
 
         batch_size = hidden_states.shape[0]
@@ -263,7 +265,8 @@ class QwenImageAttention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         hidden_states = F.reshape(
             hidden_states, [batch_size, seq_len, self.inner_dim]
         )
-        hidden_states = hidden_states.cast(query.dtype)
+        if hidden_states.dtype != query.dtype:
+            hidden_states = hidden_states.cast(query.dtype)
 
         if encoder_hidden_states is not None:
             encoder_seq_len = encoder_hidden_states.shape[1]
@@ -379,9 +382,14 @@ class QwenImageTransformerBlock(Module[..., tuple[Tensor, Tensor]]):
         image_rotary_emb: tuple[Tensor, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
         # Compute per-block modulation params from temb
-        img_mod = self.img_mod[1](F.silu(temb))
+        # Compute silu once and reuse for both modulation projections.
+        temb_activated = F.silu(temb)
+        img_mod = self.img_mod[1](temb_activated)
+        txt_mod = self.txt_mod[1](temb_activated)
+
         if len(img_mod.shape) == 2:
             img_mod = F.unsqueeze(img_mod, 1)
+            txt_mod = F.unsqueeze(txt_mod, 1)
         img_mod_chunks = F.chunk(img_mod, 6, axis=-1)
         shift_msa, scale_msa, gate_msa = (
             img_mod_chunks[0],
@@ -394,9 +402,6 @@ class QwenImageTransformerBlock(Module[..., tuple[Tensor, Tensor]]):
             img_mod_chunks[5],
         )
 
-        txt_mod = self.txt_mod[1](F.silu(temb))
-        if len(txt_mod.shape) == 2:
-            txt_mod = F.unsqueeze(txt_mod, 1)
         txt_mod_chunks = F.chunk(txt_mod, 6, axis=-1)
         c_shift_msa, c_scale_msa, c_gate_msa = (
             txt_mod_chunks[0],
