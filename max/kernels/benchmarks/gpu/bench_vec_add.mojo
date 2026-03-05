@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.sys import env_get_int
+from std.sys import get_defined_int
 
 from std.benchmark import (
     Bench,
@@ -102,7 +102,7 @@ fn bench_vec_add(
 
 
 def main() raises:
-    comptime block_dim = env_get_int["block_dim", 32]()
+    comptime block_dim = get_defined_int["block_dim", 32]()
     var m = Bench()
     update_bench_config_args(m)
 

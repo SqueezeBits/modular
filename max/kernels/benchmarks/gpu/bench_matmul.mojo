@@ -13,10 +13,10 @@
 
 from std.math import align_up, ceildiv
 from std.sys import (
-    env_get_bool,
-    env_get_dtype,
-    env_get_int,
-    env_get_string,
+    get_defined_bool,
+    get_defined_dtype,
+    get_defined_int,
+    get_defined_string,
     has_nvidia_gpu_accelerator,
     size_of,
     align_of,
@@ -496,20 +496,20 @@ fn create_matmul_bench[
 
 
 def main() raises:
-    comptime dtype = env_get_dtype["dtype", DType.bfloat16]()
+    comptime dtype = get_defined_dtype["dtype", DType.bfloat16]()
 
     var M = Int(arg_parse("M", 128))
-    comptime N = env_get_int["N", 128]()
-    comptime K = env_get_int["K", 128]()
+    comptime N = get_defined_int["N", 128]()
+    comptime K = get_defined_int["K", 128]()
     var init_type = InitializationType.from_str(
         arg_parse("init_type", "uniform_distribution")
     )
     var verify = arg_parse("verify", True)
     comptime cache_busting = True
     comptime transpose_b = True
-    comptime use_vendor_blas = env_get_bool["use_vendor_blas", False]()
-    comptime epilogue = env_get_bool["epilogue", False]()
-    comptime register_based_epilogue = env_get_bool[
+    comptime use_vendor_blas = get_defined_bool["use_vendor_blas", False]()
+    comptime epilogue = get_defined_bool["epilogue", False]()
+    comptime register_based_epilogue = get_defined_bool[
         "register_based_epilogue", True
     ]()
 

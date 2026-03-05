@@ -14,10 +14,10 @@
 from std.os import abort
 from std.math import ceildiv, align_up
 from std.sys import (
-    env_get_bool,
-    env_get_dtype,
-    env_get_int,
-    env_get_string,
+    get_defined_bool,
+    get_defined_dtype,
+    get_defined_int,
+    get_defined_string,
     has_nvidia_gpu_accelerator,
     simd_width_of,
     size_of,
@@ -59,7 +59,7 @@ from linalg.grouped_matmul_sm100_blockwise_fp8 import (
 from layout import Coord, Idx, RuntimeInt, TileTensor
 from layout._layout import row_major
 from layout._ndbuffer_stub import from_ndbuffer_row_major
-from linalg.matmul.gpu.sm100_structured.structured_kernels.tile_types import (
+from structured_kernels.tile_types import (
     GMEMLayout1D,
 )
 from linalg.utils import elementwise_epilogue_type
@@ -730,9 +730,9 @@ fn string_to_list(string: String) raises -> List[Int]:
 
 
 def main() raises:
-    comptime in_type = env_get_dtype["in_type", DType.bfloat16]()
-    comptime out_type = env_get_dtype["out_type", DType.bfloat16]()
-    comptime scaling_kind_str = env_get_string["scaling_kind", "1d2d"]()
+    comptime in_type = get_defined_dtype["in_type", DType.bfloat16]()
+    comptime out_type = get_defined_dtype["out_type", DType.bfloat16]()
+    comptime scaling_kind_str = get_defined_string["scaling_kind", "1d2d"]()
 
     var num_active_experts = Int(arg_parse("num_active_experts", 1))
     var num_tokens_by_expert_string = String(
@@ -743,16 +743,16 @@ def main() raises:
     var num_tokens_by_expert = string_to_list(num_tokens_by_expert_string)
     var expert_ids = string_to_list(expert_ids_string)
 
-    comptime N = env_get_int["N", 256]()
-    comptime K = env_get_int["K", 256]()
-    comptime num_experts = env_get_int["num_experts", 1]()
+    comptime N = get_defined_int["N", 256]()
+    comptime K = get_defined_int["K", 256]()
+    comptime num_experts = get_defined_int["num_experts", 1]()
 
     var init_type = InitializationType.from_str(
         arg_parse("init_type", "uniform_distribution")
     )
-    comptime use_vendor_blas = env_get_bool["use_vendor_blas", False]()
-    comptime has_epilogue = env_get_bool["has_epilogue", False]()
-    comptime AB_swapped = env_get_bool["AB_swapped", False]()
+    comptime use_vendor_blas = get_defined_bool["use_vendor_blas", False]()
+    comptime has_epilogue = get_defined_bool["has_epilogue", False]()
+    comptime AB_swapped = get_defined_bool["AB_swapped", False]()
 
     var b = Bench()
     comptime expert_shape = IndexList[2](N, K)

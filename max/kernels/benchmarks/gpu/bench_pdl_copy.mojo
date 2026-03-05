@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.sys import env_get_int
+from std.sys import get_defined_int
 
 from std.benchmark import Bench, Bencher, BenchId
 from std.builtin._closure import __ownership_keepalive
@@ -246,7 +246,7 @@ fn bench_copy(mut b: Bench, *, length: Int, context: DeviceContext) raises:
 
 
 def main() raises:
-    comptime length = env_get_int["length", 4096]()
+    comptime length = get_defined_int["length", 4096]()
     var m = Bench()
 
     with DeviceContext() as ctx:

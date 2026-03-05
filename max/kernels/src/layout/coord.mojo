@@ -28,7 +28,7 @@ from std.sys.intrinsics import _type_is_eq_parse_time
 
 
 trait CoordLike(
-    Defaultable, ImplicitlyCopyable, Representable, TrivialRegisterPassable
+    Defaultable, ImplicitlyCopyable, TrivialRegisterPassable, Writable
 ):
     """Trait for unified layout handling of compile-time and runtime indices."""
 
@@ -57,14 +57,6 @@ trait CoordLike(
 
         Returns:
             The number of elements (1 for single values, >1 for tuples).
-        """
-        ...
-
-    fn __repr__(self) -> String:
-        """Get the string representation of this type.
-
-        Returns:
-            A string representation of the value.
         """
         ...
 
@@ -140,13 +132,32 @@ struct ComptimeInt[val: Int](CoordLike, TrivialRegisterPassable):
         """
         return 1
 
+    @deprecated("Representable is deprecated. Use Writable instead.")
     fn __repr__(self) -> String:
         """Get the string representation of this compile-time integer.
 
         Returns:
             A string in the format "ComptimeInt[value]()".
         """
-        return String("ComptimeInt[", self.value(), "]()")
+        var s = String()
+        self.write_repr_to(s)
+        return s^
+
+    fn write_to(self, mut writer: Some[Writer]):
+        """Write this compile-time integer to a writer.
+
+        Args:
+            writer: The writer to write to.
+        """
+        writer.write(self.value())
+
+    fn write_repr_to(self, mut writer: Some[Writer]):
+        """Write the repr of this compile-time integer to a writer.
+
+        Args:
+            writer: The writer to write to.
+        """
+        t"ComptimeInt[{self.value()}]()".write_to(writer)
 
     @always_inline("nodebug")
     fn product(self) -> Int:
@@ -228,6 +239,7 @@ struct RuntimeInt[dtype: DType = DType.int](CoordLike, TrivialRegisterPassable):
         """
         return 1
 
+    @deprecated("Representable is deprecated. Use Writable instead.")
     @always_inline("nodebug")
     fn __repr__(self) -> String:
         """Get the string representation of this runtime integer.
@@ -235,7 +247,25 @@ struct RuntimeInt[dtype: DType = DType.int](CoordLike, TrivialRegisterPassable):
         Returns:
             A string in the format "RuntimeInt(value)".
         """
-        return String("RuntimeInt(", self.value(), ")")
+        var s = String()
+        self.write_repr_to(s)
+        return s^
+
+    fn write_to(self, mut writer: Some[Writer]):
+        """Write this runtime integer to a writer.
+
+        Args:
+            writer: The writer to write to.
+        """
+        writer.write(self.value())
+
+    fn write_repr_to(self, mut writer: Some[Writer]):
+        """Write the repr of this runtime integer to a writer.
+
+        Args:
+            writer: The writer to write to.
+        """
+        t"RuntimeInt({self.value()})".write_to(writer)
 
     @always_inline("nodebug")
     fn product(self) -> Int:
@@ -432,6 +462,7 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
         comptime result = Variadic.size(Self.element_types)
         return result
 
+    @deprecated("Representable is deprecated. Use Writable instead.")
     @always_inline("nodebug")
     fn __repr__(self) -> String:
         """Get the string representation of this Coord.
@@ -439,13 +470,17 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
         Returns:
             A string in the format "Coord(elem1, elem2, ...)".
         """
-        var result = String("Coord(")
+        var string = String()
+        self.write_repr_to(string)
+        return string^
 
-        comptime for i in range(Self.__len__()):
-            result += self[i].__repr__()
-            if i < Self.__len__() - 1:
-                result += String(", ")
-        return result + String(")")
+    fn write_repr_to(self, mut writer: Some[Writer]):
+        """Write the repr of this Coord to a writer.
+
+        Args:
+            writer: The writer to write the representation to.
+        """
+        t"Coord({self})".write_to(writer)
 
     fn __len__(self) -> Int:
         """Get the length of the tuple.
@@ -1471,7 +1506,7 @@ comptime _AllEqual[
 ] = _ReduceVariadicAndIdxToValue[
     BaseVal = Variadic.values[False],
     VariadicType=element_types,
-    Reducer = _AllEqualReducer[T],
+    Reducer = _AllEqualReducer[T, ...],
 ][
     0
 ]
@@ -1547,7 +1582,7 @@ comptime _DimsToCoordLike[
 ] = _ReduceValueAndIdxToVariadic[
     BaseVal = Variadic.empty_of_trait[CoordLike],
     VariadicType = dims.value.value,
-    Reducer = _DimToCoordLikeMapper[dtype],
+    Reducer = _DimToCoordLikeMapper[dtype, ...],
 ]
 """Converts a variadic of Dim values to a variadic of CoordLike types.
 
@@ -1600,7 +1635,7 @@ comptime _IntTupleToCoordLike[
     VariadicType = Variadic.types[
         T=CoordLike, *_Splatted[RuntimeInt[dtype], len(tuple)]
     ],
-    Reducer = _IntTupleToCoordLikeMapper[dtype, tuple],
+    Reducer = _IntTupleToCoordLikeMapper[dtype, tuple, ...],
 ]
 """Converts a variadic of Dim values to a variadic of CoordLike types.
 
@@ -1699,7 +1734,7 @@ comptime _CoordToDynamic[
 ] = _ReduceVariadicAndIdxToVariadic[
     BaseVal = Variadic.empty_of_trait[CoordLike],
     VariadicType=element_types,
-    Reducer = _CoordToDynamicMapper[dtype],
+    Reducer = _CoordToDynamicMapper[dtype, ...],
 ]
 """Converts a variadic of CoordLike types to all RuntimeInt[dtype].
 All elements are converted to RuntimeInt[dtype], regardless of their original type.
@@ -1763,7 +1798,7 @@ comptime _Idx2CrdResultTypes[
 ] = _ReduceVariadicAndIdxToVariadic[
     BaseVal = Variadic.empty_of_trait[CoordLike],
     VariadicType=shape_types,
-    Reducer = _Idx2CrdResultMapper[out_dtype, idx_type, stride_types],
+    Reducer = _Idx2CrdResultMapper[out_dtype, idx_type, stride_types, ...],
 ]
 """Computes the result types for idx2crd based on shape, stride, and index.
 
@@ -2237,7 +2272,7 @@ comptime _Multiply[
 ] = _MapVariadicAndIdxToType[
     To=CoordLike,
     VariadicType=Lhs,
-    Mapper = _MultiplyMapper[Rhs=Rhs],
+    Mapper = _MultiplyMapper[Rhs=Rhs, ...],
 ]
 
 
@@ -2254,7 +2289,7 @@ comptime _MultiplyByScalar[
 ] = _MapVariadicAndIdxToType[
     To=CoordLike,
     VariadicType=Types,
-    Mapper = _MultiplyByScalarMapper[scalar=scalar],
+    Mapper = _MultiplyByScalarMapper[scalar=scalar, ...],
 ]
 """Multiply each element in Types by a scalar value.
 
@@ -2280,7 +2315,7 @@ comptime _Divide[
 ] = _MapVariadicAndIdxToType[
     To=CoordLike,
     VariadicType=Lhs,
-    Mapper = _DivideMapper[Rhs=Rhs],
+    Mapper = _DivideMapper[Rhs=Rhs, ...],
 ]
 
 comptime _CeilDivMapper[
@@ -2299,5 +2334,5 @@ comptime _CeilDiv[
 ] = _MapVariadicAndIdxToType[
     To=CoordLike,
     VariadicType=Lhs,
-    Mapper = _CeilDivMapper[Rhs=Rhs],
+    Mapper = _CeilDivMapper[Rhs=Rhs, ...],
 ]

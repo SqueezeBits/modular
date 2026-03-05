@@ -145,11 +145,14 @@ class FakeModelConfig(ConfigFileModel):
     kv_cache: Any
     quantization_encoding: SupportedEncoding = "float32"
     enable_echo: bool = False
+    data_parallel_degree: int = 1
 
 
 class FakeRuntimeConfig(ConfigFileModel):
     execute_empty_batches: bool = False
     enable_overlap_scheduler: bool = False
+    device_graph_capture: bool = False
+    max_batch_size: int = 999
 
 
 class FakePipelineConfig(ConfigFileModel):
@@ -158,7 +161,6 @@ class FakePipelineConfig(ConfigFileModel):
     runtime: FakeRuntimeConfig = FakeRuntimeConfig()
     enable_echo: bool = False
     debug_verify_replay: bool = False
-    max_batch_size: int = 999
 
     def configure_session(self, *args: Any, **kwargs: Any) -> None:
         pass

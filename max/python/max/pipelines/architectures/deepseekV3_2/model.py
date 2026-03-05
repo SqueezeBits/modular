@@ -29,7 +29,6 @@ from max.kv_cache import PagedKVCacheManager
 from max.nn.comm.ep import EPCommInitializer, EPConfig
 from max.nn.kv_cache import (
     KVCacheInputs,
-    KVCacheInputsSequence,
     KVCacheParamInterface,
     MultiKVCacheParams,
 )
@@ -95,13 +94,15 @@ class DeepseekV3_2Model(DeepseekV3Model):
         """Create model configuration from huggingface config."""
         config = self.huggingface_config
 
-        max_batch_total_tokens = self.pipeline_config.max_batch_total_tokens
+        max_batch_total_tokens = (
+            self.pipeline_config.runtime.max_batch_total_tokens
+        )
         # PipelineConfig would automatically resolve it if not set by user.
         assert max_batch_total_tokens is not None, "max_length must be set"
 
-        if self.pipeline_config.pipeline_role == "prefill_only":
+        if self.pipeline_config.runtime.pipeline_role == "prefill_only":
             graph_mode = "prefill"
-        elif self.pipeline_config.pipeline_role == "decode_only":
+        elif self.pipeline_config.runtime.pipeline_role == "decode_only":
             graph_mode = "decode"
         else:
             graph_mode = "auto"
@@ -112,22 +113,22 @@ class DeepseekV3_2Model(DeepseekV3Model):
         else:
             float8_config = None
 
-        if self.pipeline_config.ep_size == 1:
+        if self.pipeline_config.runtime.ep_size == 1:
             ep_config = None
         else:
-            if self.pipeline_config.ep_size % len(self.devices) != 0:
+            if self.pipeline_config.runtime.ep_size % len(self.devices) != 0:
                 raise ValueError(
                     "If you are running with expert parallelism, ep_size must"
                     " be set to the total number of GPUs across nodes."
                 )
-            n_nodes = self.pipeline_config.ep_size // len(self.devices)
+            n_nodes = self.pipeline_config.runtime.ep_size // len(self.devices)
             ep_kwargs: dict[str, Any] = dict(
                 dispatch_dtype=dtype,
                 combine_dtype=DType.bfloat16,
                 hidden_size=config.hidden_size,
                 top_k=config.num_experts_per_tok,
                 n_experts=config.n_routed_experts,
-                max_tokens_per_rank=self.pipeline_config.max_batch_input_tokens,
+                max_tokens_per_rank=self.pipeline_config.runtime.max_batch_input_tokens,
                 n_gpus_per_node=len(self.devices),
                 n_nodes=n_nodes,
                 dispatch_fp8_config=None,
@@ -180,7 +181,7 @@ class DeepseekV3_2Model(DeepseekV3Model):
     def load_model(self, session: InferenceSession) -> Model:
         """Load the model with the given weights."""
 
-        max_batch_size = self.pipeline_config.max_batch_size
+        max_batch_size = self.pipeline_config.runtime.max_batch_size
         assert max_batch_size, "Expected max_batch_size to be set"
 
         # `_host_input_row_offsets_prealloc` tensor needs to reserve space for
@@ -331,11 +332,12 @@ class DeepseekV3_2Model(DeepseekV3Model):
         indexer_kv_inputs = self.indexer_kv_manager.runtime_inputs(
             replica_batches
         )
-        assert model_inputs.kv_cache_inputs is not None
-        combined_inputs = [model_inputs.kv_cache_inputs] + indexer_kv_inputs
-        model_inputs.kv_cache_inputs = KVCacheInputsSequence(
-            kv_cache_inputs=combined_inputs
+        kv_cache_inputs = model_inputs.kv_cache_inputs
+        assert kv_cache_inputs is not None
+        combined_inputs = list(kv_cache_inputs.inputs) + list(
+            indexer_kv_inputs.inputs
         )
+        model_inputs.kv_cache_inputs = KVCacheInputs(inputs=combined_inputs)
 
         return model_inputs
 
@@ -362,17 +364,13 @@ class DeepseekV3_2Model(DeepseekV3Model):
         )
 
         # Extract MLA inputs from previous inputs and combine with new indexer inputs
-        assert isinstance(
-            prev_model_inputs.kv_cache_inputs, KVCacheInputsSequence
-        )
-        prev_kv_inputs = prev_model_inputs.kv_cache_inputs.kv_cache_inputs
+        assert isinstance(prev_model_inputs.kv_cache_inputs, KVCacheInputs)
+        prev_kv_inputs = prev_model_inputs.kv_cache_inputs.inputs
         # MLA inputs are at the beginning, indexer inputs are at the end
-        num_indexer_inputs = len(indexer_kv_inputs)
+        num_indexer_inputs = len(indexer_kv_inputs.inputs)
         mla_kv_inputs = prev_kv_inputs[:-num_indexer_inputs]
-        combined_inputs = list(mla_kv_inputs) + indexer_kv_inputs
-        model_inputs.kv_cache_inputs = KVCacheInputsSequence(
-            kv_cache_inputs=combined_inputs
-        )
+        combined_inputs = list(mla_kv_inputs) + list(indexer_kv_inputs.inputs)
+        model_inputs.kv_cache_inputs = KVCacheInputs(inputs=combined_inputs)
 
         return model_inputs
 

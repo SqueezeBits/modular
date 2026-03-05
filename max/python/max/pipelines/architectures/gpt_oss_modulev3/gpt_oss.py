@@ -24,17 +24,17 @@ from max.nn.attention import MHAMaskVariant
 from max.nn.kv_cache import (
     KVCacheParamInterface,
     PagedCacheValues,
-    unflatten_ragged_mha_decode_inputs,
+    unflatten_ragged_attention_inputs,
 )
 from max.nn.module_v3 import Module
+from max.nn.module_v3.common_layers.rotary_embedding import (
+    YarnRotaryEmbedding,
+    YarnScalingParams,
+)
 from max.nn.module_v3.embedding import Embedding
 from max.nn.module_v3.linear import Linear
 from max.nn.module_v3.sequential import ModuleList
 
-from ..common_layers.rotary_embedding import (
-    YarnRotaryEmbedding,
-    YarnScalingParams,
-)
 from .layers.attention import GptOssAttention
 from .layers.moe import GptOssMoE
 from .layers.rms_norm import GptOssRMSNorm
@@ -185,7 +185,7 @@ class GptOss(Module[..., tuple[Tensor, ...]]):
         input_row_offsets: Tensor,
         *variadic_args,
     ) -> tuple[Tensor, ...]:
-        kv_collections = unflatten_ragged_mha_decode_inputs(
+        kv_collections = unflatten_ragged_attention_inputs(
             variadic_args, n_devices=self.kv_params.n_devices
         )
         return self.language_model(
