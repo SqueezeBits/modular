@@ -704,7 +704,8 @@ class MAXModelConfig(MAXModelConfigBase):
         component_configs = {}
         for file_name in repo_files:
             if "/" in file_name:
-                component_name, target = file_name.split("/")
+                component_name, target_path = file_name.split("/", 1)
+                target = target_path.rsplit("/", 1)[-1]
                 if "_" in component_name:
                     key = component_name.split("_")[0]
                 else:

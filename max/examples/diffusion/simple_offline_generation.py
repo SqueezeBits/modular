@@ -29,9 +29,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import gc
 import os
 from io import BytesIO
-from typing import cast
+from time import perf_counter
+from typing import Any, cast
 
 from max.driver import DeviceSpec
 from max.examples.diffusion.profiler import profile_execute
@@ -166,6 +168,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Number of iterations to run for profiling.",
     )
+    parser.add_argument(
+        "--num-generate-iterations",
+        type=int,
+        default=1,
+        help=(
+            "Number of generation iterations to run in-process after warmup. "
+            "Use >1 for persistent-worker style steady-state benchmarking."
+        ),
+    )
+    parser.add_argument(
+        "--save-every-iteration",
+        action="store_true",
+        help=(
+            "When --num-generate-iterations > 1, save every iteration output. "
+            "Default behavior saves only the final iteration."
+        ),
+    )
+    parser.add_argument(
+        "--skip-save-output",
+        action="store_true",
+        help=(
+            "Skip writing output image files. Useful for benchmark runs where "
+            "file I/O should be excluded from measured latency."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -179,6 +206,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "num-inference-steps must be a positive integer."
     )
     assert args.guidance_scale > 0.0, "guidance-scale must be positive."
+    assert args.num_generate_iterations > 0, (
+        "num-generate-iterations must be a positive integer."
+    )
 
     return args
 
@@ -203,6 +233,40 @@ def save_image(image_data: str, output_path: str) -> None:
     except ImportError:
         print("WARNING: PIL not available, cannot save image")
         print(f"Base64 data length: {len(image_data)} chars")
+
+
+def render_output_path(
+    base_output_path: str, *, image_index: int, image_count: int, iteration: int
+) -> str:
+    """Compute output path suffixes for multi-image or multi-iteration outputs."""
+    base_name, ext = os.path.splitext(base_output_path)
+    output_path = base_output_path
+    if iteration > 0:
+        output_path = f"{base_name}_iter{iteration}{ext}"
+        base_name = f"{base_name}_iter{iteration}"
+    if image_count > 1:
+        output_path = f"{base_name}_{image_index}{ext}"
+    return output_path
+
+
+def print_timing_summary(label: str, values_ms: list[float]) -> None:
+    """Print aggregate timing stats for a list of timing samples."""
+    if not values_ms:
+        return
+    sorted_vals = sorted(values_ms)
+    n = len(sorted_vals)
+
+    def pct(p: float) -> float:
+        idx = int(round((n - 1) * p))
+        idx = max(0, min(idx, n - 1))
+        return sorted_vals[idx]
+
+    avg = sum(sorted_vals) / n
+    print(
+        f"{label}: avg={avg:.3f} ms, min={sorted_vals[0]:.3f} ms, "
+        f"p50={pct(0.50):.3f} ms, p90={pct(0.90):.3f} ms, "
+        f"p99={pct(0.99):.3f} ms, max={sorted_vals[-1]:.3f} ms"
+    )
 
 
 def load_image_as_data_uri(image_path: str | None) -> str | None:
@@ -428,58 +492,123 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
-    if args.profile_timings:
-        with profile_execute(pipeline) as prof:
-            for i in range(args.num_profile_iterations):
-                print(
-                    f"Running inference {i + 1} of {args.num_profile_iterations}"
+
+    def run_inference() -> Any:
+        if args.profile_timings:
+            outputs_local = None
+            with profile_execute(pipeline) as prof:
+                for i in range(args.num_profile_iterations):
+                    print(
+                        f"Running inference {i + 1} of {args.num_profile_iterations}"
+                    )
+                    outputs_local = pipeline.execute(inputs)
+            prof.report(unit="ms")
+            assert outputs_local is not None
+            return outputs_local
+        return pipeline.execute(inputs)
+
+    execute_ms_samples: list[float] = []
+    postprocess_ms_samples: list[float] = []
+    save_ms_samples: list[float] = []
+    iter_total_ms_samples: list[float] = []
+    generation_outputs: list[tuple[int, Any]] = []
+
+    for i in range(args.num_generate_iterations):
+        if args.num_generate_iterations > 1:
+            print(
+                f"Running generation iteration {i + 1} of {args.num_generate_iterations}"
+            )
+
+        t0 = perf_counter()
+        outputs = run_inference()
+        t1 = perf_counter()
+
+        # Step 8: Get the output for our request
+        output = outputs[context.request_id]
+        output = await tokenizer.postprocess(output)
+        t2 = perf_counter()
+
+        # Check if generation completed successfully
+        if not output.is_done:
+            print(f"WARNING: Generation status: {output.final_status}")
+            return
+        if not output.output:
+            print("ERROR: No images generated")
+            return
+
+        save_this_iter = not args.skip_save_output and (
+            args.save_every_iteration
+            or i == args.num_generate_iterations - 1
+            or args.num_generate_iterations == 1
+        )
+        t3 = t2
+        if save_this_iter:
+            # Step 9: Extract and save images from OutputImageContent.
+            for idx, image_content in enumerate(output.output):
+                if not isinstance(image_content, OutputImageContent):
+                    print(
+                        "ERROR: Expected OutputImageContent, got "
+                        f"{type(image_content)}"
+                    )
+                    continue
+                output_path = render_output_path(
+                    args.output,
+                    image_index=idx,
+                    image_count=len(output.output),
+                    iteration=(
+                        (i + 1)
+                        if args.num_generate_iterations > 1
+                        and args.save_every_iteration
+                        else 0
+                    ),
                 )
-                outputs = pipeline.execute(inputs)
-        prof.report(unit="ms")
-    else:
-        outputs = pipeline.execute(inputs)
+                if image_content.image_data:
+                    save_image(image_content.image_data, output_path)
+                elif image_content.image_url:
+                    print(f"Image available at URL: {image_content.image_url}")
+                else:
+                    print("ERROR: No image data or URL in output")
+            t3 = perf_counter()
 
-    # Step 8: Get the output for our request
-    output = outputs[context.request_id]
-    output = await tokenizer.postprocess(output)
+        execute_ms = (t1 - t0) * 1000.0
+        postprocess_ms = (t2 - t1) * 1000.0
+        save_ms = (t3 - t2) * 1000.0
+        iter_total_ms = (t3 - t0) * 1000.0
+        execute_ms_samples.append(execute_ms)
+        postprocess_ms_samples.append(postprocess_ms)
+        save_ms_samples.append(save_ms)
+        iter_total_ms_samples.append(iter_total_ms)
+        generation_outputs.append((i + 1, output))
+        print(
+            f"Iteration {i + 1} timing: timed_generation_ms={execute_ms:.3f}, "
+            f"postprocess_ms={postprocess_ms:.3f}, save_ms={save_ms:.3f}, "
+            f"iteration_total_ms={iter_total_ms:.3f}"
+        )
 
-    # Check if generation completed successfully
-    if not output.is_done:
-        print(f"WARNING: Generation status: {output.final_status}")
+    if not generation_outputs:
+        print("ERROR: No successful generation iterations")
         return
 
     print("Generation complete!")
+    if args.num_generate_iterations > 1:
+        print("Persistent-run timing summary:")
+        print_timing_summary("timed_generation_ms", execute_ms_samples)
+        print_timing_summary("postprocess_ms", postprocess_ms_samples)
+        print_timing_summary("save_ms", save_ms_samples)
+        print_timing_summary("iteration_total_ms", iter_total_ms_samples)
 
-    # Step 9: Extract and save images from OutputImageContent
-    # The output now contains a list of OutputImageContent objects with base64-encoded images
-    if not output.output:
-        print("ERROR: No images generated")
-        return
-
-    # Save each generated image
-    for idx, image_content in enumerate(output.output):
-        # Narrow type for mypy - we expect OutputImageContent for pixel generation
-        if not isinstance(image_content, OutputImageContent):
-            print(
-                f"ERROR: Expected OutputImageContent, got {type(image_content)}"
-            )
-            continue
-
-        # Determine output filename
-        if len(output.output) > 1:
-            # Multiple images: add index to filename
-            base_name, ext = os.path.splitext(args.output)
-            output_path = f"{base_name}_{idx}{ext}"
-        else:
-            output_path = args.output
-
-        # Save the image
-        if image_content.image_data:
-            save_image(image_content.image_data, output_path)
-        elif image_content.image_url:
-            print(f"Image available at URL: {image_content.image_url}")
-        else:
-            print("ERROR: No image data or URL in output")
+    # Best-effort explicit cleanup timing to separate runtime from process exit.
+    shutdown_start = perf_counter()
+    del generation_outputs
+    del outputs
+    del output
+    del inputs
+    del context
+    del tokenizer
+    del pipeline
+    gc.collect()
+    shutdown_ms = (perf_counter() - shutdown_start) * 1000.0
+    print(f"Shutdown cleanup timing: shutdown_ms={shutdown_ms:.3f}")
 
 
 def main(argv: list[str] | None = None) -> int:
