@@ -11,6 +11,8 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from collections.abc import Sequence
+
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
@@ -43,7 +45,7 @@ def get_can_use_cache(
     ):
         return F.constant(False, DType.bool, device=dev)
 
-    reduced_last_dim_shape = [*intermediate_residual.shape[:-1], 1]
+    reduced_last_dim_shape = tuple(intermediate_residual.shape[:-1]) + (1,)
     reduced_last_dim_type = TensorType(
         intermediate_residual.dtype,
         shape=reduced_last_dim_shape,
@@ -427,7 +429,7 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
             return hidden_states
 
 
-class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
+class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
     def __init__(
         self,
         config: Flux2ConfigBase,
@@ -724,6 +726,7 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
         assert prev_output is not None
         assert cache_enabled is not None
         assert rdt is not None
+        prev_output_tensor = prev_output
         first_block_residual = hidden_states
         for index_block, block in enumerate(self.transformer_blocks):
             new_encoder_hidden_states, new_hidden_states = block(
@@ -759,15 +762,22 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
                     device=self.max_device,
                 )
 
-                def then_fn():
+                def then_fn(
+                    _prev_output: Tensor = prev_output_tensor,
+                    _first_block_residual: Tensor = first_block_residual,
+                ) -> tuple[TensorValue, TensorValue]:
                     return (
-                        TensorValue(prev_output),
-                        TensorValue(first_block_residual),
+                        TensorValue(_prev_output),
+                        TensorValue(_first_block_residual),
                     )
 
-                def else_fn():
-                    h = new_hidden_states
-                    enc = new_encoder_hidden_states
+                def else_fn(
+                    _new_hidden_states: Tensor = new_hidden_states,
+                    _new_encoder_hidden_states: Tensor = new_encoder_hidden_states,
+                    _first_block_residual: Tensor = first_block_residual,
+                ) -> tuple[TensorValue, TensorValue]:
+                    h = _new_hidden_states
+                    enc = _new_encoder_hidden_states
                     for rest_block in self.transformer_blocks[1:]:
                         enc, h = rest_block(
                             hidden_states=h,
@@ -791,7 +801,10 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
                     h = h[:, num_txt_tokens:, :]
                     h = self.norm_out(h, temb)
                     out = self.proj_out(h)
-                    return (TensorValue(out), TensorValue(first_block_residual))
+                    return (
+                        TensorValue(out),
+                        TensorValue(_first_block_residual),
+                    )
 
                 result = F.cond(
                     can_use_cache,
@@ -806,10 +819,10 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
 
         hidden_states = F.concat([encoder_hidden_states, hidden_states], axis=1)
         for i in range(len(self.single_transformer_blocks)):
-            single_block: Flux2SingleTransformerBlock = (
+            tail_single_block: Flux2SingleTransformerBlock = (
                 self.single_transformer_blocks[i]
             )
-            hidden_states = single_block(  # type: ignore[assignment]
+            hidden_states = tail_single_block(  # type: ignore[assignment]
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,

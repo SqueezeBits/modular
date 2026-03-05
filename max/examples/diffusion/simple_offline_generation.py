@@ -399,9 +399,9 @@ async def generate_image(args: argparse.Namespace) -> None:
     # latent initialization, and all other preprocessing
     # Image is now extracted from the message content automatically
     context = await tokenizer.new_context(request)
-    setattr(context, "step_cache", args.step_cache)
+    context.step_cache = args.step_cache
     if args.rdt is not None:
-        setattr(context, "rdt", args.rdt)
+        context.rdt = args.rdt
 
     print(
         f"Context created: {context.height}x{context.width}, {context.num_inference_steps} steps"

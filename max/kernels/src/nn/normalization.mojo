@@ -841,9 +841,7 @@ fn mean_abs_pair_lastdim_gpu_block[
     output_1_fn: fn[width: Int, alignment: Int](
         row: Int, col: Int, val: SIMD[dtype, width]
     ) capturing -> None,
-](
-    num_cols: Int,
-):
+](num_cols: Int,):
     comptime accum_type = get_accum_type[dtype]()
 
     var tid = thread_idx.x
@@ -902,11 +900,7 @@ fn mean_abs_pair_lastdim_gpu[
     output_1_fn: fn[width: Int, rank: Int, alignment: Int](
         idx: IndexList[rank], val: SIMD[dtype, width]
     ) capturing -> None,
-](
-    shape: IndexList[rank, ...],
-    *,
-    ctx: DeviceContext,
-) raises:
+](shape: IndexList[rank, ...], *, ctx: DeviceContext,) raises:
     if rank == 0:
         return
 
@@ -958,7 +952,9 @@ fn mean_abs_pair_lastdim_gpu[
         indices[rank - 1] = col
         output_1_fn[_simd_width, rank, alignment](indices.canonicalize(), val)
 
-    comptime native_simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime native_simd_width = simd_width_of[
+        dtype, target = get_gpu_target()
+    ]()
     comptime max_warps_per_block = (
         ctx.default_device_info.max_thread_block_size // WARP_SIZE
     )
@@ -1023,9 +1019,7 @@ fn mean_abs_pair_lastdim_cpu[
     output_1_fn: fn[width: Int, rank: Int, alignment: Int](
         idx: IndexList[rank], val: SIMD[dtype, width]
     ) capturing -> None,
-](
-    shape: IndexList[rank, ...],
-):
+](shape: IndexList[rank, ...],):
     if rank == 0:
         return
 
@@ -1078,10 +1072,7 @@ fn mean_abs_pair_lastdim[
     ) capturing -> None,
     /,
     target: StaticString = "cpu",
-](
-    shape: IndexList[rank],
-    ctx: DeviceContextPtr,
-) raises:
+](shape: IndexList[rank], ctx: DeviceContextPtr,) raises:
     if rank == 0 or shape.flattened_length() == 0:
         return
 

@@ -2878,12 +2878,14 @@ struct StepCacheMeanAbsPairLastDim:
 
         if output_abs_diff.shape() != expected_output_shape:
             raise Error(
-                "output_abs_diff shape must match input shape with last dimension reduced to 1."
+                "output_abs_diff shape must match input shape with last"
+                " dimension reduced to 1."
             )
 
         if output_abs_prev.shape() != expected_output_shape:
             raise Error(
-                "output_abs_prev shape must match input shape with last dimension reduced to 1."
+                "output_abs_prev shape must match input shape with last"
+                " dimension reduced to 1."
             )
 
         @parameter
