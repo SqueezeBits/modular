@@ -83,6 +83,7 @@ from max.benchmark.benchmark_shared.datasets.types import (
     PixelGenerationSampledRequest,
     RequestSamples,
     Samples,
+    encode_image_from_file_path,
 )
 from max.benchmark.benchmark_shared.lora_benchmark_manager import (
     LoRABenchmarkManager,
@@ -440,10 +441,13 @@ def build_single_turn_request_input(
             max_tokens=max_tokens,
             ignore_eos=request.ignore_eos,
         )
-    if benchmark_task == BenchmarkTask.text_to_image:
+    if benchmark_task in (
+        BenchmarkTask.text_to_image,
+        BenchmarkTask.image_to_image,
+    ):
         if not isinstance(request, PixelGenerationSampledRequest):
             raise TypeError(
-                "text-to-image benchmark requires PixelGenerationSampledRequest."
+                "Image-generation benchmark requires PixelGenerationSampledRequest."
             )
         return PixelGenerationRequestFuncInput(
             model=request_model_id,
@@ -451,6 +455,7 @@ def build_single_turn_request_input(
             prompt=request.prompt_formatted,
             api_url=api_url,
             image_options=request.image_options,
+            input_images=request.encoded_images,
         )
     raise ValueError(f"Unsupported benchmark task: {benchmark_task}")
 
@@ -1750,7 +1755,10 @@ async def benchmark(
                         "output": output.generated_text,
                     }
                 )
-        elif benchmark_task == BenchmarkTask.text_to_image:
+        elif benchmark_task in (
+            BenchmarkTask.text_to_image,
+            BenchmarkTask.image_to_image,
+        ):
             print("Generated pixel generation outputs:")
             for req_id, output in enumerate(outputs):
                 assert isinstance(output, PixelGenerationRequestFuncOutput)
@@ -1812,7 +1820,10 @@ async def benchmark(
             round(1.0 / mean_interval, 3) if mean_interval > 0 else 0.0
         )
 
-    if benchmark_task == BenchmarkTask.text_to_image:
+    if benchmark_task in (
+        BenchmarkTask.text_to_image,
+        BenchmarkTask.image_to_image,
+    ):
         assert all(
             isinstance(output, PixelGenerationRequestFuncOutput)
             for output in outputs
@@ -2003,6 +2014,12 @@ def validate_task_and_endpoint(
         if endpoint != Endpoint.responses:
             raise ValueError(
                 "--benchmark-task text-to-image requires "
+                "--endpoint /v1/responses"
+            )
+    elif benchmark_task == BenchmarkTask.image_to_image:
+        if endpoint != Endpoint.responses:
+            raise ValueError(
+                "--benchmark-task image-to-image requires "
                 "--endpoint /v1/responses"
             )
 
@@ -2244,11 +2261,14 @@ def main_with_parsed_args(args: ServingBenchmarkConfig) -> None:
             raise ValueError(
                 f"Unknown / unsupported dataset: {benchmark_dataset}"
             )
-    elif benchmark_task == BenchmarkTask.text_to_image:
+    elif benchmark_task in (
+        BenchmarkTask.text_to_image,
+        BenchmarkTask.image_to_image,
+    ):
         tokenizer = None
         if args.num_prompts is None:
             raise ValueError(
-                "Please specify '--num-prompts' for text-to-image benchmarks."
+                "Please specify '--num-prompts' for image generation benchmarks."
             )
         benchmark_dataset = BenchmarkDataset.from_flags(
             dataset_name=args.dataset_name,
@@ -2256,7 +2276,7 @@ def main_with_parsed_args(args: ServingBenchmarkConfig) -> None:
         )
         if not isinstance(benchmark_dataset, PixelBenchmarkDataset):
             raise ValueError(
-                "text-to-image requires a pixel dataset. "
+                "Image generation requires a pixel dataset. "
                 "Supported dataset names include synthetic-pixel, "
                 "text-file-pixel, and vbench-pixel."
             )
@@ -2271,6 +2291,27 @@ def main_with_parsed_args(args: ServingBenchmarkConfig) -> None:
             image_negative_prompt=args.image_negative_prompt,
             image_seed=args.image_seed,
         )
+        if benchmark_task == BenchmarkTask.image_to_image:
+            if args.input_image_path is None:
+                raise ValueError(
+                    "--benchmark-task image-to-image requires --input-image-path."
+                )
+            if not os.path.exists(args.input_image_path):
+                raise ValueError(
+                    f"Input image path {args.input_image_path} does not exist"
+                )
+            encoded_input_image = encode_image_from_file_path(
+                args.input_image_path
+            )
+            assert isinstance(samples, RequestSamples)
+            for request in samples.requests:
+                if not isinstance(request, PixelGenerationSampledRequest):
+                    raise TypeError(
+                        "image-to-image benchmark requires "
+                        "PixelGenerationSampledRequest."
+                    )
+                if not request.encoded_images:
+                    request.encoded_images = [encoded_input_image]
     else:
         raise ValueError(f"Unsupported benchmark task: {benchmark_task}")
 

@@ -53,6 +53,7 @@ class Endpoint(str, enum.Enum):
 class BenchmarkTask(str, enum.Enum):
     text_generation = "text-generation"
     text_to_image = "text-to-image"
+    image_to_image = "image-to-image"
 
 
 def _add_config_file_arg_to_parser(
@@ -304,7 +305,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
         default=BenchmarkTask.text_generation.value,
         metadata={"group": "Backend and API Configuration"},
     )
-    """Benchmark task type. Choices: text-generation, text-to-image"""
+    """Benchmark task type. Choices: text-generation, text-to-image, image-to-image"""
 
     # Request configuration (serving-specific)
     max_concurrency: str | None = field(
@@ -400,6 +401,11 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
         default=None, metadata={"group": "Output Control"}
     )
     """Optional deterministic seed for pixel generation."""
+
+    input_image_path: str | None = field(
+        default=None, metadata={"group": "Output Control"}
+    )
+    """Path to the input image file for image-to-image benchmarks."""
 
     # Traffic control (serving-specific)
     request_rate: str = field(
@@ -551,7 +557,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
     save_generated_images_dir: str | None = field(
         default=None, metadata={"group": "Result Saving"}
     )
-    """Directory to save generated images and manifest.jsonl for text-to-image benchmarks."""
+    """Directory to save generated images and manifest.jsonl for image generation benchmarks."""
 
     metadata: list[str] = field(
         default_factory=list, metadata={"group": "Result Saving"}
@@ -597,7 +603,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
             "host": "Server host.",
             "port": "Server port.",
             "endpoint": "API endpoint. Choices: /v1/completions, /v1/chat/completions, /v1/responses, /v2/models/ensemble/generate_stream",
-            "benchmark_task": "Benchmark task type. Choices: text-generation, text-to-image",
+            "benchmark_task": "Benchmark task type. Choices: text-generation, text-to-image, image-to-image",
             "max_concurrency": "Maximum concurrent requests (optimized for serving benchmarks).",
             "lora": "Optional LoRA name.",
             "max_benchmark_duration_s": "Maximum benchmark duration in seconds.",
@@ -613,6 +619,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
             "image_guidance_scale": "Guidance scale for pixel generation.",
             "image_negative_prompt": "Optional negative prompt for pixel generation.",
             "image_seed": "Optional deterministic seed for pixel generation.",
+            "input_image_path": "Path to the input image file for image-to-image benchmarks.",
             "request_rate": "Requests per second (finite rate for realistic benchmarking).",
             "burstiness": "Burstiness factor (1.0 = Poisson process).",
             "skip_first_n_requests": "Skip first N requests for measurements.",
@@ -643,7 +650,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
             "trace_file": "Path to save nsys trace. Default: $MODULAR_PATH/profile.nsys-rep or ./profile.nsys-rep.",
             "trace_session": "Optional session name to trace. If not specified, nsys traces the default session.",
             "result_filename": "JSON filename for results. If None, no results are saved. Can include directory path.",
-            "save_generated_images_dir": "Directory to save generated images and manifest.jsonl for text-to-image benchmarks.",
+            "save_generated_images_dir": "Directory to save generated images and manifest.jsonl for image generation benchmarks.",
             "record_output_lengths": "Path to save output lengths in YAML format.",
             "metadata": 'Key-value pairs for metadata (format: ["key=value", ...]).',
             "lora_paths": "Paths to existing LoRA adapters. Format: 'path' or 'name=path'.",

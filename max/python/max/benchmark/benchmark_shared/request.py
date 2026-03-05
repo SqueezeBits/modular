@@ -81,6 +81,7 @@ class PixelGenerationRequestFuncInput(BaseRequestFuncInput):
     prompt: str
     api_url: str
     image_options: PixelGenerationImageOptions | None = None
+    input_images: list[OpenAIImage] = field(default_factory=list)
 
     def get_output_type(self) -> type[BaseRequestFuncOutput]:
         return PixelGenerationRequestFuncOutput
@@ -663,10 +664,20 @@ def _extract_output_images(data: dict[str, Any]) -> list[GeneratedOutputImage]:
 def _build_pixel_generation_payload(
     request_func_input: PixelGenerationRequestFuncInput,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": request_func_input.model,
-        "input": request_func_input.prompt,
-    }
+    payload: dict[str, Any] = {"model": request_func_input.model}
+
+    if request_func_input.input_images:
+        content: list[dict[str, str]] = []
+        if request_func_input.prompt:
+            content.append(
+                {"type": "input_text", "text": request_func_input.prompt}
+            )
+        for image in request_func_input.input_images:
+            image_url = image["image_url"]["url"]
+            content.append({"type": "input_image", "image_url": image_url})
+        payload["input"] = [{"role": "user", "content": content}]
+    else:
+        payload["input"] = request_func_input.prompt
 
     if request_func_input.image_options is None:
         return payload
@@ -889,11 +900,11 @@ def get_request_driver_class(
     task: BenchmarkTask = BenchmarkTask.text_generation,
 ) -> type[RequestDriver]:
     """Return the request driver based on endpoint and optional task."""
-    if task == BenchmarkTask.text_to_image:
+    if task in (BenchmarkTask.text_to_image, BenchmarkTask.image_to_image):
         if api_url.endswith("responses"):
             return OpenResponsesRequestDriver
         raise ValueError(
-            "Unsupported API URL for text-to-image driver selection: "
+            "Unsupported API URL for image-generation driver selection: "
             f"'{api_url}'. Expected an OpenResponses endpoint."
         )
 
