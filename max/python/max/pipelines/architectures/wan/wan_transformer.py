@@ -22,6 +22,7 @@ from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
 from max.nn.module_v3.sequential import ModuleList
 from max.experimental.tensor import Tensor
+from max.graph import ops
 
 from ..flux2.layers.embeddings import (
     TimestepEmbedding,
@@ -421,20 +422,11 @@ class WanTransformerPreProcess(Module[..., tuple[Tensor, Tensor, Tensor, Tensor]
 class WanTransformerPostProcess(Module[..., Tensor]):
     """Output modulation + unpatchify (compiled separately)."""
 
-    def __init__(
-        self,
-        config: WanConfigBase,
-        ppf: int,
-        pph: int,
-        ppw: int,
-    ) -> None:
+    def __init__(self, config: WanConfigBase) -> None:
         dim = config.num_attention_heads * config.attention_head_dim
         self.inner_dim = dim
         self.out_channels = config.out_channels
         self.patch_size = config.patch_size
-        self.ppf = ppf
-        self.pph = pph
-        self.ppw = ppw
 
         self.scale_shift_table = Tensor.zeros([1, 2, dim])
         self.norm_out = WanLayerNorm(
@@ -444,10 +436,17 @@ class WanTransformerPostProcess(Module[..., Tensor]):
             dim, config.out_channels * prod(config.patch_size), bias=True,
         )
 
-    def forward(self, hidden_states: Tensor, temb: Tensor) -> Tensor:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        temb: Tensor,
+        spatial_shape: Tensor,
+    ) -> Tensor:
         batch_size = hidden_states.shape[0]
         p_t, p_h, p_w = self.patch_size
-        ppf, pph, ppw = self.ppf, self.pph, self.ppw
+        ppf = spatial_shape.shape[0]
+        pph = spatial_shape.shape[1]
+        ppw = spatial_shape.shape[2]
 
         mod = self.scale_shift_table + F.reshape(
             temb, [batch_size, 1, self.inner_dim]
@@ -456,6 +455,16 @@ class WanTransformerPostProcess(Module[..., Tensor]):
         scale = mod[:, 1:, :]
         hs = self.norm_out(hidden_states) * (1.0 + scale) + shift
         hs = self.proj_out(hs)
+        hs = Tensor.from_graph_value(
+            ops.rebind(
+                hs._graph_value,  # pyright: ignore[reportPrivateUsage]
+                shape=[
+                    batch_size,
+                    ppf * pph * ppw,
+                    self.out_channels * p_t * p_h * p_w,
+                ],
+            )
+        )
 
         # Unpatchify: [B, S, C*p_t*p_h*p_w] -> [B, C, T, H, W]
         hs = F.reshape(

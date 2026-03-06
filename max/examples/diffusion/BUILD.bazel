@@ -29,3 +29,20 @@ modular_py_binary(
         requirement("torch"),  # for test
     ],
 )
+
+modular_py_binary(
+    name = "simple_offline_video_generation",
+    srcs = ["simple_offline_video_generation.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        ":profiler",
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)

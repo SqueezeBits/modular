@@ -30,7 +30,6 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(name)s %(levelname)s %(message)s')
 import argparse
 import asyncio
-import numpy as np
 import base64
 import os
 from io import BytesIO
@@ -46,7 +45,6 @@ from max.interfaces import (
 from max.interfaces.provider_options import (
     ImageProviderOptions,
     ProviderOptions,
-    VideoProviderOptions,
 )
 from max.interfaces.request import OpenResponsesRequest
 from max.interfaces.request.open_responses import (
@@ -120,12 +118,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Guidance scale for classifier-free guidance. Set to 1.0 to disable CFG.",
     )
     parser.add_argument(
-        "--guidance-scale-2",
-        type=float,
-        default=None,
-        help="Secondary guidance scale for low-noise expert (MoE models like Wan). Defaults to guidance-scale if not set.",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -148,18 +140,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Maximum length of secondary tokenizer",
-    )
-    parser.add_argument(
-        "--num-frames",
-        type=int,
-        default=None,
-        help="Number of frames for video generation (e.g., 81 for Wan T2V).",
-    )
-    parser.add_argument(
-        "--fps",
-        type=int,
-        default=16,
-        help="Frames per second for video output.",
     )
     parser.add_argument(
         "--input-image",
@@ -197,6 +177,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "num-inference-steps must be a positive integer."
     )
     assert args.guidance_scale > 0.0, "guidance-scale must be positive."
+    assert not args.output.lower().endswith(
+        ".mp4"
+    ), (
+        "simple_offline_generation.py is image-only; "
+        "use simple_offline_video_generation.py for video output."
+    )
 
     return args
 
@@ -374,7 +360,7 @@ async def generate_image(args: argparse.Namespace) -> None:
             ),
         )
     else:
-        # Text-to-image or text-to-video: Use simple string prompt
+        # Text-to-image: Use simple string prompt
         image_opts = ImageProviderOptions(
             negative_prompt=args.negative_prompt,
             height=args.height,
@@ -382,24 +368,12 @@ async def generate_image(args: argparse.Namespace) -> None:
             steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
         )
-        video_opts = None
-        if args.num_frames is not None:
-            video_opts = VideoProviderOptions(
-                negative_prompt=args.negative_prompt,
-                height=args.height,
-                width=args.width,
-                steps=args.num_inference_steps,
-                num_frames=args.num_frames,
-                frames_per_second=args.fps,
-                guidance_scale_2=args.guidance_scale_2,
-            )
         body = OpenResponsesRequestBody(
             model=args.model,
             input=args.prompt,
             seed=args.seed,
             provider_options=ProviderOptions(
                 image=image_opts,
-                video=video_opts,
             ),
         )
 
@@ -427,18 +401,19 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 6-1: Prepare warmup input
     if args.profile_timings:
+        warmup_image_opts = ImageProviderOptions(
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+        )
         body_warmup = OpenResponsesRequestBody(
             model=args.model,
             input="warmup",
             seed=args.seed,
             provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                )
+                image=warmup_image_opts,
             ),
         )
         request_warmup = OpenResponsesRequest(
@@ -486,74 +461,24 @@ async def generate_image(args: argparse.Namespace) -> None:
         print("ERROR: No output generated")
         return
 
-    # Check if output is video (mp4) or image
-    is_video = args.output.lower().endswith(".mp4")
-
-    if is_video:
-        # Collect all frames from output
-        import subprocess
-        import tempfile
-
-        frames = []
-        for image_content in output.output:
-            if not isinstance(image_content, OutputImageContent):
-                continue
-            if image_content.image_data:
-                image_bytes = base64.b64decode(image_content.image_data)
-                frame = Image.open(BytesIO(image_bytes)).convert("RGB")
-                frames.append(np.array(frame))
-
-        if not frames:
-            print("ERROR: No frames generated for video")
-            return
-
-        print(f"Saving {len(frames)} frames as video to {args.output}")
-        fps = args.fps
-        h, w = frames[0].shape[:2]
-
-        # Use ffmpeg to encode frames to mp4
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-s", f"{w}x{h}",
-            "-pix_fmt", "rgb24",
-            "-r", str(fps),
-            "-i", "-",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-preset", "medium",
-            "-crf", "18",
-            args.output,
-        ]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        raw_data = b"".join(
-            frame.astype(np.uint8).tobytes() for frame in frames
-        )
-        _, stderr_bytes = proc.communicate(input=raw_data)
-        if proc.returncode != 0:
-            print(f"WARNING: ffmpeg returned {proc.returncode}: {stderr_bytes.decode()}")
+    # Save each generated image
+    for idx, image_content in enumerate(output.output):
+        if not isinstance(image_content, OutputImageContent):
+            print(
+                f"ERROR: Expected OutputImageContent, got {type(image_content)}"
+            )
+            continue
+        if len(output.output) > 1:
+            base_name, ext = os.path.splitext(args.output)
+            output_path = f"{base_name}_{idx}{ext}"
         else:
-            print(f"Video saved to: {args.output}")
-    else:
-        # Save each generated image
-        for idx, image_content in enumerate(output.output):
-            if not isinstance(image_content, OutputImageContent):
-                print(
-                    f"ERROR: Expected OutputImageContent, got {type(image_content)}"
-                )
-                continue
-            if len(output.output) > 1:
-                base_name, ext = os.path.splitext(args.output)
-                output_path = f"{base_name}_{idx}{ext}"
-            else:
-                output_path = args.output
-            if image_content.image_data:
-                save_image(image_content.image_data, output_path)
-            elif image_content.image_url:
-                print(f"Image available at URL: {image_content.image_url}")
-            else:
-                print("ERROR: No image data or URL in output")
+            output_path = args.output
+        if image_content.image_data:
+            save_image(image_content.image_data, output_path)
+        elif image_content.image_url:
+            print(f"Image available at URL: {image_content.image_url}")
+        else:
+            print("ERROR: No image data or URL in output")
 
 
 def main(argv: list[str] | None = None) -> int:

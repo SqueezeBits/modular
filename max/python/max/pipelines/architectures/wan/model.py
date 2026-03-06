@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-
-import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -36,8 +34,6 @@ from .wan_transformer import (
     WanTransformerPostProcess,
     WanTransformerPreProcess,
 )
-
-logger = logging.getLogger(__name__)
 
 # Weight key remapping from diffusers -> MAX module naming
 _KEY_REMAP = [
@@ -106,8 +102,6 @@ def _remap_state_dict(
     for key, tensor in raw_dict.items():
         if key not in fused_keys:
             state_dict[key] = tensor
-
-    logger.info("_remap_state_dict: %d keys", len(state_dict))
 
     # Cast all weights to target dtype. The WAN safetensors are float32 but
     # the module parameters must be bfloat16 (for flash_attention_gpu and to
@@ -227,13 +221,14 @@ class _BlockLevelModel:
         encoder_hidden_states: Tensor,
         rope_cos: Tensor,
         rope_sin: Tensor,
+        spatial_shape: Tensor,
     ) -> Tensor:
         hs, temb, timestep_proj, text_emb = self.pre(
             hidden_states, timestep, encoder_hidden_states,
         )
         for block in self.blocks:
             hs = block(hs, text_emb, timestep_proj, rope_cos, rope_sin)
-        return self.post(hs, temb)
+        return self.post(hs, temb, spatial_shape)
 
 
 class WanTransformerModel(ComponentModel):
@@ -262,44 +257,24 @@ class WanTransformerModel(ComponentModel):
         # remapped state dict.
         self.weights = None  # type: ignore[assignment]
         self.model: _BlockLevelModel | None = None
+        self._rope_cache: dict[tuple[int, int, int], tuple[Tensor, Tensor]] = {}
+        self._max_rope_cache_entries = 8
 
     def load_model(self) -> Callable[..., Any]:
         return lambda: None
 
-    def compile_model(
-        self,
-        hidden_states: Tensor,
-        encoder_hidden_states: Tensor,
-        rope_cos: Tensor,
-    ) -> None:
+    def compile_model(self) -> None:
         """Compile the transformer as separate pre/block/post graphs.
 
-        Called once before the denoising loop. Subsequent calls are no-ops.
+        Uses symbolic dimensions so the compiled graphs work for any
+        resolution / frame count without recompilation.
         """
         if self.model is not None:
             return
 
-        hs_shape = [int(s) for s in hidden_states.shape]
-        batch_size = hs_shape[0]
-        ts_shape = [batch_size]
-        enc_shape = [int(s) for s in encoder_hidden_states.shape]
-        rope_shape = [int(s) for s in rope_cos.shape]
-
-        p_t, p_h, p_w = self.config.patch_size
-        ppf = hs_shape[2] // p_t
-        pph = hs_shape[3] // p_h
-        ppw = hs_shape[4] // p_w
-        seq_len = ppf * pph * ppw
         dim = self.config.num_attention_heads * self.config.attention_head_dim
-
         dtype = self.config.dtype
         dev = self.config.device
-
-        logger.info(
-            "Compiling transformer (block-level): "
-            "seq_len=%d, %d blocks, hidden=%s enc=%s",
-            seq_len, self.config.num_layers, hs_shape, enc_shape,
-        )
 
         # --- Split state dict by component ---
         pre_weights: dict[str, object] = {}
@@ -314,21 +289,25 @@ class WanTransformerModel(ComponentModel):
             ):
                 pre_weights[key] = value
             elif key.startswith("blocks."):
-                # "blocks.3.attn1.to_q.weight" -> block_idx=3, sub_key="attn1.to_q.weight"
                 rest = key[len("blocks."):]
                 dot = rest.index(".")
                 block_idx = int(rest[:dot])
                 sub_key = rest[dot + 1:]
                 block_weights_list[block_idx][sub_key] = value
             else:
-                # scale_shift_table, norm_out.*, proj_out.*
                 post_weights[key] = value
 
-        # --- Compile pre-processing ---
+        # --- Compile pre-processing (symbolic spatial dims) ---
         pre_input_types = (
-            TensorType(dtype, hs_shape, device=dev),
-            TensorType(DType.float32, ts_shape, device=dev),  # float32 to avoid bf16 timestep quantization
-            TensorType(dtype, enc_shape, device=dev),
+            TensorType(
+                dtype,
+                ["batch", self.config.in_channels, "frames", "height", "width"],
+                device=dev,
+            ),
+            TensorType(DType.float32, ["batch"], device=dev),
+            TensorType(
+                dtype, ["batch", "seq_text", self.config.text_dim], device=dev
+            ),
         )
         with F.lazy():
             pre_module = WanTransformerPreProcess(self.config)
@@ -336,15 +315,20 @@ class WanTransformerModel(ComponentModel):
         pre_model = CompileWrapper(
             pre_module, input_types=pre_input_types, weights=pre_weights,
         )
-        logger.info("Compiled pre-processing (%d weights)", len(pre_weights))
 
-        # --- Compile each transformer block ---
-        block_hs_type = TensorType(dtype, [batch_size, seq_len, dim], device=dev)
-        text_emb_type = TensorType(
-            dtype, [batch_size, enc_shape[1], dim], device=dev,
+        # --- Compile each transformer block (symbolic seq_len) ---
+        block_hs_type = TensorType(
+            dtype, ["batch", "seq_len", dim], device=dev,
         )
-        ts_proj_type = TensorType(dtype, [batch_size, 6, dim], device=dev)
-        rope_type = TensorType(DType.float32, rope_shape, device=dev)
+        text_emb_type = TensorType(
+            dtype, ["batch", "seq_text", dim], device=dev,
+        )
+        ts_proj_type = TensorType(dtype, ["batch", 6, dim], device=dev)
+        rope_type = TensorType(
+            DType.float32,
+            ["seq_len", self.config.attention_head_dim],
+            device=dev,
+        )
 
         block_input_types = (
             block_hs_type,
@@ -374,23 +358,22 @@ class WanTransformerModel(ComponentModel):
                     weights=block_weights_list[i],
                 )
             )
-        logger.info("Compiled %d transformer blocks", len(block_models))
 
-        # --- Compile post-processing ---
+        # --- Compile post-processing (spatial shape tensor carries ppf/pph/ppw) ---
+        spatial_shape_type = TensorType(
+            DType.int8, ["ppf", "pph", "ppw"], device=dev
+        )
         post_input_types = (
             block_hs_type,
-            TensorType(dtype, [batch_size, dim], device=dev),  # temb
+            TensorType(dtype, ["batch", dim], device=dev),  # temb
+            spatial_shape_type,
         )
         with F.lazy():
-            post_module = WanTransformerPostProcess(
-                self.config, ppf=ppf, pph=pph, ppw=ppw,
-            )
+            post_module = WanTransformerPostProcess(self.config)
             post_module.to(self.devices[0])
         post_model = CompileWrapper(
             post_module, input_types=post_input_types, weights=post_weights,
         )
-        logger.info("Compiled post-processing (%d weights)", len(post_weights))
-
         self.model = _BlockLevelModel(pre_model, block_models, post_model)
 
     def compute_rope(
@@ -400,7 +383,12 @@ class WanTransformerModel(ComponentModel):
         width: int,
     ) -> tuple[Tensor, Tensor]:
         """Compute 3D RoPE cos/sin tensors for the given latent dimensions."""
-        return _compute_wan_rope(
+        key = (num_frames, height, width)
+        cached = self._rope_cache.get(key)
+        if cached is not None:
+            return cached
+
+        rope = _compute_wan_rope(
             num_frames=num_frames,
             height=height,
             width=width,
@@ -408,3 +396,7 @@ class WanTransformerModel(ComponentModel):
             head_dim=self.config.attention_head_dim,
             device=self.devices[0],
         )
+        self._rope_cache[key] = rope
+        if len(self._rope_cache) > self._max_rope_cache_entries:
+            self._rope_cache.pop(next(iter(self._rope_cache)))
+        return rope

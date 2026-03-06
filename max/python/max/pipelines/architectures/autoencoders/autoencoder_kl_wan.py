@@ -39,6 +39,20 @@ CACHE_T = 2
 WAN_DECODER_CACHE_SLOTS = 32
 
 
+def _apply_conv3d_bias_ncdhw(x: Tensor, bias: Tensor | Literal[0]) -> Tensor:
+    """Apply Conv3d bias manually in NCDHW layout.
+
+    MAX's lower-level 3D conv path applies bias while the tensor is still
+    in NDHWC layout, which does not reliably broadcast on GPU for this Wan
+    decoder path. Apply it explicitly after Conv3d.forward() returns NCDHW.
+    """
+    if not isinstance(bias, Tensor):
+        return x
+    bias_t = F.transfer_to(bias, x.device)
+    bias_t = F.reshape(bias_t, [1, int(bias_t.shape[0]), 1, 1, 1])
+    return x + bias_t
+
+
 def _zero_cache_for(x: Tensor) -> Tensor:
     """Create a zero cache tensor shaped for a causal conv input."""
     return Tensor.zeros(
@@ -127,9 +141,30 @@ class WanCausalConv3d(Conv3d):
             dilation=1,
             num_groups=1,
             device=device,
-            has_bias=has_bias,
+            has_bias=False,
             permute=True,
         )
+        self.has_bias = has_bias
+        if has_bias:
+            self.bias = Tensor.zeros(
+                [out_channels],
+                dtype=dtype,
+                device=device.to_device() if device is not None else None,
+            )
+
+    def _forward_with_manual_bias(self, x: Tensor) -> Tensor:
+        bias = self.bias if isinstance(self.bias, Tensor) else 0
+        if isinstance(bias, Tensor):
+            self.bias = 0
+        try:
+            out = super().forward(x)
+        finally:
+            if isinstance(bias, Tensor):
+                self.bias = bias
+        return _apply_conv3d_bias_ncdhw(out, bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self._forward_with_manual_bias(x)
 
 
 class WanCausalConv3dCached(Conv3d):
@@ -171,9 +206,27 @@ class WanCausalConv3dCached(Conv3d):
             dilation=1,
             num_groups=1,
             device=device,
-            has_bias=has_bias,
+            has_bias=False,
             permute=True,
         )
+        self.has_bias = has_bias
+        if has_bias:
+            self.bias = Tensor.zeros(
+                [out_channels],
+                dtype=dtype,
+                device=device.to_device() if device is not None else None,
+            )
+
+    def _forward_with_manual_bias(self, x: Tensor) -> Tensor:
+        bias = self.bias if isinstance(self.bias, Tensor) else 0
+        if isinstance(bias, Tensor):
+            self.bias = 0
+        try:
+            out = super().forward(x)
+        finally:
+            if isinstance(bias, Tensor):
+                self.bias = bias
+        return _apply_conv3d_bias_ncdhw(out, bias)
 
     def _apply_temporal_pad(self, x: Tensor, pad_left: int) -> Tensor:
         """Zero-pad the temporal dimension (axis=2) on the left only."""
@@ -186,7 +239,7 @@ class WanCausalConv3dCached(Conv3d):
 
     def forward(self, x: Tensor) -> Tensor:
         x = self._apply_temporal_pad(x, self._temporal_pad_left)
-        return super().forward(x)
+        return self._forward_with_manual_bias(x)
 
     def forward_cached(
         self, x: Tensor, cache_in: Tensor
@@ -196,7 +249,7 @@ class WanCausalConv3dCached(Conv3d):
         # Reduce temporal padding by the amount of context from cache.
         effective_pad = max(self._temporal_pad_left - int(cache_in.shape[2]), 0)
         x = self._apply_temporal_pad(x, effective_pad)
-        return super().forward(x), cache_out
+        return self._forward_with_manual_bias(x), cache_out
 
 class WanResidualBlock(Module[[Tensor], Tensor]):
     """Residual block used in Wan VAE decoder."""
@@ -460,7 +513,7 @@ class WanResample(Module[[Tensor], Tensor]):
                     padding=1,
                     has_bias=True,
                     device=device,
-                    permute=False,
+                    permute=True,
                 ),
             ]
         )
@@ -499,10 +552,8 @@ class WanResample(Module[[Tensor], Tensor]):
         x = F.permute(x, [0, 2, 1, 3, 4])  # [b, t, c, h, w]
         x = F.reshape(x, [b * t, self.dim, h, w])
         x = self.resample[0](x)  # WanUpsample2d: [b*t, dim, h*2, w*2]
-        # Conv2d(permute=False) expects NHWC input/output
-        x = F.permute(x, [0, 2, 3, 1])
-        x = self.resample[1](x)  # [b*t, h*2, w*2, out_c]
-        x = F.permute(x, [0, 3, 1, 2])  # [b*t, out_c, h*2, w*2]
+        # Conv2d(permute=True) handles NCHW->NHWC->conv->NCHW internally.
+        x = self.resample[1](x)  # [b*t, out_c, h*2, w*2]
 
         x = F.reshape(x, [b, t, self._out_c, h * 2, w * 2])
         x = F.permute(x, [0, 2, 1, 3, 4])  # [b, out_c, t, h*2, w*2]
@@ -805,7 +856,7 @@ class WanResampleCached(Module[..., tuple[Tensor, Tensor]]):
                     padding=1,
                     has_bias=True,
                     device=device,
-                    permute=False,
+                    permute=True,
                 ),
             ]
         )
@@ -836,9 +887,7 @@ class WanResampleCached(Module[..., tuple[Tensor, Tensor]]):
         x = F.permute(x, [0, 2, 1, 3, 4])
         x = F.reshape(x, [b * t, self.dim, h, w])
         x = self.resample[0](x)
-        x = F.permute(x, [0, 2, 3, 1])
         x = self.resample[1](x)
-        x = F.permute(x, [0, 3, 1, 2])
         x = F.reshape(x, [b, t, self._out_c, h * 2, w * 2])
         x = F.permute(x, [0, 2, 1, 3, 4])
         return x, cache_out
@@ -1277,136 +1326,96 @@ class _WanVAEDecoderFirstFrame(Module[[Tensor], Tensor]):
         return x
 
 
-class _PerFrameDecoder:
-    """Per-frame VAE decode with cache feedback through graph I/O."""
+class _FullDecoder:
+    """Full VAE decode: post_quant_conv + decoder in a single compiled graph.
+
+    Processes all T latent frames at once, avoiding per-frame cache I/O
+    overhead that was the bottleneck in the per-frame approach.
+    """
+
+    def __init__(self, compiled_decoder: CompileWrapper) -> None:
+        self.compiled_decoder = compiled_decoder
+
+    def __call__(self, latents_5d: Tensor) -> Tensor:
+        outputs = self.compiled_decoder(latents_5d)
+        if isinstance(outputs, (list, tuple)):
+            return outputs[0]
+        return outputs
+
+
+class _CachedFramewiseDecoder:
+    """Diffusers-like cached frame-by-frame VAE decode."""
 
     def __init__(
         self,
         post_quant_conv: CompileWrapper,
-        first_decoder: CompileWrapper,
-        rest_decoder: CompileWrapper,
+        first_frame_decoder: CompileWrapper,
+        rest_frame_decoder: CompileWrapper,
     ) -> None:
         self.post_quant_conv = post_quant_conv
-        self.first_decoder = first_decoder
-        self.rest_decoder = rest_decoder
+        self.first_frame_decoder = first_frame_decoder
+        self.rest_frame_decoder = rest_frame_decoder
 
     def __call__(self, latents_5d: Tensor) -> Tensor:
-        import time as _time
-
         t_total = int(latents_5d.shape[2])
-        t0 = _time.perf_counter()
+        if t_total <= 0:
+            raise ValueError("Expected non-empty temporal dimension for decode")
 
-        accelerator: Accelerator | None = None
-        if isinstance(latents_5d.device, Accelerator):
-            accelerator = latents_5d.device
+        cpu = CPU()
+        gpu = latents_5d.device
+        decoded_frames: list[Tensor] = []
+        caches: list[Tensor] | None = None
 
-        post_quant_outputs = self.post_quant_conv(latents_5d)
-        if isinstance(post_quant_outputs, (list, tuple)):
-            if len(post_quant_outputs) != 1:
-                raise ValueError(
-                    "post_quant_conv returned "
-                    f"{len(post_quant_outputs)} outputs, expected 1"
-                )
-            z = post_quant_outputs[0]
-        else:
-            z = post_quant_outputs
+        for t_idx in range(t_total):
+            z_t = latents_5d[:, :, t_idx : t_idx + 1, :, :]
 
-        if accelerator is not None:
-            accelerator.synchronize()
-        t_post = _time.perf_counter()
-
-        logger.info(
-            "post_quant_conv: input T=%d completed in %.1fs",
-            t_total,
-            t_post - t0,
-        )
-
-        first_outputs = _normalize_compiled_outputs(
-            self.first_decoder(z[:, :, 0:1, :, :])
-        )
-        if len(first_outputs) != WAN_DECODER_CACHE_SLOTS + 1:
-            raise ValueError(
-                "first_decoder returned "
-                f"{len(first_outputs)} outputs, expected {WAN_DECODER_CACHE_SLOTS + 1}"
+            pqc_outputs = _normalize_compiled_outputs(
+                self.post_quant_conv(z_t)
             )
-        first_pixels = first_outputs[0]
-        caches = first_outputs[1:]
-
-        if accelerator is not None:
-            accelerator.synchronize()
-        t_first_done = _time.perf_counter()
-
-        first_np = np.from_dlpack(first_pixels.cast(DType.float32).to(CPU()))
-        frames_np = [np.ascontiguousarray(first_np)]
-        t_first_cpu = _time.perf_counter()
-
-        logger.info(
-            "first frame decode: exec=%.1fs D2H=%.1fs output T=%d",
-            t_first_done - t_post,
-            t_first_cpu - t_first_done,
-            first_np.shape[2],
-        )
-
-        rest_exec_total = 0.0
-        rest_cpu_total = 0.0
-
-        for frame_idx in range(1, t_total):
-            t_exec_start = _time.perf_counter()
-            rest_outputs = _normalize_compiled_outputs(
-                self.rest_decoder(
-                    z[:, :, frame_idx : frame_idx + 1, :, :], *caches
-                )
-            )
-            if len(rest_outputs) != WAN_DECODER_CACHE_SLOTS + 1:
+            if len(pqc_outputs) != 1:
                 raise ValueError(
-                    "rest_decoder returned "
-                    f"{len(rest_outputs)} outputs, expected {WAN_DECODER_CACHE_SLOTS + 1}"
+                    f"Expected 1 output from post_quant_conv, got {len(pqc_outputs)}"
+                )
+            z_t = pqc_outputs[0]
+
+            if t_idx == 0:
+                outputs = _normalize_compiled_outputs(
+                    self.first_frame_decoder(z_t)
+                )
+            else:
+                if caches is None:
+                    raise ValueError(
+                        "Cached framewise decoder expected caches after first frame."
+                    )
+                outputs = _normalize_compiled_outputs(
+                    self.rest_frame_decoder(z_t, *caches)
                 )
 
-            pixels = rest_outputs[0]
-            caches = rest_outputs[1:]
-            if accelerator is not None:
-                accelerator.synchronize()
-            t_exec_end = _time.perf_counter()
+            if len(outputs) != 1 + WAN_DECODER_CACHE_SLOTS:
+                raise ValueError(
+                    "Cached framewise decoder produced "
+                    f"{len(outputs)} tensors; expected {1 + WAN_DECODER_CACHE_SLOTS}."
+                )
 
-            frame_np = np.from_dlpack(pixels.cast(DType.float32).to(CPU()))
-            frames_np.append(np.ascontiguousarray(frame_np))
-            t_cpu_end = _time.perf_counter()
+            decoded = outputs[0]
+            caches = outputs[1:]
+            decoded_frames.append(decoded.to(cpu))
 
-            rest_exec_total += t_exec_end - t_exec_start
-            rest_cpu_total += t_cpu_end - t_exec_end
-
-        result = np.concatenate(frames_np, axis=2)
+        return F.concat(decoded_frames, axis=2).to(gpu)
 
 
-        total = _time.perf_counter() - t0
-        logger.info(
-            "rest frames decode: frames=%d exec=%.1fs D2H=%.1fs",
-            max(t_total - 1, 0),
-            rest_exec_total,
-            rest_cpu_total,
-        )
-        logger.info(
-            "VAE output: shape=%s range=[%.4f,%.4f]",
-            result.shape,
-            result.min(),
-            result.max(),
-        )
-        logger.info(
-            "VAE decode: %d latent -> %d video frames in %.1fs",
-            t_total,
-            result.shape[2],
-            total,
-        )
-
-        result_contiguous = np.ascontiguousarray(result).astype(
-            np.float32, copy=False
-        )
-        return Tensor.from_dlpack(result_contiguous)
+_VAEShapeKey = tuple[int, int, int, int, int]
+_VAEFramewiseKey = tuple[int, int, int, int]
 
 
 class AutoencoderKLWanModel(ComponentModel):
     """Wan VAE decoder model using MAX-native 3D modules."""
+
+    # Default to cached framewise decode.
+    # Larger temporal chunks can be faster, but 720p/81f repeatedly OOMs and
+    # falls back anyway, so starting at 1 avoids the retry penalty.
+    CHUNK_T: int = 1
+    MAX_CACHED_DECODERS: int = 4
 
     def __init__(
         self,
@@ -1417,7 +1426,10 @@ class AutoencoderKLWanModel(ComponentModel):
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = AutoencoderKLWanConfig.generate(config, encoding, devices)
-        self._per_frame_decoder: _PerFrameDecoder | None = None
+        self._shape_decoder_cache: dict[_VAEShapeKey, _FullDecoder] = {}
+        self._framewise_decoder_cache: dict[
+            _VAEFramewiseKey, _CachedFramewiseDecoder
+        ] = {}
         self.load_model()
 
     def load_model(self) -> Callable[[Tensor], Tensor]:
@@ -1435,14 +1447,16 @@ class AutoencoderKLWanModel(ComponentModel):
 
             weight_data = value.data()
 
-            # Wan checkpoints store Conv3d filters in FCQRS (PyTorch) layout.
-            # Conv3d(permute=True) keeps FCQRS, enabling cuDNN on NVIDIA GPU.
-            # Conv2d weights: PyTorch FCRS [out, in, H, W] -> RSCF
-            # [H, W, in, out] for Conv2d(permute=False).
+            # Wan checkpoints store filters in PyTorch layout.
+            # Conv3d(permute=True) keeps FCQRS for cuDNN dispatch.
+            # Resample Conv2d(permute=True) keeps FCRS for cuDNN dispatch.
+            # Attention Conv2d(permute=False) needs RSCF [H,W,in,out].
             if key.endswith(".weight") and len(weight_data.shape) == 4:
-                weight_data = np.ascontiguousarray(
-                    np.from_dlpack(weight_data).transpose(2, 3, 1, 0)
-                )
+                is_resample_conv = "resample" in key
+                if not is_resample_conv:
+                    weight_data = np.ascontiguousarray(
+                        np.from_dlpack(weight_data).transpose(2, 3, 1, 0)
+                    )
 
             decoder_state_dict[key] = weight_data
 
@@ -1458,153 +1472,238 @@ class AutoencoderKLWanModel(ComponentModel):
                     cpu_device,
                 )
 
-        logger.info("Loaded %d VAE decoder weights", len(decoder_state_dict))
-
         # Defer compilation to first decode_5d() call so we have concrete
-        # dimensions.  This avoids symbolic-dim verification failures in
-        # reshape ops that merge / redistribute spatial dimensions.
+        # dimensions. Keep a small shape cache for mixed-resolution serving.
         self._decoder_state_dict = decoder_state_dict
-        self._per_frame_decoder = None
         # Free the raw Weights object now that we have the state dict.
         self.weights = None  # type: ignore[assignment]
 
         return self.decode_4d
 
-    def _compile_per_frame_decoder(
+    def _compile_decoder(
         self,
-        shape: tuple[int, ...],
-    ) -> None:
-        """Compile post-quant, first-frame, and rest-frame decoder graphs."""
-        import time as _time
-
+        shape: _VAEShapeKey,
+    ) -> _FullDecoder:
+        """Compile a single decoder graph for T latent frames."""
         cfg = self.config
         sd = self._decoder_state_dict
         device_obj = self.devices[0]
-        B, C, T_total, H, W = (int(s) for s in shape)
+        B, C, T, H, W = shape
 
-        logger.info(
-            "Compiling per-frame VAE decoders: T_total=%d",
-            T_total,
-        )
-
-        # --- post_quant_conv graph (k=1, all frames) ---
-        t0 = _time.perf_counter()
-        post_quant_input = TensorType(
+        decoder_input = TensorType(
             cfg.dtype,
-            [B, C, T_total, H, W],
+            [B, C, T, H, W],
             device=cfg.device,
         )
         with F.lazy():
-            post_quant_model = _WanVAEPostQuantConv(cfg)
-            post_quant_model.to(device_obj)
-        post_quant_keys = {name for name, _ in post_quant_model.parameters}
-        post_quant_weights = {
-            k: v for k, v in sd.items() if k in post_quant_keys
-        }
-        missing = sorted(post_quant_keys - set(post_quant_weights.keys()))
+            decoder_model = WanVAEDecoder(cfg)
+            decoder_model.to(device_obj)
+
+        model_keys = {name for name, _ in decoder_model.parameters}
+        decoder_weights = {k: v for k, v in sd.items() if k in model_keys}
+        missing = sorted(model_keys - set(decoder_weights.keys()))
         if missing:
             logger.warning(
-                "post_quant_conv: %d missing weights: %s",
+                "VAE decoder: %d missing weights: %s",
                 len(missing),
                 missing[:10],
             )
-        post_quant_compiled = CompileWrapper(
-            post_quant_model,
-            input_types=[post_quant_input],
-            weights=post_quant_weights,
+
+        compiled = CompileWrapper(
+            decoder_model,
+            input_types=[decoder_input],
+            weights=decoder_weights,
         )
-        t1 = _time.perf_counter()
-        logger.info(
-            "Compiled post_quant_conv in %.1fs, %d weights",
-            t1 - t0,
-            len(post_quant_weights),
+        return _FullDecoder(compiled_decoder=compiled)
+
+    def prepare_for_serving(self) -> None:
+        # No eager compile at init: first request compiles concrete shape and
+        # subsequent shapes reuse a small cache.
+        return None
+
+    def _get_shape_cached_decoder(self, shape: _VAEShapeKey) -> _FullDecoder:
+        cached = self._shape_decoder_cache.get(shape)
+        if cached is not None:
+            return cached
+
+        decoder = self._compile_decoder(shape)
+        self._shape_decoder_cache[shape] = decoder
+
+        if len(self._shape_decoder_cache) > self.MAX_CACHED_DECODERS:
+            oldest_key = next(iter(self._shape_decoder_cache))
+            if oldest_key != shape:
+                self._shape_decoder_cache.pop(oldest_key, None)
+            else:
+                # Shape itself is first only when cache size==1; keep it.
+                pass
+        return decoder
+
+    def _compile_framewise_cached_decoder(
+        self, shape: _VAEFramewiseKey
+    ) -> _CachedFramewiseDecoder:
+        cfg = self.config
+        sd = self._decoder_state_dict
+        device_obj = self.devices[0]
+        batch_size, z_dim, latent_h, latent_w = shape
+
+        latent_1f_type = TensorType(
+            cfg.dtype,
+            [batch_size, z_dim, 1, latent_h, latent_w],
+            device=cfg.device,
         )
 
-        # --- first-frame decoder (T=1 -> T=1 + cache init) ---
-        first_input = TensorType(cfg.dtype, [B, C, 1, H, W], device=cfg.device)
         with F.lazy():
-            first_model = _WanVAEDecoderFirstFrameCached(cfg)
-            first_model.to(device_obj)
-        first_model_keys = {name for name, _ in first_model.parameters}
-        first_weights = {k: v for k, v in sd.items() if k in first_model_keys}
-        missing = sorted(first_model_keys - set(first_weights.keys()))
-        if missing:
-            logger.warning(
-                "First-frame decoder: %d missing weights: %s",
-                len(missing),
-                missing[:10],
-            )
+            pqc_module = _WanVAEPostQuantConv(cfg)
+            pqc_module.to(device_obj)
+        pqc_keys = {name for name, _ in pqc_module.parameters}
+        pqc_weights = {k: v for k, v in sd.items() if k in pqc_keys}
+        pqc_compiled = CompileWrapper(
+            pqc_module,
+            input_types=[latent_1f_type],
+            weights=pqc_weights,
+        )
+
+        with F.lazy():
+            first_module = _WanVAEDecoderFirstFrameCached(cfg)
+            first_module.to(device_obj)
+        first_keys = {name for name, _ in first_module.parameters}
+        first_weights = {k: v for k, v in sd.items() if k in first_keys}
         first_compiled = CompileWrapper(
-            first_model,
-            input_types=[first_input],
+            first_module,
+            input_types=[latent_1f_type],
             weights=first_weights,
         )
-        t2 = _time.perf_counter()
-        logger.info(
-            "Compiled first-frame decoder (cached, spatial-only path) in %.1fs, %d weights",
-            t2 - t1,
-            len(first_weights),
-        )
 
-        # --- rest-frame decoder (T=1 + 32 cache inputs -> T=4 + 32 cache outputs) ---
-        rest_input = TensorType(
-            cfg.dtype,
-            [B, C, 1, H, W],
-            device=cfg.device,
+        cache_shapes = first_module.decoder.cache_shapes(
+            batch_size=batch_size,
+            latent_height=latent_h,
+            latent_width=latent_w,
         )
-        with F.lazy():
-            rest_model = _WanVAEDecoderRestFrameCached(cfg)
-            rest_model.to(device_obj)
-        cache_shapes = rest_model.decoder.cache_shapes(B, H, W)
-        cache_inputs = [
-            TensorType(cfg.dtype, cache_shape, device=cfg.device)
-            for cache_shape in cache_shapes
+        rest_input_types = [
+            latent_1f_type,
+            *[
+                TensorType(cfg.dtype, cache_shape, device=cfg.device)
+                for cache_shape in cache_shapes
+            ],
         ]
-
-        rest_model_keys = {name for name, _ in rest_model.parameters}
-        rest_weights = {k: v for k, v in sd.items() if k in rest_model_keys}
-        missing = sorted(rest_model_keys - set(rest_weights.keys()))
-        if missing:
-            logger.warning(
-                "Rest-frame decoder: %d missing weights: %s",
-                len(missing),
-                missing[:10],
-            )
+        with F.lazy():
+            rest_module = _WanVAEDecoderRestFrameCached(cfg)
+            rest_module.to(device_obj)
+        rest_keys = {name for name, _ in rest_module.parameters}
+        rest_weights = {k: v for k, v in sd.items() if k in rest_keys}
         rest_compiled = CompileWrapper(
-            rest_model,
-            input_types=[rest_input, *cache_inputs],
+            rest_module,
+            input_types=rest_input_types,
             weights=rest_weights,
         )
-        t3 = _time.perf_counter()
-        logger.info(
-            "Compiled rest-frame decoder (per-frame cached) in %.1fs, %d weights, %d cache inputs",
-            t3 - t2,
-            len(rest_weights),
-            len(cache_inputs),
+
+        return _CachedFramewiseDecoder(
+            post_quant_conv=pqc_compiled,
+            first_frame_decoder=first_compiled,
+            rest_frame_decoder=rest_compiled,
         )
 
-        self._per_frame_decoder = _PerFrameDecoder(
-            post_quant_conv=post_quant_compiled,
-            first_decoder=first_compiled,
-            rest_decoder=rest_compiled,
-        )
-        # Free state dict after compilation.
-        del self._decoder_state_dict
+    def _get_framewise_cached_decoder(
+        self, shape: _VAEFramewiseKey
+    ) -> _CachedFramewiseDecoder:
+        cached = self._framewise_decoder_cache.get(shape)
+        if cached is not None:
+            return cached
+
+        decoder = self._compile_framewise_cached_decoder(shape)
+        self._framewise_decoder_cache[shape] = decoder
+        if len(self._framewise_decoder_cache) > self.MAX_CACHED_DECODERS:
+            oldest_key = next(iter(self._framewise_decoder_cache))
+            if oldest_key != shape:
+                self._framewise_decoder_cache.pop(oldest_key, None)
+        return decoder
+
+    @staticmethod
+    def _is_cuda_oom(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return ("out of memory" in msg) or ("cuda_error_out_of_memory" in msg)
+
+    def _decode_with_chunk_t(
+        self, latents_5d: Tensor, chunk_t: int
+    ) -> Tensor:
+        T = int(latents_5d.shape[2])
+        B = int(latents_5d.shape[0])
+        C = int(latents_5d.shape[1])
+        H = int(latents_5d.shape[3])
+        W = int(latents_5d.shape[4])
+
+        if chunk_t == 1:
+            framewise_decoder = self._get_framewise_cached_decoder((B, C, H, W))
+            return framewise_decoder(latents_5d)
+
+        decoder = self._get_shape_cached_decoder((B, C, chunk_t, H, W))
+
+        if T <= chunk_t:
+            return decoder(latents_5d)
+
+        # Temporal chunking: decode in chunks of chunk_t latent frames.
+        # Each decoded chunk is moved to CPU to free GPU memory for the
+        # next chunk. Final concat happens on CPU, result moves to GPU.
+        cpu = CPU()
+        gpu = latents_5d.device
+        decoded_chunks: list[Tensor] = []
+        for start in range(0, T, chunk_t):
+            end = min(start + chunk_t, T)
+            chunk = latents_5d[:, :, start:end, :, :]
+
+            if int(chunk.shape[2]) < chunk_t:
+                pad_t = chunk_t - int(chunk.shape[2])
+                actual_t = int(chunk.shape[2])
+                chunk = F.pad(
+                    chunk, [0, 0, 0, 0, 0, pad_t, 0, 0, 0, 0]
+                )
+                decoded = decoder(chunk)
+                decoded = decoded[:, :, : actual_t * 4, :, :]
+            else:
+                decoded = decoder(chunk)
+
+            decoded_chunks.append(decoded.to(cpu))
+
+        return F.concat(decoded_chunks, axis=2).to(gpu)
 
     def decode_5d(self, latents_5d: Tensor) -> Tensor:
-        """Decode 5D latents [B, C, T, H, W] frame-by-frame."""
-        import time as _time
+        """Decode 5D latents [B, C, T, H, W].
 
-        shape = tuple(int(s) for s in latents_5d.shape)
-        logger.info(
-            'VAE decode input: shape=%s dtype=%s', shape, latents_5d.dtype
-        )
-        if self._per_frame_decoder is None:
-            t0 = _time.perf_counter()
-            self._compile_per_frame_decoder(shape)
-            logger.info('VAE compile total: %.1fs', _time.perf_counter() - t0)
-        assert self._per_frame_decoder is not None
-        return self._per_frame_decoder(latents_5d)
+        When T exceeds CHUNK_T, temporal chunking is used to avoid OOM.
+        """
+        self.prepare_for_serving()
+
+        T = int(latents_5d.shape[2])
+        max_chunk_t = min(T, self.CHUNK_T)
+        chunk_candidates = []
+        chunk_t = max_chunk_t
+        while chunk_t >= 1:
+            chunk_candidates.append(chunk_t)
+            if chunk_t == 1:
+                break
+            chunk_t = max(1, chunk_t // 2)
+        if chunk_candidates[-1] != 1:
+            chunk_candidates.append(1)
+
+        last_exc: Exception | None = None
+        for chunk_t in chunk_candidates:
+            try:
+                return self._decode_with_chunk_t(latents_5d, chunk_t)
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_cuda_oom(exc):
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "Wan VAE decode OOM at chunk_t=%d; retrying with a smaller chunk.",
+                    chunk_t,
+                )
+                for dev in self.devices:
+                    if not dev.is_host:
+                        Accelerator(id=dev.id).synchronize()
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Wan VAE decode failed without an explicit error.")
 
     def decode_4d(self, latents_4d: Tensor) -> Tensor:
         z5d = F.unsqueeze(latents_4d, axis=2)
