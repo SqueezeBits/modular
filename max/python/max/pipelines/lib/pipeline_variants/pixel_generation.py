@@ -156,7 +156,7 @@ class PixelGenerationPipeline(
                 request_id=request_id,
                 final_status=GenerationStatus.END_OF_SEQUENCE,
                 output=[
-                    OutputImageContent.from_numpy(img, format="png")
+                    OutputImageContent.from_numpy(img, format="jpeg")
                     for img in pixel_data
                 ],
             )

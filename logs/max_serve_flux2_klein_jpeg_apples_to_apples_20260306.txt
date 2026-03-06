@@ -1,0 +1,64 @@
+FLUX.2-klein-4B MAX Serve JPEG apples-to-apples benchmark
+Date: 2026-03-06
+
+Code change:
+  max/python/max/pipelines/lib/pipeline_variants/pixel_generation.py
+  OutputImageContent.from_numpy(..., format="jpeg")
+
+Server launch:
+  MAX_SERVE_API_TYPES='["responses"]' MAX_SERVE_DISABLE_TELEMETRY=1 \
+  MAX_SERVE_LOGS_CONSOLE_LEVEL=DEBUG \
+  ./bazelw run //max/python/max/entrypoints:pipelines -- --log-level DEBUG serve \
+    --model black-forest-labs/FLUX.2-klein-4B \
+    --devices gpu:0 \
+    --port 8013 \
+    --max-batch-size 1
+
+Request surface:
+  POST http://127.0.0.1:8013/v1/responses
+
+Request body:
+  {
+    "model": "black-forest-labs/FLUX.2-klein-4B",
+    "input": "A cat holding a sign that says hello world",
+    "seed": 42,
+    "provider_options": {
+      "image": {
+        "guidance_scale": 1.0,
+        "height": 1024,
+        "width": 1024,
+        "steps": 4,
+        "num_images": 1
+      }
+    }
+  }
+
+Methodology:
+  - Wait for /health = 200
+  - Send 1 warmup request
+  - Send 3 timed requests
+  - Then send 3 additional hot requests to confirm steady state
+  - Measure client-observed latency including HTTP response read
+
+Results:
+  warmup: 2045.083 ms, status=completed, bytes=120774
+  run1: 535.065 ms, status=completed, bytes=120774
+  run2: 267.715 ms, status=completed, bytes=120774
+  run3: 273.678 ms, status=completed, bytes=120774
+  avg_1w_3t_ms=358.819
+
+Additional hot requests:
+  run4: 286.289 ms, status=completed, bytes=120774
+  run5: 268.807 ms, status=completed, bytes=120774
+  run6: 278.189 ms, status=completed, bytes=120774
+  avg_hot3_ms=277.762
+  avg_hot5_ms=274.936
+
+DEBUG timing split for hot request run2 (request_id=8040799c435249d7b93df9be3ff28738):
+  handler start -> worker start: ~15 ms
+  worker start -> worker complete: ~249 ms
+  worker complete -> handler complete: ~3 ms
+
+Comparison to prior PNG benchmark:
+  prior PNG avg_1w_3t_ms=709.392
+  prior PNG payload bytes=1771053
