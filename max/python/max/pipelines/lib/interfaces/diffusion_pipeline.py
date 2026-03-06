@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import MISSING, dataclass, field, fields
@@ -51,12 +52,6 @@ class DiffusionPipeline(ABC):
     """
 
     components: dict[str, type[ComponentModel]] | None = None
-
-    default_num_inference_steps: int = 50
-    """Default number of denoising steps when the user does not specify one.
-
-    Subclasses may override this to provide a model-appropriate default.
-    """
 
     def __init__(
         self,
@@ -138,12 +133,17 @@ class DiffusionPipeline(ABC):
                 weight_paths, relative_paths[name]
             )
 
-            loaded_sub_models[name] = component_cls(
-                config=config_dict,
-                encoding=self.pipeline_config.model.quantization_encoding,
-                devices=self.devices,
-                weights=load_weights(abs_paths),
-            )
+            init_params = inspect.signature(component_cls.__init__).parameters
+            init_kwargs = {
+                "config": config_dict,
+                "encoding": self.pipeline_config.model.quantization_encoding,
+                "devices": self.devices,
+                "weights": load_weights(abs_paths),
+            }
+            if "session" in init_params:
+                init_kwargs["session"] = self.session
+
+            loaded_sub_models[name] = component_cls(**init_kwargs)
 
         return loaded_sub_models
 
@@ -441,8 +441,6 @@ class PixelModelInputs:
 
 
 class CompileWrapper:
-    """Wraps a compile target with optional input type annotations."""
-
     def __init__(
         self,
         compile_target: CompileTarget,
