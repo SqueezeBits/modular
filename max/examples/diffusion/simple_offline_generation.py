@@ -257,9 +257,6 @@ async def generate_image(args: argparse.Namespace) -> None:
     """
     print(f"Loading model: {args.model}")
 
-    if args.step_cache:
-        os.environ["MAX_STEP_CACHE"] = "1"
-
     # Step 1: Initialize pipeline configuration
     config = PipelineConfig(
         model=MAXModelConfig(

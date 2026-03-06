@@ -323,7 +323,6 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.patch_size = patch_size
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
-        self.step_cache = getattr(config, "step_cache", False)
 
         self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
         self.guidance_embeds = guidance_embeds
@@ -389,7 +388,6 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.in_channels = in_channels
         self.joint_attention_dim = joint_attention_dim
         self.pooled_projection_dim = pooled_projection_dim
-
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the model.
 
@@ -433,9 +431,6 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
             txt_ids_type,
             guidance_type,
         )
-
-        if not self.step_cache:
-            return base_types
 
         prev_residual_type = TensorType(
             self.max_dtype,
@@ -527,7 +522,7 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
         ids = F.concat((txt_ids, img_ids), axis=0)
         image_rotary_emb = self.pos_embed(ids)
 
-        if not self.step_cache:
+        if cache_enabled is None:
             # Standard path: no cache overhead, identical to original graph.
             for block in self.transformer_blocks:
                 encoder_hidden_states, hidden_states = block(
@@ -550,6 +545,33 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
             return (output,)
 
         # Step-cache path: F.cond branching for cache reuse.
+        if (
+            prev_residual is None
+            or prev_output is None
+            or cache_enabled is None
+            or rdt is None
+        ):
+            # Fallback path if cache tensors/flags are unavailable at runtime.
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+            for single_block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = single_block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+            hidden_states = self.norm_out(hidden_states, temb)
+            output = self.proj_out(hidden_states)
+            return (output,)
+
         assert prev_residual is not None
         assert prev_output is not None
         assert cache_enabled is not None
