@@ -191,9 +191,12 @@ class Flux2KleinPipeline(Flux2Pipeline):
                 device=self.text_encoder.devices[0],
             )
         else:
-            text_input_ids = (
-                tokens.to(self.text_encoder.devices[0]).cast(DType.int64)
-            )
+            text_input_ids = tokens
+            target_device = self.text_encoder.devices[0]
+            if text_input_ids.device != target_device:
+                text_input_ids = text_input_ids.to(target_device)
+            if text_input_ids.dtype != DType.int64:
+                text_input_ids = text_input_ids.cast(DType.int64)
             if text_input_ids.rank != 1:
                 raise ValueError(
                     "Flux2Klein expects 1D token tensor, "
