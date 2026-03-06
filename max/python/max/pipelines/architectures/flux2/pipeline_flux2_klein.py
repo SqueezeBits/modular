@@ -208,8 +208,12 @@ class Flux2KleinPipeline(Flux2Pipeline):
 
         hidden_states_raw: list[Tensor] = []
         all_match_target_seq_len = True
-        for i in layers:
-            hs = hidden_states_all[i - 1]
+        states_iter = (
+            hidden_states_all
+            if len(hidden_states_all) == len(layers)
+            else [hidden_states_all[i - 1] for i in layers]
+        )
+        for hs in states_iter:
             if hs.rank == 3:
                 hs = hs[0]
             hidden_states_raw.append(hs)

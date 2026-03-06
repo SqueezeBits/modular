@@ -111,6 +111,7 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
         self.device = config.device
+        self.output_hidden_state_layers = set(config.output_hidden_state_layers)
 
         self.rope = RotaryEmbedding(
             dim=config.hidden_size,
@@ -160,8 +161,9 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
         h = self.embed_tokens(tokens)
 
         all_hidden_states: list[Tensor] = []
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers, start=1):
             h = layer(h, self.rope)
-            all_hidden_states.append(h)
+            if layer_idx in self.output_hidden_state_layers:
+                all_hidden_states.append(h)
 
         return tuple(all_hidden_states)

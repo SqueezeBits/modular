@@ -46,6 +46,7 @@ class Qwen3TextEncoderConfigBase(MAXModelConfigBase):
     rms_norm_eps: float = 1e-6
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
+    output_hidden_state_layers: tuple[int, ...] = (9, 18, 27)
 
     @property
     def attention_multiplier(self) -> float:
