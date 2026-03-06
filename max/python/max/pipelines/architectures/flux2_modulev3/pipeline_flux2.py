@@ -20,7 +20,7 @@ from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
-from max.graph import TensorType
+from max.graph import TensorType, TensorValue, ops
 from max.graph.ops import rebind, shape_to_tensor
 from max.pipelines.core import PixelContext
 from max.pipelines.lib.interfaces import DiffusionPipeline
@@ -592,25 +592,25 @@ class Flux2Pipeline(DiffusionPipeline):
     def preprocess_latents(self, latents: Tensor) -> Tensor:
         return self._patchify_and_pack(latents)
 
-    def _patchify_and_pack(self, latents: Tensor) -> Tensor:
+    def _patchify_and_pack(self, latents: TensorValue) -> TensorValue:
         """Patchify (B,C,H,W)->(B,C*4,H//2,W//2) then pack to (B,H//2*W//2,C*4)."""
-        latents = latents.cast(self.transformer.config.dtype)
+        latents = ops.cast(latents, self.transformer.config.dtype)
         batch = latents.shape[0]
         c = latents.shape[1]
         h = latents.shape[2]
         w = latents.shape[3]
-        latents = F.rebind(latents, [batch, c, (h // 2) * 2, (w // 2) * 2])
-        latents = F.reshape(latents, (batch, c, h // 2, 2, w // 2, 2))
+        latents = ops.rebind(latents, [batch, c, (h // 2) * 2, (w // 2) * 2])
+        latents = ops.reshape(latents, (batch, c, h // 2, 2, w // 2, 2))
         h2 = latents.shape[2]
         w2 = latents.shape[4]
 
-        latents = F.permute(latents, (0, 1, 3, 5, 2, 4))
-        latents = F.reshape(latents, (batch, c * 4, h2, w2))
+        latents = ops.permute(latents, [0, 1, 3, 5, 2, 4])
+        latents = ops.reshape(latents, (batch, c * 4, h2, w2))
 
         # Pack: (B, C*4, H//2, W//2) -> (B, H//2*W//2, C*4)
         c4 = c * 4
-        latents = F.reshape(latents, (batch, c4, h2 * w2))
-        latents = F.permute(latents, (0, 2, 1))
+        latents = ops.reshape(latents, (batch, c4, h2 * w2))
+        latents = ops.permute(latents, [0, 2, 1])
 
         return latents
 
