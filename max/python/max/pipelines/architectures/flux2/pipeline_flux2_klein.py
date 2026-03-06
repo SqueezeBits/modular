@@ -65,7 +65,9 @@ class Flux2KleinPipeline(Flux2Pipeline):
     }
 
     def _ensure_prompt_embedding_postprocess_compiled(self) -> None:
-        if "_postprocess_prompt_embeddings" in self.__dict__:
+        # Keep the compiled callable under a separate name so profiling wrappers
+        # on `_postprocess_prompt_embeddings` do not suppress lazy compilation.
+        if "_compiled_postprocess_prompt_embeddings" in self.__dict__:
             return
         device = self.text_encoder.devices[0]
         dtype = self.text_encoder.config.dtype
@@ -74,12 +76,22 @@ class Flux2KleinPipeline(Flux2Pipeline):
             TensorType(dtype, shape=["seq", "d1"], device=device),
             TensorType(dtype, shape=["seq", "d2"], device=device),
         ]
-        self.__dict__["_postprocess_prompt_embeddings"] = max_compile(
-            self._postprocess_prompt_embeddings,
+        self.__dict__["_compiled_postprocess_prompt_embeddings"] = max_compile(
+            self._postprocess_prompt_embeddings_impl,
             input_types=input_types,
         )
 
     def _postprocess_prompt_embeddings(
+        self,
+        hidden_state_0: Tensor,
+        hidden_state_1: Tensor,
+        hidden_state_2: Tensor,
+    ) -> Tensor:
+        return self._postprocess_prompt_embeddings_impl(
+            hidden_state_0, hidden_state_1, hidden_state_2
+        )
+
+    def _postprocess_prompt_embeddings_impl(
         self,
         hidden_state_0: Tensor,
         hidden_state_1: Tensor,
@@ -249,7 +261,10 @@ class Flux2KleinPipeline(Flux2Pipeline):
             and num_images_per_prompt == 1
         ):
             self._ensure_prompt_embedding_postprocess_compiled()
-            prompt_embeds = self._postprocess_prompt_embeddings(
+            compiled_postprocess = self.__dict__[
+                "_compiled_postprocess_prompt_embeddings"
+            ]
+            prompt_embeds = compiled_postprocess(
                 hidden_states_selected[0],
                 hidden_states_selected[1],
                 hidden_states_selected[2],
