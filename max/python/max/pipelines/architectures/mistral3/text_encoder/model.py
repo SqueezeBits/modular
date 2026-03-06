@@ -22,8 +22,8 @@ from collections.abc import Callable
 from typing import Any
 
 from max.driver import Device
-from max.experimental import functional as F
-from max.experimental.tensor import Tensor
+from max.engine import InferenceSession, Model
+from max.graph import Graph
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
@@ -42,6 +42,7 @@ class Mistral3TextEncoderModel(ComponentModel):
         encoding: SupportedEncoding,
         devices: list[Device],
         weights: Weights,
+        session: InferenceSession,
     ) -> None:
         """Initialize Mistral3TextEncoderModel.
 
@@ -50,8 +51,10 @@ class Mistral3TextEncoderModel(ComponentModel):
             encoding: Supported encoding for the model.
             devices: List of devices to use.
             weights: Model weights.
+            session: Inference session for loading the compiled graph.
         """
         super().__init__(config, encoding, devices, weights)
+        self.session = session
         self.config = Mistral3TextEncoderConfig.generate(
             config,
             encoding,
@@ -73,15 +76,28 @@ class Mistral3TextEncoderModel(ComponentModel):
 
             state_dict[adapted_key] = value.data()
 
-        with F.lazy():
-            model = Mistral3TextEncoderTransformer(self.config)
-            model.to(self.devices[0])
+        model = Mistral3TextEncoderTransformer(self.config)
+        model.load_state_dict(state_dict, weight_alignment=1, strict=False)
+        self.state_dict = model.state_dict()
 
-        self.model = model.compile(*model.input_types(), weights=state_dict)
-        return self.model
+        with Graph(
+            "mistral3_text_encoder",
+            input_types=model.input_types(),
+        ) as graph:
+            outputs = model(*(value.tensor for value in graph.inputs))
+            if isinstance(outputs, tuple):
+                graph.output(*outputs)
+            else:
+                graph.output(outputs)
 
-    def __call__(self, tokens: Tensor) -> Tensor:
-        outputs = self.model(tokens)
+        self.model: Model = self.session.load(
+            graph,
+            weights_registry=self.state_dict,
+        )
+        return self.model.execute
+
+    def __call__(self, tokens) -> Any:
+        outputs = self.model.execute(tokens)
         if isinstance(outputs, (list, tuple)):
             return outputs[0]
         return outputs
