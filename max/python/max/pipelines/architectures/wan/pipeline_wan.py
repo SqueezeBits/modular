@@ -224,7 +224,14 @@ class WanPipeline(DiffusionPipeline):
     def prepare_inputs(self, context: PixelGenerationContext) -> WanModelInputs:
         model_inputs = WanModelInputs.from_context(context)
         if hasattr(context, "num_frames") and context.num_frames is not None:
-            model_inputs.num_frames = context.num_frames
+            requested_num_frames = int(context.num_frames)
+            model_inputs.num_frames = requested_num_frames
+            if model_inputs.latents.ndim == 5:
+                latent_frames = int(model_inputs.latents.shape[2])
+                model_inputs.num_frames = self._normalize_num_frames_for_wan(
+                    requested_num_frames=requested_num_frames,
+                    latent_frames=latent_frames,
+                )
         if (
             hasattr(context, "guidance_scale_2")
             and context.guidance_scale_2 is not None
@@ -422,10 +429,22 @@ class WanPipeline(DiffusionPipeline):
 
         with Tracer("vae_decode"):
             decoded_video = self.vae.decode_5d(denorm_latents)
+            decoded_num_frames = int(decoded_video.shape[2])
+            target_num_frames = min(
+                decoded_num_frames, int(model_inputs.num_frames)
+            )
+            if decoded_num_frames != int(model_inputs.num_frames):
+                logger.warning(
+                    "Wan VAE decode produced %d frames for requested %d; "
+                    "continuing with %d decoded frames.",
+                    decoded_num_frames,
+                    int(model_inputs.num_frames),
+                    target_num_frames,
+                )
             decoded_video = decoded_video[
                 :,
                 :,
-                : model_inputs.num_frames,
+                : target_num_frames,
                 : model_inputs.height,
                 : model_inputs.width,
             ]
@@ -635,6 +654,27 @@ class WanPipeline(DiffusionPipeline):
                 int(prompt_embeds.shape[2]),
             ),
         )
+
+    def _normalize_num_frames_for_wan(
+        self,
+        requested_num_frames: int,
+        latent_frames: int,
+    ) -> int:
+        compatible_num_frames = max(
+            1,
+            (max(latent_frames, 1) - 1) * self.vae_scale_factor_temporal + 1,
+        )
+        if requested_num_frames <= compatible_num_frames:
+            return requested_num_frames
+
+        logger.warning(
+            "Requested Wan num_frames=%d is incompatible with latent temporal "
+            "shape (%d latent frames). Auto-adjusting output frame count to %d.",
+            requested_num_frames,
+            latent_frames,
+            compatible_num_frames,
+        )
+        return compatible_num_frames
 
     @staticmethod
     def compute_boundary_timestep(

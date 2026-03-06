@@ -67,6 +67,7 @@ DEFAULT_WAN_WARMUP_HEIGHT = 480
 DEFAULT_WAN_WARMUP_WIDTH = 832
 DEFAULT_WAN_WARMUP_NUM_FRAMES = 5
 DEFAULT_WAN_WARMUP_NUM_INFERENCE_STEPS = 5
+WAN_TEMPORAL_FRAME_STRIDE = 4
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -242,6 +243,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _normalize_wan_num_frames(num_frames: int, *, phase: str) -> int:
+    """Round Wan frame counts up to the nearest valid 1 + 4k size."""
+    if num_frames <= 1:
+        return 1
+
+    remainder = (num_frames - 1) % WAN_TEMPORAL_FRAME_STRIDE
+    if remainder == 0:
+        return num_frames
+
+    adjusted_num_frames = (
+        num_frames + WAN_TEMPORAL_FRAME_STRIDE - remainder
+    )
+    print(
+        "WanPipeline adjusted "
+        f"{phase} num_frames from {num_frames} to {adjusted_num_frames}; "
+        "Wan VAE temporal decode is stable on frame counts of the form 1 + 4k."
+    )
+    return adjusted_num_frames
+
+
 def _build_request_body(
     args: argparse.Namespace,
     prompt: str,
@@ -395,14 +416,22 @@ async def generate_video(args: argparse.Namespace) -> None:
         pipeline_model=pipeline_model,
     )
 
+    effective_num_frames = args.num_frames
+    if arch.name == "WanPipeline":
+        effective_num_frames = _normalize_wan_num_frames(
+            args.num_frames, phase="main"
+        )
+
     print(f"Generating video for prompt: '{args.prompt}'")
     print(
-        f"Parameters: {args.height}x{args.width}, {args.num_frames} frames, "
+        f"Parameters: {args.height}x{args.width}, {effective_num_frames} frames, "
         f"steps={args.num_inference_steps}, guidance={args.guidance_scale}"
     )
 
     # Create main request
-    body = _build_request_body(args, args.prompt)
+    body = _build_request_body(
+        args, args.prompt, num_frames=effective_num_frames
+    )
     request = OpenResponsesRequest(request_id=RequestID(), body=body)
     context = await tokenizer.new_context(request)
     inputs = PixelGenerationInputs[PixelContext](
@@ -459,14 +488,10 @@ async def generate_video(args: argparse.Namespace) -> None:
                 if args.warmup_num_inference_steps is not None
                 else args.num_inference_steps
             )
-        if arch.name == "WanPipeline" and 1 < warmup_num_frames < 5:
-            print(
-                "Warmup num_frames adjusted from "
-                f"{warmup_num_frames} to 5 for WanPipeline; "
-                "2-4 frames collapse to a single latent frame and break "
-                "the cached VAE decode crop path."
+        if arch.name == "WanPipeline":
+            warmup_num_frames = _normalize_wan_num_frames(
+                warmup_num_frames, phase="warmup"
             )
-            warmup_num_frames = 5
         warmup_guidance_scale = (
             args.warmup_guidance_scale
             if args.warmup_guidance_scale is not None
