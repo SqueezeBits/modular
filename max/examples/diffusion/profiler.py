@@ -245,11 +245,20 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
             specs = [
                 ("execute", "E2E execute"),
                 ("prepare_prompt_embeddings", "prepare_embeddings"),
+                ("encode_prompt", "encode_prompt"),
+                (
+                    "_postprocess_prompt_embeddings",
+                    "postprocess_prompt_embeddings",
+                ),
                 ("decode_latents", "decode_latents"),
+                ("_postprocess_and_decode", "postprocess_and_decode"),
                 ("prepare_scheduler", "prepare_scheduler"),
                 ("scheduler_step", "scheduler_step"),
                 ("preprocess_latents", "preprocess_latents"),
                 ("prepare_image_latents", "prepare_image_latents"),
+                ("concat_image_latents", "concat_image_latents"),
+                ("_numpy_image_to_tensor", "numpy_image_to_tensor"),
+                ("_get_shape_carriers", "get_shape_carriers"),
             ]
         else:
             specs = [
