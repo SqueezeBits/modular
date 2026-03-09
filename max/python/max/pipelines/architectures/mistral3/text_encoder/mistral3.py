@@ -28,7 +28,7 @@ from max.experimental.nn.common_layers.rotary_embedding import RotaryEmbedding
 from max.experimental.nn.norm import RMSNorm
 from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
-from max.graph import TensorType
+from max.graph import DeviceRef, TensorType
 
 from .attention import EncoderAttention
 
@@ -150,22 +150,31 @@ class Mistral3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
                 shape=["total_seq_len"],
                 device=self.device,
             ),
+            TensorType(
+                DType.float32,
+                shape=["target_seq_len"],
+                device=DeviceRef.CPU(),
+            ),
         )
 
-    def forward(self, tokens: Tensor) -> tuple[Tensor, ...]:
+    def forward(
+        self, tokens: Tensor, seq_len_carrier: Tensor
+    ) -> tuple[Tensor, ...]:
         """Forward pass returning fused prompt embeddings.
 
         Runs the transformer up to the last configured layer, collects hidden
-        states from the configured layers, then stacks and reshapes them into
-        a single prompt-embedding tensor.
+        states from the configured layers, then stacks, reshapes, and
+        left-pads them into a single prompt-embedding tensor.
 
         Args:
             tokens: Input token IDs [total_seq_len]
+            seq_len_carrier: 1-D shape carrier whose length encodes the
+                tokenizer-padded prompt length. Content is never read.
 
         Returns:
-            Tensor of shape [1, seq_len, num_layers * hidden_dim] with the
-            selected hidden states stacked and the layer/hidden dimensions
-            merged, ready for the diffusion transformer.
+            Tensor of shape [1, target_seq_len, num_layers * hidden_dim] with
+            the selected hidden states stacked, the layer/hidden dimensions
+            merged, and the prompt restored to its tokenizer-padded length.
         """
         h = self.embed_tokens(tokens)
 
@@ -188,8 +197,19 @@ class Mistral3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
         # Read L and D directly from the tensor dims to avoid any Python-side
         # constant that could force a device sync at eager execution time.
         seq_len = stacked.shape[1]
-        return (
-            F.reshape(
-                stacked, [1, seq_len, stacked.shape[2] * stacked.shape[3]]
+        target_seq_len = seq_len_carrier.shape[0]
+        prompt_embeds = F.reshape(
+            stacked, [1, seq_len, stacked.shape[2] * stacked.shape[3]]
+        )
+        left_pad = Tensor.zeros(
+            (
+                prompt_embeds.shape[0],
+                target_seq_len - seq_len,
+                prompt_embeds.shape[2],
             ),
+            dtype=prompt_embeds.dtype,
+            device=prompt_embeds.device,
+        )
+        return (
+            F.concat([left_pad, prompt_embeds], axis=1),
         )

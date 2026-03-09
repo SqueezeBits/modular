@@ -40,7 +40,13 @@ class Flux2ModelInputs:
     """Input container for Flux2 pipeline execution."""
 
     tokens: Tensor
-    """Primary encoder token IDs on device."""
+    """Primary encoder token IDs with padding removed, on device."""
+
+    seq_len: int
+    """Tokenizer-padded prompt length expected by the diffusion transformer."""
+
+    seq_len_carrier: Tensor
+    """1-D shape carrier whose length encodes the tokenizer-padded prompt."""
 
     latents: Tensor
     """Initial latent noise tensor on device."""
@@ -109,6 +115,13 @@ class Flux2ModelInputs:
             raise ValueError(
                 f"num_images_per_prompt must be > 0. Got {self.num_images_per_prompt!r}"
             )
+        if (
+            not isinstance(self.seq_len, int)
+            or self.seq_len <= 0
+        ):
+            raise ValueError(
+                f"seq_len must be a positive int. Got {self.seq_len!r}"
+            )
 
 
 @dataclass
@@ -164,6 +177,7 @@ class Flux2Pipeline(DiffusionPipeline):
         self._cached_guidance: dict[str, Tensor] = {}
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
+        self._cached_seq_len_carriers: dict[int, Tensor] = {}
         self._cached_shape_carriers: dict[int, Tensor] = {}
 
     @traced
@@ -183,6 +197,32 @@ class Flux2Pipeline(DiffusionPipeline):
             )
 
         device = self.transformer.devices[0]
+        token_ids = np.asarray(context.tokens.array, dtype=np.int64)
+        if token_ids.ndim != 1:
+            raise ValueError(
+                f"Flux2 expects 1D tokens, got shape {token_ids.shape}."
+            )
+        if context.mask is not None:
+            if context.mask.shape[0] != token_ids.shape[0]:
+                raise ValueError(
+                    "Prompt mask length must match token length. "
+                    f"Got mask={context.mask.shape[0]}, tokens={token_ids.shape[0]}."
+                )
+            valid_token_ids = token_ids[context.mask]
+            seq_len = int(context.mask.shape[0])
+        else:
+            valid_token_ids = token_ids
+            seq_len = int(token_ids.shape[0])
+        if seq_len < int(valid_token_ids.shape[0]):
+            raise ValueError(
+                "Prompt length after padding must be at least the compact token length. "
+                f"Got padded={seq_len}, compact={valid_token_ids.shape[0]}."
+            )
+        if seq_len not in self._cached_seq_len_carriers:
+            self._cached_seq_len_carriers[seq_len] = Tensor.from_dlpack(
+                np.empty(seq_len, dtype=np.float32)
+            )
+        seq_len_carrier = self._cached_seq_len_carriers[seq_len]
 
         # Retrieve cached sigmas, if possible.
         latent_h = context.height // self.vae_scale_factor
@@ -225,10 +265,12 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return Flux2ModelInputs(
             tokens=Tensor(
-                storage=Buffer.from_dlpack(context.tokens.array).to(
+                storage=Buffer.from_dlpack(valid_token_ids).to(
                     self.text_encoder.devices[0]
                 )
             ),
+            seq_len=seq_len,
+            seq_len_carrier=seq_len_carrier,
             latents=Tensor(
                 storage=Buffer.from_dlpack(context.latents).to(device)
             ),
@@ -488,16 +530,21 @@ class Flux2Pipeline(DiffusionPipeline):
     def prepare_prompt_embeddings(
         self,
         tokens: Tensor,
+        seq_len: int,
+        seq_len_carrier: Tensor,
         num_images_per_prompt: int = 1,
     ) -> tuple[Tensor, Tensor]:
         """Create prompt embeddings and text position IDs for the transformer.
 
         The text encoder returns fused prompt embeddings directly, with hidden
         states from the configured layers already stacked and merged across the
-        layer/hidden dimensions.
+        layer/hidden dimensions, then restored to the tokenizer-padded prompt
+        length inside the compiled encoder graph.
 
         Args:
             tokens: Token ID tensor of shape (S,) on the text encoder device.
+            seq_len: Tokenizer-padded prompt length.
+            seq_len_carrier: 1-D shape carrier whose length encodes `seq_len`.
             num_images_per_prompt: Number of image generations per prompt.
 
         Returns:
@@ -505,12 +552,10 @@ class Flux2Pipeline(DiffusionPipeline):
                 - prompt_embeds: Tensor of shape (B', S, L*D)
                 - text_ids: Tensor[int64] of shape (B', S, 4)
         """
-        # Shape metadata is host-side; this does not trigger a GPU sync.
-        seq_len = int(tokens.shape[0])
         batch_size = 1  # text encoder always outputs a single batch
 
         with Tracer("text_encoder"):
-            prompt_embeds = self.text_encoder(tokens)
+            prompt_embeds = self.text_encoder(tokens, seq_len_carrier)
 
         with Tracer("post_process"):
             if num_images_per_prompt != 1:
@@ -684,6 +729,8 @@ class Flux2Pipeline(DiffusionPipeline):
         prompt_embeds, text_ids = self.prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
+            seq_len=model_inputs.seq_len,
+            seq_len_carrier=model_inputs.seq_len_carrier,
         )
         batch_size = int(prompt_embeds.shape[0])
 

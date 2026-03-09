@@ -648,13 +648,6 @@ class PixelGenerationTokenizer(
                 f"length ({input_ids_array.shape[0]} != {attention_mask_array.shape[0]})."
             )
 
-        # FLUX.2 uses compact token IDs; FLUX.2-Klein keeps full tokenizer output.
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
-            input_ids_array = input_ids_array[attention_mask_array]
-            attention_mask_array = np.ones(
-                input_ids_array.shape[0], dtype=np.bool_
-            )
-
         if (
             max_sequence_length
             and input_ids_array.shape[0] > max_sequence_length
