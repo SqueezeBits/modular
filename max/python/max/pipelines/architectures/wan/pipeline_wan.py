@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-from max.driver import CPU, Device
+from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
@@ -80,7 +80,7 @@ class WanModelInputs(PixelModelInputs):
 
 @dataclass
 class WanPipelineOutput:
-    images: np.ndarray | Tensor
+    images: np.ndarray | Buffer
 
 
 class WanPipeline(DiffusionPipeline):
@@ -194,8 +194,8 @@ class WanPipeline(DiffusionPipeline):
         if self.transformer_2 is not None:
             self.transformer_2.compile_model()
         self.vae.prepare_for_serving()
-        self._cached_spatial_shapes: dict[str, Tensor] = {}
-        self._cached_batched_timesteps: dict[str, list[Tensor]] = {}
+        self._cached_spatial_shapes: dict[str, Buffer] = {}
+        self._cached_batched_timesteps: dict[str, list[Buffer]] = {}
 
     def build_guidance_model(self) -> None:
         """Compile classifier-free guidance: uncond + scale * (cond - uncond)."""
@@ -316,6 +316,12 @@ class WanPipeline(DiffusionPipeline):
                 device=device,
             )
 
+            # Convert prompt_embeds Tensor -> Buffer for transformer
+            prompt_embeds_buf = prompt_embeds.driver_tensor
+            negative_prompt_embeds_buf: Buffer | None = None
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds_buf = negative_prompt_embeds.driver_tensor
+
             guidance_scale_high: Tensor | None = None
             guidance_scale_low: Tensor | None = None
             if do_cfg:
@@ -349,7 +355,7 @@ class WanPipeline(DiffusionPipeline):
                         boundary_step_idx = idx
                         break
 
-        # Build a tiny tensor carrying post-patch [frames, height, width]
+        # Build a tiny buffer carrying post-patch [frames, height, width]
         # so compiled post-processing can recover symbolic dims.
         p_t, p_h, p_w = self.transformer.config.patch_size
         ppf = int(latents.shape[2]) // p_t
@@ -365,8 +371,8 @@ class WanPipeline(DiffusionPipeline):
             latents, latents_np_cache = self._run_denoising_phase(
                 latents=latents,
                 transformer_model=high_noise_model,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
+                prompt_embeds=prompt_embeds_buf,
+                negative_prompt_embeds=negative_prompt_embeds_buf,
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
                 scheduler_timesteps=scheduler_timesteps,
@@ -392,8 +398,8 @@ class WanPipeline(DiffusionPipeline):
                 latents, latents_np_cache = self._run_denoising_phase(
                     latents=latents,
                     transformer_model=low_noise_model,
-                    prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=negative_prompt_embeds,
+                    prompt_embeds=prompt_embeds_buf,
+                    negative_prompt_embeds=negative_prompt_embeds_buf,
                     rope_cos=rope_cos,
                     rope_sin=rope_sin,
                     scheduler_timesteps=scheduler_timesteps,
@@ -455,50 +461,54 @@ class WanPipeline(DiffusionPipeline):
         self,
         latents: Tensor,
         transformer_model: Any,
-        prompt_embeds: Tensor,
-        negative_prompt_embeds: Tensor | None,
-        rope_cos: Tensor,
-        rope_sin: Tensor,
+        prompt_embeds: Buffer,
+        negative_prompt_embeds: Buffer | None,
+        rope_cos: Buffer,
+        rope_sin: Buffer,
         scheduler_timesteps: np.ndarray,
-        batched_timesteps: list[Tensor],
+        batched_timesteps: list[Buffer],
         do_cfg: bool,
         guidance_scale: Tensor | None,
         device: Device,
         step_range: range,
         desc: str,
-        spatial_shape: Tensor,
+        spatial_shape: Buffer,
         latents_np: np.ndarray | None = None,
     ) -> tuple[Tensor, np.ndarray]:
         """Run a denoising phase using UniPC multistep scheduler.
 
-        Transformer forward passes run on GPU. Scheduler step runs on
+        Transformer forward passes run on GPU (takes/returns Buffer).
+        Guidance model uses compiled Tensor API. Scheduler step runs on
         CPU via numpy (cheap for the small latent tensor, avoids lazy
         graph accumulation that causes quadratic slowdown).
         """
         sched = self._scheduler
-        transformer_dtype = prompt_embeds.dtype  # bf16
+        transformer_dtype = DType.bfloat16
         cpu = CPU()
 
         for i in tqdm(step_range, desc=desc):
             dit_timestep = batched_timesteps[i]
 
-            latent_model_input = latents.cast(transformer_dtype)
-            noise_pred = transformer_model(
+            # Cast latents to bf16 Buffer for transformer
+            latent_model_input = latents.cast(transformer_dtype).driver_tensor
+            noise_pred_buf: Buffer = transformer_model(
                 latent_model_input, dit_timestep, prompt_embeds,
                 rope_cos, rope_sin, spatial_shape,
             )
+            # Wrap Buffer -> Tensor for guidance model / scheduler
+            noise_pred = Tensor.from_dlpack(noise_pred_buf)
 
             if do_cfg and negative_prompt_embeds is not None:
                 assert guidance_scale is not None
-                noise_uncond = transformer_model(
+                noise_uncond_buf: Buffer = transformer_model(
                     latent_model_input, dit_timestep, negative_prompt_embeds,
                     rope_cos, rope_sin, spatial_shape,
                 )
+                noise_uncond = Tensor.from_dlpack(noise_uncond_buf)
                 noise_pred = self._guidance_model(
                     noise_pred, noise_uncond, guidance_scale,
                 )
                 del noise_uncond
-            del latent_model_input
 
             # Scheduler step on CPU via numpy.
             # Keep a CPU-side latents cache to avoid re-downloading latents
@@ -525,14 +535,13 @@ class WanPipeline(DiffusionPipeline):
 
     def _get_spatial_shape(
         self, ppf: int, pph: int, ppw: int, device: Device
-    ) -> Tensor:
+    ) -> Buffer:
         key = f"{ppf}_{pph}_{ppw}_{device.id}"
         cached = self._cached_spatial_shapes.get(key)
         if cached is not None:
             return cached
-        spatial_shape = Tensor.zeros(
-            [ppf, pph, ppw], dtype=DType.int8, device=device
-        )
+        spatial_np = np.zeros((ppf, pph, ppw), dtype=np.int8)
+        spatial_shape = Buffer.from_numpy(spatial_np).to(device)
         self._cached_spatial_shapes[key] = spatial_shape
         return spatial_shape
 
@@ -541,7 +550,7 @@ class WanPipeline(DiffusionPipeline):
         scheduler_timesteps: np.ndarray,
         batch_size: int,
         device: Device,
-    ) -> list[Tensor]:
+    ) -> list[Buffer]:
         key = (
             f"{batch_size}_{len(scheduler_timesteps)}_"
             f"{int(scheduler_timesteps[0])}_{int(scheduler_timesteps[-1])}_"
@@ -552,12 +561,9 @@ class WanPipeline(DiffusionPipeline):
             return cached
 
         batched_timesteps = [
-            Tensor.full(
-                [batch_size],
-                float(int(step_value)),
-                dtype=DType.float32,
-                device=device,
-            )
+            Buffer.from_numpy(
+                np.full([batch_size], float(int(step_value)), dtype=np.float32)
+            ).to(device)
             for step_value in scheduler_timesteps
         ]
         self._cached_batched_timesteps[key] = batched_timesteps

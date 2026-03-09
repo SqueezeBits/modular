@@ -15,59 +15,56 @@ import math
 from collections.abc import Callable
 
 from max.dtype import DType
-from max.experimental import functional as F
-from max.experimental.tensor import Tensor
-from max.nn.module_v3 import Linear, Module
-from max.pipelines.architectures.common_layers.activation import (
-    activation_function_from_name,
-)
+from max.graph import DeviceRef, TensorValue, ops
+from max.nn.activation import activation_function_from_name
+from max.nn.layer import Module
+from max.nn.linear import Linear
 
 
 def get_timestep_embedding(
-    timesteps: Tensor,
+    timesteps: TensorValue,
     embedding_dim: int,
     flip_sin_to_cos: bool = False,
     downscale_freq_shift: float = 1,
     scale: float = 1,
     max_period: int = 10000,
-) -> Tensor:
+) -> TensorValue:
     """This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings."""
     half_dim = embedding_dim // 2
 
     # Create frequency bands
-    exponent = -math.log(max_period) * F.arange(
+    exponent = -math.log(max_period) * ops.range(
         0, half_dim, dtype=DType.float32, device=timesteps.device
     )
     exponent = exponent / (half_dim - downscale_freq_shift)
-    emb = F.exp(exponent)
+    emb = ops.exp(exponent)
 
     # Expand timesteps: [B] -> [B, 1]
     # Expand emb: [half_dim] -> [1, half_dim]
-    timesteps_expanded = F.cast(timesteps[:, None], DType.float32)
-    # emb_expanded = F.reshape(emb, [1] * len(timesteps.shape) + [half_dim])
-    emb_expanded = emb[None, :]
+    timesteps_expanded = ops.cast(ops.unsqueeze(timesteps, 1), DType.float32)
+    emb_expanded = ops.unsqueeze(emb, 0)
 
     # Multiply: [B, 1] * [1, half_dim] -> [B, half_dim]
     emb = scale * timesteps_expanded * emb_expanded
 
-    emb = F.concat([F.sin(emb), F.cos(emb)], axis=-1)
+    emb = ops.concat([ops.sin(emb), ops.cos(emb)], axis=-1)
     # Concatenate sin and cos
     if flip_sin_to_cos:
-        emb = F.concat([emb[:, half_dim:], emb[:, :half_dim]], axis=-1)
+        emb = ops.concat([emb[:, half_dim:], emb[:, :half_dim]], axis=-1)
 
     if embedding_dim % 2 == 1:
-        emb = F.pad(emb, (0, 1, 0, 0))
+        emb = ops.pad(emb, (0, 0, 0, 1))
 
     return emb
 
 
 def apply_rotary_emb(
-    x: Tensor,
-    freqs_cis: tuple[Tensor, Tensor],
+    x: TensorValue,
+    freqs_cis: tuple[TensorValue, TensorValue],
     use_real: bool = True,
     use_real_unbind_dim: int = -1,
     sequence_dim: int = 2,
-) -> Tensor:
+) -> TensorValue:
     """Apply rotary position embeddings to input tensor.
 
     Args:
@@ -92,12 +89,12 @@ def apply_rotary_emb(
     # Expand cos/sin to match x shape based on sequence_dim
     if sequence_dim == 2:
         # x: [B, H, S, D], need cos/sin: [1, 1, S, D]
-        cos = F.unsqueeze(F.unsqueeze(cos, 0), 0)
-        sin = F.unsqueeze(F.unsqueeze(sin, 0), 0)
+        cos = ops.unsqueeze(ops.unsqueeze(cos, 0), 0)
+        sin = ops.unsqueeze(ops.unsqueeze(sin, 0), 0)
     elif sequence_dim == 1:
         # x: [B, S, H, D], need cos/sin: [1, S, 1, D]
-        cos = F.unsqueeze(F.unsqueeze(cos, 0), 2)
-        sin = F.unsqueeze(F.unsqueeze(sin, 0), 2)
+        cos = ops.unsqueeze(ops.unsqueeze(cos, 0), 2)
+        sin = ops.unsqueeze(ops.unsqueeze(sin, 0), 2)
     else:
         raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
 
@@ -108,7 +105,7 @@ def apply_rotary_emb(
         # Reshape x: [..., D] -> [..., D//2, 2]
         x_shape = list(x.shape)
         new_shape = x_shape[:-1] + [x_shape[-1] // 2, 2]
-        x_reshaped = F.reshape(x, new_shape)
+        x_reshaped = ops.reshape(x, new_shape)
 
         # Split into real and imaginary parts: [..., D//2, 2] -> 2 x [..., D//2]
         x_real = x_reshaped[..., 0]  # [..., D//2]
@@ -118,26 +115,26 @@ def apply_rotary_emb(
         # This creates [..., D//2, 2]
         x_rotated_real = -x_imag
         x_rotated_imag = x_real
-        x_rotated_stacked = F.stack(
+        x_rotated_stacked = ops.stack(
             [x_rotated_real, x_rotated_imag], axis=-1
         )  # [..., D//2, 2]
 
         # Flatten back to [..., D]
-        x_rotated = F.reshape(x_rotated_stacked, x_shape)
+        x_rotated = ops.reshape(x_rotated_stacked, x_shape)
 
     elif use_real_unbind_dim == -2:
         # Used for Stable Audio, OmniGen, CogView4, Cosmos
         # Reshape x: [..., D] -> [..., 2, D//2]
         x_shape = list(x.shape)
         new_shape = x_shape[:-1] + [2, x_shape[-1] // 2]
-        x_reshaped = F.reshape(x, new_shape)
+        x_reshaped = ops.reshape(x, new_shape)
 
         # Split into real and imaginary parts: [..., 2, D//2] -> 2 x [..., D//2]
         x_real = x_reshaped[..., 0, :]  # [..., D//2]
         x_imag = x_reshaped[..., 1, :]  # [..., D//2]
 
         # Create rotated version: cat([-x_imag, x_real], dim=-1)
-        x_rotated = F.concat([-x_imag, x_real], axis=-1)  # [..., D]
+        x_rotated = ops.concat([-x_imag, x_real], axis=-1)  # [..., D]
 
     else:
         raise ValueError(
@@ -146,24 +143,24 @@ def apply_rotary_emb(
 
     # Apply rotation: x * cos + x_rotated * sin
     # Cast to float32 for computation, then back to input dtype
-    x_float = F.cast(x, DType.float32)
-    x_rotated_float = F.cast(x_rotated, DType.float32)
-    cos_float = F.cast(cos, DType.float32)
-    sin_float = F.cast(sin, DType.float32)
+    x_float = ops.cast(x, DType.float32)
+    x_rotated_float = ops.cast(x_rotated, DType.float32)
+    cos_float = ops.cast(cos, DType.float32)
+    sin_float = ops.cast(sin, DType.float32)
 
     out = x_float * cos_float + x_rotated_float * sin_float
-    out = F.cast(out, input_dtype)
+    out = ops.cast(out, input_dtype)
 
     return out
 
 
 def get_1d_rotary_pos_embed(
     dim: int,
-    pos: Tensor | int,
+    pos: TensorValue | int,
     theta: float = 10000.0,
     use_real: bool = True,
     repeat_interleave_real: bool = True,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[TensorValue, TensorValue]:
     """Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
     Args:
@@ -190,31 +187,31 @@ def get_1d_rotary_pos_embed(
         )
 
     # Create frequency bands: [dim/2]
-    device = pos.device if isinstance(pos, Tensor) else None
+    device = pos.device if isinstance(pos, TensorValue) else DeviceRef.CPU()
     freq_exponent = (
-        F.arange(0, dim, 2, dtype=DType.float32, device=device) / dim
+        ops.range(0, dim, 2, dtype=DType.float32, device=device) / dim
     )
     freq = 1.0 / (theta**freq_exponent)
 
     # Compute outer product: [S, dim/2]
-    freqs = F.outer(pos, freq)
+    freqs = ops.outer(pos, freq)
 
     # Compute cos and sin: [S, dim/2]
-    cos_emb = F.cos(freqs)
-    sin_emb = F.sin(freqs)
+    cos_emb = ops.cos(freqs)
+    sin_emb = ops.sin(freqs)
 
     # Repeat interleave: [S, dim/2] -> [S, dim]
     # repeat_interleave not supported on GPU, use stack + reshape instead
     # PyTorch: repeat_interleave(2, dim=1) makes [a, b, c] -> [a, a, b, b, c, c]
     # MAX equivalent: stack([x, x], axis=2) + reshape
-    cos_stacked = F.stack([cos_emb, cos_emb], axis=2)  # [S, dim/2, 2]
-    sin_stacked = F.stack([sin_emb, sin_emb], axis=2)  # [S, dim/2, 2]
+    cos_stacked = ops.stack([cos_emb, cos_emb], axis=2)  # [S, dim/2, 2]
+    sin_stacked = ops.stack([sin_emb, sin_emb], axis=2)  # [S, dim/2, 2]
 
-    freqs_cos = F.reshape(
+    freqs_cos = ops.reshape(
         cos_stacked,
         [cos_emb.shape[0], cos_stacked.shape[1] * cos_stacked.shape[2]],
     )  # [S, dim]
-    freqs_sin = F.reshape(
+    freqs_sin = ops.reshape(
         sin_stacked,
         [sin_emb.shape[0], sin_stacked.shape[1] * sin_stacked.shape[2]],
     )  # [S, dim]
@@ -222,7 +219,7 @@ def get_1d_rotary_pos_embed(
     return freqs_cos, freqs_sin
 
 
-class Timesteps(Module[[Tensor], Tensor]):
+class Timesteps(Module):
     def __init__(
         self,
         num_channels: int,
@@ -238,12 +235,13 @@ class Timesteps(Module[[Tensor], Tensor]):
             downscale_freq_shift: Shift for frequency downscaling.
             scale: Scale factor for the embeddings.
         """
+        super().__init__()
         self.num_channels = num_channels
         self.flip_sin_to_cos = flip_sin_to_cos
         self.downscale_freq_shift = downscale_freq_shift
         self.scale = scale
 
-    def forward(self, timesteps: Tensor) -> Tensor:
+    def __call__(self, timesteps: TensorValue) -> TensorValue:
         """Convert timesteps to embeddings.
 
         Args:
@@ -262,7 +260,7 @@ class Timesteps(Module[[Tensor], Tensor]):
         return t_emb
 
 
-class TimestepEmbedding(Module[[Tensor], Tensor]):
+class TimestepEmbedding(Module):
     def __init__(
         self,
         in_channels: int,
@@ -272,6 +270,9 @@ class TimestepEmbedding(Module[[Tensor], Tensor]):
         post_act_fn: str | None = None,
         cond_proj_dim: int | None = None,
         sample_proj_bias: bool = True,
+        *,
+        dtype: DType = DType.bfloat16,
+        device: DeviceRef = DeviceRef.CPU(),
     ):
         """Initialize TimestepEmbedding MLP.
 
@@ -283,14 +284,27 @@ class TimestepEmbedding(Module[[Tensor], Tensor]):
             post_act_fn: Optional post-activation function name.
             cond_proj_dim: Optional conditioning projection dimension.
             sample_proj_bias: Whether to use bias in linear layers.
+            dtype: Data type for weights.
+            device: Device for weights.
         """
+        super().__init__()
         self.linear_1 = Linear(
-            in_channels, time_embed_dim, bias=sample_proj_bias
+            in_dim=in_channels,
+            out_dim=time_embed_dim,
+            dtype=dtype,
+            device=device,
+            has_bias=sample_proj_bias,
         )
 
         self.cond_proj: Linear | None
         if cond_proj_dim is not None:
-            self.cond_proj = Linear(cond_proj_dim, in_channels, bias=False)
+            self.cond_proj = Linear(
+                in_dim=cond_proj_dim,
+                out_dim=in_channels,
+                dtype=dtype,
+                device=device,
+                has_bias=False,
+            )
         else:
             self.cond_proj = None
 
@@ -302,16 +316,20 @@ class TimestepEmbedding(Module[[Tensor], Tensor]):
             time_embed_dim_out = time_embed_dim
 
         self.linear_2 = Linear(
-            time_embed_dim, time_embed_dim_out, bias=sample_proj_bias
+            in_dim=time_embed_dim,
+            out_dim=time_embed_dim_out,
+            dtype=dtype,
+            device=device,
+            has_bias=sample_proj_bias,
         )
 
-        self.post_act: Callable[[Tensor], Tensor] | None
+        self.post_act: Callable[[TensorValue], TensorValue] | None
         if post_act_fn is not None:
             self.post_act = activation_function_from_name(post_act_fn)
         else:
             self.post_act = None
 
-    def forward(self, sample: Tensor) -> Tensor:
+    def __call__(self, sample: TensorValue) -> TensorValue:
         """Process timestep embeddings through MLP.
 
         Args:

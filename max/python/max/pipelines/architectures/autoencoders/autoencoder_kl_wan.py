@@ -16,20 +16,21 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from itertools import pairwise
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
-from max.experimental import functional as F
-from max.driver import CPU, Accelerator, Device
+from max.driver import CPU, Accelerator, Buffer, Device
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType
+from max.engine import InferenceSession, Model
+from max.graph import DeviceRef, Graph, TensorType, TensorValue, Weight, ops
 from max.graph.buffer_utils import cast_dlpack_to
+from max.graph.type import ConvInputLayout, FilterLayout
 from max.graph.weights import Weights
-from max.nn.module_v3 import Conv2d, Conv3d, Module, ModuleList
+from max.nn.layer import LayerList, Module
 from max.pipelines.lib import SupportedEncoding
-from max.pipelines.lib.interfaces import CompileWrapper
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 from max.experimental.tensor import Tensor
+from max.experimental import functional as F
 
 from .model_config import AutoencoderKLWanConfig
 
@@ -39,43 +40,18 @@ CACHE_T = 2
 WAN_DECODER_CACHE_SLOTS = 32
 
 
-def _apply_conv3d_bias_ncdhw(x: Tensor, bias: Tensor | Literal[0]) -> Tensor:
-    """Apply Conv3d bias manually in NCDHW layout.
-
-    MAX's lower-level 3D conv path applies bias while the tensor is still
-    in NDHWC layout, which does not reliably broadcast on GPU for this Wan
-    decoder path. Apply it explicitly after Conv3d.forward() returns NCDHW.
-    """
-    if not isinstance(bias, Tensor):
-        return x
-    bias_t = F.transfer_to(bias, x.device)
-    bias_t = F.reshape(bias_t, [1, int(bias_t.shape[0]), 1, 1, 1])
-    return x + bias_t
-
-
-def _zero_cache_for(x: Tensor) -> Tensor:
+def _zero_cache_for(x: TensorValue) -> TensorValue:
     """Create a zero cache tensor shaped for a causal conv input."""
-    return Tensor.zeros(
-        [x.shape[0], x.shape[1], CACHE_T, x.shape[3], x.shape[4]],
+    shape = [int(x.shape[0]), int(x.shape[1]), CACHE_T, int(x.shape[3]), int(x.shape[4])]
+    return ops.constant(
+        np.zeros(shape, dtype=np.float32),
         dtype=x.dtype,
         device=x.device,
     )
 
 
-def _normalize_compiled_outputs(
-    outputs: Tensor | list[Tensor] | tuple[Tensor, ...],
-) -> list[Tensor]:
-    if isinstance(outputs, Tensor):
-        return [outputs]
-    if isinstance(outputs, tuple):
-        return list(outputs)
-    return outputs
-
-
-class WanRMSNorm(Module[[Tensor], Tensor]):
+class WanRMSNorm(Module):
     """RMS norm used by Wan VAE blocks."""
-
-    gamma: Tensor
 
     def __init__(
         self,
@@ -85,33 +61,36 @@ class WanRMSNorm(Module[[Tensor], Tensor]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         self.channel_first = channel_first
 
         broadcastable_dims = (1, 1) if images else (1, 1, 1)
         shape = [dim, *broadcastable_dims] if channel_first else [dim]
-        self.gamma = Tensor.ones(
+        dev_ref = device if device is not None else DeviceRef.CPU()
+        self.gamma = Weight(
+            "gamma",
+            dtype or DType.float32,
             shape,
-            dtype=dtype,
-            device=device.to_device() if device is not None else None,
+            dev_ref,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: TensorValue) -> TensorValue:
         axis = 1 if self.channel_first else x.rank - 1
-        rms = F.mean(x * x, axis=axis)
-        inv = F.rsqrt(rms + 1e-12)
-        gamma = F.transfer_to(self.gamma, x.device)
+        rms = ops.mean(x * x, axis=axis)
+        inv = ops.rsqrt(rms + 1e-12)
+        gamma = ops.transfer_to(self.gamma, x.device)
         return x * inv * gamma
 
 
-class WanCausalConv3d(Conv3d):
+class WanCausalConv3d(Module):
     """3D causal convolution for Wan VAE.
 
     Temporal causality is implemented via asymmetric padding: the front
-    (temporal) dimension is padded on the left only, which the Conv3d
+    (temporal) dimension is padded on the left only, which the conv3d
     padding parameter supports directly.
 
-    Uses permute=True so that weights stay in FCQRS (PyTorch) layout and
-    Conv3d.forward() can dispatch to cuDNN on NVIDIA GPUs.
+    Weights stay in FCQRS (PyTorch) layout. Input is permuted from
+    NCDHW to NDHWC before conv, and back after.
     """
 
     def __init__(
@@ -125,54 +104,55 @@ class WanCausalConv3d(Conv3d):
         device: DeviceRef | None = None,
         has_bias: bool = True,
     ) -> None:
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride, stride)
         if isinstance(padding, int):
             pad_t = pad_h = pad_w = padding
         else:
             pad_t, pad_h, pad_w = padding
 
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self._stride = stride
         # Causal: pad only the front of the temporal axis (left=2*pad_t, right=0).
-        super().__init__(
-            kernel_size=kernel_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            dtype=dtype,
-            stride=stride,
-            padding=(2 * pad_t, 0, pad_h, pad_h, pad_w, pad_w),
-            dilation=1,
-            num_groups=1,
-            device=device,
-            has_bias=False,
-            permute=True,
-        )
-        self.has_bias = has_bias
+        self._padding = (2 * pad_t, 0, pad_h, pad_h, pad_w, pad_w)
+
+        dev_ref = device if device is not None else DeviceRef.CPU()
+        dt = dtype or DType.float32
+        # Weight in FCQRS layout (PyTorch convention)
+        f, c = out_channels, in_channels
+        d, h, w = kernel_size
+        self.filter = Weight("weight", dt, [f, c, d, h, w], dev_ref)
+        self._has_bias = has_bias
         if has_bias:
-            self.bias = Tensor.zeros(
-                [out_channels],
-                dtype=dtype,
-                device=device.to_device() if device is not None else None,
-            )
+            self.bias = Weight("bias", dt, [out_channels], dev_ref)
 
-    def _forward_with_manual_bias(self, x: Tensor) -> Tensor:
-        bias = self.bias if isinstance(self.bias, Tensor) else 0
-        if isinstance(bias, Tensor):
-            self.bias = 0
-        try:
-            out = super().forward(x)
-        finally:
-            if isinstance(bias, Tensor):
-                self.bias = bias
-        return _apply_conv3d_bias_ncdhw(out, bias)
+    def __call__(self, x: TensorValue) -> TensorValue:
+        # NCDHW -> NDHWC
+        x_ndhwc = ops.permute(x, [0, 2, 3, 4, 1])
+        out = ops.conv3d(
+            x_ndhwc,
+            self.filter,
+            stride=self._stride,
+            padding=self._padding,
+            filter_layout=FilterLayout.FCQRS,
+        )
+        # NDHWC -> NCDHW
+        out = ops.permute(out, [0, 4, 1, 2, 3])
+        if self._has_bias:
+            bias_5d = ops.reshape(self.bias, [1, self.out_channels, 1, 1, 1])
+            out = out + bias_5d
+        return out
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_with_manual_bias(x)
 
-
-class WanCausalConv3dCached(Conv3d):
+class WanCausalConv3dCached(Module):
     """3D causal convolution with explicit cache tensor I/O.
 
-    Uses Conv3d's internal padding for spatial dimensions and handles
-    temporal causal padding separately via concat/pad before calling
-    super().forward().
+    Handles temporal causal padding separately via concat/pad before
+    calling the conv, while spatial padding is handled by conv3d.
     """
 
     def __init__(
@@ -186,72 +166,183 @@ class WanCausalConv3dCached(Conv3d):
         device: DeviceRef | None = None,
         has_bias: bool = True,
     ) -> None:
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride, stride)
         if isinstance(padding, int):
             pad_t = pad_h = pad_w = padding
         else:
             pad_t, pad_h, pad_w = padding
 
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self._stride = stride
         # Temporal causal padding: left=2*pad_t, right=0
         self._temporal_pad_left = 2 * pad_t
+        # Let conv3d handle spatial padding. Temporal padding = 0 here.
+        self._padding = (0, 0, pad_h, pad_h, pad_w, pad_w)
 
-        # Let Conv3d handle spatial padding via F.conv3d internally.
-        # Temporal padding = 0 here; we handle it ourselves.
-        super().__init__(
-            kernel_size=kernel_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            dtype=dtype,
-            stride=stride,
-            padding=(0, 0, pad_h, pad_h, pad_w, pad_w),
-            dilation=1,
-            num_groups=1,
-            device=device,
-            has_bias=False,
-            permute=True,
-        )
-        self.has_bias = has_bias
+        dev_ref = device if device is not None else DeviceRef.CPU()
+        dt = dtype or DType.float32
+        f, c = out_channels, in_channels
+        d, h, w = kernel_size
+        self.filter = Weight("weight", dt, [f, c, d, h, w], dev_ref)
+        self._has_bias = has_bias
         if has_bias:
-            self.bias = Tensor.zeros(
-                [out_channels],
-                dtype=dtype,
-                device=device.to_device() if device is not None else None,
-            )
+            self.bias = Weight("bias", dt, [out_channels], dev_ref)
 
-    def _forward_with_manual_bias(self, x: Tensor) -> Tensor:
-        bias = self.bias if isinstance(self.bias, Tensor) else 0
-        if isinstance(bias, Tensor):
-            self.bias = 0
-        try:
-            out = super().forward(x)
-        finally:
-            if isinstance(bias, Tensor):
-                self.bias = bias
-        return _apply_conv3d_bias_ncdhw(out, bias)
-
-    def _apply_temporal_pad(self, x: Tensor, pad_left: int) -> Tensor:
+    def _apply_temporal_pad(self, x: TensorValue, pad_left: int) -> TensorValue:
         """Zero-pad the temporal dimension (axis=2) on the left only."""
         if pad_left <= 0:
             return x
-        # F.pad expects 2*rank values: [d0_before, d0_after, d1_before, d1_after, ...]
+        # ops.pad expects 2*rank values: [d0_before, d0_after, d1_before, d1_after, ...]
         # For 5D [B, C, T, H, W]: pad only dim 2 (T) on the left.
         pad_vals = [0, 0, 0, 0, pad_left, 0, 0, 0, 0, 0]
-        return F.pad(x, pad_vals)
+        return ops.pad(x, pad_vals)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _forward_conv(self, x: TensorValue) -> TensorValue:
+        # NCDHW -> NDHWC
+        x_ndhwc = ops.permute(x, [0, 2, 3, 4, 1])
+        out = ops.conv3d(
+            x_ndhwc,
+            self.filter,
+            stride=self._stride,
+            padding=self._padding,
+            filter_layout=FilterLayout.FCQRS,
+        )
+        # NDHWC -> NCDHW
+        out = ops.permute(out, [0, 4, 1, 2, 3])
+        if self._has_bias:
+            bias_5d = ops.reshape(self.bias, [1, self.out_channels, 1, 1, 1])
+            out = out + bias_5d
+        return out
+
+    def __call__(self, x: TensorValue) -> TensorValue:
         x = self._apply_temporal_pad(x, self._temporal_pad_left)
-        return self._forward_with_manual_bias(x)
+        return self._forward_conv(x)
 
     def forward_cached(
-        self, x: Tensor, cache_in: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        x = F.concat([cache_in, x], axis=2)
+        self, x: TensorValue, cache_in: TensorValue
+    ) -> tuple[TensorValue, TensorValue]:
+        x = ops.concat([cache_in, x], axis=2)
         cache_out = x[:, :, -CACHE_T:, :, :]
         # Reduce temporal padding by the amount of context from cache.
         effective_pad = max(self._temporal_pad_left - int(cache_in.shape[2]), 0)
         x = self._apply_temporal_pad(x, effective_pad)
-        return self._forward_with_manual_bias(x), cache_out
+        return self._forward_conv(x), cache_out
 
-class WanResidualBlock(Module[[Tensor], Tensor]):
+
+class WanConv2dPermuted(Module):
+    """2D convolution with NCHW input and FCRS weights (permute=True equivalent).
+
+    Input is permuted from NCHW to NHWC before conv, and back after.
+    Weights stay in FCRS (PyTorch) layout.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+        has_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        if isinstance(stride, int):
+            self._stride = (stride, stride)
+        else:
+            self._stride = stride
+        if isinstance(padding, int):
+            self._padding = (padding, padding, padding, padding)
+        else:
+            self._padding = padding
+
+        dev_ref = device if device is not None else DeviceRef.CPU()
+        dt = dtype or DType.float32
+        self.filter = Weight(
+            "weight", dt, [out_channels, in_channels, kernel_size, kernel_size], dev_ref
+        )
+        self._has_bias = has_bias
+        if has_bias:
+            self.bias = Weight("bias", dt, [out_channels], dev_ref)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        # NCHW -> NHWC
+        x_nhwc = ops.permute(x, [0, 2, 3, 1])
+        out = ops.conv2d(
+            x_nhwc,
+            self.filter,
+            stride=self._stride,
+            padding=self._padding,
+            filter_layout=FilterLayout.FCRS,
+        )
+        # NHWC -> NCHW
+        out = ops.permute(out, [0, 3, 1, 2])
+        if self._has_bias:
+            bias_4d = ops.reshape(self.bias, [1, self.out_channels, 1, 1])
+            out = out + bias_4d
+        return out
+
+
+class WanConv2d(Module):
+    """2D convolution with NHWC input and RSCF weights (permute=False equivalent).
+
+    Input is already in NHWC layout. Weights are in RSCF layout
+    [H, W, in_channels, out_channels].
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+        has_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        if isinstance(stride, int):
+            self._stride = (stride, stride)
+        else:
+            self._stride = stride
+        if isinstance(padding, int):
+            self._padding = (padding, padding, padding, padding)
+        else:
+            self._padding = padding
+
+        dev_ref = device if device is not None else DeviceRef.CPU()
+        dt = dtype or DType.float32
+        self.filter = Weight(
+            "weight", dt, [kernel_size, kernel_size, in_channels, out_channels], dev_ref
+        )
+        self._has_bias = has_bias
+        if has_bias:
+            self.bias = Weight("bias", dt, [out_channels], dev_ref)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        out = ops.conv2d(
+            x,
+            self.filter,
+            stride=self._stride,
+            padding=self._padding,
+            filter_layout=FilterLayout.RSCF,
+            bias=self.bias if self._has_bias else None,
+        )
+        return out
+
+
+class WanResidualBlock(Module):
     """Residual block used in Wan VAE decoder."""
 
     def __init__(
@@ -261,6 +352,7 @@ class WanResidualBlock(Module[[Tensor], Tensor]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         self.norm1 = WanRMSNorm(
             in_dim,
             images=False,
@@ -305,27 +397,27 @@ class WanResidualBlock(Module[[Tensor], Tensor]):
             else None
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: TensorValue) -> TensorValue:
         residual = (
             self.conv_shortcut(x) if self.conv_shortcut is not None else x
         )
-        x = F.silu(self.norm1(x))
+        x = ops.silu(self.norm1(x))
         x = self.conv1(x)
-        x = F.silu(self.norm2(x))
+        x = ops.silu(self.norm2(x))
         x = self.conv2(x)
         return x + residual
 
 
-class WanAttentionBlock(Module[[Tensor], Tensor]):
+class WanAttentionBlock(Module):
     """Per-frame windowed self-attention used in Wan decoder mid block.
 
     Uses window attention instead of full (H*W)^2 attention to avoid OOM
     at high resolutions. The spatial dimensions are partitioned into
-    non-overlapping windows of size ws×ws, and attention is computed
+    non-overlapping windows of size ws*ws, and attention is computed
     independently per window.
 
     Memory: O(b*t * num_windows * ws^2 * ws^2) instead of O(b*t * (H*W)^2).
-    At 720p latent (90×160) with ws=8: ~158MB vs ~2.5GB+ per chunk.
+    At 720p latent (90x160) with ws=8: ~158MB vs ~2.5GB+ per chunk.
     """
 
     _WINDOW_SIZE: int = 8
@@ -336,6 +428,7 @@ class WanAttentionBlock(Module[[Tensor], Tensor]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         self.dim = dim
         self.norm = WanRMSNorm(
             dim,
@@ -343,30 +436,28 @@ class WanAttentionBlock(Module[[Tensor], Tensor]):
             dtype=dtype,
             device=device,
         )
-        self.to_qkv = Conv2d(
-            kernel_size=1,
+        self.to_qkv = WanConv2d(
             in_channels=dim,
             out_channels=dim * 3,
-            dtype=dtype,
+            kernel_size=1,
             stride=1,
             padding=0,
-            has_bias=True,
+            dtype=dtype,
             device=device,
-            permute=False,
+            has_bias=True,
         )
-        self.proj = Conv2d(
-            kernel_size=1,
+        self.proj = WanConv2d(
             in_channels=dim,
             out_channels=dim,
-            dtype=dtype,
+            kernel_size=1,
             stride=1,
             padding=0,
-            has_bias=True,
+            dtype=dtype,
             device=device,
-            permute=False,
+            has_bias=True,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: TensorValue) -> TensorValue:
         identity = x
         b = int(x.shape[0])
         t = int(x.shape[2])
@@ -376,30 +467,30 @@ class WanAttentionBlock(Module[[Tensor], Tensor]):
         ws = self._WINDOW_SIZE
 
         # [b, c, t, h, w] -> [b*t, c, h, w]
-        x2d = F.permute(x, [0, 2, 1, 3, 4])
-        x2d = F.reshape(x2d, [b * t, c, h, w])
+        x2d = ops.permute(x, [0, 2, 1, 3, 4])
+        x2d = ops.reshape(x2d, [b * t, c, h, w])
         x2d = self.norm(x2d)
 
-        x2d_nhwc = F.permute(x2d, [0, 2, 3, 1])  # [bt, h, w, c]
+        x2d_nhwc = ops.permute(x2d, [0, 2, 3, 1])  # [bt, h, w, c]
         qkv = self.to_qkv(x2d_nhwc)  # [bt, h, w, 3c]
 
-        # Pad H and W to multiples of ws using Tensor.zeros (no broadcast).
+        # Pad H and W to multiples of ws using ops.constant (no broadcast).
         pad_h = (ws - (h % ws)) % ws
         pad_w = (ws - (w % ws)) % ws
         if pad_w:
-            zw = Tensor.zeros(
-                [b * t, h, pad_w, 3 * c],
+            zw = ops.constant(
+                np.zeros([b * t, h, pad_w, 3 * c], dtype=np.float32),
                 dtype=qkv.dtype,
                 device=qkv.device,
             )
-            qkv = F.concat([qkv, zw], axis=2)
+            qkv = ops.concat([qkv, zw], axis=2)
         if pad_h:
-            zh = Tensor.zeros(
-                [b * t, pad_h, w + pad_w, 3 * c],
+            zh = ops.constant(
+                np.zeros([b * t, pad_h, w + pad_w, 3 * c], dtype=np.float32),
                 dtype=qkv.dtype,
                 device=qkv.device,
             )
-            qkv = F.concat([qkv, zh], axis=1)
+            qkv = ops.concat([qkv, zh], axis=1)
 
         h_p = h + pad_h
         w_p = w + pad_w
@@ -412,36 +503,36 @@ class WanAttentionBlock(Module[[Tensor], Tensor]):
         k = qkv[:, :, :, c : 2 * c]
         v = qkv[:, :, :, 2 * c : 3 * c]
 
-        def to_windows(y: Tensor) -> Tensor:
-            y = F.reshape(y, [b * t, hws, ws, wws, ws, c])
-            y = F.permute(y, [0, 1, 3, 2, 4, 5])  # [bt, hws, wws, ws, ws, c]
-            return F.reshape(y, [b * t, nwin, tok, c])
+        def to_windows(y: TensorValue) -> TensorValue:
+            y = ops.reshape(y, [b * t, hws, ws, wws, ws, c])
+            y = ops.permute(y, [0, 1, 3, 2, 4, 5])  # [bt, hws, wws, ws, ws, c]
+            return ops.reshape(y, [b * t, nwin, tok, c])
 
         q_w = to_windows(q)
         k_w = to_windows(k)
         v_w = to_windows(v)
 
-        attn_scores = F.matmul(
-            q_w * (float(c) ** -0.5), F.permute(k_w, [0, 1, 3, 2])
+        attn_scores = ops.matmul(
+            q_w * (float(c) ** -0.5), ops.permute(k_w, [0, 1, 3, 2])
         )
-        attn = F.softmax(attn_scores, axis=-1)
-        out = F.matmul(attn, v_w)  # [bt, nwin, tok, c]
+        attn = ops.softmax(attn_scores, axis=-1)
+        out = ops.matmul(attn, v_w)  # [bt, nwin, tok, c]
 
-        out = F.reshape(out, [b * t, hws, wws, ws, ws, c])
-        out = F.permute(out, [0, 1, 3, 2, 4, 5])
-        out = F.reshape(out, [b * t, h_p, w_p, c])
+        out = ops.reshape(out, [b * t, hws, wws, ws, ws, c])
+        out = ops.permute(out, [0, 1, 3, 2, 4, 5])
+        out = ops.reshape(out, [b * t, h_p, w_p, c])
 
         if pad_h or pad_w:
             out = out[:, :h, :w, :]
 
         out = self.proj(out)  # [bt, h, w, c]
-        out = F.permute(out, [0, 3, 1, 2])  # [bt, c, h, w]
-        out = F.reshape(out, [b, t, c, h, w])
-        out = F.permute(out, [0, 2, 1, 3, 4])
+        out = ops.permute(out, [0, 3, 1, 2])  # [bt, c, h, w]
+        out = ops.reshape(out, [b, t, c, h, w])
+        out = ops.permute(out, [0, 2, 1, 3, 4])
         return out + identity
 
 
-class WanMidBlock(Module[[Tensor], Tensor]):
+class WanMidBlock(Module):
     """Middle decoder block with residual-attention-residual."""
 
     def __init__(
@@ -450,39 +541,43 @@ class WanMidBlock(Module[[Tensor], Tensor]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
-        self.resnets = ModuleList(
+        super().__init__()
+        self.resnets = LayerList(
             [
                 WanResidualBlock(dim, dim, dtype=dtype, device=device),
                 WanResidualBlock(dim, dim, dtype=dtype, device=device),
             ]
         )
-        self.attentions = ModuleList(
+        self.attentions = LayerList(
             [WanAttentionBlock(dim, dtype=dtype, device=device)]
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: TensorValue) -> TensorValue:
         x = self.resnets[0](x)
         x = self.attentions[0](x)
         x = self.resnets[1](x)
         return x
 
 
-class WanUpsample2d(Module[[Tensor], Tensor]):
+class WanUpsample2d(Module):
     """Nearest-neighbor 2D upsample by factor 2."""
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __init__(self) -> None:
+        super().__init__()
+
+    def __call__(self, x: TensorValue) -> TensorValue:
         n = x.shape[0]
         c = x.shape[1]
         h = x.shape[2]
         w = x.shape[3]
         # Reshape to [N, C, H, 1, W, 1], duplicate along new axes, reshape back
-        x = F.reshape(x, [n, c, h, 1, w, 1])
-        x = F.concat([x, x], axis=3)  # [N, C, H, 2, W, 1]
-        x = F.concat([x, x], axis=5)  # [N, C, H, 2, W, 2]
-        return F.reshape(x, [n, c, h * 2, w * 2])
+        x = ops.reshape(x, [n, c, h, 1, w, 1])
+        x = ops.concat([x, x], axis=3)  # [N, C, H, 2, W, 1]
+        x = ops.concat([x, x], axis=5)  # [N, C, H, 2, W, 2]
+        return ops.reshape(x, [n, c, h * 2, w * 2])
 
 
-class WanResample(Module[[Tensor], Tensor]):
+class WanResample(Module):
     """Wan decoder upsampling module."""
 
     def __init__(
@@ -493,6 +588,7 @@ class WanResample(Module[[Tensor], Tensor]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         self.dim = dim
         self.mode = mode
 
@@ -501,19 +597,18 @@ class WanResample(Module[[Tensor], Tensor]):
         self._out_c = upsample_out_dim
 
         self.time_conv: WanCausalConv3d | None = None
-        self.resample = ModuleList(
+        self.resample = LayerList(
             [
                 WanUpsample2d(),
-                Conv2d(
-                    kernel_size=3,
+                WanConv2dPermuted(
                     in_channels=dim,
                     out_channels=upsample_out_dim,
-                    dtype=dtype,
+                    kernel_size=3,
                     stride=1,
                     padding=1,
-                    has_bias=True,
+                    dtype=dtype,
                     device=device,
-                    permute=True,
+                    has_bias=True,
                 ),
             ]
         )
@@ -532,7 +627,7 @@ class WanResample(Module[[Tensor], Tensor]):
         elif mode != "upsample2d":
             raise ValueError(f"Unsupported WanResample mode: {mode}")
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: TensorValue) -> TensorValue:
         b = x.shape[0]
         t = x.shape[2]
         h = x.shape[3]
@@ -543,24 +638,24 @@ class WanResample(Module[[Tensor], Tensor]):
                 raise ValueError("time_conv is required for upsample3d mode")
             x = self.time_conv(x)
             # x: [b, 2*dim, t, h, w] -> interleave temporal frames
-            x = F.reshape(x, [b, 2, self.dim, t, h, w])
-            x = F.permute(x, [0, 2, 3, 1, 4, 5])  # [b, dim, t, 2, h, w]
+            x = ops.reshape(x, [b, 2, self.dim, t, h, w])
+            x = ops.permute(x, [0, 2, 3, 1, 4, 5])  # [b, dim, t, 2, h, w]
             t = t * 2
-            x = F.reshape(x, [b, self.dim, t, h, w])
+            x = ops.reshape(x, [b, self.dim, t, h, w])
 
         # Per-frame 2D upsample + conv
-        x = F.permute(x, [0, 2, 1, 3, 4])  # [b, t, c, h, w]
-        x = F.reshape(x, [b * t, self.dim, h, w])
+        x = ops.permute(x, [0, 2, 1, 3, 4])  # [b, t, c, h, w]
+        x = ops.reshape(x, [b * t, self.dim, h, w])
         x = self.resample[0](x)  # WanUpsample2d: [b*t, dim, h*2, w*2]
-        # Conv2d(permute=True) handles NCHW->NHWC->conv->NCHW internally.
+        # WanConv2dPermuted handles NCHW->NHWC->conv->NCHW internally.
         x = self.resample[1](x)  # [b*t, out_c, h*2, w*2]
 
-        x = F.reshape(x, [b, t, self._out_c, h * 2, w * 2])
-        x = F.permute(x, [0, 2, 1, 3, 4])  # [b, out_c, t, h*2, w*2]
+        x = ops.reshape(x, [b, t, self._out_c, h * 2, w * 2])
+        x = ops.permute(x, [0, 2, 1, 3, 4])  # [b, out_c, t, h*2, w*2]
         return x
 
 
-class WanUpBlock(Module[[Tensor], Tensor]):
+class WanUpBlock(Module):
     """Wan decoder up block composed of residual blocks and optional upsample."""
 
     def __init__(
@@ -572,6 +667,7 @@ class WanUpBlock(Module[[Tensor], Tensor]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         resnets: list[WanResidualBlock] = []
         current_dim = in_dim
         for _ in range(num_res_blocks + 1):
@@ -584,11 +680,11 @@ class WanUpBlock(Module[[Tensor], Tensor]):
                 )
             )
             current_dim = out_dim
-        self.resnets = ModuleList(resnets)
+        self.resnets = LayerList(resnets)
 
-        self.upsamplers: ModuleList[WanResample] | None = None
+        self.upsamplers: LayerList | None = None
         if upsample_mode is not None:
-            self.upsamplers = ModuleList(
+            self.upsamplers = LayerList(
                 [
                     WanResample(
                         out_dim,
@@ -600,7 +696,7 @@ class WanUpBlock(Module[[Tensor], Tensor]):
                 ]
             )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: TensorValue) -> TensorValue:
         for resnet in self.resnets:
             x = resnet(x)
 
@@ -610,7 +706,7 @@ class WanUpBlock(Module[[Tensor], Tensor]):
         return x
 
 
-class WanDecoder3d(Module[[Tensor], Tensor]):
+class WanDecoder3d(Module):
     """Wan 3D decoder module."""
 
     def __init__(
@@ -625,6 +721,7 @@ class WanDecoder3d(Module[[Tensor], Tensor]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         del is_residual
 
         dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
@@ -666,7 +763,7 @@ class WanDecoder3d(Module[[Tensor], Tensor]):
             )
             final_out_dim = out_dim
 
-        self.up_blocks = ModuleList(up_blocks)
+        self.up_blocks = LayerList(up_blocks)
 
         self.norm_out = WanRMSNorm(
             final_out_dim,
@@ -684,7 +781,7 @@ class WanDecoder3d(Module[[Tensor], Tensor]):
             has_bias=True,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: TensorValue) -> TensorValue:
         x = self.conv_in(x)
         x = self.mid_block(x)
 
@@ -692,12 +789,12 @@ class WanDecoder3d(Module[[Tensor], Tensor]):
             x = up_block(x)
 
         x = self.norm_out(x)
-        x = F.silu(x)
+        x = ops.silu(x)
         x = self.conv_out(x)
         return x
 
 
-class WanResidualBlockCached(Module[..., tuple[Tensor, Tensor, Tensor]]):
+class WanResidualBlockCached(Module):
     """Wan residual block with explicit cache I/O for conv1/conv2."""
 
     def __init__(
@@ -707,6 +804,7 @@ class WanResidualBlockCached(Module[..., tuple[Tensor, Tensor, Tensor]]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         self.norm1 = WanRMSNorm(
             in_dim,
             images=False,
@@ -751,29 +849,29 @@ class WanResidualBlockCached(Module[..., tuple[Tensor, Tensor, Tensor]]):
             else None
         )
 
-    def forward(
+    def __call__(
         self,
-        x: Tensor,
-        cache1_in: Tensor | None = None,
-        cache2_in: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        x: TensorValue,
+        cache1_in: TensorValue | None = None,
+        cache2_in: TensorValue | None = None,
+    ) -> tuple[TensorValue, TensorValue, TensorValue]:
         residual = (
             self.conv_shortcut(x) if self.conv_shortcut is not None else x
         )
 
-        x = F.silu(self.norm1(x))
+        x = ops.silu(self.norm1(x))
         if cache1_in is None:
             cache1_in = _zero_cache_for(x)
         x, cache1_out = self.conv1.forward_cached(x, cache1_in)
 
-        x = F.silu(self.norm2(x))
+        x = ops.silu(self.norm2(x))
         if cache2_in is None:
             cache2_in = _zero_cache_for(x)
         x, cache2_out = self.conv2.forward_cached(x, cache2_in)
         return x + residual, cache1_out, cache2_out
 
 
-class WanMidBlockCached(Module[..., tuple[Tensor, ...]]):
+class WanMidBlockCached(Module):
     """Middle decoder block with cache threading."""
 
     def __init__(
@@ -782,19 +880,20 @@ class WanMidBlockCached(Module[..., tuple[Tensor, ...]]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
-        self.resnets = ModuleList(
+        super().__init__()
+        self.resnets = LayerList(
             [
                 WanResidualBlockCached(dim, dim, dtype=dtype, device=device),
                 WanResidualBlockCached(dim, dim, dtype=dtype, device=device),
             ]
         )
-        self.attentions = ModuleList(
+        self.attentions = LayerList(
             [WanAttentionBlock(dim, dtype=dtype, device=device)]
         )
 
-    def forward(
-        self, x: Tensor, *cache_inputs: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def __call__(
+        self, x: TensorValue, *cache_inputs: TensorValue
+    ) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue, TensorValue]:
         if len(cache_inputs) not in (0, 4):
             raise ValueError(
                 f"WanMidBlockCached expected 0 or 4 cache tensors, got {len(cache_inputs)}"
@@ -811,7 +910,7 @@ class WanMidBlockCached(Module[..., tuple[Tensor, ...]]):
         return x, cache1_out, cache2_out, cache3_out, cache4_out
 
 
-class WanResampleCached(Module[..., tuple[Tensor, Tensor]]):
+class WanResampleCached(Module):
     """Wan upsample3d module with explicit cache I/O."""
 
     def __init__(
@@ -822,6 +921,7 @@ class WanResampleCached(Module[..., tuple[Tensor, Tensor]]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         if mode != "upsample3d":
             raise ValueError(
                 "WanResampleCached only supports mode='upsample3d'"
@@ -844,29 +944,28 @@ class WanResampleCached(Module[..., tuple[Tensor, Tensor]]):
             device=device,
             has_bias=True,
         )
-        self.resample = ModuleList(
+        self.resample = LayerList(
             [
                 WanUpsample2d(),
-                Conv2d(
-                    kernel_size=3,
+                WanConv2dPermuted(
                     in_channels=dim,
                     out_channels=upsample_out_dim,
-                    dtype=dtype,
+                    kernel_size=3,
                     stride=1,
                     padding=1,
-                    has_bias=True,
+                    dtype=dtype,
                     device=device,
-                    permute=True,
+                    has_bias=True,
                 ),
             ]
         )
 
-    def forward(
+    def __call__(
         self,
-        x: Tensor,
-        cache_in: Tensor | None = None,
+        x: TensorValue,
+        cache_in: TensorValue | None = None,
         first_chunk: bool = False,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[TensorValue, TensorValue]:
         b = x.shape[0]
         t = x.shape[2]
         h = x.shape[3]
@@ -879,21 +978,21 @@ class WanResampleCached(Module[..., tuple[Tensor, Tensor]]):
             cache_out = cache_in
         else:
             x, cache_out = self.time_conv.forward_cached(x, cache_in)
-            x = F.reshape(x, [b, 2, self.dim, t, h, w])
-            x = F.permute(x, [0, 2, 3, 1, 4, 5])
+            x = ops.reshape(x, [b, 2, self.dim, t, h, w])
+            x = ops.permute(x, [0, 2, 3, 1, 4, 5])
             t = t * 2
-            x = F.reshape(x, [b, self.dim, t, h, w])
+            x = ops.reshape(x, [b, self.dim, t, h, w])
 
-        x = F.permute(x, [0, 2, 1, 3, 4])
-        x = F.reshape(x, [b * t, self.dim, h, w])
+        x = ops.permute(x, [0, 2, 1, 3, 4])
+        x = ops.reshape(x, [b * t, self.dim, h, w])
         x = self.resample[0](x)
         x = self.resample[1](x)
-        x = F.reshape(x, [b, t, self._out_c, h * 2, w * 2])
-        x = F.permute(x, [0, 2, 1, 3, 4])
+        x = ops.reshape(x, [b, t, self._out_c, h * 2, w * 2])
+        x = ops.permute(x, [0, 2, 1, 3, 4])
         return x, cache_out
 
 
-class WanUpBlockCached(Module[..., tuple[Tensor, ...]]):
+class WanUpBlockCached(Module):
     """Wan decoder up block with explicit cache threading."""
 
     cache_slots: int
@@ -907,6 +1006,7 @@ class WanUpBlockCached(Module[..., tuple[Tensor, ...]]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         resnets: list[WanResidualBlockCached] = []
         current_dim = in_dim
         for _ in range(num_res_blocks + 1):
@@ -919,17 +1019,17 @@ class WanUpBlockCached(Module[..., tuple[Tensor, ...]]):
                 )
             )
             current_dim = out_dim
-        self.resnets = ModuleList(resnets)
+        self.resnets = LayerList(resnets)
 
         self._has_temporal_upsample = upsample_mode == "upsample3d"
         self.cache_slots = len(resnets) * 2 + (
             1 if self._has_temporal_upsample else 0
         )
 
-        self.upsamplers: ModuleList | None = None
+        self.upsamplers: LayerList | None = None
         if upsample_mode is not None:
             if upsample_mode == "upsample3d":
-                upsampler: Module[..., Any] = WanResampleCached(
+                upsampler: Module = WanResampleCached(
                     out_dim,
                     mode=upsample_mode,
                     upsample_out_dim=None,
@@ -949,21 +1049,21 @@ class WanUpBlockCached(Module[..., tuple[Tensor, ...]]):
                     f"Unsupported WanUpBlockCached upsample mode: {upsample_mode}"
                 )
 
-            self.upsamplers = ModuleList([upsampler])
+            self.upsamplers = LayerList([upsampler])
 
-    def forward(
+    def __call__(
         self,
-        x: Tensor,
-        *cache_inputs: Tensor,
+        x: TensorValue,
+        *cache_inputs: TensorValue,
         first_chunk: bool = False,
-    ) -> tuple[Tensor, ...]:
+    ) -> tuple[TensorValue, ...]:
         if len(cache_inputs) not in (0, self.cache_slots):
             raise ValueError(
                 f"WanUpBlockCached expected 0 or {self.cache_slots} cache tensors, got {len(cache_inputs)}"
             )
 
         use_cache_inputs = len(cache_inputs) == self.cache_slots
-        cache_outputs: list[Tensor] = []
+        cache_outputs: list[TensorValue] = []
         cache_idx = 0
 
         for resnet in self.resnets:
@@ -995,7 +1095,7 @@ class WanUpBlockCached(Module[..., tuple[Tensor, ...]]):
         return (x, *cache_outputs)
 
 
-class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
+class WanDecoder3dCached(Module):
     """Wan 3D decoder with explicit cache tensor I/O."""
 
     def __init__(
@@ -1010,6 +1110,7 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
+        super().__init__()
         del is_residual
 
         dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
@@ -1051,7 +1152,7 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
             )
             final_out_dim = out_dim
 
-        self.up_blocks = ModuleList(up_blocks)
+        self.up_blocks = LayerList(up_blocks)
         self.norm_out = WanRMSNorm(
             final_out_dim,
             images=False,
@@ -1068,12 +1169,12 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
             has_bias=True,
         )
 
-    def forward(
+    def __call__(
         self,
-        x: Tensor,
-        *cache_inputs: Tensor,
+        x: TensorValue,
+        *cache_inputs: TensorValue,
         first_chunk: bool = False,
-    ) -> tuple[Tensor, ...]:
+    ) -> tuple[TensorValue, ...]:
         if len(cache_inputs) not in (0, WAN_DECODER_CACHE_SLOTS):
             raise ValueError(
                 "WanDecoder3dCached expected 0 or "
@@ -1081,7 +1182,7 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
             )
 
         use_cache_inputs = len(cache_inputs) == WAN_DECODER_CACHE_SLOTS
-        cache_outputs: list[Tensor] = []
+        cache_outputs: list[TensorValue] = []
         cache_idx = 0
 
         conv_in_cache = cache_inputs[cache_idx] if use_cache_inputs else None
@@ -1091,7 +1192,7 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
         cache_outputs.append(cache_out)
         cache_idx += 1
 
-        mid_cache_inputs: tuple[Tensor, ...] = (
+        mid_cache_inputs: tuple[TensorValue, ...] = (
             tuple(cache_inputs[cache_idx : cache_idx + 4])
             if use_cache_inputs
             else ()
@@ -1102,7 +1203,7 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
         cache_idx += 4
 
         for up_block in self.up_blocks:
-            block_cache_inputs: tuple[Tensor, ...] = (
+            block_cache_inputs: tuple[TensorValue, ...] = (
                 tuple(
                     cache_inputs[cache_idx : cache_idx + up_block.cache_slots]
                 )
@@ -1119,7 +1220,7 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
             cache_idx += up_block.cache_slots
 
         x = self.norm_out(x)
-        x = F.silu(x)
+        x = ops.silu(x)
         conv_out_cache = cache_inputs[cache_idx] if use_cache_inputs else None
         if conv_out_cache is None:
             conv_out_cache = _zero_cache_for(x)
@@ -1185,10 +1286,11 @@ class WanDecoder3dCached(Module[..., tuple[Tensor, ...]]):
         return shapes
 
 
-class _WanVAEPostQuantConv(Module[[Tensor], Tensor]):
+class _WanVAEPostQuantConv(Module):
     """Standalone post-quant conv graph (k=1, frame-independent)."""
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        super().__init__()
         self.post_quant_conv = WanCausalConv3d(
             in_channels=config.z_dim,
             out_channels=config.z_dim,
@@ -1199,14 +1301,15 @@ class _WanVAEPostQuantConv(Module[[Tensor], Tensor]):
             has_bias=True,
         )
 
-    def forward(self, z: Tensor) -> Tensor:
+    def __call__(self, z: TensorValue) -> TensorValue:
         return self.post_quant_conv(z)
 
 
-class _WanVAEDecoderFirstFrameCached(Module[[Tensor], tuple[Tensor, ...]]):
+class _WanVAEDecoderFirstFrameCached(Module):
     """First-frame decoder graph returning pixels + initialized caches."""
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        super().__init__()
         self.decoder = WanDecoder3dCached(
             dim=config.base_dim,
             z_dim=config.z_dim,
@@ -1219,18 +1322,19 @@ class _WanVAEDecoderFirstFrameCached(Module[[Tensor], tuple[Tensor, ...]]):
             device=config.device,
         )
 
-    def forward(self, z: Tensor) -> tuple[Tensor, ...]:
+    def __call__(self, z: TensorValue) -> tuple[TensorValue, ...]:
         outputs = self.decoder(z, first_chunk=True)
         x = outputs[0]
-        x = F.max(x, -1.0)
-        x = F.min(x, 1.0)
+        x = ops.max(x, -1.0)
+        x = ops.min(x, 1.0)
         return (x, *outputs[1:])
 
 
-class _WanVAEDecoderRestFrameCached(Module[..., tuple[Tensor, ...]]):
+class _WanVAEDecoderRestFrameCached(Module):
     """Per-frame decoder graph with cache feedback for frames 1..T-1."""
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        super().__init__()
         self.decoder = WanDecoder3dCached(
             dim=config.base_dim,
             z_dim=config.z_dim,
@@ -1243,18 +1347,19 @@ class _WanVAEDecoderRestFrameCached(Module[..., tuple[Tensor, ...]]):
             device=config.device,
         )
 
-    def forward(self, z: Tensor, *cache_inputs: Tensor) -> tuple[Tensor, ...]:
+    def __call__(self, z: TensorValue, *cache_inputs: TensorValue) -> tuple[TensorValue, ...]:
         outputs = self.decoder(z, *cache_inputs, first_chunk=False)
         x = outputs[0]
-        x = F.max(x, -1.0)
-        x = F.min(x, 1.0)
+        x = ops.max(x, -1.0)
+        x = ops.min(x, 1.0)
         return (x, *outputs[1:])
 
 
-class WanVAEDecoder(Module[[Tensor], Tensor]):
+class WanVAEDecoder(Module):
     """Wan VAE decoder graph used by AutoencoderKLWanModel."""
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        super().__init__()
         self._config = config
         self.post_quant_conv = WanCausalConv3d(
             in_channels=config.z_dim,
@@ -1277,15 +1382,15 @@ class WanVAEDecoder(Module[[Tensor], Tensor]):
             device=config.device,
         )
 
-    def forward(self, z: Tensor) -> Tensor:
+    def __call__(self, z: TensorValue) -> TensorValue:
         x = self.post_quant_conv(z)
         x = self.decoder(x)
-        x = F.max(x, -1.0)
-        x = F.min(x, 1.0)
+        x = ops.max(x, -1.0)
+        x = ops.min(x, 1.0)
         return x
 
 
-class _WanVAEDecoderFirstFrame(Module[[Tensor], Tensor]):
+class _WanVAEDecoderFirstFrame(Module):
     """Wan VAE decoder for the FIRST latent frame.
 
     Identical to WanVAEDecoder but ALL temporal upsamples are replaced
@@ -1295,6 +1400,7 @@ class _WanVAEDecoderFirstFrame(Module[[Tensor], Tensor]):
     """
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        super().__init__()
         self._config = config
         self.post_quant_conv = WanCausalConv3d(
             in_channels=config.z_dim,
@@ -1318,11 +1424,11 @@ class _WanVAEDecoderFirstFrame(Module[[Tensor], Tensor]):
             device=config.device,
         )
 
-    def forward(self, z: Tensor) -> Tensor:
+    def __call__(self, z: TensorValue) -> TensorValue:
         x = self.post_quant_conv(z)
         x = self.decoder(x)
-        x = F.max(x, -1.0)
-        x = F.min(x, 1.0)
+        x = ops.max(x, -1.0)
+        x = ops.min(x, 1.0)
         return x
 
 
@@ -1333,14 +1439,12 @@ class _FullDecoder:
     overhead that was the bottleneck in the per-frame approach.
     """
 
-    def __init__(self, compiled_decoder: CompileWrapper) -> None:
+    def __init__(self, compiled_decoder: Model) -> None:
         self.compiled_decoder = compiled_decoder
 
     def __call__(self, latents_5d: Tensor) -> Tensor:
-        outputs = self.compiled_decoder(latents_5d)
-        if isinstance(outputs, (list, tuple)):
-            return outputs[0]
-        return outputs
+        buffers = self.compiled_decoder(latents_5d.driver_tensor)
+        return Tensor.from_dlpack(buffers[0])
 
 
 class _CachedFramewiseDecoder:
@@ -1348,9 +1452,9 @@ class _CachedFramewiseDecoder:
 
     def __init__(
         self,
-        post_quant_conv: CompileWrapper,
-        first_frame_decoder: CompileWrapper,
-        rest_frame_decoder: CompileWrapper,
+        post_quant_conv: Model,
+        first_frame_decoder: Model,
+        rest_frame_decoder: Model,
     ) -> None:
         self.post_quant_conv = post_quant_conv
         self.first_frame_decoder = first_frame_decoder
@@ -1364,32 +1468,26 @@ class _CachedFramewiseDecoder:
         cpu = CPU()
         gpu = latents_5d.device
         decoded_frames: list[Tensor] = []
-        caches: list[Tensor] | None = None
+        caches: list[Buffer] | None = None
 
         for t_idx in range(t_total):
             z_t = latents_5d[:, :, t_idx : t_idx + 1, :, :]
 
-            pqc_outputs = _normalize_compiled_outputs(
-                self.post_quant_conv(z_t)
-            )
+            pqc_outputs = self.post_quant_conv(z_t.driver_tensor)
             if len(pqc_outputs) != 1:
                 raise ValueError(
                     f"Expected 1 output from post_quant_conv, got {len(pqc_outputs)}"
                 )
-            z_t = pqc_outputs[0]
+            z_t_buf = pqc_outputs[0]
 
             if t_idx == 0:
-                outputs = _normalize_compiled_outputs(
-                    self.first_frame_decoder(z_t)
-                )
+                outputs = self.first_frame_decoder(z_t_buf)
             else:
                 if caches is None:
                     raise ValueError(
                         "Cached framewise decoder expected caches after first frame."
                     )
-                outputs = _normalize_compiled_outputs(
-                    self.rest_frame_decoder(z_t, *caches)
-                )
+                outputs = self.rest_frame_decoder(z_t_buf, *caches)
 
             if len(outputs) != 1 + WAN_DECODER_CACHE_SLOTS:
                 raise ValueError(
@@ -1397,9 +1495,9 @@ class _CachedFramewiseDecoder:
                     f"{len(outputs)} tensors; expected {1 + WAN_DECODER_CACHE_SLOTS}."
                 )
 
-            decoded = outputs[0]
-            caches = outputs[1:]
-            decoded_frames.append(decoded.to(cpu))
+            decoded_buf = outputs[0]
+            caches = list(outputs[1:])
+            decoded_frames.append(Tensor.from_dlpack(decoded_buf).to(cpu))
 
         return F.concat(decoded_frames, axis=2).to(gpu)
 
@@ -1430,6 +1528,7 @@ class AutoencoderKLWanModel(ComponentModel):
         self._framewise_decoder_cache: dict[
             _VAEFramewiseKey, _CachedFramewiseDecoder
         ] = {}
+        self._session = InferenceSession(devices=devices)
         self.load_model()
 
     def load_model(self) -> Callable[[Tensor], Tensor]:
@@ -1448,9 +1547,9 @@ class AutoencoderKLWanModel(ComponentModel):
             weight_data = value.data()
 
             # Wan checkpoints store filters in PyTorch layout.
-            # Conv3d(permute=True) keeps FCQRS for cuDNN dispatch.
-            # Resample Conv2d(permute=True) keeps FCRS for cuDNN dispatch.
-            # Attention Conv2d(permute=False) needs RSCF [H,W,in,out].
+            # Conv3d weights stay in FCQRS for cuDNN dispatch.
+            # Resample Conv2d (permute=True equivalent) stays in FCRS.
+            # Attention Conv2d (permute=False equivalent) needs RSCF [H,W,in,out].
             if key.endswith(".weight") and len(weight_data.shape) == 4:
                 is_resample_conv = "resample" in key
                 if not is_resample_conv:
@@ -1487,7 +1586,6 @@ class AutoencoderKLWanModel(ComponentModel):
         """Compile a single decoder graph for T latent frames."""
         cfg = self.config
         sd = self._decoder_state_dict
-        device_obj = self.devices[0]
         B, C, T, H, W = shape
 
         decoder_input = TensorType(
@@ -1495,26 +1593,21 @@ class AutoencoderKLWanModel(ComponentModel):
             [B, C, T, H, W],
             device=cfg.device,
         )
-        with F.lazy():
-            decoder_model = WanVAEDecoder(cfg)
-            decoder_model.to(device_obj)
 
-        model_keys = {name for name, _ in decoder_model.parameters}
-        decoder_weights = {k: v for k, v in sd.items() if k in model_keys}
-        missing = sorted(model_keys - set(decoder_weights.keys()))
-        if missing:
-            logger.warning(
-                "VAE decoder: %d missing weights: %s",
-                len(missing),
-                missing[:10],
-            )
+        decoder_model = WanVAEDecoder(cfg)
+        decoder_model.load_state_dict(sd, weight_alignment=1, strict=False)
 
-        compiled = CompileWrapper(
-            decoder_model,
+        with Graph(
+            "wan_vae_decoder",
             input_types=[decoder_input],
-            weights=decoder_weights,
+        ) as graph:
+            out = decoder_model(graph.inputs[0].tensor)
+            graph.output(out)
+
+        model = self._session.load(
+            graph, weights_registry=decoder_model.state_dict()
         )
-        return _FullDecoder(compiled_decoder=compiled)
+        return _FullDecoder(compiled_decoder=model)
 
     def prepare_for_serving(self) -> None:
         # No eager compile at init: first request compiles concrete shape and
@@ -1543,7 +1636,6 @@ class AutoencoderKLWanModel(ComponentModel):
     ) -> _CachedFramewiseDecoder:
         cfg = self.config
         sd = self._decoder_state_dict
-        device_obj = self.devices[0]
         batch_size, z_dim, latent_h, latent_w = shape
 
         latent_1f_type = TensorType(
@@ -1552,28 +1644,33 @@ class AutoencoderKLWanModel(ComponentModel):
             device=cfg.device,
         )
 
-        with F.lazy():
-            pqc_module = _WanVAEPostQuantConv(cfg)
-            pqc_module.to(device_obj)
-        pqc_keys = {name for name, _ in pqc_module.parameters}
-        pqc_weights = {k: v for k, v in sd.items() if k in pqc_keys}
-        pqc_compiled = CompileWrapper(
-            pqc_module,
+        # Post-quant conv
+        pqc_module = _WanVAEPostQuantConv(cfg)
+        pqc_module.load_state_dict(sd, weight_alignment=1, strict=False)
+        with Graph(
+            "wan_vae_pqc",
             input_types=[latent_1f_type],
-            weights=pqc_weights,
+        ) as pqc_graph:
+            out = pqc_module(pqc_graph.inputs[0].tensor)
+            pqc_graph.output(out)
+        pqc_model = self._session.load(
+            pqc_graph, weights_registry=pqc_module.state_dict()
         )
 
-        with F.lazy():
-            first_module = _WanVAEDecoderFirstFrameCached(cfg)
-            first_module.to(device_obj)
-        first_keys = {name for name, _ in first_module.parameters}
-        first_weights = {k: v for k, v in sd.items() if k in first_keys}
-        first_compiled = CompileWrapper(
-            first_module,
+        # First-frame decoder
+        first_module = _WanVAEDecoderFirstFrameCached(cfg)
+        first_module.load_state_dict(sd, weight_alignment=1, strict=False)
+        with Graph(
+            "wan_vae_first_frame",
             input_types=[latent_1f_type],
-            weights=first_weights,
+        ) as first_graph:
+            outputs = first_module(first_graph.inputs[0].tensor)
+            first_graph.output(*outputs)
+        first_model = self._session.load(
+            first_graph, weights_registry=first_module.state_dict()
         )
 
+        # Rest-frame decoder (with caches)
         cache_shapes = first_module.decoder.cache_shapes(
             batch_size=batch_size,
             latent_height=latent_h,
@@ -1586,21 +1683,23 @@ class AutoencoderKLWanModel(ComponentModel):
                 for cache_shape in cache_shapes
             ],
         ]
-        with F.lazy():
-            rest_module = _WanVAEDecoderRestFrameCached(cfg)
-            rest_module.to(device_obj)
-        rest_keys = {name for name, _ in rest_module.parameters}
-        rest_weights = {k: v for k, v in sd.items() if k in rest_keys}
-        rest_compiled = CompileWrapper(
-            rest_module,
+        rest_module = _WanVAEDecoderRestFrameCached(cfg)
+        rest_module.load_state_dict(sd, weight_alignment=1, strict=False)
+        with Graph(
+            "wan_vae_rest_frame",
             input_types=rest_input_types,
-            weights=rest_weights,
+        ) as rest_graph:
+            rest_inputs = [inp.tensor for inp in rest_graph.inputs]
+            outputs = rest_module(rest_inputs[0], *rest_inputs[1:])
+            rest_graph.output(*outputs)
+        rest_model = self._session.load(
+            rest_graph, weights_registry=rest_module.state_dict()
         )
 
         return _CachedFramewiseDecoder(
-            post_quant_conv=pqc_compiled,
-            first_frame_decoder=first_compiled,
-            rest_frame_decoder=rest_compiled,
+            post_quant_conv=pqc_model,
+            first_frame_decoder=first_model,
+            rest_frame_decoder=rest_model,
         )
 
     def _get_framewise_cached_decoder(
