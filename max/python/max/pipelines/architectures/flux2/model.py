@@ -36,7 +36,11 @@ class Flux2TransformerModel(ComponentModel):
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.session = session
-        self.config = Flux2Config.generate(config, encoding, devices)
+        self.config = Flux2Config.initialize_from_config(
+            config,
+            encoding,
+            devices,
+        )
         self.load_model()
 
     def load_model(self) -> Callable[..., Any]:

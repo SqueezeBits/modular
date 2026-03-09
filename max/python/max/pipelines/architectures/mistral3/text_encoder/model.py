@@ -55,7 +55,7 @@ class Mistral3TextEncoderModel(ComponentModel):
         """
         super().__init__(config, encoding, devices, weights)
         self.session = session
-        self.config = Mistral3TextEncoderConfig.generate(
+        self.config = Mistral3TextEncoderConfig.initialize_from_config(
             config,
             encoding,
             devices,

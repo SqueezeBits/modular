@@ -32,7 +32,7 @@ from max.nn.rotary_embedding import RotaryEmbedding
 from .attention import EncoderAttention
 
 if TYPE_CHECKING:
-    from .model_config import Mistral3TextEncoderConfigBase
+    from .model_config import Mistral3TextEncoderConfig
 
 
 class Mistral3MLP(Module):
@@ -119,7 +119,7 @@ class Mistral3TextEncoderTransformer(Module):
     states from the configured layers and merging the layer/hidden dimensions.
     """
 
-    def __init__(self, config: Mistral3TextEncoderConfigBase) -> None:
+    def __init__(self, config: Mistral3TextEncoderConfig) -> None:
         super().__init__()
 
         self.dim = config.hidden_size

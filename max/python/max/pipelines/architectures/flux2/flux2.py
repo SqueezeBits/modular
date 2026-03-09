@@ -24,7 +24,7 @@ from .layers.flux2_attention import (
     Flux2PosEmbed,
 )
 from .layers.normalizations import AdaLayerNormContinuous, LayerNormNoAffine
-from .model_config import Flux2ConfigBase
+from .model_config import Flux2Config
 
 
 class Flux2TimestepGuidanceEmbeddings(Module):
@@ -391,7 +391,7 @@ class Flux2SingleTransformerBlock(Module):
 
 
 class Flux2Transformer2DModel(Module):
-    def __init__(self, config: Flux2ConfigBase) -> None:
+    def __init__(self, config: Flux2Config) -> None:
         """Initialize Flux2Transformer2DModel.
 
         Args:
