@@ -11,18 +11,17 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import ceil, floor
+from std.math import ceil, floor
 
 
-from algorithm.functional import elementwise
-from algorithm.reduction import _get_nd_indices_from_flat_index
-from layout._coord import Coord, coord_to_index_list
-from layout._layout import TensorLayout, row_major
-from layout._tile_tensor import TileTensor
+from std.algorithm.functional import elementwise
+from std.algorithm.reduction import _get_nd_indices_from_flat_index
+from layout import Coord, TileTensor, coord_to_index_list, row_major
+from layout.tile_layout import TensorLayout
 from layout.int_tuple import fill_like
-from memory import memcpy
+from std.memory import memcpy
 
-from utils import IndexList, StaticTuple
+from std.utils import IndexList, StaticTuple
 
 
 struct CoordinateTransformationMode(ImplicitlyCopyable):
@@ -73,7 +72,6 @@ fn coord_transform[
         return out_coord_f32 / scale
     else:
         comptime assert False, "coordinate_transformation_mode not implemented"
-        return 0
 
 
 struct RoundMode(ImplicitlyCopyable):
@@ -118,19 +116,17 @@ struct Interpolator[mode: InterpolationMode](
     @staticmethod
     @always_inline
     fn filter_length() -> Int:
-        comptime if Self.mode == InterpolationMode.Linear:
-            return 1
-        else:
-            comptime assert False, "InterpolationMode not supported"
-            return -1
+        comptime assert (
+            Self.mode == InterpolationMode.Linear
+        ), "InterpolationMode not supported"
+        return 1
 
     @always_inline
     fn filter(self, x: Float32) -> Float32:
-        comptime if Self.mode == InterpolationMode.Linear:
-            return linear_filter(x)
-        else:
-            comptime assert False, "InterpolationMode not supported"
-            return -1
+        comptime assert (
+            Self.mode == InterpolationMode.Linear
+        ), "InterpolationMode not supported"
+        return linear_filter(x)
 
 
 fn resize_nearest_neighbor[
@@ -163,7 +159,6 @@ fn resize_nearest_neighbor[
             return ceil(val)
         else:
             comptime assert False, "round_mode not implemented"
-            return val
 
     @__copy_capture(scales)
     @parameter
@@ -233,11 +228,11 @@ fn interpolate_point_1d[
         mut=True,
         dtype,
         InputLayoutType,
-        address_space = AddressSpace.GENERIC,
+        address_space=AddressSpace.GENERIC,
         ...,
     ],
     output: TileTensor[
-        mut=True, dtype, address_space = AddressSpace.GENERIC, ...
+        mut=True, dtype, address_space=AddressSpace.GENERIC, ...
     ],
 ):
     var center = (
@@ -275,11 +270,9 @@ fn resize_linear[
     antialias: Bool,
     dtype: DType,
 ](
-    input: TileTensor[
-        mut=True, dtype, address_space = AddressSpace.GENERIC, ...
-    ],
+    input: TileTensor[mut=True, dtype, address_space=AddressSpace.GENERIC, ...],
     output: TileTensor[
-        mut=True, dtype, address_space = AddressSpace.GENERIC, ...
+        mut=True, dtype, address_space=AddressSpace.GENERIC, ...
     ],
 ):
     """Resizes input to output shape using linear interpolation.
@@ -309,11 +302,9 @@ fn _resize[
     antialias: Bool,
     dtype: DType,
 ](
-    input: TileTensor[
-        mut=True, dtype, address_space = AddressSpace.GENERIC, ...
-    ],
+    input: TileTensor[mut=True, dtype, address_space=AddressSpace.GENERIC, ...],
     output: TileTensor[
-        mut=True, dtype, address_space = AddressSpace.GENERIC, ...
+        mut=True, dtype, address_space=AddressSpace.GENERIC, ...
     ],
 ):
     comptime assert (
@@ -378,7 +369,7 @@ fn _resize[
             for i in range(out_shape[resize_dim]):
                 coords[resize_dim] = i
                 interpolate_point_1d[
-                    InputLayoutType = in_buf.LayoutType,
+                    InputLayoutType=in_buf.LayoutType,
                     coordinate_transformation_mode,
                     antialias,
                 ](

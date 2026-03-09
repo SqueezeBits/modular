@@ -11,10 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import Optional
-from sys import align_of, simd_width_of
+from std.collections import Optional
+from std.sys import align_of, simd_width_of
 
-from gpu import (
+from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     barrier,
@@ -22,7 +22,7 @@ from gpu import (
     lane_id,
     warp_id,
 )
-from gpu.sync import (
+from std.gpu.sync import (
     AMDScheduleBarrierMask,
     schedule_barrier,
     schedule_group_barrier,
@@ -38,10 +38,10 @@ from layout.layout_tensor import (
 from layout._utils import idx2crd
 from layout.swizzle import Swizzle
 from layout.tensor_core import TiledTensorCore
-from memory import stack_allocation
+from std.memory import stack_allocation
 
-from utils import IndexList, StaticTuple
-from utils.numerics import get_accum_type
+from std.utils import IndexList, StaticTuple
+from std.utils.numerics import get_accum_type
 
 from ....structuring import (
     IteratorScatterGatherAmd,
@@ -55,7 +55,7 @@ from .._multistage_gemm_gpu import (
     warp_split_k_reduction,
     WarpSplitKReductionSMem,
 )
-from itertools import product
+from std.itertools import product
 
 comptime SMemWarpTileType[
     _dtype: DType, layout: Layout, warp_rows: Int, warp_cols: Int
@@ -137,12 +137,12 @@ struct MmaOpAMD[
     fn load_tile_fragment[
         k_tile_idx: Int
     ](self, a_smem_tiles: SMemWarpTileType, b_smem_tiles: SMemWarpTileType):
-        Self.tensor_core_mma.mma_op.load_a[swizzle = Self.swizzle](
+        Self.tensor_core_mma.mma_op.load_a[swizzle=Self.swizzle](
             a_smem_tiles,
             self.a_reg_tile(k_tile_idx).vectorize(),
             UInt(k_tile_idx),
         )
-        Self.tensor_core_mma.mma_op.load_b[swizzle = Self.swizzle](
+        Self.tensor_core_mma.mma_op.load_b[swizzle=Self.swizzle](
             b_smem_tiles,
             self.b_reg_tile(k_tile_idx).vectorize(),
             UInt(k_tile_idx),
@@ -439,7 +439,7 @@ fn gemm_kernel_amd[
     var mma_op = MmaOpAMD[
         out_type=accum_type,
         in_type=a_type,
-        shape = config.mma_shape,
+        shape=config.mma_shape,
         transpose_b=True,
         k_group_size=k_group_size,
         num_k_tiles=num_k_tiles,
@@ -454,9 +454,9 @@ fn gemm_kernel_amd[
     # A tensor tiles manager
     var a_tiles = MMATileBuffers[
         mma_op.in_type,
-        smem_layout = smem_tile_layout[BM, BK](),
-        reg_tile_layout = mma_op.reg_tile_layout[num_m_mmas],
-        tensor_type = type_of(a),
+        smem_layout=smem_tile_layout[BM, BK](),
+        reg_tile_layout=mma_op.reg_tile_layout[num_m_mmas],
+        tensor_type=type_of(a),
         thread_layout=thread_layout,
         warp_rows=WM,
         warp_cols=WK,
@@ -475,9 +475,9 @@ fn gemm_kernel_amd[
     # B tensor tiles manager
     var b_tiles = MMATileBuffers[
         mma_op.in_type,
-        smem_layout = smem_tile_layout[BN, BK](),
-        reg_tile_layout = mma_op.reg_tile_layout[num_n_mmas],
-        tensor_type = type_of(b),
+        smem_layout=smem_tile_layout[BN, BK](),
+        reg_tile_layout=mma_op.reg_tile_layout[num_n_mmas],
+        tensor_type=type_of(b),
         thread_layout=thread_layout,
         warp_rows=WN,
         warp_cols=WK,
@@ -730,7 +730,7 @@ fn gemm_kernel_amd[
     else:
         # Direct tile copy to global memory
         var c_scatter_gather = ScatterGatherAmd[
-            output_thread_layout, thread_scope = ThreadScope.WARP
+            output_thread_layout, thread_scope=ThreadScope.WARP
         ](c)
 
         c_scatter_gather.copy(
@@ -806,7 +806,7 @@ fn write_output_fragments[
                 var m = thread_tile_m + frag_m * MMA_M
                 var n = thread_tile_n + frag_n * MMA_N
 
-                epilogue_fn[alignment = align_of[SIMD[c_type, c_frag_size]]()](
+                epilogue_fn[alignment=align_of[SIMD[c_type, c_frag_size]]()](
                     (m, n), result_vec
                 )
             else:

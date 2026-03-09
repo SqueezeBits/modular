@@ -11,29 +11,26 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from memory import LegacyUnsafePointer
+from std.math import ceildiv, isclose
+from std.random import randn
+from std.sys import argv, has_nvidia_gpu_accelerator
 
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-from math import ceildiv, isclose
-from random import randn
-from sys import argv, has_nvidia_gpu_accelerator
-
-from gpu import *
-from gpu.host import DeviceContext
+from std.gpu import *
+from std.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
 from nn.mha import _naive_attention_with_transpose, mha_gpu_naive
 from nn.mha_mask import CausalMask, MaterializedMask
 from nn.mha_operand import LayoutTensorMHAOperand
-from nn.mha_score_mod import IdentityScoreMod
 from nn.mla import flare_mla_decoding, flare_mla_prefill
+from nn.mla_decode_sm100_dispatch import MLADispatchScalarArgs
 from tensor import IOUnknown, ManagedTensorSlice
 from tensor.managed_tensor_slice import StaticTensorSpec
-from testing import assert_almost_equal
-from gpu.host.info import B200, GPUInfo
+from std.testing import assert_almost_equal
+from std.gpu.host.info import B200, GPUInfo
 
 
-from utils.index import Index
-from utils.numerics import get_accum_type
+from std.utils.index import Index
+from std.utils.numerics import get_accum_type
 
 
 fn is_benchmark() -> Bool:
@@ -98,15 +95,15 @@ fn test[
     )
 
     # Allocate memory for all variables.
-    var q_ptr = UnsafePointer[Scalar[qkv_type]].alloc(q_size)
-    var k_ptr = UnsafePointer[Scalar[qkv_type]].alloc(k_size)
-    var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(mask_size)
-    var output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
+    var q_ptr = alloc[Scalar[qkv_type]](q_size)
+    var k_ptr = alloc[Scalar[qkv_type]](k_size)
+    var mask_ptr = alloc[Scalar[mask_type]](mask_size)
+    var output_ptr = alloc[Scalar[qkv_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[qkv_type]](o_size)
 
     # Q, K, V are randomly initialized.
     if use_index_input:
-        debug_assert(batch_size == 1)
+        assert batch_size == 1
         for i in range(seq_len):
             for h in range(num_heads):
                 for j in range(depth):
@@ -237,9 +234,22 @@ fn test[
     comptime q_tile_num_rows = 32
     comptime k_tile_num_rows = 128
 
+    var mla_args = MLADispatchScalarArgs[
+        num_heads=num_heads,
+        _is_cache_length_accurate=True,
+    ](batch_size, num_keys, seq_len, ctx)
+    var scalar_args_buf_lt = mla_args.gpu_layout_tensor()
+
     @parameter
     @always_inline
-    @__copy_capture(q_device, k_device, mask3d, mask4d, output_device)
+    @__copy_capture(
+        q_device,
+        k_device,
+        mask3d,
+        mask4d,
+        output_device,
+        scalar_args_buf_lt,
+    )
     fn kernel_launch(ctx: DeviceContext) raises:
         comptime if use_causal_mask:
             flare_mla_decoding[decoding_warp_split_k=decoding_warp_split_k](
@@ -247,10 +257,10 @@ fn test[
                 q_device,
                 k_device,
                 CausalMask(),
-                IdentityScoreMod(),
                 scale,
                 ctx,
-                num_partitions,
+                scalar_args_buf_lt,
+                num_partitions=num_partitions,
             )
         elif mask_rank == 3:
             flare_mla_decoding[decoding_warp_split_k=decoding_warp_split_k](
@@ -258,10 +268,10 @@ fn test[
                 q_device,
                 k_device,
                 MaterializedMask(mask3d),
-                IdentityScoreMod(),
                 scale,
                 ctx,
-                num_partitions,
+                scalar_args_buf_lt,
+                num_partitions=num_partitions,
             )
         else:
             flare_mla_decoding[decoding_warp_split_k=decoding_warp_split_k](
@@ -269,10 +279,10 @@ fn test[
                 q_device,
                 k_device,
                 MaterializedMask(mask4d),
-                IdentityScoreMod(),
                 scale,
                 ctx,
-                num_partitions,
+                scalar_args_buf_lt,
+                num_partitions=num_partitions,
             )
 
     if is_benchmark():
@@ -312,7 +322,7 @@ fn test[
             var null_valid_length = LayoutTensor[
                 DType.uint32, Layout.row_major(UNKNOWN_VALUE)
             ](
-                UnsafePointer[UInt32](),
+                UnsafePointer[UInt32, MutAnyOrigin](),
                 RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(
                     Index(0)
                 ),
@@ -398,6 +408,7 @@ fn test[
                         print(b, h, s, d, actual, expect)
                     assert_almost_equal(actual, expect, atol=1e-1, rtol=rtol)
 
+    _ = mla_args
     _ = q_device_ptr
     _ = k_device_ptr
     _ = mask_device_ptr
@@ -451,11 +462,11 @@ fn test_prefill[
     var o_size = batch_size * seq_len * num_heads * kv_depth
     var cache_size = batch_size * num_keys * cache_num_heads * cache_depth
 
-    var q_ptr = UnsafePointer[Scalar[qkv_type]].alloc(q_size)
-    var k_ptr = UnsafePointer[Scalar[qkv_type]].alloc(k_size)
-    var v_ptr = UnsafePointer[Scalar[qkv_type]].alloc(v_size)
-    var cache_ptr = UnsafePointer[Scalar[k_rope_type]].alloc(cache_size)
-    var output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
+    var q_ptr = alloc[Scalar[qkv_type]](q_size)
+    var k_ptr = alloc[Scalar[qkv_type]](k_size)
+    var v_ptr = alloc[Scalar[qkv_type]](v_size)
+    var cache_ptr = alloc[Scalar[k_rope_type]](cache_size)
+    var output_ptr = alloc[Scalar[qkv_type]](o_size)
 
     # Q, K, V, cache are randomly initialized.
     randn[qkv_type](q_ptr, q_size)
@@ -464,8 +475,8 @@ fn test_prefill[
     randn[k_rope_type](cache_ptr, cache_size)
 
     # input row offsets and cache row offsets
-    var input_row_offsets = UnsafePointer[UInt32].alloc(batch_size + 1)
-    var cache_row_offsets = UnsafePointer[UInt32].alloc(batch_size + 1)
+    var input_row_offsets = alloc[UInt32](batch_size + 1)
+    var cache_row_offsets = alloc[UInt32](batch_size + 1)
     for i in range(batch_size):
         input_row_offsets[i] = UInt32(i * seq_len)
         cache_row_offsets[i] = UInt32(i * num_keys)
@@ -594,14 +605,13 @@ fn test_prefill[
         output_device,
     )
     fn kernel_launch(ctx: DeviceContext) raises:
-        flare_mla_prefill[rank = q.rank](
+        flare_mla_prefill[rank=q.rank](
             output_device,
             q_device,
             k_device,
             v_device,
             cache_device,
             CausalMask(),
-            IdentityScoreMod(),
             input_row_offsets_device,
             cache_row_offsets_device,
             scale,
@@ -640,13 +650,13 @@ fn test_prefill[
 
     # create reference K and V
     # unlike flare_mla_prefill, K_ref and V_ref each head is of size depth (not kv_depth)
-    var k_ref_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
+    var k_ref_ptr = alloc[Scalar[qkv_type]](
         batch_size * num_keys * num_heads * depth
     )
-    var v_ref_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
+    var v_ref_ptr = alloc[Scalar[qkv_type]](
         batch_size * num_keys * num_heads * depth
     )
-    var output_ref_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
+    var output_ref_ptr = alloc[Scalar[qkv_type]](
         batch_size * seq_len * num_heads * depth
     )
 
@@ -746,7 +756,7 @@ fn test_prefill[
     var null_valid_length = LayoutTensor[
         DType.uint32, Layout.row_major(UNKNOWN_VALUE)
     ](
-        UnsafePointer[UInt32](),
+        UnsafePointer[UInt32, MutAnyOrigin](),
         RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(Index(0)),
     )
 
@@ -1105,7 +1115,7 @@ fn test_mla_prefill[
     ](120, 240, ctx)
 
 
-def main():
+def main() raises:
     with DeviceContext() as ctx:
         comptime if has_nvidia_gpu_accelerator():
             # tests with mask tensor

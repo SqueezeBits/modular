@@ -32,19 +32,17 @@ print(d)  # prints 2
 ```
 """
 
-from os import abort
+from std.os import abort
 
-from utils import Variant
+from std.utils import Variant
 
-from builtin.constrained import _constrained_conforms_to
-from builtin.device_passable import DevicePassable
-from compile import get_type_name
-from format._utils import FormatStruct, TypeNames, write_to, write_repr_to
+from std.builtin.device_passable import DevicePassable
+from std.compile import get_type_name
+from std.format._utils import FormatStruct, TypeNames, write_to, write_repr_to
 
 
-# TODO(27780): NoneType can't currently conform to traits
 @fieldwise_init
-struct _NoneType(ImplicitlyCopyable):
+struct _NoneType(TrivialRegisterPassable):
     pass
 
 
@@ -88,9 +86,7 @@ struct Optional[T: Movable](
     ImplicitlyCopyable,
     Iterable,
     Iterator,
-    Representable,
-    Stringable,
-    Writable,
+    Writable where conforms_to(T, Writable),
 ):
     """A type modeling a value which may or may not be present.
 
@@ -146,9 +142,6 @@ struct Optional[T: Movable](
     comptime Element = Self.T
     """The element type of this optional."""
 
-    # Fields
-    # _NoneType comes first so its index is 0.
-    # This means that Optionals that are 0-initialized will be None.
     comptime _type = Variant[_NoneType, Self.T]
     var _value: Self._type
 
@@ -416,39 +409,26 @@ struct Optional[T: Movable](
             raise EmptyOptionalError[Self.T]()
         return self.unsafe_value()
 
-    fn __str__(self: Self) -> String:
+    @deprecated("Stringable is deprecated. Use Writable instead.")
+    fn __str__(self: Self) -> String where conforms_to(Self.T, Writable):
         """Return the string representation of the value of the `Optional`.
 
         Returns:
             A string representation of the `Optional`.
         """
-        _constrained_conforms_to[
-            conforms_to(Self.T, Stringable),
-            Parent=Self,
-            Element = Self.T,
-            ParentConformsTo="Stringable",
-        ]()
+        var output = String()
+        self.write_to(output)
+        return output^
 
-        if self:
-            return trait_downcast[Stringable](self.value()).__str__()
-        else:
-            return "None"
-
-    fn __repr__(self: Self) -> String:
+    @deprecated("Representable is deprecated. Use Writable instead.")
+    fn __repr__(self: Self) -> String where conforms_to(Self.T, Writable):
         """Returns the verbose string representation of the `Optional`.
 
         Returns:
             A verbose string representation of the `Optional`.
         """
-        _constrained_conforms_to[
-            conforms_to(Self.T, Representable),
-            Parent=Self,
-            Element = Self.T,
-            ParentConformsTo="Representable",
-        ]()
-
         var output = String()
-        output.write("Optional(", self, ")")
+        self.write_repr_to(output)
         return output^
 
     @always_inline("nodebug")
@@ -465,14 +445,9 @@ struct Optional[T: Movable](
         """
         return self.__bool__()
 
-    fn _write_to[*, is_repr: Bool](self: Self, mut writer: Some[Writer]):
-        _constrained_conforms_to[
-            conforms_to(Self.T, Writable),
-            Parent=Self,
-            Element = Self.T,
-            ParentConformsTo="Writable",
-        ]()
-
+    fn _write_to[
+        *, is_repr: Bool
+    ](self: Self, mut writer: Some[Writer]) where conforms_to(Self.T, Writable):
         if self:
             comptime if is_repr:
                 trait_downcast[Writable](self.value()).write_repr_to(writer)
@@ -481,7 +456,9 @@ struct Optional[T: Movable](
         else:
             writer.write_string("None")
 
-    fn write_to(self: Self, mut writer: Some[Writer]):
+    fn write_to(
+        self: Self, mut writer: Some[Writer]
+    ) where conforms_to(Self.T, Writable):
         """Write this `Optional` to a `Writer`.
 
         Args:
@@ -489,7 +466,9 @@ struct Optional[T: Movable](
         """
         self._write_to[is_repr=False](writer)
 
-    fn write_repr_to(self: Self, mut writer: Some[Writer]):
+    fn write_repr_to(
+        self: Self, mut writer: Some[Writer]
+    ) where conforms_to(Self.T, Writable):
         """Write this `Optional`'s representation to a `Writer`.
 
         Args:
@@ -566,7 +545,7 @@ struct Optional[T: Movable](
         print(y)
         ```
         """
-        debug_assert(self.__bool__(), "`.value()` on empty `Optional`")
+        assert self.__bool__(), "`.value()` on empty `Optional`"
         return self._value.unsafe_get[Self.T]()
 
     fn take(mut self) -> Self.T:
@@ -640,7 +619,7 @@ struct Optional[T: Movable](
         print(y)                    # Does not reach this line
         ```
         """
-        debug_assert(self.__bool__(), "`.unsafe_take()` on empty `Optional`")
+        assert self.__bool__(), "`.unsafe_take()` on empty `Optional`"
         return self._value.unsafe_replace[_NoneType, Self.T](_NoneType())
 
     fn or_else[
@@ -671,7 +650,7 @@ struct Optional[T: Movable](
         ```
         """
         if self:
-            return self.unsafe_take()
+            return self._value^.unsafe_take[_T]()
         return default^
 
     fn copied[
@@ -747,7 +726,7 @@ struct OptionalReg[T: __TypeOfAllTypes](
         Returns:
             A string representation of the type, e.g. `OptionalReg[Int]`.
         """
-        return String("OptionalReg[", get_type_name[Self.T](), "]")
+        return t"OptionalReg[{get_type_name[Self.T]()}]"
 
     # ===-------------------------------------------------------------------===#
     # Life cycle methods
@@ -767,7 +746,7 @@ struct OptionalReg[T: __TypeOfAllTypes](
             value: The value.
         """
         self._value = __mlir_op.`kgen.variant.create`[
-            _type = Self._mlir_type, index = Int(0)._mlir_value
+            _type=Self._mlir_type, index=Int(0)._mlir_value
         ](value)
 
     # TODO(MSTDL-715):
@@ -793,7 +772,7 @@ struct OptionalReg[T: __TypeOfAllTypes](
             value: The None value.
         """
         self._value = __mlir_op.`kgen.variant.create`[
-            _type = Self._mlir_type, index = Int(1)._mlir_value
+            _type=Self._mlir_type, index=Int(1)._mlir_value
         ](__mlir_attr.false)
 
     # ===-------------------------------------------------------------------===#
@@ -850,7 +829,7 @@ struct OptionalReg[T: __TypeOfAllTypes](
         Returns:
             True if the optional has a value and False otherwise.
         """
-        return __mlir_op.`kgen.variant.is`[index = Int(0)._mlir_value](
+        return __mlir_op.`kgen.variant.is`[index=Int(0)._mlir_value](
             self._value
         )
 
@@ -865,7 +844,7 @@ struct OptionalReg[T: __TypeOfAllTypes](
         Returns:
             The contained value.
         """
-        return __mlir_op.`kgen.variant.get`[index = Int(0)._mlir_value](
+        return __mlir_op.`kgen.variant.get`[index=Int(0)._mlir_value](
             self._value
         )
 

@@ -11,10 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from sys import has_amd_gpu_accelerator
+from std.sys import has_amd_gpu_accelerator
 
-from gpu.host import get_gpu_target
-from gpu.host.compile import _compile_code
+from std.gpu.host import get_gpu_target
+from std.gpu.host.compile import _compile_code
 from layout import Layout, LayoutTensor
 from linalg.matmul.gpu import _amdgpu_matmul_config_from_block_shape
 from linalg.matmul.gpu.amd.matmul import gemm_kernel_amd
@@ -22,9 +22,9 @@ from linalg.matmul.gpu.amd.pingpong_kernel import (
     AMDPingPongMatmul,
     KernelConfig,
 )
-from testing import assert_true
+from std.testing import assert_true
 
-from utils.index import Index
+from std.utils.index import Index
 
 
 struct RegisterCounts(Movable):
@@ -168,7 +168,7 @@ fn compile_kernel_to_asm[
     # Compile for AMD GPU
     var compiled = _compile_code[
         kernel,
-        target = get_gpu_target["gfx950"](),
+        target=get_gpu_target["gfx950"](),
     ]()
     return compiled.asm
 
@@ -226,7 +226,7 @@ fn compile_pingpong_kernel_to_asm[
     # Compile for AMD GPU
     var compiled = _compile_code[
         kernel,
-        target = get_gpu_target["gfx950"](),
+        target=get_gpu_target["gfx950"](),
     ]()
     return compiled.asm
 
@@ -373,7 +373,7 @@ fn test_amd_pingpong_bf16_max_config() raises:
     print("=== Assembly check passed ===\n")
 
 
-def main():
+def main() raises:
     test_amd_matmul_bf16_max_config()
     test_amd_matmul_fp8_max_config()
     test_amd_pingpong_fp8_max_config()

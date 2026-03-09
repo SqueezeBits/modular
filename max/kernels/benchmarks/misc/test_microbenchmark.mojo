@@ -11,18 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from random import random_si64
+from std.random import random_si64
 
 import microbenchmark
 from buffer import NDBuffer
 from buffer.dimlist import DimList
 from linalg.matmul import matmul
-from memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from microbenchmark import Benchmarkable
 
-from utils.index import Index
+from std.utils.index import Index
 
 comptime alignment = 64
 
@@ -52,9 +49,9 @@ struct MatmulNaiveTest[a_type: DType, b_type: DType, c_type: DType](
     var m: Int
     var n: Int
     var k: Int
-    var a_ptr: UnsafePointer[Scalar[a_type]]
-    var b_ptr: UnsafePointer[Scalar[b_type]]
-    var c_ptr: UnsafePointer[Scalar[c_type]]
+    var a_ptr: UnsafePointer[Scalar[a_type], MutAnyOrigin]
+    var b_ptr: UnsafePointer[Scalar[b_type], MutAnyOrigin]
+    var c_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin]
     var am: NDBuffer[a_type, 2, MutAnyOrigin, DimList.create_unknown[2]()]
     var bm: NDBuffer[b_type, 2, MutAnyOrigin, DimList.create_unknown[2]()]
     var cm: NDBuffer[c_type, 2, MutAnyOrigin, DimList.create_unknown[2]()]
@@ -63,15 +60,9 @@ struct MatmulNaiveTest[a_type: DType, b_type: DType, c_type: DType](
         self.m = m
         self.n = n
         self.k = k
-        self.a_ptr = UnsafePointer[Scalar[a_type]].alloc(
-            m * k, alignment=alignment
-        )
-        self.b_ptr = UnsafePointer[Scalar[b_type]].alloc(
-            k * n, alignment=alignment
-        )
-        self.c_ptr = UnsafePointer[Scalar[c_type]].alloc(
-            m * n, alignment=alignment
-        )
+        self.a_ptr = alloc[Scalar[a_type]](m * k, alignment=alignment)
+        self.b_ptr = alloc[Scalar[b_type]](k * n, alignment=alignment)
+        self.c_ptr = alloc[Scalar[c_type]](m * n, alignment=alignment)
         self.am = NDBuffer[a_type, 2, DimList.create_unknown[2]()](
             self.a_ptr, Index(self.m, self.k)
         )
@@ -84,7 +75,7 @@ struct MatmulNaiveTest[a_type: DType, b_type: DType, c_type: DType](
 
     @no_inline
     fn __str__(self) -> String:
-        return String("m = ", self.m, ", n = ", self.n, ", k = ", self.k)
+        return t"m = {self.m}, n = {self.n}, k = {self.k}"
 
     fn __del__(deinit self):
         self.a_ptr.free()
@@ -131,9 +122,9 @@ struct MatmulTest[a_type: DType, b_type: DType, c_type: DType](
     var m: Int
     var n: Int
     var k: Int
-    var a_ptr: UnsafePointer[Scalar[a_type]]
-    var b_ptr: UnsafePointer[Scalar[b_type]]
-    var c_ptr: UnsafePointer[Scalar[c_type]]
+    var a_ptr: UnsafePointer[Scalar[a_type], MutAnyOrigin]
+    var b_ptr: UnsafePointer[Scalar[b_type], MutAnyOrigin]
+    var c_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin]
     var am: NDBuffer[a_type, 2, DimList.create_unknown[2]()]
     var bm: NDBuffer[b_type, 2, DimList.create_unknown[2]()]
     var cm: NDBuffer[c_type, 2, DimList.create_unknown[2]()]
@@ -142,15 +133,9 @@ struct MatmulTest[a_type: DType, b_type: DType, c_type: DType](
         self.m = m
         self.n = n
         self.k = k
-        self.a_ptr = UnsafePointer[Scalar[a_type]].alloc(
-            self.m * self.k, alignment=alignment
-        )
-        self.b_ptr = UnsafePointer[Scalar[b_type]].alloc(
-            self.k * self.n, alignment=alignment
-        )
-        self.c_ptr = UnsafePointer[Scalar[c_type]].alloc(
-            self.m * self.n, alignment=alignment
-        )
+        self.a_ptr = alloc[Scalar[a_type]](self.m * self.k, alignment=alignment)
+        self.b_ptr = alloc[Scalar[b_type]](self.k * self.n, alignment=alignment)
+        self.c_ptr = alloc[Scalar[c_type]](self.m * self.n, alignment=alignment)
         self.am = NDBuffer[a_type, 2, DimList.create_unknown[2]()](
             self.a_ptr, Index(self.m, self.k)
         )
@@ -163,7 +148,7 @@ struct MatmulTest[a_type: DType, b_type: DType, c_type: DType](
 
     @no_inline
     fn __str__(self) -> String:
-        return String("m = ", self.m, ", n = ", self.n, ", k = ", self.k)
+        return t"m = {self.m}, n = {self.n}, k = {self.k}"
 
     fn __del__(deinit self):
         self.a_ptr.free()

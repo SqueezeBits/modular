@@ -19,9 +19,9 @@ from typing import Any
 
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.nn.legacy.kv_cache import KVCacheParams
+from max.nn.kv_cache import KVCacheParams
 from max.pipelines.lib import KVCacheConfig, PipelineConfig
-from max.pipelines.lib.config_enums import supported_encoding_dtype
+from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from max.pipelines.lib.interfaces.arch_config import ArchConfigWithKVCache
 from max.pipelines.lib.utils import upper_bounded_default
 from transformers import AutoConfig
@@ -132,6 +132,7 @@ class DeepseekV2Config(ArchConfigWithKVCache):
             num_layers=DeepseekV2Config.get_num_layers(huggingface_config),
             devices=devices,
             is_mla=True,
+            num_q_heads=huggingface_config.num_attention_heads,
             data_parallel_degree=pipeline_config.model.data_parallel_degree,
         )
 
@@ -166,9 +167,9 @@ class DeepseekV2Config(ArchConfigWithKVCache):
             cache_dtype=cache_dtype,
         )
 
-        if pipeline_config.pipeline_role == "prefill_only":
+        if pipeline_config.runtime.pipeline_role == "prefill_only":
             graph_mode = "prefill"
-        elif pipeline_config.pipeline_role == "decode_only":
+        elif pipeline_config.runtime.pipeline_role == "decode_only":
             graph_mode = "decode"
         else:
             graph_mode = "auto"

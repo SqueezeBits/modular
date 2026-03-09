@@ -22,20 +22,19 @@ import numpy as np
 from max.driver import Buffer, Device
 from max.dtype import DType
 from max.engine import InferenceSession, Model
-from max.graph import DeviceRef, Graph, TensorType
+from max.graph import BufferType, DeviceRef, Graph, TensorType
 from max.graph.weights import (
     SafetensorWeights,
     WeightData,
     Weights,
     WeightsAdapter,
 )
-from max.nn.legacy.kv_cache import (
+from max.nn.kv_cache import (
     KVCacheInputs,
     KVCacheParams,
-    PagedCacheValues,
 )
-from max.nn.legacy.layer import Module
-from max.nn.legacy.transformer import ReturnLogits
+from max.nn.layer import Module
+from max.nn.transformer import ReturnLogits
 from max.pipelines.core import TextAndVisionContext
 from max.pipelines.lib import (
     CompilationTimer,
@@ -302,7 +301,7 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
             }
         return state_dict
 
-    def graph_inputs(self) -> tuple[TensorType]:
+    def graph_inputs(self) -> tuple[TensorType | BufferType, ...]:
         # Generate DeviceRef
         device_ref = DeviceRef.from_device(self.devices[0])
 
@@ -378,17 +377,12 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
                     return_n_logits,
                     *kv_cache_inputs,
                 ) = graph.inputs
-                kv_collection = PagedCacheValues(
-                    kv_blocks=kv_cache_inputs[0].buffer,
-                    cache_lengths=kv_cache_inputs[1].tensor,
-                    lookup_table=kv_cache_inputs[2].tensor,
-                    max_lengths=kv_cache_inputs[3].tensor,
-                )
+                kv_collections = self._unflatten_kv_inputs(kv_cache_inputs)
                 outputs = nn_model(
                     input_ids=input_ids.tensor,
                     pixel_values=pixel_values.tensor,
                     attention_mask=attention_mask.tensor,
-                    kv_collection=kv_collection,
+                    kv_collection=kv_collections[0],
                     return_n_logits=return_n_logits.tensor,
                     input_row_offsets=input_row_offsets.tensor,
                 )
@@ -407,11 +401,14 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
 
         # Pre-allocate a buffer for input_row_offsets in multistep execution.
         # We do this to avoid materializing and copying a buffer with each multistep step
-        assert self.pipeline_config.max_batch_size, (
+        assert self.pipeline_config.runtime.max_batch_size, (
             "Expected max_batch_size to be set"
         )
         self._input_row_offsets_prealloc = Buffer.from_numpy(
-            np.arange(self.pipeline_config.max_batch_size + 1, dtype=np.uint32)
+            np.arange(
+                self.pipeline_config.runtime.max_batch_size + 1,
+                dtype=np.uint32,
+            )
         ).to(self.devices[0])
 
         if not isinstance(self.weights, SafetensorWeights):

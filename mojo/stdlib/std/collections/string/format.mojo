@@ -70,11 +70,11 @@ methods.
 """
 
 
-from builtin.globals import global_constant
-from builtin.variadics import Variadic
-from collections.string.string_slice import get_static_string
-from compile import get_type_name
-from utils import Variant
+from std.builtin.globals import global_constant
+from std.builtin.variadics import Variadic
+from std.collections.string.string_slice import get_static_string
+from std.compile import get_type_name
+from std.utils import Variant
 
 # ===-----------------------------------------------------------------------===#
 # Formatter
@@ -170,14 +170,14 @@ struct _FormatUtils:
 
         @always_inline
         fn _build_slice(
-            p: UnsafePointer[mut=False, UInt8], start: Int, end: Int
+            p: UnsafePointer[mut=False, UInt8, _], start: Int, end: Int
         ) -> StringSlice[p.origin]:
             return StringSlice(ptr=p + start, length=end - start)
 
         var auto_arg_index = 0
         for e in compiled.entries:
             # offset can equal fmt_len when format ends with a replacement field
-            debug_assert(offset <= fmt_len, "offset > format.byte_length()")
+            assert offset <= fmt_len, "offset > format.byte_length()"
             writer.write(_build_slice(ptr, offset, e.first_curly))
             e._format_entry[len_pos_args](writer, args, auto_arg_index)
             offset = e.last_curly + 1
@@ -279,7 +279,7 @@ struct _FormatUtils:
         format: StringSlice,
     ) -> Variant[
         _PrecompiledEntriesRuntime[
-            format_origin = ImmutOrigin(format.origin), *Ts
+            format_origin=ImmutOrigin(format.origin), *Ts
         ],
         Error,
     ]:
@@ -300,7 +300,7 @@ struct _FormatUtils:
     ](
         format: StringSlice,
     ) raises -> _PrecompiledEntriesRuntime[
-        format_origin = ImmutOrigin(format.origin), *Ts
+        format_origin=ImmutOrigin(format.origin), *Ts
     ]:
         """Parses and compiles a format string at runtime.
 
@@ -522,7 +522,7 @@ struct _FormatCurlyEntry[origin: ImmutOrigin](ImplicitlyCopyable):
     ) raises -> Bool:
         @always_inline("nodebug")
         fn _build_slice(
-            p: UnsafePointer[mut=False, UInt8], start: Int, end: Int
+            p: UnsafePointer[mut=False, UInt8, _], start: Int, end: Int
         ) -> StringSlice[p.origin]:
             return StringSlice(ptr=p + start, length=end - start)
 

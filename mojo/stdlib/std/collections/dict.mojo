@@ -37,14 +37,13 @@ Value elements must be `Copyable`. As with `KeyElement`, the
 See the `Dict` docs for more details.
 """
 
-from builtin.constrained import _constrained_conforms_to
-from compile import get_type_name
-from hashlib import Hasher, default_comp_time_hasher, default_hasher
-import format._utils as fmt
-from sys.intrinsics import is_compile_time, likely
+from std.compile import get_type_name
+from std.hashlib import Hasher, default_comp_time_hasher, default_hasher
+import std.format._utils as fmt
+from std.sys.intrinsics import is_run_in_comptime_interpreter, likely
 
-from bit import count_trailing_zeros, next_power_of_two
-from memory import alloc, bitcast, memcpy, memset, pack_bits
+from std.bit import count_trailing_zeros, next_power_of_two
+from std.memory import alloc, bitcast, memcpy, memset, pack_bits
 
 comptime KeyElement = Copyable & Hashable & Equatable
 """A trait composition for types which implement all requirements of
@@ -97,7 +96,7 @@ struct _Group(Copyable, Movable):
     var ctrl: SIMD[DType.uint8, _GROUP_WIDTH]
 
     @always_inline
-    fn __init__(out self, ptr: UnsafePointer[UInt8]):
+    fn __init__(out self, ptr: UnsafePointer[UInt8, _]):
         """Load a group of control bytes from memory.
 
         Args:
@@ -105,7 +104,7 @@ struct _Group(Copyable, Movable):
         """
         self.ctrl = ptr.load[width=_GROUP_WIDTH]()
 
-    # TODO: Remove `is_compile_time()` branches once `pack_bits` is supported
+    # TODO: Remove `is_run_in_comptime_interpreter()` branches once `pack_bits` is supported
     # by the compile-time interpreter. Currently `pack_bits` uses `pop.bitcast`
     # which the interpreter can't handle, so we fall back to scalar loops for
     # comptime contexts (e.g., Dict used in `comptime` expressions).
@@ -120,7 +119,7 @@ struct _Group(Copyable, Movable):
         Returns:
             A bitmask where bit i is set if ctrl[i] == h2.
         """
-        if is_compile_time():
+        if is_run_in_comptime_interpreter():
             return Self._scalar_match(self.ctrl, h2)
         return pack_bits(self.ctrl.eq(SIMD[DType.uint8, _GROUP_WIDTH](h2)))
 
@@ -131,7 +130,7 @@ struct _Group(Copyable, Movable):
         Returns:
             A bitmask where bit i is set if ctrl[i] == EMPTY (0xFF).
         """
-        if is_compile_time():
+        if is_run_in_comptime_interpreter():
             return Self._scalar_match(self.ctrl, _CTRL_EMPTY)
         return pack_bits(
             self.ctrl.eq(SIMD[DType.uint8, _GROUP_WIDTH](_CTRL_EMPTY))
@@ -147,7 +146,7 @@ struct _Group(Copyable, Movable):
         Returns:
             A bitmask where bit i is set if ctrl[i] is EMPTY or DELETED.
         """
-        if is_compile_time():
+        if is_run_in_comptime_interpreter():
             var result = UInt16(0)
 
             comptime for i in range(_GROUP_WIDTH):
@@ -156,6 +155,36 @@ struct _Group(Copyable, Movable):
             return result
         return pack_bits(
             self.ctrl.ge(SIMD[DType.uint8, _GROUP_WIDTH](_CTRL_DELETED))
+        )
+
+    @always_inline
+    fn _convert_special_to_empty_and_full_to_deleted(
+        self,
+    ) -> SIMD[DType.uint8, _GROUP_WIDTH]:
+        """Convert ctrl bytes for in-place rehash preparation.
+
+        EMPTY  (0xFF) -> EMPTY  (0xFF)  (unchanged)
+        DELETED(0x80) -> EMPTY  (0xFF)  (reclaim tombstone)
+        h2 (0x00-0x7F) -> DELETED(0x80) (mark for relocation)
+
+        Returns:
+            Transformed control byte vector.
+        """
+        if is_run_in_comptime_interpreter():
+            var result = SIMD[DType.uint8, _GROUP_WIDTH](0)
+
+            comptime for i in range(_GROUP_WIDTH):
+                if self.ctrl[i] < _CTRL_DELETED:
+                    result[i] = _CTRL_DELETED
+                else:
+                    result[i] = _CTRL_EMPTY
+            return result
+        var is_full = self.ctrl.lt(
+            SIMD[DType.uint8, _GROUP_WIDTH](_CTRL_DELETED)
+        )
+        return is_full.select(
+            SIMD[DType.uint8, _GROUP_WIDTH](_CTRL_DELETED),
+            SIMD[DType.uint8, _GROUP_WIDTH](_CTRL_EMPTY),
         )
 
     @staticmethod
@@ -308,10 +337,9 @@ struct _DictEntryIter[
                     .unsafe_origin_cast[Self.origin]()[]
                 )
 
-        debug_assert(
-            self.seen == len(self.src[]),
-            "_order exhausted but not all entries seen: _len out of sync",
-        )
+        assert self.seen == len(
+            self.src[]
+        ), "_order exhausted but not all entries seen: _len out of sync"
         raise StopIteration()
 
     @always_inline
@@ -369,10 +397,9 @@ struct _TakeDictEntryIter[
                 self.src[]._len -= 1
                 return entry^
 
-        debug_assert(
-            len(self.src[]) == 0,
-            "_order exhausted but _len > 0: ctrl bytes and _len out of sync",
-        )
+        assert (
+            len(self.src[]) == 0
+        ), "_order exhausted but _len > 0: ctrl bytes and _len out of sync"
         raise StopIteration()
 
 
@@ -510,7 +537,7 @@ struct DictEntry[
             key: The key of the entry.
             value: The value of the entry.
         """
-        self.hash = hash[HasherType = Self.H](key)
+        self.hash = hash[HasherType=Self.H](key)
         self.key = key^
         self.value = value^
 
@@ -537,10 +564,8 @@ struct Dict[
     Copyable,
     Defaultable,
     Iterable,
-    Representable,
     Sized,
-    Stringable,
-    Writable,
+    Writable where conforms_to(K, Writable) and conforms_to(V, Writable),
 ):
     """A container that stores key-value pairs.
 
@@ -831,12 +856,10 @@ struct Dict[
             values: The corresponding values to pair with the keys.
             __dict_literal__: Tell Mojo to use this method for dict literals.
         """
-        # TODO: Use capacity to reserve space.
-        self = Self()
-        debug_assert(
-            len(keys) == len(values),
-            "keys and values must have the same length",
-        )
+        self = Self(capacity=len(keys))
+        assert len(keys) == len(
+            values
+        ), "keys and values must have the same length"
 
         # TODO: Should transfer the key/value's from the list to avoid copying
         # the values.
@@ -965,7 +988,7 @@ struct Dict[
         Returns:
             True if the key exists in the dictionary, False otherwise.
         """
-        var found, _ = self._find_slot(hash[HasherType = Self.H](key), key)
+        var found, _ = self._find_slot(hash[HasherType=Self.H](key), key)
         return found
 
     fn __iter__(ref self) -> Self.IteratorType[origin_of(self)]:
@@ -1030,8 +1053,13 @@ struct Dict[
         """
         return len(self).__bool__()
 
+    @deprecated("Representable is deprecated. Use Writable instead.")
     @no_inline
-    fn __repr__(self) -> String:
+    fn __repr__(
+        self,
+    ) -> String where conforms_to(Self.K, Writable) and conforms_to(
+        Self.V, Writable
+    ):
         """Returns a string representation of a `Dict`.
 
         Returns:
@@ -1042,7 +1070,12 @@ struct Dict[
         return output^
 
     @no_inline
-    fn __str__(self) -> String:
+    @deprecated("Stringable is deprecated. Use Writable instead.")
+    fn __str__(
+        self,
+    ) -> String where conforms_to(Self.K, Writable) and conforms_to(
+        Self.V, Writable
+    ):
         """Returns a string representation of a `Dict`.
 
         Returns:
@@ -1066,10 +1099,9 @@ struct Dict[
 
     fn _write_dict_body[
         f_key: fn(Self.K, mut Some[Writer]), f_val: fn(Self.V, mut Some[Writer])
-    ](self, mut writer: Some[Writer]):
-        fmt.constrained_conforms_to_writable[Self.K, Parent=Self]()
-        fmt.constrained_conforms_to_writable[Self.V, Parent=Self]()
-
+    ](self, mut writer: Some[Writer]) where conforms_to(
+        Self.K, Writable
+    ) and conforms_to(Self.V, Writable):
         writer.write_string("{")
 
         var i = 0
@@ -1085,19 +1117,23 @@ struct Dict[
         writer.write_string("}")
 
     @no_inline
-    fn write_to(self, mut writer: Some[Writer]):
+    fn write_to(
+        self, mut writer: Some[Writer]
+    ) where conforms_to(Self.K, Writable) and conforms_to(Self.V, Writable):
         """Write this `Dict` to the writer.
 
         Args:
             writer: The value to write to.
         """
         self._write_dict_body[
-            f_key = fmt.write_to[Self.K],
-            f_val = fmt.write_to[Self.V],
+            f_key=fmt.write_to[Self.K],
+            f_val=fmt.write_to[Self.V],
         ](writer)
 
     @no_inline
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    fn write_repr_to(
+        self, mut writer: Some[Writer]
+    ) where conforms_to(Self.K, Writable) and conforms_to(Self.V, Writable):
         """Write this `Dict`'s representation to the writer.
 
         Args:
@@ -1107,8 +1143,8 @@ struct Dict[
         @parameter
         fn write_fields(mut w: Some[Writer]):
             self._write_dict_body[
-                f_key = fmt.write_repr_to[Self.K],
-                f_val = fmt.write_repr_to[Self.V],
+                f_key=fmt.write_repr_to[Self.K],
+                f_val=fmt.write_repr_to[Self.V],
             ](w)
 
         fmt.FormatStruct(writer, "Dict").params(
@@ -1169,14 +1205,13 @@ struct Dict[
             An optional value containing a reference to the value if it is
             present, otherwise an empty Optional.
         """
-        var hash = hash[HasherType = Self.H](key)
+        var hash = hash[HasherType=Self.H](key)
         var found, slot_idx = self._find_slot(hash, key)
 
         if found:
-            debug_assert(
-                _is_occupied(self._ctrl[slot_idx]),
-                "_find_slot returned found=True but ctrl byte is not occupied",
-            )
+            assert _is_occupied(
+                self._ctrl[slot_idx]
+            ), "_find_slot returned found=True but ctrl byte is not occupied"
             return (self._slots + slot_idx)[].value
 
         raise DictKeyError[Self.K]()
@@ -1203,7 +1238,7 @@ struct Dict[
         var missing_value = my_dict.get("c")
         print(missing_value.__str__())  # => -1
 
-        from testing import assert_true
+        from std.testing import assert_true
         assert_true(my_dict["a"] == my_dict.get("a").or_else(Int.MAX))
         ```
         """
@@ -1231,7 +1266,7 @@ struct Dict[
         var missing_value = my_dict.get("c", -1)
         print(missing_value.__str__())  # => -1
 
-        from testing import assert_true
+        from std.testing import assert_true
         assert_true(my_dict["a"] == my_dict.get("a", Int.MAX))
         ```
         """
@@ -1291,13 +1326,12 @@ struct Dict[
         print(missing_value.__str__())  # => 99
         ```
         """
-        var hash = hash[HasherType = Self.H](key)
+        var hash = hash[HasherType=Self.H](key)
         var found, slot_idx = self._find_slot(hash, key)
         if found:
-            debug_assert(
-                _is_occupied(self._ctrl[slot_idx]),
-                "_find_slot returned found=True but ctrl byte is not occupied",
-            )
+            assert _is_occupied(
+                self._ctrl[slot_idx]
+            ), "_find_slot returned found=True but ctrl byte is not occupied"
             var entry = (self._slots + slot_idx).take_pointee()
             self._set_ctrl(slot_idx, _CTRL_DELETED)
             self._len -= 1
@@ -1522,20 +1556,19 @@ struct Dict[
         ```
         """
         self._maybe_resize()
-        var h = hash[HasherType = Self.H](key)
+        var h = hash[HasherType=Self.H](key)
         var found, slot_idx = self._find_slot(h, key)
         if not found:
-            var entry = DictEntry[H = Self.H](key.copy(), default^)
+            var entry = DictEntry[H=Self.H](key.copy(), default^)
             self._set_ctrl(slot_idx, _h2(h))
             (self._slots + slot_idx).init_pointee_move(entry^)
             self._order.append(Int32(slot_idx))
             self._len += 1
             self._growth_left -= 1
         else:
-            debug_assert(
-                _is_occupied(self._ctrl[slot_idx]),
-                "_find_slot returned found=True but ctrl byte is not occupied",
-            )
+            assert _is_occupied(
+                self._ctrl[slot_idx]
+            ), "_find_slot returned found=True but ctrl byte is not occupied"
         return (self._slots + slot_idx)[].value
 
     # ===-------------------------------------------------------------------===#
@@ -1563,10 +1596,9 @@ struct Dict[
             self._order.append(Int32(slot_idx))
             self._len += 1
             self._growth_left -= 1
-            debug_assert(
-                self._growth_left >= 0,
-                "_growth_left went negative after insert",
-            )
+            assert (
+                self._growth_left >= 0
+            ), "_growth_left went negative after insert"
 
     @always_inline
     fn _set_ctrl(mut self, index: Int, value: UInt8):
@@ -1576,10 +1608,7 @@ struct Dict[
             index: The slot index.
             value: The control byte value (h2, EMPTY, or DELETED).
         """
-        debug_assert(
-            0 <= index < self._capacity,
-            "ctrl index out of bounds",
-        )
+        assert 0 <= index < self._capacity, "ctrl index out of bounds"
         self._ctrl[index] = value
         # Mirror first GROUP_WIDTH bytes at the end of the ctrl array
         if index < _GROUP_WIDTH:
@@ -1635,7 +1664,8 @@ struct Dict[
     fn _find_empty_slot(self, hash: UInt64) -> Int:
         """Find the first EMPTY or DELETED slot for the given hash.
 
-        Used during resize when we know the key is unique.
+        Used during resize and in-place rehash when we know the key is
+        unique.
 
         Args:
             hash: The hash to determine the starting probe position.
@@ -1659,12 +1689,12 @@ struct Dict[
             self._maybe_compact_order()
             return
 
-        # TODO: When most non-EMPTY slots are DELETED (tombstones) rather than
-        # occupied, we could rehash in-place at the same capacity instead of
-        # doubling. This avoids unnecessary memory growth for workloads with
-        # heavy insert/delete churn. The abseil Swiss Table implements this as:
-        # if _len <= capacity * 7 / 16, rehash at same size; else double.
-        # For now we always double, which is correct but uses more memory.
+        # If table is sparse (occupancy <= 7/16 ≈ 44% of capacity), tombstones
+        # dominate. Rehash in-place to reclaim them without doubling memory.
+        # This threshold matches Abseil's Swiss Table heuristic.
+        if self._len <= self._capacity * 7 // 16:
+            self._rehash_in_place()
+            return
 
         # Double capacity and rehash
         var new_capacity = self._capacity * 2
@@ -1693,14 +1723,95 @@ struct Dict[
                 (self._slots + new_slot).init_pointee_move(entry^)
                 self._order.append(Int32(new_slot))
 
-        debug_assert(
-            len(self._order) == self._len,
-            "order length doesn't match _len after resize",
-        )
+        assert (
+            len(self._order) == self._len
+        ), "order length doesn't match _len after resize"
 
         # Free old storage
         old_ctrl.free()
         old_slots.free()
+
+    fn _rehash_in_place(mut self):
+        """Rehash the table in place without changing capacity.
+
+        Reclaims DELETED tombstones by moving all entries to their ideal
+        probe positions at the current capacity. This is the Abseil
+        "drop deletes without resize" algorithm.
+        """
+        assert (
+            self._len <= self._capacity * 7 // 16
+        ), "in-place rehash called when table is too full"
+
+        # Step 0: Compact _order to remove stale entries before we lose
+        # track of which slots are occupied vs deleted.
+        var compacted = List[Int32](capacity=self._len)
+        for j in range(len(self._order)):
+            var slot = Int(self._order[j])
+            if _is_occupied(self._ctrl[slot]):
+                compacted.append(self._order[j])
+        self._order = compacted^
+
+        # Step 1: Rewrite ctrl bytes.
+        # EMPTY->EMPTY, DELETED->EMPTY, OCCUPIED(h2)->DELETED
+        for pos in range(0, self._capacity, _GROUP_WIDTH):
+            var group = _Group(self._ctrl + pos)
+            var converted = (
+                group._convert_special_to_empty_and_full_to_deleted()
+            )
+            (self._ctrl + pos).store(converted)
+
+        # Step 2: Refresh mirror bytes.
+        memcpy(
+            dest=self._ctrl + self._capacity,
+            src=self._ctrl,
+            count=_GROUP_WIDTH,
+        )
+
+        # Step 3: Relocate entries.
+        # Build old->new slot mapping for _order update.
+        var slot_map = alloc[Int32](self._capacity)
+        for i in range(self._capacity):
+            slot_map[i] = Int32(i)
+
+        for i in range(self._capacity):
+            if self._ctrl[i] != _CTRL_DELETED:
+                continue
+
+            # This slot was occupied before rewrite; relocate its entry.
+            var entry = (self._slots + i).take_pointee()
+            self._set_ctrl(i, _CTRL_EMPTY)
+
+            var source = i
+            var target = self._find_empty_slot(entry.hash)
+
+            while self._ctrl[target] == _CTRL_DELETED:
+                # Target has another entry awaiting relocation; swap.
+                self._set_ctrl(target, _h2(entry.hash))
+                var displaced = (self._slots + target).take_pointee()
+                (self._slots + target).init_pointee_move(entry^)
+                slot_map[source] = Int32(target)
+
+                entry = displaced^
+                source = target
+                target = self._find_empty_slot(entry.hash)
+
+            # Target is EMPTY: final placement.
+            self._set_ctrl(target, _h2(entry.hash))
+            (self._slots + target).init_pointee_move(entry^)
+            slot_map[source] = Int32(target)
+
+        # Step 4: Update _order with new slot indices.
+        for j in range(len(self._order)):
+            self._order[j] = slot_map[Int(self._order[j])]
+
+        assert (
+            len(self._order) == self._len
+        ), "order length doesn't match _len after in-place rehash"
+
+        # Step 5: Reset growth_left (all tombstones are now EMPTY).
+        self._growth_left = self._capacity * 7 // 8 - self._len
+
+        slot_map.free()
 
     fn _maybe_compact_order(mut self):
         """Compact the order array if it has too many stale entries."""

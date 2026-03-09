@@ -28,12 +28,12 @@ from .model import PixtralModel
 from .model_config import PixtralConfig
 
 pixtral_arch = SupportedArchitecture(
-    name="LlavaForConditionalGeneration_Legacy",
+    name="LlavaForConditionalGeneration",
     task=PipelineTask.TEXT_GENERATION,
     example_repo_ids=["mistral-community/pixtral-12b"],
     default_encoding="bfloat16",
     supported_encodings={
-        "bfloat16": ["paged"],
+        "bfloat16",
     },
     pipeline_model=PixtralModel,
     tokenizer=TextAndVisionTokenizer,
@@ -45,6 +45,7 @@ pixtral_arch = SupportedArchitecture(
     required_arguments={
         "enable_prefix_caching": False,
         "enable_chunked_prefill": False,
+        "max_batch_size": 1,
     },
     context_validators=[
         validate_requires_vision_context,

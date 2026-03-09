@@ -11,22 +11,19 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import align_up, ceildiv
-from memory import LegacyUnsafePointer
+from std.math import align_up, ceildiv
+from std.os.atomic import Atomic
+from std.sys import size_of
 
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-from os.atomic import Atomic
-from sys import size_of
-
-from gpu import NamedBarrierSemaphore
-from gpu.globals import WARPGROUP_SIZE
-from gpu.host.info import H100
-from gpu import block_idx, grid_dim, thread_idx
+from std.gpu import NamedBarrierSemaphore
+from std.gpu.globals import WARPGROUP_SIZE
+from std.gpu.host.info import H100
+from std.gpu import block_idx, grid_dim, thread_idx
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from std.bit import log2_floor
 
-from utils.index import Index, IndexList
+from std.utils.index import Index, IndexList
 
 from .tile_scheduler import RasterOrder, WorkInfo
 
@@ -111,7 +108,7 @@ struct SplitKTileScheduler[
 
     var cluster_blk_major: UInt32
 
-    var locks_ptr: UnsafePointer[Int32]
+    var locks_ptr: UnsafePointer[Int32, MutAnyOrigin]
 
     comptime k_tiles_per_output_tile = UInt32(
         ceildiv(Self.problem_shape_nk[1], Self.tile_shape[2])
@@ -134,7 +131,7 @@ struct SplitKTileScheduler[
         out self,
         prob_shape: IndexList[3],
         block_id_in_cluster: IndexList[2],
-        locks_ptr: UnsafePointer[UInt8],
+        locks_ptr: UnsafePointer[mut=True, UInt8, _],
     ):
         _check_scheduler_constraints[
             Self.problem_shape_nk,
@@ -150,7 +147,9 @@ struct SplitKTileScheduler[
         self.prob_shape = prob_shape
         self.block_id_in_cluster = block_id_in_cluster
 
-        self.locks_ptr = locks_ptr.bitcast[Int32]()
+        self.locks_ptr = rebind[UnsafePointer[Int32, MutAnyOrigin]](
+            locks_ptr.bitcast[Int32]()
+        )
 
         var problem_blocks = Self.get_problem_blocks_shape(
             prob_shape, Self.tile_shape, Self.cluster_shape
@@ -605,7 +604,7 @@ struct SplitKTileScheduler[
     @staticmethod
     @always_inline
     fn wait_eq(
-        lock_ptr: UnsafePointer[Int32],
+        lock_ptr: UnsafePointer[Int32, MutAnyOrigin],
         barrier_id: Int32,
         barrier_group_thread_idx: Int,
         lock_idx: UInt32,
@@ -619,7 +618,7 @@ struct SplitKTileScheduler[
     @staticmethod
     @always_inline
     fn wait_lt(
-        lock_ptr: UnsafePointer[Int32],
+        lock_ptr: UnsafePointer[Int32, MutAnyOrigin],
         barrier_id: Int32,
         barrier_group_thread_idx: Int,
         lock_idx: UInt32,
@@ -633,7 +632,7 @@ struct SplitKTileScheduler[
     @staticmethod
     @always_inline
     fn arrive_set(
-        lock_ptr: UnsafePointer[Int32],
+        lock_ptr: UnsafePointer[Int32, MutAnyOrigin],
         barrier_id: Int32,
         barrier_group_thread_idx: Int,
         lock_idx: UInt32,

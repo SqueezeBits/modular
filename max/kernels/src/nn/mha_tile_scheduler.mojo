@@ -11,22 +11,22 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import OptionalReg
+from std.collections import OptionalReg
 
-from os.atomic import Atomic
+from std.os.atomic import Atomic
 
-import gpu.primitives.warp as warp
-from builtin.device_passable import DevicePassable
-from gpu.host.info import H100
-from gpu import block_idx, thread_idx
-from gpu.sync import barrier, named_barrier
+import std.gpu.primitives.warp as warp
+from std.builtin.device_passable import DevicePassable
+from std.gpu.host.info import H100
+from std.gpu import block_idx, thread_idx
+from std.gpu.sync import barrier, named_barrier
 from nn.mha_fa3_utils import NullPointer, OptionalPointer
 
-from builtin.device_passable import DevicePassable
+from std.builtin.device_passable import DevicePassable
 
 
 @fieldwise_init
-struct WorkInfo(Stringable, TrivialRegisterPassable, Writable):
+struct WorkInfo(TrivialRegisterPassable, Writable):
     # (query_offset, head_idx, sequence idx in batch)
     var prompt_offset: UInt32
     var head_idx: UInt32
@@ -43,6 +43,7 @@ struct WorkInfo(Stringable, TrivialRegisterPassable, Writable):
         return self.is_valid_tile
 
     @no_inline
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     fn __str__(self) -> String:
         return String.write(self)
 
@@ -133,7 +134,7 @@ struct MHATileState(TrivialRegisterPassable):
     # Linear work tile index i.e. idx-th work among all possible workload.
     var idx: UInt32
     var sidx_ptr: UnsafePointer[
-        UInt32, MutAnyOrigin, address_space = AddressSpace.SHARED
+        UInt32, MutAnyOrigin, address_space=AddressSpace.SHARED
     ]
     var max_idx: UInt32
 
@@ -142,7 +143,7 @@ struct MHATileState(TrivialRegisterPassable):
         out self,
         idx: UInt32,
         sidx_ptr: UnsafePointer[
-            UInt32, MutAnyOrigin, address_space = AddressSpace.SHARED
+            UInt32, MutAnyOrigin, address_space=AddressSpace.SHARED
         ],
         max_idx: UInt32,
     ):
@@ -272,9 +273,9 @@ struct MHATileSummary[ValidLengthType: OptionalPointer](
             num_heads, schedule
         ](idx)
 
-        debug_assert(prompt_tile_idx < self.max_num_prompt_tiles)
-        debug_assert(head_idx < num_heads)
-        debug_assert(prompt_idx < self.batch_size)
+        assert prompt_tile_idx < self.max_num_prompt_tiles
+        assert head_idx < num_heads
+        assert prompt_idx < self.batch_size
 
         return WorkInfo(
             prompt_tile_idx * tile_shape,
@@ -376,7 +377,7 @@ trait MHATileScheduler(Copyable, DevicePassable, TrivialRegisterPassable):
     ](
         self,
         ptr: UnsafePointer[
-            UInt32, MutAnyOrigin, address_space = AddressSpace.SHARED
+            UInt32, MutAnyOrigin, address_space=AddressSpace.SHARED
         ],
         tile_summary: MHATileSummary[ValidLengthType],
     ) -> MHATileState:
@@ -490,7 +491,7 @@ struct TransientScheduler[
     ](
         self,
         ptr: UnsafePointer[
-            UInt32, MutAnyOrigin, address_space = AddressSpace.SHARED
+            UInt32, MutAnyOrigin, address_space=AddressSpace.SHARED
         ],
         tile_summary: MHATileSummary[ValidLengthType],
     ) -> MHATileState:
@@ -603,7 +604,7 @@ struct TileScheduler[
     ](
         self,
         ptr: UnsafePointer[
-            UInt32, MutAnyOrigin, address_space = AddressSpace.SHARED
+            UInt32, MutAnyOrigin, address_space=AddressSpace.SHARED
         ],
         tile_summary: MHATileSummary[ValidLengthType],
     ) -> MHATileState:
@@ -638,7 +639,7 @@ struct QueuedTileScheduler[
 
     # Linear work tile index i.e. idx-th work among all possible workload.
     var gidx_ptr: UnsafePointer[
-        UInt32, MutAnyOrigin, address_space = AddressSpace.GLOBAL
+        UInt32, MutAnyOrigin, address_space=AddressSpace.GLOBAL
     ]
 
     comptime may_advance: Bool = True
@@ -746,7 +747,7 @@ struct QueuedTileScheduler[
     ](
         self,
         ptr: UnsafePointer[
-            UInt32, MutAnyOrigin, address_space = AddressSpace.SHARED
+            UInt32, MutAnyOrigin, address_space=AddressSpace.SHARED
         ],
         tile_summary: MHATileSummary[ValidLengthType],
     ) -> MHATileState:

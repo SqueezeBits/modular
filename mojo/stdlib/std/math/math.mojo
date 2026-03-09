@@ -15,34 +15,34 @@
 You can import these APIs from the `math` package. For example:
 
 ```mojo
-from math import floor
+from std.math import floor
 ```
 """
 
-from sys import (
+from std.sys import (
     CompilationTarget,
     bit_width_of,
     is_amd_gpu,
     is_apple_gpu,
-    is_compile_time,
+    is_run_in_comptime_interpreter,
     is_gpu,
     is_nvidia_gpu,
     llvm_intrinsic,
     simd_width_of,
     size_of,
 )
-from sys._assembly import inlined_assembly
-from ffi import _external_call_const
-from sys.info import _is_sm_9x_or_newer, is_32bit
+from std.sys._assembly import inlined_assembly
+from std.ffi import _external_call_const
+from std.sys.info import _is_sm_9x_or_newer, is_32bit
 
-from algorithm import vectorize
-from bit import count_trailing_zeros
-from builtin.dtype import _integral_type_of
-from builtin.simd import _modf, _simd_apply
-from memory import Span
+from std.algorithm import vectorize
+from std.bit import count_trailing_zeros
+from std.builtin.dtype import _integral_type_of
+from std.builtin.simd import _modf, _simd_apply
+from std.memory import Span
 
-from utils.numerics import FPUtils, isnan, nan
-from utils.static_tuple import StaticTuple
+from std.utils.numerics import FPUtils, isnan, nan
+from std.utils.static_tuple import StaticTuple
 
 from .constants import log2e
 from .polynomial import polynomial_evaluate
@@ -937,7 +937,7 @@ fn log[
     comptime if size_of[dtype]() < size_of[DType.float32]():
         return log(x.cast[DType.float32]()).cast[dtype]()
 
-    if is_compile_time():
+    if is_run_in_comptime_interpreter():
         return _log_base[27](x)
 
     comptime if is_nvidia_gpu() and dtype == DType.float32:
@@ -974,7 +974,7 @@ fn log2[
         Vector containing result of performing log base 2 on x.
     """
 
-    if is_compile_time():
+    if is_run_in_comptime_interpreter():
         comptime if size_of[dtype]() < size_of[DType.float32]():
             return log2(x.cast[DType.float32]()).cast[dtype]()
 
@@ -1141,6 +1141,18 @@ fn tanh[
                 instruction="tanh.approx.f32", constraints="=f,f"
             ](x)
 
+    comptime if dtype == DType.float64 and not is_gpu():
+        # For float64 on CPU, use the expm1-based identity for full accuracy:
+        #   tanh(x) = -expm1(-2|x|) / (expm1(-2|x|) + 2)
+        # expm1 computes e^y - 1 accurately even for small |y|, avoiding the
+        # catastrophic cancellation that occurs in (e^y - 1) computed naively.
+        # This matches the accuracy of FreeBSD/Cephes libm tanh for float64.
+        # Clamp at ±20: tanh(±20) rounds to exactly ±1 in float64.
+        var xc64 = x.clamp(-20, 20)
+        var x_abs = abs(xc64)
+        var e = expm1((-2) * x_abs)
+        return copysign((-e) / (e + 2), xc64)
+
     var xc = x.clamp(-9, 9)
     var x_squared = xc * xc
 
@@ -1267,7 +1279,7 @@ fn iota[
 
     comptime step_dtype = dtype if dtype.is_integral() else DType.int
     var step: SIMD[step_dtype, width]
-    if is_compile_time():
+    if is_run_in_comptime_interpreter():
         step = 0
 
         comptime for i in range(width):
@@ -1282,7 +1294,7 @@ fn iota[
 fn iota[
     dtype: DType, //
 ](
-    buff: UnsafePointer[mut=True, Scalar[dtype], address_space=_],
+    buff: UnsafePointer[mut=True, Scalar[dtype], _, address_space=_],
     len: Int,
     offset: Int = 0,
 ):
@@ -1401,7 +1413,7 @@ fn align_down(value: Int, alignment: Int) -> Int:
         Closest multiple of the alignment that is less than or equal to the
         input value. In other words, floor(value / alignment) * alignment.
     """
-    debug_assert(alignment != 0, "zero alignment")
+    assert alignment != 0, "zero alignment"
     return (value // alignment) * alignment
 
 
@@ -1418,7 +1430,7 @@ fn align_down(value: UInt, alignment: UInt) -> UInt:
         Closest multiple of the alignment that is less than or equal to the
         input value. In other words, floor(value / alignment) * alignment.
     """
-    debug_assert(alignment != 0, "zero alignment")
+    assert alignment != 0, "zero alignment"
     return (value // alignment) * alignment
 
 
@@ -1440,7 +1452,7 @@ fn align_up(value: Int, alignment: Int) -> Int:
         Closest multiple of the alignment that is greater than or equal to the
         input value. In other words, ceiling(value / alignment) * alignment.
     """
-    debug_assert(alignment != 0, "zero alignment")
+    assert alignment != 0, "zero alignment"
     return ceildiv(value, alignment) * alignment
 
 
@@ -1457,7 +1469,7 @@ fn align_up(value: UInt, alignment: UInt) -> UInt:
         Closest multiple of the alignment that is greater than or equal to the
         input value. In other words, ceiling(value / alignment) * alignment.
     """
-    debug_assert(alignment != 0, "zero alignment")
+    assert alignment != 0, "zero alignment"
     return ceildiv(value, alignment) * alignment
 
 
@@ -1494,7 +1506,7 @@ fn acos[
     # splitting to improve accuracy.
 
     # Determine which approximation method to use based on domain.
-    var x_abs = clamp(abs(x), 0, 1)
+    var x_abs = clamp(abs(x), 0.0, 1.0)
     var directed_polynomial_mask = x_abs.lt(0.5)
 
     # Compute x² for polynomial evaluation
@@ -1508,7 +1520,7 @@ fn acos[
     var d = directed_polynomial_mask.select(abs(x), sqrt(x_squared))
 
     # Special case: handle |x| = 1 to avoid numerical instability
-    d = x_abs.eq(1).select(type_of(x)(0.0), d)
+    d = x_abs.eq(1.0).select(type_of(x)(0.0), d)
 
     # Evaluate Remez polynomial using Horner's method
     # Coefficients derived to minimize maximum absolute error
@@ -1532,7 +1544,7 @@ fn acos[
     var d_plus_poly = d + poly
 
     # Select result based on domain
-    var result = directed_polynomial_mask.select(y, 2 * d_plus_poly)
+    var result = directed_polynomial_mask.select(y, 2.0 * d_plus_poly)
 
     # Large domain with negative x: apply π - result transformation.
     return (~directed_polynomial_mask & x.lt(0)).select(pi - result, result)
@@ -1578,7 +1590,7 @@ fn asin[
     # Compute d² for polynomial evaluation:
     #  - For |x| < 0.5: d² = x²
     #  - For |x| >= 0.5: d² = (1 - |x|) / 2  (for identity transformation)
-    var d2 = directed_polynomial_mask.select(x * x, (1 - x_abs) * 0.5)
+    var d2 = directed_polynomial_mask.select(x * x, (1.0 - x_abs) * 0.5)
 
     # Compute d for evaluation:
     # - For |x| < 0.5: d = |x|
@@ -1604,7 +1616,7 @@ fn asin[
     # Compute final result based on domain:
     # - For |x| < 0.5: result = poly  (direct approximation)
     # - For |x| >= 0.5: result = π/2 - 2*poly  (using identity)
-    var result = directed_polynomial_mask.select(poly, pi / 2 - 2 * poly)
+    var result = directed_polynomial_mask.select(poly, pi / 2.0 - 2.0 * poly)
 
     return copysign(result, x)
 
@@ -1710,7 +1722,7 @@ fn cos[
     comptime if size_of[dtype]() < size_of[DType.float32]():
         return cos(x.cast[DType.float32]()).cast[dtype]()
 
-    if is_compile_time():
+    if is_run_in_comptime_interpreter():
         return _llvm_unary_fn["llvm.cos"](x)
 
     comptime if is_nvidia_gpu() and dtype == DType.float32:
@@ -1753,7 +1765,7 @@ fn sin[
     comptime if size_of[dtype]() < size_of[DType.float32]():
         return sin(x.cast[DType.float32]()).cast[dtype]()
 
-    if is_compile_time():
+    if is_run_in_comptime_interpreter():
         return _llvm_unary_fn["llvm.sin"](x)
 
     comptime if is_nvidia_gpu() and dtype == DType.float32:
@@ -2171,7 +2183,7 @@ fn _log1p_f64[width: Int, //](x: SIMD[DType.float64, width]) -> type_of(x):
     # Sqrt(2)
     comptime sqrt2 = 1.41421356237309504880
 
-    var z = 1 + x
+    var z = 1.0 + x
     var log1x = log(z)
 
     var in_domain_mask = z.lt(sqrt2_div_2) | z.gt(sqrt2)
@@ -2961,7 +2973,7 @@ fn gcd(m: Int, n: Int, /) -> Int:
     return u << shift
 
 
-fn gcd(s: Span[Int], /) -> Int:
+fn gcd(s: Span[Int, _], /) -> Int:
     """Computes the greatest common divisor of a span of integers.
 
     Args:
@@ -3002,7 +3014,7 @@ fn gcd(*values: Int) -> Int:
     Returns:
         The greatest common divisor of the given integers.
     """
-    # TODO: Deduplicate when we can create a Span from VariadicList
+    # TODO: Deduplicate when we can create a Span from VariadicParamList
     if len(values) == 0:
         return 0
     var result = values[0]
@@ -3033,7 +3045,7 @@ fn lcm(m: Int, n: Int, /) -> Int:
     return 0
 
 
-fn lcm(s: Span[Int], /) -> Int:
+fn lcm(s: Span[Int, _], /) -> Int:
     """Computes the least common multiple of a span of integers.
 
     Args:
@@ -3073,7 +3085,7 @@ fn lcm(*values: Int) -> Int:
     Returns:
         The least common multiple of the list.
     """
-    # TODO: Deduplicate when we can create a Span from VariadicList
+    # TODO: Deduplicate when we can create a Span from VariadicParamList
     if len(values) == 0:
         return 1
 
@@ -3189,9 +3201,9 @@ fn factorial(n: Int) -> Int:
         121645100408832000,
         2432902008176640000,
     )
-    debug_assert(
-        0 <= n <= (12 if is_32bit() else 20), "input value causes an overflow"
-    )
+    assert (
+        0 <= n <= (12 if is_32bit() else 20)
+    ), "input value causes an overflow"
     return table[n]
 
 
@@ -3433,7 +3445,6 @@ fn _get_amdgcn_type_suffix[dtype: DType]() -> StaticString:
         return "f64"
     else:
         comptime assert False, "Extend to support additional dtypes."
-        return ""
 
 
 # ===----------------------------------------------------------------------=== #
@@ -3450,7 +3461,7 @@ trait Ceilable:
 
     For example:
     ```mojo
-    from math import Ceilable, ceil
+    from std.math import Ceilable, ceil
 
     @fieldwise_init
     struct Complex(Ceilable, ImplicitlyCopyable):
@@ -3487,7 +3498,7 @@ trait Floorable:
 
     For example:
     ```mojo
-    from math import Floorable, floor
+    from std.math import Floorable, floor
 
     @fieldwise_init
     struct Complex(Floorable, ImplicitlyCopyable):
@@ -3525,7 +3536,7 @@ trait CeilDivable:
 
     For example:
     ```mojo
-    from math import CeilDivable
+    from std.math import CeilDivable
 
     @fieldwise_init
     struct Foo(CeilDivable, ImplicitlyCopyable):
@@ -3558,7 +3569,7 @@ trait CeilDivableRaising:
 
     For example:
     ```mojo
-    from math import CeilDivableRaising
+    from std.math import CeilDivableRaising
 
     @fieldwise_init
     struct Foo(CeilDivableRaising, ImplicitlyCopyable):
@@ -3599,7 +3610,7 @@ trait Truncable:
 
     For example:
     ```mojo
-    from math import Truncable, trunc
+    from std.math import Truncable, trunc
 
     @fieldwise_init
     struct Complex(Truncable, ImplicitlyCopyable):

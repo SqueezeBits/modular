@@ -22,8 +22,8 @@ from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef
 from max.graph.weights import Weights, WeightsAdapter
-from max.nn.legacy.kv_cache import KVCacheInputs, KVCacheParams
-from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
+from max.nn.kv_cache import KVCacheInputs, KVCacheParams
+from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
     KVCacheConfig,
@@ -53,7 +53,7 @@ class MockModelInputs(ModelInputs):
             np.array([0, max(active_batch_size, 1)], dtype=np.uint32)
         )
         self.signal_buffers: list[Buffer] = []
-        self.kv_cache_inputs = kv_cache_inputs
+        self.kv_cache_inputs: KVCacheInputs | None = kv_cache_inputs
         if isinstance(return_n_logits, Buffer):
             self.return_n_logits = return_n_logits
         else:
@@ -63,17 +63,16 @@ class MockModelInputs(ModelInputs):
 
     @property
     def buffers(self) -> tuple[Buffer, ...]:
-        kv_cache_inputs = tuple(self.kv_cache_inputs or ())
         return (
             self.tokens,
             self.input_row_offsets,
             self.return_n_logits,
             *self.signal_buffers,
-            *kv_cache_inputs,
+            *(self.kv_cache_inputs or ()),
         )
 
 
-class MockPipelineModel(PipelineModelWithKVCache):
+class MockPipelineModel(PipelineModelWithKVCache):  # type: ignore[type-arg]
     def __init__(
         self,
         pipeline_config: PipelineConfig,
@@ -117,7 +116,7 @@ class MockPipelineModel(PipelineModelWithKVCache):
                 n_heads=self.huggingface_config.num_attention_heads,
                 n_kv_heads=self.huggingface_config.num_key_value_heads,
                 head_dim=self.huggingface_config.head_dim,
-                zmq_endpoint_base=self.pipeline_config.zmq_endpoint_base,
+                zmq_endpoint_base=self.pipeline_config.runtime.zmq_endpoint_base,
             )
             if self.pipeline_config.lora
             and self.pipeline_config.lora.enable_lora
@@ -160,7 +159,6 @@ class MockPipelineModel(PipelineModelWithKVCache):
             head_dim=1,
             num_layers=1,
             enable_prefix_caching=False,
-            cache_strategy="paged",
             devices=devices,
             data_parallel_degree=pipeline_config.model.data_parallel_degree,
         )

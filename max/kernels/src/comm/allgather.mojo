@@ -28,18 +28,18 @@ hardware capabilities:
    - Simple but functional approach for systems without P2P support.
 """
 
-from collections import InlineArray
-from math import ceildiv
-from sys import simd_width_of
+from std.collections import InlineArray
+from std.math import ceildiv
+from std.sys import simd_width_of
 
 from buffer import NDBuffer
-from memory import UnsafePointer
-from gpu import WARP_SIZE, global_idx, grid_dim
-from gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
+from std.memory import UnsafePointer
+from std.gpu import WARP_SIZE, global_idx, grid_dim
+from std.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
 
-from utils import StaticTuple
+from std.utils import StaticTuple
 
-from .sync import MAX_GPUS, Signal, _multi_gpu_barrier, can_enable_p2p
+from .sync import MAX_GPUS, Signal, _multi_gpu_barrier, is_p2p_enabled
 
 
 @always_inline
@@ -113,7 +113,7 @@ fn _allgather_p2p_kernel[
     Each GPU directly reads from all other GPUs and writes to its output buffers.
     Uses round-robin access pattern to balance NVLink traffic.
     """
-    comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
 
     var global_tid = global_idx.x
     var stride = grid_dim.x * UInt(BLOCK_SIZE)
@@ -196,7 +196,7 @@ fn _allgather_p2p[
         for i in range(ngpus):
             max_length = max(max_length, lengths[i])
 
-        comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+        comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
         # Use ceildiv for max_length to ensure we have enough threads.
         var grid_size = min(
             max_num_blocks,
@@ -258,6 +258,7 @@ fn allgather[
         ctxs: List of device contexts for participating GPUs.
         _max_num_blocks: Maximum number of blocks for kernel launch (optional).
     """
+    comptime assert ngpus >= 2, "allgather requires at least 2 GPUs"
 
     # Return early, if all input buffers are empty
     var all_empty = True
@@ -273,7 +274,7 @@ fn allgather[
     var max_num_blocks = _max_num_blocks.or_else(216)
 
     # Check P2P availability.
-    if not can_enable_p2p():
+    if not is_p2p_enabled():
         return _allgather_naive(input_buffers, output_buffers, ctxs)
     else:
         return _allgather_p2p(
@@ -300,5 +301,7 @@ fn allgather[
     This version uses the naive implementation since we can't allocate signal
     buffers with proper lifetime in this function.
     """
+    comptime assert ngpus >= 2, "allgather requires at least 2 GPUs"
+
     # Use naive implementation for backward compatibility.
     _allgather_naive(input_buffers, output_buffers, ctxs)

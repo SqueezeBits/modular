@@ -34,7 +34,7 @@ from max.graph import (
     Value,
     ops,
 )
-from max.nn.legacy import MLP, Allreduce, Module, Signals
+from max.nn import MLP, Allreduce, Module, Signals
 from test_common.graph_utils import are_all_buffer_values_sequence
 
 DTYPE = DType.float32
@@ -112,10 +112,10 @@ class WrapModuleForSubgraph(Module):
         # The name of the variable is used to determine the prefix of the weights in the Module class
         self.prefix = module
 
-    def __call__(self, *args: Any) -> Value | list[Value] | list[TensorValue]:
-        subgraph_arg_types: list[Type] = []
+    def __call__(self, *args: Any) -> Value | list[Value] | list[TensorValue]:  # type: ignore[type-arg]
+        subgraph_arg_types: list[Type] = []  # type: ignore[type-arg]
 
-        def flatten(t: Any, result: list[Type]) -> None:
+        def flatten(t: Any, result: list[Type]) -> None:  # type: ignore[type-arg]
             if isinstance(t, list | tuple):
                 for item in t:
                     flatten(item, result)
@@ -214,7 +214,7 @@ def mlp_output(
         graph_input, *graph_signal_buffers = graph.inputs
         assert isinstance(graph_input, TensorValue)
         assert are_all_buffer_values_sequence(graph_signal_buffers)
-        graph_output: Value | list[Value] | list[TensorValue]
+        graph_output: Value | list[Value] | list[TensorValue]  # type: ignore[type-arg]
         if n_gpus <= 1:
             graph_output = mlp(graph_input)
         else:

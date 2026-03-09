@@ -12,12 +12,11 @@
 # ===----------------------------------------------------------------------=== #
 
 
-from algorithm.functional import _get_start_indices_of_nth_subvolume
-from layout._coord import Coord, Idx, coord_to_index_list
-from layout._tile_tensor import TileTensor
-from runtime.tracing import Trace, TraceLevel
+from std.algorithm.functional import _get_start_indices_of_nth_subvolume
+from layout import Coord, Idx, TileTensor, coord_to_index_list
+from std.runtime.tracing import Trace, TraceLevel
 
-from utils.index import IndexList
+from std.utils.index import IndexList
 
 # ===-----------------------------------------------------------------------===#
 # arg_nonzero
@@ -47,7 +46,7 @@ fn arg_nonzero[
         output_buffer.flat_rank == 2
     ), "output_buffer must be of rank 2"
 
-    with Trace[TraceLevel.OP, target = StaticString("cpu")]("arg_nonzero"):
+    with Trace[TraceLevel.OP, target=StaticString("cpu")]("arg_nonzero"):
         var numel = input_buffer.numel()
         if numel == 0:
             return

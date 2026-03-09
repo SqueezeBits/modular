@@ -12,10 +12,10 @@
 # ===----------------------------------------------------------------------=== #
 # DOC: max/develop/index.mdx
 
-from max import functional as F
 from max.driver import CPU
 from max.dtype import DType
-from max.tensor import Tensor
+from max.experimental import functional as F
+from max.experimental.tensor import Tensor
 
 
 def debug_forward_pass(x: Tensor) -> Tensor:
@@ -32,5 +32,5 @@ def debug_forward_pass(x: Tensor) -> Tensor:
     return h
 
 
-x = Tensor.constant([-1.0, 0.0, 1.0, 2.0], dtype=DType.float32, device=CPU())
+x = Tensor([-1.0, 0.0, 1.0, 2.0], dtype=DType.float32, device=CPU())
 result = debug_forward_pass(x)

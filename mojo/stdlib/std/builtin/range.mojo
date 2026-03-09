@@ -16,13 +16,13 @@ These are Mojo built-ins, so you don't need to import them.
 """
 
 
-from math import ceildiv
-from sys.info import size_of
-from sys.intrinsics import unlikely
+from std.math import ceildiv
+from std.sys.info import size_of
+from std.sys.intrinsics import unlikely
 
-from python import PythonObject
+from std.python import PythonObject
 
-from utils._select import _select_register_value as select
+from std.utils._select import _select_register_value as select
 
 # ===----------------------------------------------------------------------=== #
 # Utilities
@@ -76,7 +76,7 @@ struct _ZeroStartingRange(
     @always_inline
     fn __getitem__[I: Indexer](self, idx: I) -> Int:
         var i = index(idx)
-        debug_assert(i < self.__len__(), "index out of range")
+        assert i < self.__len__(), "index out of range"
         return i
 
     @always_inline
@@ -122,7 +122,7 @@ struct _SequentialRange(
 
     @always_inline
     fn __getitem__[I: Indexer](self, idx: I) -> Int:
-        debug_assert(self.__len__() > index(idx), "index out of range")
+        assert self.__len__() > index(idx), "index out of range"
         return self.start + index(idx)
 
     @always_inline
@@ -234,7 +234,7 @@ struct _StridedRange(
 
     @always_inline
     fn __getitem__[I: Indexer](self, idx: I) -> Int:
-        debug_assert(self.__len__() > index(idx), "index out of range")
+        assert self.__len__() > index(idx), "index out of range"
         return self.start + index(idx) * self.step
 
     @always_inline
@@ -434,7 +434,7 @@ struct _ZeroStartingScalarRange[dtype: DType](
 
     @always_inline
     fn __getitem__(self, idx: Scalar[Self.dtype]) -> Scalar[Self.dtype]:
-        debug_assert(idx < self.__len__(), "index out of range")
+        assert idx < self.__len__(), "index out of range"
         return idx
 
     @always_inline
@@ -484,7 +484,7 @@ struct _SequentialScalarRange[dtype: DType](
 
     @always_inline
     fn __getitem__(self, idx: Scalar[Self.dtype]) -> Scalar[Self.dtype]:
-        debug_assert(idx < self.__len__(), "index out of range")
+        assert idx < self.__len__(), "index out of range"
         return self.start + idx
 
     @always_inline
@@ -555,7 +555,7 @@ struct _StridedScalarRange[dtype: DType](
 
     @always_inline
     fn __getitem__(self, idx: Scalar[Self.dtype]) -> Scalar[Self.dtype]:
-        debug_assert(idx < self.__len__(), "index out of range")
+        assert idx < self.__len__(), "index out of range"
         return self.start + idx * self.step
 
 

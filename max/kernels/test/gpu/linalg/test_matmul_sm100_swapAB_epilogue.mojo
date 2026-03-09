@@ -10,26 +10,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-from collections import Optional
-from random import random_si64, shuffle, seed
-from sys import align_of, size_of, argv
+from std.collections import Optional
+from std.random import random_si64, shuffle, seed
+from std.sys import align_of, size_of, argv
 
 import linalg.matmul.vendor.blas as vendor_blas
 from buffer import NDBuffer
 from buffer.dimlist import DimList
-from gpu.host import DeviceContext
-from gpu.host.nvidia.tma import TensorMapSwizzle
-from memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-
+from std.gpu.host import DeviceContext
+from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from internal_utils import assert_almost_equal
-from random import rand
+from std.random import rand
 from internal_utils._utils import ValOrDim, dynamic, static
-from layout._ndbuffer_stub import from_ndbuffer_row_major
-from linalg.matmul.gpu.sm100_structured.structured_kernels.tile_types import (
-    lt_to_tt,
-)
+from layout.tile_tensor import TileTensor
 from linalg.matmul.gpu.sm100_structured.default.matmul import (
     blackwell_matmul_tma_umma_warp_specialized,
 )
@@ -38,8 +31,8 @@ from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
 )
 from linalg.utils import elementwise_compute_lambda_type
 
-from utils.index import Index, IndexList
-from utils.static_tuple import StaticTuple
+from std.utils.index import Index, IndexList
+from std.utils.static_tuple import StaticTuple
 
 
 fn is_benchmark() -> Bool:
@@ -72,38 +65,15 @@ def test_matmul_sm100_epilogue[
     n: ValOrDim,
     k: ValOrDim,
     is_benchmark: Bool = False,
-):
+) raises:
     var M = m.value
     var N = n.value
     var K = k.value
 
     print(
-        String(
-            "in/out dtypes=(",
-            a_type,
-            ", ",
-            b_type,
-            ", ",
-            c_type,
-            ") ",
-            " problem shape=(",
-            M,
-            ", ",
-            N,
-            ", ",
-            K,
-            ") ",
-            "mma_shape=",
-            mma_shape,
-            " block_tile_shape=",
-            block_tile_shape,
-            " register_based_epilogue=",
-            register_based_epilogue,
-            " swapAB=",
-            swapAB,
-            " k_group_size=",
-            k_group_size,
-        )
+        t"in/out dtypes=({a_type}, {b_type}, {c_type})  problem shape=({M},"
+        t" {N}, {K})"
+        t" mma_shape={mma_shape} block_tile_shape={block_tile_shape} register_based_epilogue={register_based_epilogue} swapAB={swapAB} k_group_size={k_group_size}"
     )
 
     comptime static_a_shape = DimList(m.dim, k.dim)
@@ -111,21 +81,21 @@ def test_matmul_sm100_epilogue[
         k.dim, n.dim
     )
     comptime static_c_shape = DimList(m.dim, n.dim)
-    var dynamic_a_shape = DimList(m.value, k.value)
-    var dynamic_b_shape = DimList(n.value, k.value) if transpose_b else DimList(
-        k.value, n.value
-    )
-    var dynamic_c_shape = DimList(m.value, n.value)
+    var dynamic_a_shape = IndexList[2](m.value, k.value)
+    var dynamic_b_shape = IndexList[2](
+        n.value, k.value
+    ) if transpose_b else IndexList[2](k.value, n.value)
+    var dynamic_c_shape = IndexList[2](m.value, n.value)
 
     var a_size = m.value * k.value
     var b_size = n.value * k.value
     var c_size = m.value * n.value
 
-    var a_host_ptr = UnsafePointer[Scalar[a_type]].alloc(a_size)
-    var b_host_ptr = UnsafePointer[Scalar[b_type]].alloc(b_size)
-    var c_host_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
-    var c_host_ref_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
-    var c_host_copy_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
+    var a_host_ptr = alloc[Scalar[a_type]](a_size)
+    var b_host_ptr = alloc[Scalar[b_type]](b_size)
+    var c_host_ptr = alloc[Scalar[c_type]](c_size)
+    var c_host_ref_ptr = alloc[Scalar[c_type]](c_size)
+    var c_host_copy_ptr = alloc[Scalar[c_type]](c_size)
 
     var a_host = NDBuffer[a_type, 2, _, static_a_shape](
         a_host_ptr, dynamic_a_shape
@@ -211,9 +181,9 @@ def test_matmul_sm100_epilogue[
         test_lambda_add_coords_prod
     ) if test_lambda_fn else None
 
-    var c_dev = lt_to_tt(from_ndbuffer_row_major(c_device_nd))
-    var a_dev = lt_to_tt(from_ndbuffer_row_major(a_device_nd))
-    var b_dev = lt_to_tt(from_ndbuffer_row_major(b_device_nd))
+    var c_dev = TileTensor(c_device_nd)
+    var a_dev = TileTensor(a_device_nd)
+    var b_dev = TileTensor(b_device_nd)
 
     @parameter
     @always_inline
@@ -308,7 +278,7 @@ def test_matmul_sm100_epilogue[
     _ = c_device_ref^
 
 
-def main():
+def main() raises:
     comptime dtype = DType.bfloat16
     comptime BK = (TensorMapSwizzle.SWIZZLE_128B.bytes() // size_of[dtype]())
     comptime MMA_K = 16
@@ -332,7 +302,7 @@ def main():
                         DType.bfloat16,
                         block_tile_shape,
                         umma_shape,
-                        cluster_shape = StaticTuple[Int32, 3](4, 4, 1),
+                        cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
                         cta_group=2,
                         test_lambda_fn=True,
                         register_based_epilogue=register_based_epilogue,
@@ -352,7 +322,7 @@ def main():
                         DType.bfloat16,
                         block_tile_shape,
                         umma_shape,
-                        cluster_shape = StaticTuple[Int32, 3](4, 4, 1),
+                        cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
                         cta_group=2,
                         test_lambda_fn=True,
                         register_based_epilogue=register_based_epilogue,
@@ -378,7 +348,7 @@ def main():
                         DType.bfloat16,
                         block_tile_shape,
                         umma_shape,
-                        cluster_shape = StaticTuple[Int32, 3](4, 4, 1),
+                        cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
                         cta_group=1,
                         test_lambda_fn=True,
                         register_based_epilogue=register_based_epilogue,
@@ -398,7 +368,7 @@ def main():
                         DType.bfloat16,
                         block_tile_shape,
                         umma_shape,
-                        cluster_shape = StaticTuple[Int32, 3](4, 2, 1),
+                        cluster_shape=StaticTuple[Int32, 3](4, 2, 1),
                         cta_group=1,
                         test_lambda_fn=True,
                         register_based_epilogue=register_based_epilogue,

@@ -11,20 +11,20 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import iota
-from sys import align_of, size_of
+from std.math import iota
+from std.sys import align_of, size_of
 
-from algorithm import parallelize_over_rows
-from bit import log2_floor
+from std.algorithm import parallelize_over_rows
+from std.bit import log2_floor
 from compiler import register
-from gpu import WARP_SIZE, barrier, block_dim, block_idx, thread_idx
-from gpu.primitives import warp
-from gpu.memory import AddressSpace, external_memory
-from memory import Span
-from runtime.asyncrt import DeviceContextPtr
+from std.gpu import WARP_SIZE, barrier, block_dim, block_idx, thread_idx
+from std.gpu.primitives import warp
+from std.gpu.memory import AddressSpace, external_memory
+from std.memory import Span
+from std.runtime.asyncrt import DeviceContextPtr
 from tensor import InputTensor, OutputTensor
 
-from utils.numerics import min_or_neg_inf
+from std.utils.numerics import min_or_neg_inf
 
 
 @fieldwise_init
@@ -58,9 +58,9 @@ struct TopK:
         K: Int,
         target: StaticString,
     ](
-        out_vals: OutputTensor[dtype=dtype, rank=rank],
-        out_idxs: OutputTensor[dtype = DType.int32, rank=rank],
-        in_vals: InputTensor[dtype=dtype, rank=rank],
+        out_vals: OutputTensor[dtype=dtype, rank=rank, ...],
+        out_idxs: OutputTensor[dtype=DType.int32, rank=rank, ...],
+        in_vals: InputTensor[dtype=dtype, rank=rank, ...],
         ctx: DeviceContextPtr,
     ) raises:
         comptime assert rank == 2, "rank must be 2"
@@ -90,8 +90,8 @@ struct TopK:
             # Get a pointer to shared memory for the indices and values
             var top_k_sram = external_memory[
                 TopKElement[dtype],
-                address_space = AddressSpace.SHARED,
-                alignment = align_of[TopKElement[dtype]](),
+                address_space=AddressSpace.SHARED,
+                alignment=align_of[TopKElement[dtype]](),
             ]()
 
             # Threads put their corresponding index and value into shared memory

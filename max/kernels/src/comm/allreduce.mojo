@@ -91,34 +91,35 @@ For the naive allreduce (no P2P) per-device flow and staging details, see the
 `_allreduce_naive_single` docstring in this file.
 """
 
-from collections import InlineArray
-from math import ceildiv
-from sys import align_of, simd_width_of, size_of
+from std.collections import InlineArray
+from std.math import ceildiv
+from std.sys import align_of, simd_width_of, size_of
 
 from buffer import NDBuffer
-from gpu import (
+from layout import Coord, Idx, TileTensor, row_major
+from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     barrier,
     block_dim,
     global_idx,
     grid_dim,
 )
-from gpu.primitives.grid_controls import (
+from std.gpu.primitives.grid_controls import (
     PDLLevel,
     launch_dependent_grids,
     pdl_launch_attributes,
     wait_on_dependent_grids,
 )
-from gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
+from std.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
 
-from utils import IndexList, StaticTuple
-from utils.numerics import get_accum_type
+from std.utils import IndexList, StaticTuple
+from std.utils.numerics import get_accum_type
 
-from collections.optional import Optional
+from std.collections.optional import Optional
 
 from .reducescatter import (
     ReduceScatterConfig,
-    _reduce_scatter_impl,
+    _reduce_scatter_flat_impl,
     _load_reduce,
     _target_address_space,
 )
@@ -127,7 +128,7 @@ from .sync import (
     MAX_NUM_BLOCKS_UPPER_BOUND,
     Signal,
     _multi_gpu_barrier,
-    can_enable_p2p,
+    is_p2p_enabled,
 )
 from .device_query import get_sm_version, _dispatch_max_num_blocks
 
@@ -179,7 +180,7 @@ fn _naive_reduce_kernel_with_lambda[
     """Naive reduction kernel with elementwise lambda support."""
     var tid = global_idx.x
     var stride = grid_dim.x * block_dim.x
-    comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
 
     for idx in range(tid, num_elements // simd_width, stride):
         var elem_idx = idx * simd_width
@@ -253,7 +254,7 @@ fn _allreduce_naive_single[
     - Each op instance only writes to its own temporary buffer and its own
       output buffer (`out_r`).
     """
-    comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
     comptime BLOCK_SIZE = 256
     var num_elements = list_of_in_bufs[0].num_elements()
 
@@ -311,7 +312,7 @@ fn _allreduce_naive_single[
         dtype,
         rank,
         width=simd_width,
-        alignment = align_of[SIMD[dtype, simd_width]](),
+        alignment=align_of[SIMD[dtype, simd_width]](),
         output_lambda=output_lambda,
     ]
     ctx.enqueue_function[
@@ -422,26 +423,29 @@ fn _allreduce_2stage_kernel[
 
     # TODO(KERN-2273): Remove this once temporary buffers removed
     # Output lambda for reduce-scatter: write to scratch buffer
-    var tmp_buff = NDBuffer[dtype, 1, MutAnyOrigin](
-        tmp_out,
-        rs_config.rank_part(my_rank),
+    var tmp_buff = TileTensor[mut=True, dtype](
+        tmp_out, row_major(Idx(rs_config.rank_part(my_rank)))
     )
 
     @always_inline
     @parameter
-    @__copy_capture(tmp_out)
+    @__copy_capture(tmp_buff)
     fn rs_output_lambda[
         _dtype: DType,
-        _rank: Int,
         _width: Int,
         *,
         _alignment: Int,
-    ](coords: IndexList[_rank], val: SIMD[_dtype, _width]) -> None:
-        tmp_out.address_space_cast[_target_address_space]().store[
-            alignment=_alignment
-        ](coords[0], val.cast[dtype]())
+    ](coords: Coord, val: SIMD[_dtype, _width]) -> None where (
+        coords.flat_rank == tmp_buff.flat_rank
+    ):
+        tmp_buff.address_space_cast[_target_address_space]().store[
+            width=_width, alignment=_alignment
+        ](
+            coords,
+            val.cast[dtype](),
+        )
 
-    _reduce_scatter_impl[
+    _reduce_scatter_flat_impl[
         ngpus, output_lambda=rs_output_lambda, use_multimem=use_multimem
     ](ptrs, tmp_buff, my_rank, rs_config)
 
@@ -459,10 +463,8 @@ fn _allreduce_2stage_kernel[
     comptime alignment = rs_config.alignment
 
     # Ragged handling:
-    # When there are ragged elements (rs_config.remainder > 0), GPU-0 has the
-    # largest partition and GPU-(ngpus - 1) has the smallest partition
-    # (at most 1 SIMD vector smaller). When remainder == 0, all GPUs have
-    # equal partition sizes.
+    # GPU-0 is guaranteed to have largest partition
+    # GPU-ngpus-1 has smallest partition (only 1 simd vector smaller)
 
     # Main loop - only process unragged elements (no bounds check)
     for idx in range(
@@ -484,7 +486,7 @@ fn _allreduce_2stage_kernel[
     # Ragged tail - max 1 simd vector per gpu, spread work between threads
     if global_tid < ngpus:
         var peer_rank = (my_rank + global_tid) % ngpus
-        if peer_rank < rs_config.remainder:
+        if peer_rank < rs_config.axis_remainder:
             var idx = (
                 rs_config.rank_part(0) - simd_width
             )  # last ragged simd_vector
@@ -540,7 +542,7 @@ fn _allreduce_1stage_kernel[
     Synchronizes using _multi_gpu_barrier before and after reduction.
     """
     comptime accum_type = get_accum_type[dtype]()
-    comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
     comptime alignment = align_of[SIMD[dtype, simd_width]]()
 
     var global_tid = global_idx.x
@@ -618,7 +620,7 @@ fn _allreduce_p2p[
     Launches P2P reduction kernel on the current GPU to perform direct reduction.
     """
     comptime num_buffers = 1 if use_multimem else ngpus
-    comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
     var num_elements = list_of_in_bufs[0].num_elements()
 
     # Do nothing if there are no elements to reduce.
@@ -769,6 +771,8 @@ fn allreduce[
       - The naive path is automatically selected if P2P cannot be enabled.
       - The `use_multimem` parameter requires P2P access between GPUs to be enabled.
     """
+    comptime assert ngpus >= 2, "allreduce requires at least 2 GPUs"
+
     # Return early, if the input buffer is empty
     var num_elements = input_buffers[0].num_elements()
     if num_elements == 0:
@@ -806,7 +810,7 @@ fn allreduce[
         )
 
     # Check P2P availability.
-    if not can_enable_p2p():
+    if not is_p2p_enabled():
         comptime if use_multimem:
             raise Error(
                 "Allreduce with multimem requires P2P access between GPUs"

@@ -11,8 +11,8 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from ffi import c_int, external_call
-from sys.info import CompilationTarget, platform_map
+from std.ffi import c_int, external_call
+from std.sys.info import CompilationTarget, platform_map
 
 
 fn _errno_ptr(out result: UnsafePointer[c_int, MutExternalOrigin]):
@@ -21,9 +21,7 @@ fn _errno_ptr(out result: UnsafePointer[c_int, MutExternalOrigin]):
     elif CompilationTarget.is_macos():
         result = external_call["__error", type_of(result)]()
     else:
-        result = CompilationTarget.unsupported_target_error[
-            type_of(result), operation="get_errno"
-        ]()
+        CompilationTarget.unsupported_target_error[operation="get_errno"]()
 
 
 fn get_errno() -> ErrNo:
@@ -62,7 +60,7 @@ comptime pm = platform_map[T=Int, ...]
 
 
 @fieldwise_init
-struct ErrNo(Equatable, Stringable, TrivialRegisterPassable, Writable):
+struct ErrNo(Equatable, TrivialRegisterPassable, Writable):
     """Represents a error number from libc.
 
     This struct acts as an enum providing a wrapper around C library error codes,
@@ -70,8 +68,8 @@ struct ErrNo(Equatable, Stringable, TrivialRegisterPassable, Writable):
 
     Example:
         ```mojo
-        import os
-        from ffi import get_errno, set_errno, ErrNo
+        import std.os
+        from std.ffi import get_errno, set_errno, ErrNo
 
         try:
             _ = os.path.realpath("non-existent-file")
@@ -407,10 +405,9 @@ struct ErrNo(Equatable, Stringable, TrivialRegisterPassable, Writable):
         Args:
             value: The numeric error code.
         """
-        debug_assert(
-            0 <= value <= Int(c_int.MAX),
-            "constructed ErrNo from an `Int` out of range of `c_int`",
-        )
+        assert (
+            0 <= value <= Int(c_int.MAX)
+        ), "constructed ErrNo from an `Int` out of range of `c_int`"
         self.value = c_int(value)
 
     fn write_to(self, mut writer: Some[Writer]):
@@ -421,15 +418,14 @@ struct ErrNo(Equatable, Stringable, TrivialRegisterPassable, Writable):
         """
 
         comptime if CompilationTarget.is_macos():
-            debug_assert(
-                self != ErrNo.SUCCESS, "macos can't stringify ErrNo.SUCCESS"
-            )
+            assert self != ErrNo.SUCCESS, "macos can't stringify ErrNo.SUCCESS"
         var ptr = external_call[
             "strerror", UnsafePointer[Byte, MutExternalOrigin]
         ](self.value)
         var string = StringSlice(unsafe_from_utf8_ptr=ptr)
         string.write_to(writer)
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     fn __str__(self) -> String:
         """Returns the human-readable error description as a string.
 

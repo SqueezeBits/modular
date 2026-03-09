@@ -11,13 +11,13 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import OptionalReg
-from sys import align_of
+from std.collections import OptionalReg
+from std.sys import align_of
 
 from buffer.dimlist import DimList
 from layout import IntTuple, Layout
 
-from utils import IndexList
+from std.utils import IndexList
 
 
 fn __mogg_intrinsic_attr(intrin: StaticString):
@@ -55,7 +55,7 @@ fn _row_major_strides[rank: Int](shape: DimList) -> DimList:
 struct StaticTensorSpec[
     dtype: DType,
     rank: Int,
-](TrivialRegisterPassable):
+](ImplicitlyCopyable):
     # Represents the DimList type (not accessible from KGEN tests).
     comptime in_lambda_t = fn[simd_width: Int, element_alignment: Int = 1](
         IndexList[Self.rank]
@@ -106,12 +106,9 @@ struct StaticTensorSpec[
             "initializing `StaticTensorSpec` with just a shape only"
             " supports rank 1 to 3"
         )
-        debug_assert(
-            len(shape) == Self.rank,
-            (
-                "initialized `StaticTensorSpec` with a shape length not equal"
-                "to the `rank` parameter"
-            ),
+        assert len(shape) == Self.rank, (
+            "initialized `StaticTensorSpec` with a shape length not equal"
+            "to the `rank` parameter"
         )
         self.shape = shape
         self.strides = _row_major_strides[Self.rank](shape)
@@ -141,11 +138,9 @@ struct StaticTensorSpec[
 
     @always_inline
     fn with_layout[
-        new_rank: Int
-    ](self, new_shape: DimList, new_strides: DimList) -> StaticTensorSpec[
-        Self.dtype, new_rank
-    ]:
-        return StaticTensorSpec[Self.dtype, new_rank](
+        new_rank: Int, new_shape: DimList, new_strides: DimList
+    ](self) -> StaticTensorSpec[Self.dtype, new_rank]:
+        return {
             new_shape,
             new_strides,
             self.alignment,
@@ -154,15 +149,13 @@ struct StaticTensorSpec[
             None,
             None,
             None,
-        )
+        }
 
     @always_inline
     fn with_layout_and_alignment[
-        new_rank: Int
-    ](
-        self, new_shape: DimList, new_strides: DimList, new_alignment: Int
-    ) -> StaticTensorSpec[Self.dtype, new_rank]:
-        return StaticTensorSpec[Self.dtype, new_rank](
+        new_rank: Int, new_shape: DimList, new_strides: DimList
+    ](self, new_alignment: Int) -> StaticTensorSpec[Self.dtype, new_rank]:
+        return {
             new_shape,
             new_strides,
             new_alignment,
@@ -171,7 +164,7 @@ struct StaticTensorSpec[
             None,
             None,
             None,
-        )
+        }
 
     @always_inline
     fn to_layout(self) -> Layout:

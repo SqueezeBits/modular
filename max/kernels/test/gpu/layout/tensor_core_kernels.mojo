@@ -11,18 +11,18 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from io.io import _printf
+from std.io.io import _printf
 
-from gpu import WARP_SIZE, barrier
-from gpu.host import DeviceContext
-from gpu import thread_idx
+from std.gpu import WARP_SIZE, barrier
+from std.gpu.host import DeviceContext
+from std.gpu import thread_idx
 from layout import Layout, LayoutTensor
 from layout._fillers import arange
 from layout._utils import ManagedLayoutTensor, load_to_simd
 from layout.layout_tensor import copy_dram_to_sram
 from layout.tensor_core import TensorCore
 
-from utils.index import IndexList
+from std.utils.index import IndexList
 
 
 fn mma_load_and_multiply[
@@ -154,7 +154,7 @@ def test_load_and_mma_and_multiply_operands[
     dtype: DType,
     shape: IndexList[3],
     transpose_b: Bool = False,
-](ctx: DeviceContext):
+](ctx: DeviceContext) raises:
     comptime M = shape[0]
     comptime N = shape[1]
     comptime K = shape[2]
@@ -180,13 +180,10 @@ def test_load_and_mma_and_multiply_operands[
     )
     ctx.synchronize()
 
-    _ = lhs^
-    _ = rhs^
-
 
 def test_write_res_operand[
     dst_dtype: DType, dtype: DType, shape: IndexList[3]
-](ctx: DeviceContext):
+](ctx: DeviceContext) raises:
     comptime M = shape[0]
     comptime N = shape[1]
     comptime K = shape[2]
@@ -202,8 +199,6 @@ def test_write_res_operand[
     ctx.synchronize()
 
     print(dst.tensor())
-
-    _ = dst^
 
 
 fn mma_load_and_print_operands_kernel_ldmatrix[
@@ -222,14 +217,14 @@ fn mma_load_and_print_operands_kernel_ldmatrix[
         dtype,
         lhs.layout,
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
     ].stack_allocation()
 
     var b_smem = LayoutTensor[
         dtype,
         rhs.layout,
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
     ].stack_allocation()
 
     comptime thread_layout = Layout.row_major(WARP_SIZE // 4, 4)
@@ -244,7 +239,7 @@ fn mma_load_and_print_operands_kernel_ldmatrix[
             dtype,
             Layout.row_major(1, a_simd_width),
             MutAnyOrigin,
-            address_space = AddressSpace.LOCAL,
+            address_space=AddressSpace.LOCAL,
         ]
         .stack_allocation()
         .vectorize[1, a_simd_width]()
@@ -255,7 +250,7 @@ fn mma_load_and_print_operands_kernel_ldmatrix[
             dtype,
             Layout.row_major(1, b_simd_width),
             MutAnyOrigin,
-            address_space = AddressSpace.LOCAL,
+            address_space=AddressSpace.LOCAL,
         ]
         .stack_allocation()
         .vectorize[1, b_simd_width]()
@@ -322,7 +317,7 @@ def test_load_operands_ldmatrix[
     dtype: DType,
     shape: IndexList[3],
     transpose_b: Bool = False,
-](ctx: DeviceContext):
+](ctx: DeviceContext) raises:
     comptime M = shape[0]
     comptime N = shape[1]
     comptime K = shape[2]
@@ -344,5 +339,3 @@ def test_load_operands_ldmatrix[
         block_dim=(WARP_SIZE),
     )
     ctx.synchronize()
-    _ = lhs^
-    _ = rhs^

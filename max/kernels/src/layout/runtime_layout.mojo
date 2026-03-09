@@ -23,7 +23,7 @@ from layout.runtime_layout import RuntimeLayout, make_layout
 """
 
 
-from utils import IndexList
+from std.utils import IndexList
 
 from . import IntTuple, Layout
 from .int_tuple import UNKNOWN_VALUE, flatten
@@ -47,7 +47,7 @@ struct RuntimeLayout[
     *,
     element_type: DType = DType.int64,
     linear_idx_type: DType = DType.int64,
-](Defaultable, Stringable, TrivialRegisterPassable, Writable):
+](Defaultable, TrivialRegisterPassable, Writable):
     """A runtime-configurable layout that uses `RuntimeTuple` for storage.
 
     This struct provides a layout implementation that can be modified at runtime,
@@ -65,7 +65,7 @@ struct RuntimeLayout[
     """
 
     comptime ShapeType = RuntimeTuple[
-        Self.layout.shape, element_type = Self.element_type
+        Self.layout.shape, element_type=Self.element_type
     ]
     """Type alias for the runtime shape tuple."""
     var shape: Self.ShapeType
@@ -76,7 +76,7 @@ struct RuntimeLayout[
     """
 
     comptime StrideType = RuntimeTuple[
-        Self.layout.stride, element_type = Self.linear_idx_type
+        Self.layout.stride, element_type=Self.linear_idx_type
     ]
     """Type alias for the runtime stride tuple."""
     var stride: Self.StrideType
@@ -110,11 +110,9 @@ struct RuntimeLayout[
     @always_inline
     fn __init__(
         out self,
-        shape: RuntimeTuple[
-            Self.layout.shape, element_type = Self.element_type
-        ],
+        shape: RuntimeTuple[Self.layout.shape, element_type=Self.element_type],
         stride: RuntimeTuple[
-            Self.layout.stride, element_type = Self.linear_idx_type
+            Self.layout.stride, element_type=Self.linear_idx_type
         ],
     ):
         """Initialize a `RuntimeLayout` with specified shape and stride.
@@ -155,7 +153,7 @@ struct RuntimeLayout[
         Returns:
             The corresponding flat linear index in the layout.
         """
-        return crd2idx[out_type = Self.linear_idx_type](
+        return crd2idx[out_type=Self.linear_idx_type](
             idx, self.shape, self.stride
         )
 
@@ -164,7 +162,7 @@ struct RuntimeLayout[
         t: IntTuple
     ](self, idx: RuntimeTuple[t, ...]) -> RuntimeTuple[
         idx2crd_int_tuple(t, Self.layout.shape, Self.layout.stride),
-        element_type = Self.element_type,
+        element_type=Self.element_type,
     ]:
         """Converts a linear index to logical coordinates.
 
@@ -233,6 +231,7 @@ struct RuntimeLayout[
         }
 
     @no_inline
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     fn __str__(self) -> String:
         """Convert the layout to a string representation.
 
@@ -248,8 +247,8 @@ struct RuntimeLayout[
         shape: IndexList[rank, ...],
         out result: RuntimeLayout[
             Self.layout,
-            element_type = Self.element_type,
-            linear_idx_type = Self.linear_idx_type,
+            element_type=Self.element_type,
+            linear_idx_type=Self.linear_idx_type,
         ],
     ):
         """Create a row-major layout from the given shape.
@@ -267,7 +266,7 @@ struct RuntimeLayout[
             A `RuntimeLayout` with row-major stride ordering.
         """
 
-        var stride = IndexList[rank, element_type = Self.linear_idx_type]()
+        var stride = IndexList[rank, element_type=Self.linear_idx_type]()
         var c_stride = 1
         stride[rank - 1] = c_stride
 
@@ -284,8 +283,8 @@ struct RuntimeLayout[
         shape: IndexList[rank, ...],
         out result: RuntimeLayout[
             Self.layout,
-            element_type = Self.element_type,
-            linear_idx_type = Self.linear_idx_type,
+            element_type=Self.element_type,
+            linear_idx_type=Self.linear_idx_type,
         ],
     ):
         """Create a column-major layout from the given shape.
@@ -303,7 +302,7 @@ struct RuntimeLayout[
             A `RuntimeLayout` with column-major stride ordering.
         """
 
-        var stride = IndexList[rank, element_type = Self.linear_idx_type]()
+        var stride = IndexList[rank, element_type=Self.linear_idx_type]()
         var c_stride = 1
         stride[0] = c_stride
 
@@ -333,8 +332,8 @@ struct RuntimeLayout[
         self,
         out result: RuntimeLayout[
             Self.layout[i],
-            element_type = Self.element_type,
-            linear_idx_type = Self.linear_idx_type,
+            element_type=Self.element_type,
+            linear_idx_type=Self.linear_idx_type,
         ],
     ):
         """Extract a nested sublayout at the specified index.
@@ -348,12 +347,12 @@ struct RuntimeLayout[
         return {
             rebind[
                 RuntimeTuple[
-                    Self.layout[i].shape, element_type = Self.element_type
+                    Self.layout[i].shape, element_type=Self.element_type
                 ]
             ](self.shape[i]),
             rebind[
                 RuntimeTuple[
-                    Self.layout[i].stride, element_type = Self.linear_idx_type
+                    Self.layout[i].stride, element_type=Self.linear_idx_type
                 ]
             ](self.stride[i]),
         }
@@ -386,8 +385,8 @@ fn coalesce[
     layout: RuntimeLayout[l, ...],
     out result: RuntimeLayout[
         coalesce_layout(l, keep_rank),
-        element_type = layout.element_type,
-        linear_idx_type = layout.linear_idx_type,
+        element_type=layout.element_type,
+        linear_idx_type=layout.linear_idx_type,
     ],
 ):
     """Coalesce adjacent dimensions in a runtime layout when possible.
@@ -409,11 +408,11 @@ fn coalesce[
     comptime assert not keep_rank, "Unsupported coalesce mode"
 
     var res_shape = RuntimeTuple[
-        coalesce_layout(l, keep_rank).shape, element_type = layout.element_type
+        coalesce_layout(l, keep_rank).shape, element_type=layout.element_type
     ]()
     var res_stride = RuntimeTuple[
         coalesce_layout(l, keep_rank).stride,
-        element_type = layout.linear_idx_type,
+        element_type=layout.linear_idx_type,
     ]()
 
     res_shape.value[0] = 1
@@ -460,7 +459,7 @@ fn make_layout[
     b: RuntimeLayout[l2, ...],
     out result: RuntimeLayout[
         make_layout_static(l1, l2),
-        element_type = b.element_type,
+        element_type=b.element_type,
         linear_idx_type=linear_idx_type,
     ],
 ):
@@ -485,7 +484,7 @@ fn make_layout[
 
     var res_shape = RuntimeTuple[
         make_layout_static(l1, l2).shape,
-        element_type = b.element_type,
+        element_type=b.element_type,
     ]()
     var res_stride = RuntimeTuple[
         make_layout_static(l1, l2).stride,

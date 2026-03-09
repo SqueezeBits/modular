@@ -11,11 +11,11 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import ceil
+from std.math import ceil
 
-from layout._tile_tensor import TileTensor
+from layout import TileTensor
 
-from utils.numerics import min_or_neg_inf
+from std.utils.numerics import min_or_neg_inf
 
 
 struct Weighted2DPoint[dtype: DType](TrivialRegisterPassable):
@@ -159,7 +159,7 @@ fn roi_align_nhwc[
     comptime assert input.element_size == 1
     comptime assert output.element_size == 1
 
-    debug_assert(mode == "AVG" or mode == "MAX", "mode must be AVG or MAX")
+    assert mode == "AVG" or mode == "MAX", "mode must be AVG or MAX"
 
     var spatial_scale = in_spatial_scale.cast[DType.float32]()
     var sampling_ratio = in_sampling_ratio.cast[DType.float32]()

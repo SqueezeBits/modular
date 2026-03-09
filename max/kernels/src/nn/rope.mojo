@@ -11,20 +11,27 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import OptionalReg
-from math import gcd
-from sys.info import _current_target, simd_width_of
+from std.collections import OptionalReg
+from std.math import gcd
+from std.sys.info import _current_target, simd_width_of
 
-from algorithm.functional import elementwise
-from complex import ComplexSIMD
-from gpu.host import DeviceContext, get_gpu_target
-from gpu.host.info import is_cpu
-from layout._coord import Coord, CoordLike, ComptimeInt, RuntimeInt, Idx, coord
-from layout._layout import Layout, _RowMajor
-from layout._tile_tensor import TileTensor
+from std.algorithm.functional import elementwise
+from std.complex import ComplexSIMD
+from std.gpu.host import DeviceContext, get_gpu_target
+from std.gpu.host.info import is_cpu
+from layout import (
+    ComptimeInt,
+    Coord,
+    CoordLike,
+    Idx,
+    RuntimeInt,
+    TileTensor,
+    coord,
+)
+from layout.tile_layout import TensorLayout, RowMajorLayout
 from nn._ragged_utils import get_batch_from_row_offsets
 
-from utils import IndexList
+from std.utils import IndexList
 
 
 @always_inline
@@ -87,15 +94,15 @@ fn apply_rope[
     comptime if interleaved:
         var coord = Coord(idx)
         comptime assert coord.flat_rank == x.flat_rank
-        val = x.load[width=width](coord)
+        val = x.load[width=width, alignment=1](coord)
     else:
         var re_coord = Coord(pos_re)
         comptime assert re_coord.flat_rank == x.flat_rank
         var im_coord = Coord(pos_im)
         comptime assert im_coord.flat_rank == x.flat_rank
         val = rebind[SIMD[dtype, width]](
-            x.load[width=width_2](re_coord).interleave(
-                x.load[width=width_2](im_coord)
+            x.load[width=width_2, alignment=1](re_coord).interleave(
+                x.load[width=width_2, alignment=1](im_coord)
             )
         )
 
@@ -123,6 +130,9 @@ fn rope_ragged[
         CoordLike
     ],
     mrope_section: Optional[Coord[*mrope_types]] = None,
+    PositionIdsLayoutType: TensorLayout = RowMajorLayout[
+        RuntimeInt[DType.int64], RuntimeInt[DType.int64]
+    ],
 ](
     x: TileTensor[dtype, ...],
     input_row_offsets: TileTensor[DType.uint32, ...],
@@ -130,32 +140,18 @@ fn rope_ragged[
     freqs_cis: TileTensor[freq_dtype, ...],
     context: Optional[DeviceContext],
     position_ids: OptionalReg[
-        TileTensor[
-            DType.uint32,
-            Layout[
-                Variadic.types[
-                    RuntimeInt[DType.int64], RuntimeInt[DType.int64]
-                ],
-                _RowMajor[
-                    *Variadic.types[
-                        RuntimeInt[DType.int64], RuntimeInt[DType.int64]
-                    ]
-                ],
-            ],
-            MutAnyOrigin,
-        ]
+        TileTensor[DType.uint32, PositionIdsLayoutType, ImmutAnyOrigin]
     ] = None,
 ) raises where (
     input_row_offsets.flat_rank == 1
     and start_pos.flat_rank == 1
-    and position_ids.T.flat_rank == 2
     and freqs_cis.flat_rank == 2
 ):
-    comptime assert (
-        freqs_cis.all_dims_known
-    ), "freqs_cis shape must be statically shaped"
-    comptime head_size = x.static_shape[2]
-    comptime rope_dim = freqs_cis.static_shape[1]
+    comptime assert freqs_cis.LayoutType._shape_types[
+        1
+    ].is_static_value, "Need static rope_dim for freqs_cis"
+    comptime head_size = Int(x.static_shape[2])
+    comptime rope_dim = Int(freqs_cis.static_shape[1])
     comptime unroped_dim = head_size - rope_dim
     comptime has_nope = unroped_dim > 0
 
@@ -168,14 +164,11 @@ fn rope_ragged[
         comptime assert rank == 3, "Invalid rank passed to rope kernel"
 
         comptime if width == 1:
-            debug_assert(
-                False,
-                (
-                    "RoPE kernel called with simd width = 1, We should never be"
-                    " here. This is indicative of an uneven last dimension of"
-                    " the rope tensor. Ensure the model's head_size is"
-                    " divisible by the simd width of your target hardware."
-                ),
+            assert False, (
+                "RoPE kernel called with simd width = 1, We should never be"
+                " here. This is indicative of an uneven last dimension of"
+                " the rope tensor. Ensure the model's head_size is"
+                " divisible by the simd width of your target hardware."
             )
             return
         else:
@@ -196,6 +189,8 @@ fn rope_ragged[
 
             var position_ids_idx = Int(post_seq_idx)
             if position_ids:
+                comptime PIdTensor = type_of(position_ids.value())
+                comptime assert PIdTensor.flat_rank == 2
                 comptime if mrope_section:
                     var section_idx = 0
 
@@ -222,13 +217,13 @@ fn rope_ragged[
                 if is_unroped_region:
                     f_c_temp = get_identity_rope_coeff[width, freq_dtype]()
                 else:
-                    f_c_temp = freqs_cis.load[width=width](
+                    f_c_temp = freqs_cis.load[width=width, alignment=1](
                         coord[freqs_cis.linear_idx_type](
                             (position_ids_idx, head_dim_idx - unroped_dim)
                         )
                     )
             else:
-                f_c_temp = freqs_cis.load[width=width](
+                f_c_temp = freqs_cis.load[width=width, alignment=1](
                     coord[freqs_cis.linear_idx_type](
                         (position_ids_idx, head_dim_idx)
                     )

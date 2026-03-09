@@ -25,10 +25,10 @@ directly to hardware instructions and require understanding of the
 underlying GPU architecture.
 """
 
-from collections.string.string_slice import get_static_string
-from os.atomic import Consistency
-from ffi import external_call
-from sys import (
+from std.collections.string.string_slice import get_static_string
+from std.os.atomic import Consistency
+from std.ffi import external_call
+from std.sys import (
     is_amd_gpu,
     is_gpu,
     is_nvidia_gpu,
@@ -36,8 +36,8 @@ from sys import (
     size_of,
     _RegisterPackType,
 )
-from sys._assembly import inlined_assembly
-from sys.info import (
+from std.sys._assembly import inlined_assembly
+from std.sys.info import (
     CompilationTarget,
     _is_sm_9x_or_newer,
     align_of,
@@ -49,9 +49,9 @@ from sys.info import (
     _is_amd_rdna3,
     _is_amd_rdna4,
 )
-from sys.intrinsics import llvm_intrinsic, readfirstlane
+from std.sys.intrinsics import llvm_intrinsic, readfirstlane
 
-from memory.unsafe import bitcast
+from std.memory.unsafe import bitcast
 
 from .memory.memory import CacheOperation, _int_to_str
 
@@ -67,7 +67,7 @@ fn ldg[
     width: Int = 1,
     *,
     alignment: Int = align_of[SIMD[dtype, width]](),
-](x: UnsafePointer[mut=False, Scalar[dtype]]) -> SIMD[dtype, width]:
+](x: UnsafePointer[mut=False, Scalar[dtype], _]) -> SIMD[dtype, width]:
     """Load data from global memory through the non-coherent cache.
 
     This function provides a hardware-accelerated global memory load operation
@@ -207,9 +207,8 @@ fn lop[lut: Int32](a: Int32, b: Int32, c: Int32) -> Int32:
             has_side_effect=False,
         ](a, b, c, lut)
     else:
-        return CompilationTarget.unsupported_target_error[
-            Int32,
-            operation = __get_current_function_name(),
+        CompilationTarget.unsupported_target_error[
+            operation=__get_current_function_name(),
             note="lop() is only supported when targeting NVIDIA GPUs.",
         ]()
 
@@ -252,9 +251,8 @@ fn _byte_permute_inst() -> StaticString:
     elif is_amd_gpu():
         return "llvm.amdgcn.perm"
     else:
-        return CompilationTarget.unsupported_target_error[
-            StaticString,
-            operation = __get_current_function_name(),
+        CompilationTarget.unsupported_target_error[
+            operation=__get_current_function_name(),
         ]()
 
 
@@ -564,7 +562,7 @@ struct Scope(Equatable, ImplicitlyCopyable, Writable):
         Returns:
             A string representation of the memory scope.
         """
-        return String("Scope(", self, ")")
+        return t"Scope({self})"
 
     @always_inline("nodebug")
     fn mnemonic(self) -> StaticString:
@@ -641,7 +639,6 @@ fn _get_air_atomic_suffix[dtype: DType]() -> StaticString:
         return "i32"
     else:
         comptime assert False, "unsupported dtype for air atomic intrinsics"
-        return ""
 
 
 fn _get_nvtx_register_constraint[dtype: DType]() -> StaticString:
@@ -753,8 +750,8 @@ fn store_release[
         ](value, ptr)
     elif is_amd_gpu():
         __mlir_op.`pop.store`[
-            alignment = alignment._mlir_value,
-            ordering = Consistency.RELEASE.__mlir_attr(),
+            alignment=alignment._mlir_value,
+            ordering=Consistency.RELEASE.__mlir_attr(),
         ](value, ptr.address)
     elif is_apple_gpu():
         comptime mem_flags = _AirMemFlags.ThreadGroup if ptr.address_space == AddressSpace.SHARED else _AirMemFlags.Device
@@ -777,8 +774,8 @@ fn store_release[
             True,
         )
     else:
-        return CompilationTarget.unsupported_target_error[
-            operation = __get_current_function_name()
+        CompilationTarget.unsupported_target_error[
+            operation=__get_current_function_name()
         ]()
 
 
@@ -824,12 +821,12 @@ fn store_relaxed[
         ](value, ptr)
     elif is_amd_gpu():
         __mlir_op.`pop.store`[
-            alignment = alignment._mlir_value,
-            ordering = Consistency.MONOTONIC.__mlir_attr(),
+            alignment=alignment._mlir_value,
+            ordering=Consistency.MONOTONIC.__mlir_attr(),
         ](value, ptr.address)
     else:
-        return CompilationTarget.unsupported_target_error[
-            operation = __get_current_function_name()
+        CompilationTarget.unsupported_target_error[
+            operation=__get_current_function_name()
         ]()
 
 
@@ -885,8 +882,8 @@ fn load_acquire[
         ](ptr.address_space_cast[AddressSpace.GENERIC]())
     elif is_amd_gpu():
         return __mlir_op.`pop.load`[
-            alignment = alignment._mlir_value,
-            ordering = Consistency.ACQUIRE.__mlir_attr(),
+            alignment=alignment._mlir_value,
+            ordering=Consistency.ACQUIRE.__mlir_attr(),
         ](ptr.address)
     elif is_apple_gpu():
         comptime addr_space = AddressSpace.GLOBAL if ptr.address_space == AddressSpace.GENERIC else ptr.address_space
@@ -909,9 +906,8 @@ fn load_acquire[
         )
         return value
     else:
-        return CompilationTarget.unsupported_target_error[
-            Scalar[dtype],
-            operation = __get_current_function_name(),
+        CompilationTarget.unsupported_target_error[
+            operation=__get_current_function_name(),
         ]()
 
 
@@ -959,13 +955,12 @@ fn load_relaxed[
         ](ptr.address_space_cast[AddressSpace.GENERIC]())
     elif is_amd_gpu():
         return __mlir_op.`pop.load`[
-            alignment = alignment._mlir_value,
-            ordering = Consistency.MONOTONIC.__mlir_attr(),
+            alignment=alignment._mlir_value,
+            ordering=Consistency.MONOTONIC.__mlir_attr(),
         ](ptr.address)
     else:
-        return CompilationTarget.unsupported_target_error[
-            Scalar[dtype],
-            operation = __get_current_function_name(),
+        CompilationTarget.unsupported_target_error[
+            operation=__get_current_function_name(),
         ]()
 
 
@@ -1182,7 +1177,7 @@ struct AMDBufferResource(TrivialRegisterPassable):
         self,
         vector_offset: Int32,
         shared_ptr: UnsafePointer[
-            mut=True, Scalar[dtype], address_space = AddressSpace.SHARED
+            mut=True, Scalar[dtype], _, address_space=AddressSpace.SHARED
         ],
         *,
         scalar_offset: Int32 = 0,
@@ -1345,7 +1340,7 @@ fn ds_read_tr16_b64[
     //,
 ](
     shared_ptr: UnsafePointer[
-        mut=False, Scalar[dtype], address_space = AddressSpace.SHARED
+        mut=False, Scalar[dtype], _, address_space=AddressSpace.SHARED
     ]
 ) -> SIMD[dtype, 4]:
     """Reads a 64-bit LDS transpose block using TR16 layout and returns SIMD[dtype, 4] of 16-bit types.

@@ -8,7 +8,7 @@ is_tutorial: true
 ---
 
 import Requirements from '@site/src/components/Requirements';
-import { requirementsWithGPU } from '@site/docs/max/requirements';
+import { requirementsWithGPU } from '../../requirements';
 import MDXListing from '@site/src/components/Listing/MDXListing';
 
 Mojo is our not-so-secret weapon to achieve architecture-independent
@@ -112,7 +112,7 @@ struct AddOne:
         target: StaticString,
     ](
         output: OutputTensor,
-        x: InputTensor[dtype = output.dtype, rank = output.rank],
+        x: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContextPtr,
     ) raises:
         # See below for the rest
@@ -159,7 +159,7 @@ struct AddOne:
         target: StaticString,
     ](
         output: OutputTensor,
-        x: InputTensor[dtype = output.dtype, rank = output.rank],
+        x: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter
@@ -314,13 +314,12 @@ struct VectorAddition:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[rank=1],
-        lhs: InputTensor[dtype = output.dtype, rank = output.rank],
-        rhs: InputTensor[dtype = output.dtype, rank = output.rank],
+        output: OutputTensor[rank=1, ...],
+        lhs: InputTensor[dtype=output.dtype, rank=output.rank, ...],
+        rhs: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContextPtr,
     ) raises:
-        @parameter
-        if target == "cpu":
+        comptime if target == "cpu":
             _vector_addition_cpu(output, lhs, rhs, ctx)
         elif target == "gpu":
             _vector_addition_gpu(output, lhs, rhs, ctx)
@@ -328,7 +327,9 @@ struct VectorAddition:
             raise Error("No known target:", target)
 ```
 
-Using the [parametric `if`](/mojo/manual/decorators/parameter), Mojo checks at
+Using the
+[`comptime if`](/mojo/manual/metaprogramming/comptime-evaluation/#comptime-if)
+statement, Mojo checks at
 compile time if the target device has a GPU or not. If it does, it uses the
 `_vector_addition_gpu()` function; otherwise, it uses `_vector_addition_cpu()`.
 Compile-time specialization like this is a unique and powerful feature of Mojo
@@ -338,9 +339,9 @@ The `_vector_addition_gpu()` function looks like this:
 
 ```mojo title="kernels/vector_addition.mojo"
 fn _vector_addition_gpu(
-    output: ManagedTensorSlice[mut=True],
-    lhs: ManagedTensorSlice[dtype = output.dtype, rank = output.rank],
-    rhs: ManagedTensorSlice[dtype = output.dtype, rank = output.rank],
+    output: ManagedTensorSlice[mut=True, ...],
+    lhs: ManagedTensorSlice[dtype=output.dtype, rank=output.rank, ...],
+    rhs: ManagedTensorSlice[dtype=output.dtype, rank=output.rank, ...],
     ctx: DeviceContextPtr,
 ) raises:
     alias BLOCK_SIZE = 16

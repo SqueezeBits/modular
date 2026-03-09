@@ -19,20 +19,20 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias, overload
 
 import numpy as np
 import numpy.typing as npt
 from max._core.driver import Device
 from max.driver import CPU, Accelerator
 from max.engine import InferenceSession, Model
+from max.experimental.nn import Module
+from max.experimental.tensor import Tensor
 from max.graph import Graph, TensorType
 from max.graph.weights import load_weights
 from max.interfaces import PixelGenerationContext
 from max.interfaces.tokens import TokenBuffer
-from max.nn import Module
 from max.pipelines.lib.interfaces.component_model import ComponentModel
-from max.tensor import Tensor
 from PIL import Image
 from tqdm import tqdm
 from typing_extensions import Self
@@ -53,6 +53,12 @@ class DiffusionPipeline(ABC):
     """
 
     components: dict[str, type[ComponentModel]] | None = None
+
+    default_num_inference_steps: int = 50
+    """Default number of denoising steps when the user does not specify one.
+
+    Subclasses may override this to provide a model-appropriate default.
+    """
 
     def __init__(
         self,
@@ -437,6 +443,8 @@ class PixelModelInputs:
 
 
 class CompileWrapper:
+    """Wraps a compile target with optional input type annotations."""
+
     def __init__(
         self,
         compile_target: CompileTarget,
@@ -487,7 +495,7 @@ class CompileWrapper:
         session = InferenceSession([device])
         self._compiled_model = session.load(compiled_graph)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Tensor | list[Tensor]:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Execute the compiled session with the given arguments.
 
         Args:
@@ -519,6 +527,20 @@ class CompileWrapper:
             return value
         except TypeError:
             return value
+
+
+@overload
+def max_compile(
+    compile_target: CompileTarget,
+    input_types: Iterable[TensorType] | None = ...,
+) -> CompileWrapper: ...
+
+
+@overload
+def max_compile(
+    compile_target: None = ...,
+    input_types: Iterable[TensorType] | None = ...,
+) -> CompileDecorator: ...
 
 
 def max_compile(

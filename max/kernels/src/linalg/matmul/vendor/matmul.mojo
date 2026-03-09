@@ -11,15 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from sys import align_of, simd_width_of, size_of, has_nvidia_gpu_accelerator
-from sys.info import _is_sm_100x_or_newer
+from std.sys import align_of, simd_width_of, size_of, has_nvidia_gpu_accelerator
+from std.sys.info import _is_sm_100x_or_newer
 
-from algorithm import elementwise
+from std.algorithm import elementwise
 from buffer.buffer import NDBuffer
-from gpu.host import DeviceContext, get_gpu_target
-from gpu.host.info import B200
+from std.gpu.host import DeviceContext, get_gpu_target
+from std.gpu.host.info import B200
 
-from utils import Index, IndexList
+from std.utils import Index, IndexList
 
 from ...utils import elementwise_epilogue_type
 from ...utils_gpu import MatmulConfig
@@ -61,7 +61,7 @@ fn matmul[
             and ctx.default_device_info.compute >= B200.compute
         )
         comptime simd_size = 32 // size_of[c.type]() if use_32b_simd else (
-            simd_width_of[c.type, target = get_gpu_target()]()
+            simd_width_of[c.type, target=get_gpu_target()]()
         )
 
         @parameter
@@ -73,7 +73,7 @@ fn matmul[
             var c_val = c.load[
                 width=simd_width,
                 # Load takes alignment in bytes, lambda takes number of elements
-                alignment = alignment * size_of[c_type](),
+                alignment=alignment * size_of[c_type](),
             ](c_coord)
             epilogue[c.type, simd_width, alignment=alignment](c_coord, c_val)
 

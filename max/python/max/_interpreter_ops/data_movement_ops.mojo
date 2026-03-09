@@ -16,14 +16,14 @@
 Contains broadcast, transpose, memcpy, and slice operations.
 """
 
-from os import abort
-from python import PythonObject
-from python.bindings import PythonModuleBuilder
-from sys.info import has_accelerator, simd_width_of
+from std.os import abort
+from std.python import PythonObject
+from std.python.bindings import PythonModuleBuilder
+from std.sys.info import has_accelerator, simd_width_of
 
-from algorithm.functional import elementwise, IndexList
-from memory import OpaquePointer
-from runtime.asyncrt import DeviceContextPtr
+from std.algorithm.functional import elementwise, IndexList
+from std.memory import OpaquePointer
+from std.runtime.asyncrt import DeviceContextPtr
 from tensor.managed_tensor_slice import ManagedTensorSlice
 from tensor.io_spec import Input, Output
 from compiler_internal import StaticTensorSpec
@@ -58,7 +58,7 @@ fn PyInit_data_movement_ops() -> PythonObject:
 
         return b.finalize()
     except e:
-        abort(String("failed to create data movement op bindings module: ", e))
+        abort(t"failed to create data movement op bindings module: {e}")
 
 
 # =============================================================================
@@ -359,7 +359,7 @@ fn transpose_op[
         Transpose.execute[
             target="cpu",
             _trace_name="interpreter.transpose",
-            static_permutations = DimList.create_unknown[MAX_RANK](),
+            static_permutations=DimList.create_unknown[MAX_RANK](),
             dtype=dtype,
             rank=MAX_RANK,
         ](output_tensor, input_tensor, perm_tensor, DeviceContextPtr())
@@ -370,7 +370,7 @@ fn transpose_op[
                 Transpose.execute[
                     target="gpu",
                     _trace_name="interpreter.transpose",
-                    static_permutations = DimList.create_unknown[MAX_RANK](),
+                    static_permutations=DimList.create_unknown[MAX_RANK](),
                     dtype=dtype,
                     rank=MAX_RANK,
                 ](output_tensor, input_tensor, perm_tensor, device_ctx)
@@ -750,7 +750,7 @@ fn memcpy_op[
     if not ctx:
         # TODO(MXF-108): Remove use_blocking_impl=True
         elementwise[
-            func, simd_width = simd_width_of[dtype](), use_blocking_impl=True
+            func, simd_width=simd_width_of[dtype](), use_blocking_impl=True
         ](IndexList[1](count))
     else:
         # GPU execution

@@ -15,24 +15,24 @@
 You can import these APIs from the `algorithm` package. For example:
 
 ```mojo
-from algorithm import map_reduce
+from std.algorithm import map_reduce
 ```
 """
 
-from collections import OptionalReg
-from math import align_down, ceildiv
-from sys.info import align_of, simd_width_of, size_of
+from std.collections import OptionalReg
+from std.math import align_down, ceildiv
+from std.sys.info import align_of, simd_width_of, size_of
 
-from algorithm import sync_parallelize, vectorize
-from algorithm.functional import _get_num_workers
-from bit import log2_floor
-from math.math import max as _max, min as _min
-from gpu.host import DeviceContext
-from gpu.host.info import is_cpu, is_valid_target
-from runtime.asyncrt import DeviceContextPtr
-from runtime.tracing import Trace, TraceLevel, get_safe_task_id, trace_arg
+from std.algorithm import sync_parallelize, vectorize
+from std.algorithm.functional import _get_num_workers
+from std.bit import log2_floor
+from std.math.math import max as _max, min as _min
+from std.gpu.host import DeviceContext
+from std.gpu.host.info import is_cpu, is_valid_target
+from std.runtime.asyncrt import DeviceContextPtr
+from std.runtime.tracing import Trace, TraceLevel, get_safe_task_id, trace_arg
 
-from utils.index import Index, IndexList, StaticTuple
+from std.utils.index import Index, IndexList, StaticTuple
 
 from ._gpu.reduction import reduce_launch
 
@@ -110,7 +110,7 @@ fn map_reduce[
     reduce_vec_to_scalar_fn: fn[dtype: DType, width: Int](
         SIMD[dtype, width]
     ) -> Scalar[dtype],
-](dst: Span[mut=True, Scalar[dtype]], init: Scalar[acc_type]) -> Scalar[
+](dst: Span[mut=True, Scalar[dtype], _], init: Scalar[acc_type]) -> Scalar[
     acc_type
 ]:
     """Stores the result of calling input_gen_fn in dst and simultaneously
@@ -236,7 +236,7 @@ fn reduce[
         SIMD[acc_type, width], SIMD[dtype, width]
     ) capturing[_] -> SIMD[acc_type, width],
     dtype: DType,
-](src: Span[Scalar[dtype]], init: Scalar[dtype]) raises -> Scalar[dtype]:
+](src: Span[Scalar[dtype], _], init: Scalar[dtype]) raises -> Scalar[dtype]:
     """Computes a custom reduction of buffer elements.
 
     Parameters:
@@ -299,7 +299,7 @@ fn reduce_boolean[
     ] -> Bool,
     continue_fn: fn(Bool) capturing[_] -> Bool,
     dtype: DType,
-](src: Span[Scalar[dtype]], init: Bool) -> Bool:
+](src: Span[Scalar[dtype], _], init: Bool) -> Bool:
     """Computes a bool reduction of buffer elements. The reduction will early
     exit if the `continue_fn` returns False.
 
@@ -370,7 +370,7 @@ fn _reduce_generator[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    shape: IndexList[_, element_type = DType.int64],
+    shape: IndexList[_, element_type=DType.int64],
     init: StaticTuple[Scalar[init_type], num_reductions],
     reduce_dim: Int,
     context: DeviceContextPtr = DeviceContextPtr(),
@@ -438,7 +438,7 @@ fn _reduce_generator_gpu[
     /,
     single_thread_blocking_override: Bool = False,
 ](
-    shape: IndexList[_, element_type = DType.int64],
+    shape: IndexList[_, element_type=DType.int64],
     init: StaticTuple[Scalar[init_type], num_reductions],
     reduce_dim: Int,
     ctx: DeviceContext,
@@ -494,7 +494,7 @@ fn _reduce_generator_cpu[
     /,
     single_thread_blocking_override: Bool = False,
 ](
-    shape: IndexList[_, element_type = DType.int64],
+    shape: IndexList[_, element_type=DType.int64],
     init: StaticTuple[Scalar[init_type], num_reductions],
     reduce_dim: Int,
 ):
@@ -570,7 +570,7 @@ fn _reduce_generator_wrapper[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    shape: IndexList[_, element_type = DType.int64],
+    shape: IndexList[_, element_type=DType.int64],
     init: Scalar,
     reduce_dim: Int,
     context: DeviceContextPtr = DeviceContextPtr(),
@@ -625,7 +625,7 @@ fn _reduce_generator[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    shape: IndexList[_, element_type = DType.int64],
+    shape: IndexList[_, element_type=DType.int64],
     init: Scalar,
     reduce_dim: Int,
     context: DeviceContextPtr = DeviceContextPtr(),
@@ -699,7 +699,7 @@ fn _reduce_along_inner_dimension[
     /,
     single_thread_blocking_override: Bool = False,
 ](
-    shape: IndexList[_, element_type = DType.int64],
+    shape: IndexList[_, element_type=DType.int64],
     init_value: StaticTuple[Scalar[init_type], num_reductions],
     reduce_dim: Int,
 ):
@@ -743,7 +743,7 @@ fn _reduce_along_inner_dimension[
 
         comptime for i in range(num_reductions):
             out_acc_tup[i] = in_acc_tup[i].reduce[
-                reduce_function[init_type, reduction_idx=i], out_width
+                reduce_function[init_type, reduction_idx=i, ...], out_width
             ]()
 
         return out_acc_tup
@@ -867,7 +867,7 @@ fn _reduce_along_outer_dimension[
     /,
     single_thread_blocking_override: Bool = False,
 ](
-    shape: IndexList[_, element_type = DType.int64],
+    shape: IndexList[_, element_type=DType.int64],
     init: StaticTuple[Scalar[init_type], num_reductions],
     reduce_dim: Int,
 ):
@@ -998,7 +998,7 @@ fn _simd_max_elementwise[
     return _max(x, y.cast[acc_type]())
 
 
-fn max[dtype: DType](src: Span[Scalar[dtype]]) raises -> Scalar[dtype]:
+fn max[dtype: DType](src: Span[Scalar[dtype], _]) raises -> Scalar[dtype]:
     """Computes the max element in a buffer.
 
     Parameters:
@@ -1029,7 +1029,7 @@ fn max[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    input_shape: IndexList[_, element_type = DType.int64],
+    input_shape: IndexList[_, element_type=DType.int64],
     reduce_dim: Int,
     context: DeviceContextPtr = DeviceContextPtr(),
 ) raises:
@@ -1113,7 +1113,7 @@ fn _simd_min_elementwise[
     return _min(x, y.cast[acc_type]())
 
 
-fn min[dtype: DType](src: Span[Scalar[dtype]]) raises -> Scalar[dtype]:
+fn min[dtype: DType](src: Span[Scalar[dtype], _]) raises -> Scalar[dtype]:
     """Computes the min element in a buffer.
 
     Parameters:
@@ -1144,7 +1144,7 @@ fn min[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    input_shape: IndexList[_, element_type = DType.int64],
+    input_shape: IndexList[_, element_type=DType.int64],
     reduce_dim: Int,
     context: DeviceContextPtr = DeviceContextPtr(),
 ) raises:
@@ -1228,7 +1228,7 @@ fn _simd_sum_elementwise[
     return x + y.cast[acc_type]()
 
 
-fn sum[dtype: DType](src: Span[Scalar[dtype]]) raises -> Scalar[dtype]:
+fn sum[dtype: DType](src: Span[Scalar[dtype], _]) raises -> Scalar[dtype]:
     """Computes the sum of buffer elements.
 
     Parameters:
@@ -1269,7 +1269,7 @@ fn sum[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    input_shape: IndexList[_, element_type = DType.int64],
+    input_shape: IndexList[_, element_type=DType.int64],
     reduce_dim: Int,
     context: DeviceContextPtr = DeviceContextPtr(),
 ) raises:
@@ -1419,7 +1419,7 @@ fn _simd_product_elementwise[
     return x * y.cast[acc_type]()
 
 
-fn product[dtype: DType](src: Span[Scalar[dtype]]) raises -> Scalar[dtype]:
+fn product[dtype: DType](src: Span[Scalar[dtype], _]) raises -> Scalar[dtype]:
     """Computes the product of the buffer elements.
 
     Parameters:
@@ -1450,7 +1450,7 @@ fn product[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    input_shape: IndexList[_, element_type = DType.int64],
+    input_shape: IndexList[_, element_type=DType.int64],
     reduce_dim: Int,
     context: DeviceContextPtr = DeviceContextPtr(),
 ) raises:
@@ -1511,7 +1511,7 @@ fn product[
 # ===-----------------------------------------------------------------------===#
 
 
-fn mean[dtype: DType](src: Span[Scalar[dtype]]) raises -> Scalar[dtype]:
+fn mean[dtype: DType](src: Span[Scalar[dtype], _]) raises -> Scalar[dtype]:
     """Computes the mean value of the elements in a buffer.
 
     Parameters:
@@ -1527,7 +1527,7 @@ fn mean[dtype: DType](src: Span[Scalar[dtype]]) raises -> Scalar[dtype]:
         If the operation fails.
     """
 
-    debug_assert(len(src) != 0, "input must not be empty")
+    assert len(src) != 0, "input must not be empty"
 
     @parameter
     @always_inline
@@ -1554,7 +1554,7 @@ fn mean[
     single_thread_blocking_override: Bool = False,
     target: StaticString = "cpu",
 ](
-    input_shape: IndexList[_, element_type = DType.int64],
+    input_shape: IndexList[_, element_type=DType.int64],
     reduce_dim: Int,
     output_shape: type_of(input_shape),
     context: DeviceContextPtr = DeviceContextPtr(),
@@ -1710,7 +1710,7 @@ fn mean[
 fn variance[
     dtype: DType
 ](
-    src: Span[Scalar[dtype]], mean_value: Scalar[dtype], correction: Int = 1
+    src: Span[Scalar[dtype], _], mean_value: Scalar[dtype], correction: Int = 1
 ) raises -> Scalar[dtype]:
     """Given a mean, computes the variance of elements in a buffer.
 
@@ -1735,7 +1735,7 @@ fn variance[
         If the operation fails.
     """
 
-    debug_assert(len(src) > 1, "input length must be greater than 1")
+    assert len(src) > 1, "input length must be greater than 1"
 
     @parameter
     @always_inline
@@ -1831,7 +1831,7 @@ fn variance[
 
 fn variance[
     dtype: DType
-](src: Span[Scalar[dtype]], correction: Int = 1) raises -> Scalar[dtype]:
+](src: Span[Scalar[dtype], _], correction: Int = 1) raises -> Scalar[dtype]:
     """Computes the variance value of the elements in a buffer.
 
     ```
@@ -1900,7 +1900,7 @@ fn variance[
 @always_inline
 fn _cumsum_small[
     dtype: DType
-](dst: Span[mut=True, Scalar[dtype]], src: Span[Scalar[dtype]]):
+](dst: Span[mut=True, Scalar[dtype], _], src: Span[Scalar[dtype], _]):
     dst[0] = src[0]
     for i in range(1, len(dst)):
         dst[i] = src[i] + dst[i - 1]
@@ -1908,7 +1908,7 @@ fn _cumsum_small[
 
 fn cumsum[
     dtype: DType
-](dst: Span[mut=True, Scalar[dtype]], src: Span[Scalar[dtype]]):
+](dst: Span[mut=True, Scalar[dtype], _], src: Span[Scalar[dtype], _]):
     """Computes the cumulative sum of all elements in a buffer.
        dst[i] = src[i] + src[i-1] + ... + src[0].
 
@@ -1920,8 +1920,8 @@ fn cumsum[
         src: The buffer of elements for which the cumulative sum is computed.
     """
 
-    debug_assert(len(src) != 0, "Input must not be empty")
-    debug_assert(len(dst) != 0, "Output must not be empty")
+    assert len(src) != 0, "Input must not be empty"
+    assert len(dst) != 0, "Output must not be empty"
 
     comptime simd_width = simd_width_of[dtype]()
 

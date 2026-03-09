@@ -11,15 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import align_up
-from sys import prefetch
-from sys.info import align_of
-from sys.intrinsics import PrefetchOptions
+from std.math import align_up
+from std.sys import prefetch
+from std.sys.info import align_of
+from std.sys.intrinsics import PrefetchOptions
 
 from buffer.buffer import partial_simd_load, partial_simd_store
 from layout import Layout, LayoutTensor, RuntimeTuple
 
-from utils.index import Index, IndexList
+from std.utils.index import Index, IndexList
 
 from ...accumulate import _Accumulator
 from ...arch.cpu.neon_intrinsics import _neon_matmul
@@ -198,9 +198,9 @@ struct Inner_matmul_i8mm(InnerMatmulKernel, Movable):
         comptime for idx0 in range(kernel_rows):
             comptime for idx1 in range(kernel_cols // simd_size):
                 comptime alignment = align_of[SIMD[c_local.dtype, simd_size]]()
-                var a_val = a_ptr.load[width = simd_size * 4](2 * idx0 * K)
+                var a_val = a_ptr.load[width=simd_size * 4](2 * idx0 * K)
                 var b_val = (b_ptr + 16 * idx1).load[
-                    width = simd_size * 4, alignment=alignment
+                    width=simd_size * 4, alignment=alignment
                 ]()
                 var c_val = c_local[idx0, idx1]
                 c_val = _neon_matmul(c_val, a_val, b_val)

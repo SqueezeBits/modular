@@ -25,22 +25,23 @@ shared memory using two different mechanisms:
 The TileLoader struct abstracts these loading mechanisms to provide a unified
 interface for the matmul kernel's producer threads.
 """
-from layout.tma_async import TMATensorTile
+from layout.tma_async import TMATensorTile, _idx_product
 from layout.layout_tensor import LayoutTensor
-from gpu.memory import (
+from std.gpu.memory import (
     AddressSpace,
     async_copy,
 )
 from ....structuring import SharedMemBarrier, SMemBarrier, SMemTile
 from layout.swizzle import make_swizzle
-from gpu import thread_idx
-from gpu.globals import WARPGROUP_SIZE
-from gpu.sync import async_copy_arrive
-from ..sm100_structured.structured_kernels.pipeline import (
+from std.gpu import thread_idx
+from std.gpu.globals import WARPGROUP_SIZE
+from std.gpu.sync import async_copy_arrive
+from structured_kernels.pipeline import (
     ProducerConsumerPipeline,
 )
-from sys import simd_width_of
-from gpu.host.nvidia.tma import TensorMapSwizzle
+from std.sys import simd_width_of
+from std.utils.index import IndexList
+from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from layout.layout import coalesce
 
 
@@ -173,8 +174,9 @@ struct CPAsyncBarrierHandler(BarrierHandler):
 struct TileLoaderTMA[
     tma_origin: ImmutOrigin,
     dtype: DType,
-    tile_layout: Layout,
-    desc_layout: Layout,
+    tma_rank: Int,
+    tile_shape: IndexList[tma_rank],
+    desc_shape: IndexList[tma_rank],
     /,
     *,
     BK: UInt,
@@ -190,8 +192,9 @@ struct TileLoaderTMA[
     Parameters:
         tma_origin: Origin type for the TMA operation.
         dtype: Data type of the elements being loaded.
-        tile_layout: Layout of the complete tile in shared memory.
-        desc_layout: Layout described by the TMA descriptor (may be smaller).
+        tma_rank: Rank of the TMA tile (number of dimensions).
+        tile_shape: Shape of the complete tile in shared memory.
+        desc_shape: Shape described by the TMA descriptor (may be smaller).
         BK: Block size in the K dimension (for coordinate conversion).
         cluster_size: Number of blocks in the cluster (1 for no clustering).
         use_partitioned_multicast: Whether to use partitioned multicast loading.
@@ -200,7 +203,9 @@ struct TileLoaderTMA[
     comptime _dtype = Self.dtype
 
     comptime TMATensorTilePtr = Pointer[
-        TMATensorTile[Self.dtype, Self.tile_layout, Self.desc_layout],
+        TMATensorTile[
+            Self.dtype, Self.tma_rank, Self.tile_shape, Self.desc_shape
+        ],
         Self.tma_origin,
     ]
     var tma_op: Self.TMATensorTilePtr
@@ -247,10 +252,13 @@ struct TileLoaderTMA[
             (k_elements, row/col_elements) for TMA's K-major ordering.
         """
         # Switch coordinates to k-minor and multiply k by BK to match the CPAsync API.
-        var coords = (_coords[1] * Self.BK, _coords[0])  # (m/n, k) -> (k, m/n)
+        var coords = (
+            Int(_coords[1] * Self.BK),
+            Int(_coords[0]),
+        )  # (m/n, k) -> (k, m/n)
 
-        comptime tma_load_size = Self.desc_layout.size()
-        comptime tma_rows = Self.desc_layout.shape[0].value()
+        comptime tma_load_size = _idx_product[Self.tma_rank, Self.desc_shape]()
+        comptime tma_rows = Self.desc_shape[0]
 
         comptime if Self.cluster_size > 1:
             # Multi-block cluster: Use multicast to share data across blocks
@@ -284,7 +292,7 @@ struct TileLoaderTMA[
             self.tma_op[].async_copy(
                 dst,
                 mem_barrier[],
-                (Int(coords[0]), Int(coords[1])),
+                (coords[0], coords[1]),
             )
 
 
@@ -315,7 +323,7 @@ struct TileLoaderCPAsync[
         Self.dtype,
         Self.src_layout,
         ImmutAnyOrigin,
-        address_space = AddressSpace.GENERIC,
+        address_space=AddressSpace.GENERIC,
     ]
 
     @always_inline
@@ -325,7 +333,7 @@ struct TileLoaderCPAsync[
             Self.dtype,
             Self.src_layout,
             ImmutAnyOrigin,
-            address_space = AddressSpace.GENERIC,
+            address_space=AddressSpace.GENERIC,
         ],
     ):
         """Initialize the cp.async tile loader.
@@ -386,14 +394,14 @@ fn async_copy_with_bound_check[
         dtype,
         src_layout,
         ImmutAnyOrigin,
-        address_space = AddressSpace.GENERIC,
+        address_space=AddressSpace.GENERIC,
         ...,
     ],
     dst: LayoutTensor[
         dtype,
         dst_layout,
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
         ...,
     ],
 ):
@@ -499,10 +507,10 @@ fn async_copy_with_bound_check[
             async_copy[
                 size_bytes,
                 bypass_L1_16B=False,
-                fill = Scalar[dst.dtype](0),
+                fill=Scalar[dst.dtype](0),
             ](src_ptr, dst_ptr, src_size=Int32(size_bytes))
         else:
             # Out-of-bounds: zero-fill
             async_copy[
-                size_bytes, bypass_L1_16B=False, fill = Scalar[dst.dtype](0)
+                size_bytes, bypass_L1_16B=False, fill=Scalar[dst.dtype](0)
             ](src_ptr, dst_ptr, src_size=0)

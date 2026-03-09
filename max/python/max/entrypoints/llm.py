@@ -199,7 +199,7 @@ async def _async_worker(
     pipeline_task = PIPELINE_REGISTRY.retrieve_pipeline_task(pipeline_config)
     lora_queue: LoRAQueue | None = (
         LoRAQueue(
-            pipeline_config.zmq_endpoint_base,
+            pipeline_config.runtime.zmq_endpoint_base,
             pipeline_config.lora.lora_paths,
         )
         if pipeline_config.lora
@@ -255,6 +255,7 @@ async def _async_worker(
 
                 # Generate this request until complete
                 chunks = await pipeline.all_tokens(gen_request)
+                # TODO: (MODELS-1120) determine whether to include reasoning tokens
                 return "".join(
                     chunk.decoded_tokens
                     if chunk.decoded_tokens is not None

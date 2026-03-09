@@ -11,14 +11,14 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import Optional
-from math import inf, isnan, log, nan, sqrt
-from sys import simd_width_of
+from std.collections import Optional
+from std.math import inf, isnan, log, nan, sqrt
+from std.sys import simd_width_of
 
-from algorithm import elementwise, mean, sum, vectorize
-from algorithm.functional import unswitch
+from std.algorithm import elementwise, mean, sum, vectorize
+from std.algorithm.functional import unswitch
 
-from utils import IndexList
+from std.utils import IndexList
 
 # ===----------------------------------------------------------------------=== #
 # kl_div
@@ -247,7 +247,7 @@ fn cosine[
     The cosine distance is also referred to as 'uncentered correlation',
     or 'reflective correlation'.
     """
-    return 1 - uncentered_unweighted_correlation[out_type = DType.float64](
+    return 1 - uncentered_unweighted_correlation[out_type=DType.float64](
         u, v, len
     )
 

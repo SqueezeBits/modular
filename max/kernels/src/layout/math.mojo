@@ -12,17 +12,15 @@
 # ===----------------------------------------------------------------------=== #
 """Implements math methods that work on layout tensors."""
 
-import math
-from sys.info import simd_width_of
+import std.math
+from std.sys.info import simd_width_of
 
-import algorithm.reduction
-from algorithm import vectorize
-from math.math import max as b_max
-from layout import LayoutTensor, UNKNOWN_VALUE
-from layout._coord import Coord, Idx
-from layout._tile_tensor import TileTensor
+import std.algorithm.reduction
+from std.algorithm import vectorize
+from std.math.math import max as b_max
+from layout import Coord, Idx, LayoutTensor, TileTensor, UNKNOWN_VALUE
 
-from utils.index import IndexList
+from std.utils.index import IndexList
 
 
 @always_inline
@@ -235,10 +233,10 @@ fn max[
         inp.dtype,
         _reduce_res_row_major_shape(axis, inp.layout),
         MutAnyOrigin,
-        address_space = inp.address_space,
-        element_layout = inp.element_layout,
-        layout_int_type = inp.layout_int_type,
-        linear_idx_type = inp.linear_idx_type,
+        address_space=inp.address_space,
+        element_layout=inp.element_layout,
+        layout_int_type=inp.layout_int_type,
+        linear_idx_type=inp.linear_idx_type,
     ],
 ):
     """Computes maximum reduction along specified axis, returning a new tensor.
@@ -313,10 +311,10 @@ fn sum[
         inp.dtype,
         _reduce_res_row_major_shape(axis, inp.layout),
         MutAnyOrigin,
-        address_space = inp.address_space,
-        element_layout = inp.element_layout,
-        layout_int_type = inp.layout_int_type,
-        linear_idx_type = inp.linear_idx_type,
+        address_space=inp.address_space,
+        element_layout=inp.element_layout,
+        layout_int_type=inp.layout_int_type,
+        linear_idx_type=inp.linear_idx_type,
     ],
 ):
     """Computes sum reduction along specified axis, returning a new tensor.
@@ -359,7 +357,7 @@ fn mean(src: LayoutTensor[...]) raises -> Scalar[src.dtype]:
     """
     comptime assert src.rank == 1, "src must be of rank 1"
 
-    debug_assert(src.size() != 0, "input must not be empty")
+    assert src.size() != 0, "input must not be empty"
 
     @parameter
     @always_inline
@@ -396,7 +394,7 @@ fn mean[
     var dst_1d = LayoutTensor[
         dst.dtype,
         Layout.row_major(UNKNOWN_VALUE),
-        address_space = dst.address_space,
+        address_space=dst.address_space,
     ](
         dst.ptr,
         RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(
@@ -515,7 +513,7 @@ fn mean(src: TileTensor[...]) raises -> Scalar[src.dtype]:
     """
     comptime assert src.rank == 1, "src must be of rank 1"
 
-    debug_assert(src.numel() != 0, "input must not be empty")
+    assert src.numel() != 0, "input must not be empty"
 
     @parameter
     @always_inline

@@ -26,7 +26,6 @@ from max.interfaces import (
     RequestID,
     TextGenerationOutput,
 )
-from max.nn.legacy.kv_cache import KVCacheInputsSequence
 from max.pipelines.core import TTSContext
 from max.profiler import Tracer, traced
 
@@ -40,6 +39,8 @@ if TYPE_CHECKING:
 
 @final
 class SpeechTokenGenerationPipeline(TextGenerationPipeline[TTSContext]):
+    """A text-to-speech token generation pipeline for TTS models."""
+
     def __init__(
         self,
         pipeline_config: PipelineConfig,
@@ -143,17 +144,9 @@ class SpeechTokenGenerationPipeline(TextGenerationPipeline[TTSContext]):
             # Prepare inputs for the next token in multistep execution
             tracer.next("increment_cache_lengths")  # pops sample_next_token
 
-            assert isinstance(
-                curr_step_inputs.kv_cache_inputs, KVCacheInputsSequence
-            ), (
-                "prepare_batch instantiates and passes this as a KVCacheInputsSequence"
-            )
-            assert isinstance(
-                curr_step_inputs.kv_cache_inputs.kv_cache_inputs, list
-            ), "increment_cache_lengths instantiates and passes this as a list"
             curr_step_inputs.kv_cache_inputs.kv_cache_inputs = (
                 self._kv_manager.increment_cache_lengths(
-                    curr_step_inputs.kv_cache_inputs.kv_cache_inputs,
+                    curr_step_inputs.kv_cache_inputs,
                     curr_step_inputs,
                 )
             )

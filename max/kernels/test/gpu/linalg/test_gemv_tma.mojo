@@ -12,37 +12,35 @@
 # ===----------------------------------------------------------------------=== #
 
 
-from math import ceildiv
-from memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-from random import rand
-from sys import argv, size_of
+from std.math import ceildiv
+from std.random import rand
+from std.sys import argv, size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
 from buffer.buffer import NDBuffer
 from buffer.dimlist import DimList
-from gpu import WARP_SIZE, barrier, block_idx, lane_id, thread_idx, warp_id
-from gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
-from gpu.host.nvidia.tma import TMADescriptor, create_tma_descriptor
-from gpu.primitives import warp
-from gpu.memory import (
+from std.gpu import WARP_SIZE, barrier, block_idx, lane_id, thread_idx, warp_id
+from std.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
+from std.gpu.host.nvidia.tma import TMADescriptor, create_tma_descriptor
+from std.gpu.primitives import warp
+from std.gpu.memory import (
     AddressSpace,
     cp_async_bulk_tensor_shared_cluster_global,
     external_memory,
 )
 from internal_utils import assert_almost_equal
-from random import rand
+from std.random import rand
 from internal_utils._utils import ValOrDim, dynamic, static
-from layout import Layout, LayoutTensor
+from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
 from layout._ndbuffer_stub import from_ndbuffer_row_major
+from layout._utils import ManagedLayoutTensor
 from layout.int_tuple import IntTuple
 from layout.layout_tensor import LayoutTensorIter
 from layout.tma_async import PipelineState, SharedMemBarrier
 
-from utils import StaticTuple
-from utils.index import Index
-from utils.numerics import get_accum_type
+from std.utils import StaticTuple
+from std.utils.index import Index, IndexList
+from std.utils.numerics import get_accum_type
 
 
 fn is_benchmark() -> Bool:
@@ -88,19 +86,19 @@ fn gemv_tma_kernel[
 
     comptime b_smem_layout = Layout.row_major(Int(BLOCK_SIZE_K))
 
-    var descriptor_a_ptr = LegacyUnsafePointer(to=descriptor_a).bitcast[
-        NoneType
-    ]()
-    var descriptor_b_ptr = LegacyUnsafePointer(to=descriptor_b).bitcast[
-        NoneType
-    ]()
+    var descriptor_a_ptr = UnsafePointer(to=descriptor_a).bitcast[NoneType]()
+    var descriptor_b_ptr = UnsafePointer(to=descriptor_b).bitcast[NoneType]()
 
     var a_smem_base = rebind[
-        UnsafePointer[Scalar[dtype], address_space = AddressSpace.SHARED]
+        UnsafePointer[
+            Scalar[dtype],
+            address_space=AddressSpace.SHARED,
+            ExternalOrigin[mut=True],
+        ]
     ](
         external_memory[
             Scalar[dtype],
-            address_space = AddressSpace.SHARED,
+            address_space=AddressSpace.SHARED,
             alignment=128,
             name="tmem_A_dynamic_shared_memory",
         ]()
@@ -118,7 +116,7 @@ fn gemv_tma_kernel[
         dtype,
         a_smem_layout,
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
         alignment=128,
         circular=False,
     ](
@@ -130,7 +128,7 @@ fn gemv_tma_kernel[
         dtype,
         b_smem_layout,
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
         alignment=128,
         circular=False,
     ](
@@ -177,7 +175,7 @@ fn gemv_tma_kernel[
             ](
                 a_smem.next(stage)[].ptr,
                 descriptor_a_ptr,
-                LegacyUnsafePointer(to=tma_mbar[stage]),
+                UnsafePointer(to=tma_mbar[stage]),
                 Index(UInt(col_offset), block_row),
             )
             cp_async_bulk_tensor_shared_cluster_global[
@@ -187,7 +185,7 @@ fn gemv_tma_kernel[
             ](
                 b_smem.next(stage)[].ptr,
                 descriptor_b_ptr,
-                LegacyUnsafePointer(to=tma_mbar[stage]),
+                UnsafePointer(to=tma_mbar[stage]),
                 Index(UInt(col_offset)),
             )
             producer_phase.step()
@@ -245,7 +243,7 @@ def gemv_tma[
     N: Int,
     K: Int,
     ctx: DeviceContext,
-):
+) raises:
     # TODO: Tune further.
     comptime THREAD_NUM = 1024
     comptime BLOCK_SIZE_M = 64
@@ -323,7 +321,7 @@ def test_gemv_tma[
     n: ValOrDim,
     k: ValOrDim,
     benchmark: Bool = False,
-):
+) raises:
     var M = m.value
     var N = n.value
     var K = k.value
@@ -331,26 +329,34 @@ def test_gemv_tma[
     comptime static_a_shape = DimList(m.dim, k.dim)
     comptime static_b_shape = DimList(k.dim)
     comptime static_c_shape = DimList(m.dim, n.dim)
-    var dynamic_a_shape = DimList(m.value, k.value)
-    var dynamic_b_shape = DimList(k.value)
-    var dynamic_c_shape = DimList(m.value, n.value)
+    var dynamic_a_shape = IndexList[2](m.value, k.value)
+    var dynamic_b_shape = IndexList[1](k.value)
+    var dynamic_c_shape = IndexList[2](m.value, n.value)
     var a_size = m.value * k.value
     var b_size = k.value
     var c_size = m.value * n.value
 
-    var a_host_ptr = UnsafePointer[Scalar[dtype]].alloc(a_size)
+    var a_host_ptr = alloc[Scalar[dtype]](a_size)
     var a_host = NDBuffer[dtype, 2, _, static_a_shape](
         a_host_ptr, dynamic_a_shape
     )
-    var b_host_ptr = UnsafePointer[Scalar[dtype]].alloc(b_size)
+    var b_host_ptr = alloc[Scalar[dtype]](b_size)
     var b_host = NDBuffer[dtype, 1, _, static_b_shape](
         b_host_ptr, dynamic_b_shape
     )
-    var c_host_ptr = UnsafePointer[Scalar[dtype]].alloc(c_size)
+    var c_host_managed = ManagedLayoutTensor[dtype, Layout(UNKNOWN_VALUE)](
+        RuntimeLayout[Layout(UNKNOWN_VALUE)].row_major(IndexList[1](c_size)),
+        ctx,
+    )
+    var c_host_ptr = c_host_managed.tensor[update=False]().ptr
     var c_host = NDBuffer[dtype, 2, _, static_c_shape](
         c_host_ptr, dynamic_c_shape
     )
-    var c_host_ref_ptr = UnsafePointer[Scalar[dtype]].alloc(c_size)
+    var c_host_ref_managed = ManagedLayoutTensor[dtype, Layout(UNKNOWN_VALUE)](
+        RuntimeLayout[Layout(UNKNOWN_VALUE)].row_major(IndexList[1](c_size)),
+        ctx,
+    )
+    var c_host_ref_ptr = c_host_ref_managed.tensor[update=False]().ptr
     var c_host_ref = NDBuffer[dtype, 2, _, static_c_shape](
         c_host_ref_ptr, dynamic_c_shape
     )
@@ -431,7 +437,7 @@ def test_gemv_tma[
         var tflops = TFlop / sectime
         var tflops_rounded = round(tflops, 3)
         print(
-            String(M, "x", N, "x", K, ": DTYPE=", dtype),
+            t"{M}x{N}x{K}: DTYPE={dtype}",
             sectime * 1000,
             tflops_rounded,
         )
@@ -469,15 +475,9 @@ def test_gemv_tma[
     # Cleanup
     a_host_ptr.free()
     b_host_ptr.free()
-    c_host_ptr.free()
-    c_host_ref_ptr.free()
-    _ = a_device^
-    _ = b_device^
-    _ = c_device^
-    _ = c_device_ref^
 
 
-def main():
+def main() raises:
     with DeviceContext() as ctx:
         var benchmark = is_benchmark()
         test_gemv_tma[DType.bfloat16](

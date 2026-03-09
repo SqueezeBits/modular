@@ -10,20 +10,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-from sys import size_of
-from math import align_up
+from std.sys import size_of
+from std.math import align_up
 
-from gpu.primitives.cluster import cluster_mask_base
-from gpu.host._tensormap import SwizzleMode
-from gpu.memory import AddressSpace
-from gpu.host.nvidia.tma import TensorMapSwizzle
-from gpu import block_id_in_cluster
-from gpu.compute.arch.mma_nvidia_sm100 import *
-from gpu.compute.arch.tcgen05 import *
-from gpu.compute.arch.mma_nvidia_sm100 import MMASmemDescriptorPair
-from layout import IntTuple, Layout, LayoutTensor
-from layout._coord import coord_to_int_tuple
-from layout._tile_tensor import TileTensor
+from std.gpu.primitives.cluster import cluster_mask_base
+from std.gpu.host._tensormap import SwizzleMode
+from std.gpu.memory import AddressSpace
+from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from std.gpu import block_id_in_cluster
+from std.gpu.compute.arch.mma_nvidia_sm100 import *
+from std.gpu.compute.arch.tcgen05 import *
+from std.gpu.compute.arch.mma_nvidia_sm100 import MMASmemDescriptorPair
+from layout import IntTuple, Layout, LayoutTensor, TileTensor
+from layout.coord import coord_to_int_tuple
 from layout.layout import coalesce
 from layout.tensor_core_async import (
     tile_to_descriptor,
@@ -31,10 +30,7 @@ from layout.tensor_core_async import (
     tile_layout_mn_major,
 )
 
-from memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-from utils.index import Index, IndexList, product
+from std.utils.index import Index, IndexList, product
 from linalg.fp4_utils import SF_MN_GROUP_SIZE, SF_ATOM_M, SF_ATOM_K
 
 
@@ -86,7 +82,6 @@ fn max_contiguous_tile_shape[
         return IntTuple(8, swizzle_mode.bytes() // size_of[dtype]())
     else:
         comptime assert False, "Invalid major"
-        return IntTuple()
 
 
 # TODO: add create method to mma_operand trait and unify this with
@@ -94,7 +89,7 @@ fn max_contiguous_tile_shape[
 fn _create_mma_desc[
     dtype: DType, //, canonical_layout: Layout, swizzle_mode: TensorMapSwizzle
 ](
-    ptr: UnsafePointer[Scalar[dtype], address_space = AddressSpace.SHARED, ...]
+    ptr: UnsafePointer[Scalar[dtype], address_space=AddressSpace.SHARED, ...]
 ) -> MMASmemDescriptor:
     # Extract the stride values from the canonical layout
     # The canonical layout is expected to have at least 2 dimensions
@@ -111,7 +106,7 @@ fn _create_mma_desc[
 fn _create_mma_desc_pair[
     dtype: DType, //, canonical_layout: Layout, swizzle_mode: TensorMapSwizzle
 ](
-    ptr: UnsafePointer[Scalar[dtype], address_space = AddressSpace.SHARED, ...]
+    ptr: UnsafePointer[Scalar[dtype], address_space=AddressSpace.SHARED, ...]
 ) -> MMASmemDescriptorPair:
     # Extract the stride values from the canonical layout
     # The canonical layout is expected to have at least 2 dimensions
@@ -135,7 +130,7 @@ fn smem_descriptor[
     swizzle_mode: TensorMapSwizzle,
     is_k_major: Bool,
 ](
-    ptr: UnsafePointer[Scalar[dtype], address_space = AddressSpace.SHARED, ...]
+    ptr: UnsafePointer[Scalar[dtype], address_space=AddressSpace.SHARED, ...]
 ) -> MMASmemDescriptorPair:
     comptime smem_layout = tile_layout_k_major[
         dtype, BMN, BK, swizzle_mode
@@ -186,8 +181,8 @@ struct MmaOpSM100_SS[
             Self.accum_type,
             Self.a_type,
             Self.b_type,
-            Index[dtype = DType.uint32](Self.mma_shape[0], Self.mma_shape[1]),
-            transpose_b = Self.transpose_b,
+            Index[dtype=DType.uint32](Self.mma_shape[0], Self.mma_shape[1]),
+            transpose_b=Self.transpose_b,
         ]()
 
         self.mask = 0
@@ -222,8 +217,8 @@ struct MmaOpSM100_SS[
     @always_inline
     fn mma(
         self,
-        a: LayoutTensor[address_space = AddressSpace.SHARED, ...],
-        b: LayoutTensor[address_space = AddressSpace.SHARED, ...],
+        a: LayoutTensor[address_space=AddressSpace.SHARED, ...],
+        b: LayoutTensor[address_space=AddressSpace.SHARED, ...],
         c_tmem: UInt32,
         init_c: Bool,
     ):
@@ -274,8 +269,8 @@ struct MmaOpSM100_SS[
     @always_inline
     fn mma(
         self,
-        a: TileTensor[address_space = AddressSpace.SHARED, ...],
-        b: TileTensor[address_space = AddressSpace.SHARED, ...],
+        a: TileTensor[address_space=AddressSpace.SHARED, ...],
+        b: TileTensor[address_space=AddressSpace.SHARED, ...],
         c_tmem: UInt32,
         init_c: Bool,
     ):
@@ -379,7 +374,7 @@ struct MmaOpSM100_SS[
     @always_inline
     fn commit(
         self,
-        ptr_mbar: UnsafePointer[address_space = AddressSpace.SHARED, ...],
+        ptr_mbar: UnsafePointer[address_space=AddressSpace.SHARED, ...],
     ):
         comptime if product(Self.cluster_shape) == 1:
             mma_arrive[Self.cta_group](ptr_mbar)
@@ -464,8 +459,8 @@ struct MmaOpSM100_BlockScaled_SS[
             Self.a_type,
             Self.b_type,
             Self.sfa_dtype,
-            Index[dtype = DType.uint32](Self.mma_shape[0], Self.mma_shape[1]),
-            transpose_b = Self.transpose_b,
+            Index[dtype=DType.uint32](Self.mma_shape[0], Self.mma_shape[1]),
+            transpose_b=Self.transpose_b,
         ]()
 
         self.mask = 0
@@ -500,10 +495,10 @@ struct MmaOpSM100_BlockScaled_SS[
     @always_inline
     fn mma(
         self,
-        a: LayoutTensor[address_space = AddressSpace.SHARED, ...],
-        b: LayoutTensor[address_space = AddressSpace.SHARED, ...],
-        sfa_smem: LayoutTensor[address_space = AddressSpace.SHARED, ...],
-        sfb_smem: LayoutTensor[address_space = AddressSpace.SHARED, ...],
+        a: LayoutTensor[address_space=AddressSpace.SHARED, ...],
+        b: LayoutTensor[address_space=AddressSpace.SHARED, ...],
+        sfa_smem: LayoutTensor[address_space=AddressSpace.SHARED, ...],
+        sfb_smem: LayoutTensor[address_space=AddressSpace.SHARED, ...],
         c_tmem: UInt32,
         sfa_tmem: UInt32,
         sfb_tmem: UInt32,
@@ -543,12 +538,14 @@ struct MmaOpSM100_BlockScaled_SS[
             self.copy_sf_to_tmem[
                 Self.sfa_dtype, sfa_smem.layout, Self.block_tile_shape[0], 0
             ](sfa_smem, sfa_tmem)
-            self.copy_sf_to_tmem[
-                Self.sfb_dtype,
-                sfb_smem.layout,
-                align_up(Self.mma_shape[1], SF_MN_GROUP_SIZE),
-                0,
-            ](sfb_smem, sfb_tmem)
+            # only use tcgen_cp for MMA_N shapes that already meet the SFB TMEM alignment requirement. For the rest shapes, we will load them manually using tcgen_st
+            comptime if Self.mma_shape[1] % 64 == 0:
+                self.copy_sf_to_tmem[
+                    Self.sfb_dtype,
+                    sfb_smem.layout,
+                    align_up(Self.mma_shape[1], SF_MN_GROUP_SIZE),
+                    0,
+                ](sfb_smem, sfb_tmem)
 
         comptime for k in range(0, Self.block_tile_shape[2], Self.mma_shape[2]):
             comptime a_offset = a.layout(IntTuple(0, k)) * size_of[
@@ -566,15 +563,16 @@ struct MmaOpSM100_BlockScaled_SS[
 
             @always_inline
             @parameter
-            fn _get_sfb_tmem_offset[
-                mma_n: Int,
-            ](sfb_tmem: UInt32, work_tile_coord: Tuple[UInt, UInt],) -> UInt32:
-                comptime if mma_n in (64, 192):
+            fn _get_sfb_tmem_offset(
+                sfb_tmem: UInt32,
+                work_tile_coord: Tuple[UInt, UInt],
+            ) -> UInt32:
+                comptime if Self.mma_shape[1] in (64, 192):
                     return sfb_tmem + UInt32(work_tile_coord[1] % 2) * 2
                 else:
                     return sfb_tmem
 
-            var sfb_tmem_offset = _get_sfb_tmem_offset[Self.mma_shape[1]](
+            var sfb_tmem_offset = _get_sfb_tmem_offset(
                 sfb_tmem, work_tile_coord
             )
 
@@ -600,12 +598,14 @@ struct MmaOpSM100_BlockScaled_SS[
                     Self.block_tile_shape[0],
                     sf_idx,
                 ](sfa_smem, sfa_tmem)
-                self.copy_sf_to_tmem[
-                    Self.sfb_dtype,
-                    sfb_smem.layout,
-                    align_up(Self.mma_shape[1], SF_MN_GROUP_SIZE),
-                    sf_idx,
-                ](sfb_smem, sfb_tmem)
+                # only use tcgen_cp for MMA_N shapes that already meet the SFB TMEM alignment requirement. For the rest shapes, we will load them manually using tcgen_st
+                comptime if Self.mma_shape[1] % 64 == 0:
+                    self.copy_sf_to_tmem[
+                        Self.sfb_dtype,
+                        sfb_smem.layout,
+                        align_up(Self.mma_shape[1], SF_MN_GROUP_SIZE),
+                        sf_idx,
+                    ](sfb_smem, sfb_tmem)
 
                 mma[Self.cta_group](
                     a_desc + a_offset,
@@ -620,14 +620,17 @@ struct MmaOpSM100_BlockScaled_SS[
     @always_inline
     fn mma(
         self,
-        a: TileTensor[address_space = AddressSpace.SHARED, ...],
-        b: TileTensor[address_space = AddressSpace.SHARED, ...],
-        sfa_smem: TileTensor[address_space = AddressSpace.SHARED, ...],
-        sfb_smem: TileTensor[address_space = AddressSpace.SHARED, ...],
+        a: TileTensor[address_space=AddressSpace.SHARED, ...],
+        b: TileTensor[address_space=AddressSpace.SHARED, ...],
+        sfa_smem: TileTensor[address_space=AddressSpace.SHARED, ...],
+        sfb_smem: TileTensor[address_space=AddressSpace.SHARED, ...],
         c_tmem: UInt32,
         sfa_tmem: UInt32,
         sfb_tmem: UInt32,
         init_c: Bool,
+        sfb_tmem_adj: UInt32 = UInt32(
+            0
+        ),  # TMEM col offset for MMA_N < SF_MN_GROUP_SIZE
     ):
         """TileTensor overload for block-scaled MMA input tiles.
 
@@ -817,7 +820,10 @@ struct MmaOpSM100_BlockScaled_SS[
                 Self.sfa_dtype, sfa_layout, Self.block_tile_shape[0], 0
             ](sfa_smem, sfa_tmem)
             self._copy_sf_to_tmem_tt[
-                Self.sfb_dtype, sfb_layout, Self.mma_shape[1], 0
+                Self.sfb_dtype,
+                sfb_layout,
+                align_up(Self.mma_shape[1], SF_MN_GROUP_SIZE),
+                0,
             ](sfb_smem, sfb_tmem)
 
         comptime for k in range(0, Self.block_tile_shape[2], Self.mma_shape[2]):
@@ -845,7 +851,7 @@ struct MmaOpSM100_BlockScaled_SS[
                     c_tmem,
                     runtime_desc,
                     sfa_tmem,
-                    sfb_tmem,
+                    sfb_tmem + sfb_tmem_adj,
                     c_scale=c_scale,
                 )
             else:
@@ -858,7 +864,10 @@ struct MmaOpSM100_BlockScaled_SS[
                     sf_idx,
                 ](sfa_smem, sfa_tmem)
                 self._copy_sf_to_tmem_tt[
-                    Self.sfb_dtype, sfb_layout, Self.mma_shape[1], sf_idx
+                    Self.sfb_dtype,
+                    sfb_layout,
+                    align_up(Self.mma_shape[1], SF_MN_GROUP_SIZE),
+                    sf_idx,
                 ](sfb_smem, sfb_tmem)
 
                 mma[Self.cta_group](
@@ -867,14 +876,16 @@ struct MmaOpSM100_BlockScaled_SS[
                     c_tmem,
                     self.idesc,
                     sfa_tmem + UInt32(sf_idx * (SF_MN_GROUP_SIZE // 32)),
-                    sfb_tmem + UInt32(sf_idx * (SF_MN_GROUP_SIZE // 32)),
+                    sfb_tmem
+                    + sfb_tmem_adj
+                    + UInt32(sf_idx * (SF_MN_GROUP_SIZE // 32)),
                     c_scale=c_scale,
                 )
 
     @always_inline
     fn commit(
         self,
-        ptr_mbar: UnsafePointer[address_space = AddressSpace.SHARED, ...],
+        ptr_mbar: UnsafePointer[address_space=AddressSpace.SHARED, ...],
     ):
         comptime if product(Self.cluster_shape) == 1:
             mma_arrive[Self.cta_group](ptr_mbar)
@@ -893,7 +904,7 @@ struct MmaOpSM100_BlockScaled_SS[
         tile_k_idx: Int,
     ](
         self,
-        sf_smem: LayoutTensor[address_space = AddressSpace.SHARED, ...],
+        sf_smem: LayoutTensor[address_space=AddressSpace.SHARED, ...],
         sf_tmem: UInt32,
     ):
         comptime sf_smem_size = sf_smem_layout.size()
@@ -912,7 +923,7 @@ struct MmaOpSM100_BlockScaled_SS[
                 8 * 16, 0, TensorMapSwizzle.SWIZZLE_NONE
             ](sf_smem.ptr + sf_offset)
             tcgen05_cp[
-                cta_group = Int32(Self.cta_group),
+                cta_group=Int32(Self.cta_group),
                 datapaths=32,
                 bits=128,
                 multicast="warpx4",
@@ -926,7 +937,7 @@ struct MmaOpSM100_BlockScaled_SS[
         tile_k_idx: Int,
     ](
         self,
-        sf_smem: TileTensor[address_space = AddressSpace.SHARED, ...],
+        sf_smem: TileTensor[address_space=AddressSpace.SHARED, ...],
         sf_tmem: UInt32,
     ):
         """TileTensor overload for copying scale factors to TMEM."""
@@ -946,7 +957,7 @@ struct MmaOpSM100_BlockScaled_SS[
                 8 * 16, 0, TensorMapSwizzle.SWIZZLE_NONE
             ](sf_smem.ptr + sf_offset)
             tcgen05_cp[
-                cta_group = Int32(Self.cta_group),
+                cta_group=Int32(Self.cta_group),
                 datapaths=32,
                 bits=128,
                 multicast="warpx4",

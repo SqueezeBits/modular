@@ -12,33 +12,42 @@
 # ===----------------------------------------------------------------------=== #
 """RMSNorm with fused residual connection for state space models."""
 
-from math import align_down, ceildiv, rsqrt
-from sys.info import align_of, simd_width_of, size_of
+from std.math import align_down, ceildiv, rsqrt
+from std.sys.info import align_of, simd_width_of, size_of
 
-from algorithm import vectorize
-from algorithm.functional import _get_start_indices_of_nth_subvolume
-from gpu import (
+from std.algorithm import vectorize
+from std.algorithm.functional import _get_start_indices_of_nth_subvolume
+from std.gpu import (
     WARP_SIZE,
     barrier,
     block_dim,
     block_idx,
     thread_idx,
 )
-from gpu.host import DeviceContext, FuncAttribute, get_gpu_target
-from gpu.host.info import is_gpu
-from gpu.memory import external_memory
-from gpu.primitives.grid_controls import PDL, pdl_launch_attributes
-from layout import IntTuple, Layout, LayoutTensor, RuntimeTuple, UNKNOWN_VALUE
-from layout._coord import Coord, CoordLike, Idx
-from layout._layout import Layout as TileLayout, row_major
-from layout._tile_tensor import TileTensor
-from random import Random
+from std.gpu.host import DeviceContext, FuncAttribute, get_gpu_target
+from std.gpu.host.info import is_gpu
+from std.gpu.memory import external_memory
+from std.gpu.primitives.grid_controls import PDL, pdl_launch_attributes
+from layout import (
+    Coord,
+    CoordLike,
+    Idx,
+    IntTuple,
+    Layout,
+    LayoutTensor,
+    RuntimeTuple,
+    TileTensor,
+    UNKNOWN_VALUE,
+    row_major,
+)
+from layout.tile_layout import Layout as TileLayout
+from std.random import Random
 from register import register_internal
-from runtime.asyncrt import DeviceContextPtr
-from runtime.tracing import Trace, TraceLevel, trace_arg
+from std.runtime.asyncrt import DeviceContextPtr
+from std.runtime.tracing import Trace, TraceLevel, trace_arg
 
-from utils.index import Index, IndexList
-from utils.numerics import get_accum_type
+from std.utils.index import Index, IndexList
+from std.utils.numerics import get_accum_type
 
 from nn.normalization import _rms_norm_gpu_block_subkernel, _sum_to_mean
 
@@ -314,8 +323,8 @@ fn rms_norm_fused_residual_gpu_block[
 
     var shared_mem = external_memory[
         Scalar[dtype],
-        address_space = AddressSpace.SHARED,
-        alignment = align_of[SIMD[dtype, simd_width]](),
+        address_space=AddressSpace.SHARED,
+        alignment=align_of[SIMD[dtype, simd_width]](),
         name="intermediate_shared_memory",
     ]()
     with PDL():
@@ -368,7 +377,7 @@ fn rms_norm_fused_residual_gpu_block[
                 # Store in shared memory for normalization
                 shared_mem.store[
                     width=simd_width,
-                    alignment = align_of[SIMD[dtype, simd_width]](),
+                    alignment=align_of[SIMD[dtype, simd_width]](),
                 ](idx, residual_add_val)
 
         barrier()
@@ -469,7 +478,7 @@ fn rms_norm_fused_residual_gpu[
         indices[rank - 1] = col
         return residual_input_fn[simd_width](indices.canonicalize())
 
-    comptime simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
     comptime max_warps_per_block = ctx.default_device_info.max_thread_block_size // WARP_SIZE
 
     var grid_dim = rows
@@ -483,9 +492,9 @@ fn rms_norm_fused_residual_gpu[
     )
 
     comptime kernel = rms_norm_fused_residual_gpu_block[
-        mut = gamma.mut,
-        origin = gamma.origin,
-        layout = gamma.layout,
+        mut=gamma.mut,
+        origin=gamma.origin,
+        layout=gamma.layout,
         simd_width,
         max_warps_per_block,
         input_fn_2d,

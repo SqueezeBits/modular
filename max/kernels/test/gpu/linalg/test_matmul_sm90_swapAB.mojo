@@ -12,10 +12,10 @@
 # ===----------------------------------------------------------------------=== #
 """Tests for swapAB matmul optimization comparing normal vs swapAB execution."""
 
-from collections import Optional
-from sys import align_of
+from std.collections import Optional
+from std.sys import align_of
 
-from gpu.host import DeviceContext
+from std.gpu.host import DeviceContext
 from internal_utils._utils import dynamic, static
 from linalg.matmul.gpu.sm90.config import MatmulConfig as MatmulConfigSM90
 from linalg.matmul.gpu.sm90.testbed_swapAB import (
@@ -24,12 +24,12 @@ from linalg.matmul.gpu.sm90.testbed_swapAB import (
 )
 from linalg.utils import elementwise_compute_lambda_type
 
-from utils.index import Index, IndexList
+from std.utils.index import Index, IndexList
 
 comptime bf16 = DType.bfloat16
 
 
-def main():
+def main() raises:
     print("\n" + "=" * 60)
     print("SWAPAB COMPARISON TEST SUITE")
     print("=" * 60 + "\n")
@@ -396,7 +396,7 @@ def main():
             MMA_K_SWAPAB=16,
             num_pipeline_stages_swapAB=2,
             num_consumer_swapAB=2,
-            elementwise_compute_lambda_fn = Optional[
+            elementwise_compute_lambda_fn=Optional[
                 elementwise_compute_lambda_type
             ](coord_lambda),
             use_vendor_reference=True,
@@ -422,7 +422,7 @@ def main():
             MMA_K_SWAPAB=16,
             num_pipeline_stages_swapAB=2,
             num_consumer_swapAB=2,
-            elementwise_compute_lambda_fn = Optional[
+            elementwise_compute_lambda_fn=Optional[
                 elementwise_compute_lambda_type
             ](coord_lambda),
             use_vendor_reference=True,

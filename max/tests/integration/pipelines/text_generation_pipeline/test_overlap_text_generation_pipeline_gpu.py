@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 from max.config import ConfigFileModel
-from max.driver import Accelerator, Buffer, DeviceSpec
+from max.driver import Accelerator, Buffer, DevicePinnedBuffer, DeviceSpec
 from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import (
@@ -34,8 +34,8 @@ from max.graph import (
     ops,
 )
 from max.interfaces import RequestID, TextGenerationInputs, TokenBuffer
-from max.nn.legacy import KVCacheInputs, kernels
-from max.nn.legacy.kv_cache import KVCacheParams
+from max.nn import KVCacheInputs, kernels
+from max.nn.kv_cache import KVCacheParams
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
     ModelInputs,
@@ -145,14 +145,22 @@ class FakeModelConfig(ConfigFileModel):
     kv_cache: Any
     quantization_encoding: SupportedEncoding = "float32"
     enable_echo: bool = False
+    data_parallel_degree: int = 1
+
+
+class FakeRuntimeConfig(ConfigFileModel):
+    execute_empty_batches: bool = False
+    enable_overlap_scheduler: bool = False
+    device_graph_capture: bool = False
+    max_batch_size: int = 999
 
 
 class FakePipelineConfig(ConfigFileModel):
     model: FakeModelConfig
     sampling: FakeSamplingConfig
-    execute_empty_batches: bool = False
-    enable_overlap_scheduler: bool = False
-    max_batch_size: int = 999
+    runtime: FakeRuntimeConfig = FakeRuntimeConfig()
+    enable_echo: bool = False
+    debug_verify_replay: bool = False
 
     def configure_session(self, *args: Any, **kwargs: Any) -> None:
         pass
@@ -243,7 +251,9 @@ class FakePipelineModel(PipelineModelWithKVCache[TextContext]):
         self, pipeline_config: FakePipelineConfig, *args: Any, **kwargs: Any
     ) -> None:
         self.kv_params = MagicMock(spec=KVCacheParams)
-        self.enable_overlap_scheduler = pipeline_config.enable_overlap_scheduler
+        self.enable_overlap_scheduler = (
+            pipeline_config.runtime.enable_overlap_scheduler
+        )
         self.device = Accelerator()
         self.kv_cache_config = MagicMock()
         self.max_seq_len = 9999
@@ -270,35 +280,29 @@ class FakePipelineModel(PipelineModelWithKVCache[TextContext]):
         )
         active_lengths = [ctx.tokens.active_length for ctx in batch]
         total_seq_len = sum(active_lengths)
-        tokens = Buffer(
+        tokens = DevicePinnedBuffer(
             shape=[total_seq_len],
             dtype=DType.int64,
             device=self.device,
-            pinned=True,
         )
-        tokens.disable_auto_sync()
         np.concatenate(
             [ctx.tokens.active for ctx in batch], out=tokens.to_numpy()
         )
-        input_row_offsets = Buffer(
+        input_row_offsets = DevicePinnedBuffer(
             shape=[len(batch) + 1],
             dtype=DType.int64,
             device=self.device,
-            pinned=True,
         )
-        input_row_offsets.disable_auto_sync()
         np.cumsum(
             [0] + active_lengths,
             dtype=np.int64,
             out=input_row_offsets.to_numpy(),
         )
-        arange = Buffer(
+        arange = DevicePinnedBuffer(
             dtype=DType.int64,
             shape=[batch_size],
             device=self.device,
-            pinned=True,
         )
-        arange.disable_auto_sync()
         arange.to_numpy()[:] = np.arange(
             start=0, stop=batch_size, dtype=np.int64
         )
@@ -365,10 +369,13 @@ def create_overlap_pipeline(
         device_specs=[DeviceSpec(id=0, device_type="gpu")],
         kv_cache=MagicMock(),
     )
+    runtime = FakeRuntimeConfig(
+        enable_overlap_scheduler=enable_overlap_scheduler,
+    )
     pipeline_config = FakePipelineConfig(
         model=model_config,
         sampling=sampling_config,
-        enable_overlap_scheduler=enable_overlap_scheduler,
+        runtime=runtime,
     )
     pipeline = OverlapTextGenerationPipeline(
         pipeline_config=cast(PipelineConfig, pipeline_config),

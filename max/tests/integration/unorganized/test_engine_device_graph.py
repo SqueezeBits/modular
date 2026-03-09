@@ -22,7 +22,7 @@ from max.driver import Accelerator, Buffer, accelerator_count
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType
-from max.nn.legacy import Linear
+from max.nn import Linear
 
 
 @pytest.fixture(autouse=True)
@@ -195,7 +195,7 @@ def test_graph_capture_rejects_unsafe_key_reuse() -> None:
     with pytest.raises(RuntimeError, match="Unsafe graph key reuse"):
         model.replay(graph_key, input_tensor2)
 
-    with pytest.raises(RuntimeError, match="Unsafe graph key reuse"):
+    with pytest.raises(RuntimeError, match="Graph keys already captured"):
         model.capture(graph_key, input_tensor2)
 
 
@@ -249,6 +249,7 @@ def test_replay_with_external_allocations() -> None:
     input_buf = Buffer.from_dlpack(input_tensor)
 
     results = model.capture(graph_key, input_buf)
+    model.replay(graph_key, input_buf)
 
     external_buffers = []
     for _ in range(10):
@@ -266,6 +267,9 @@ def test_replay_with_external_allocations() -> None:
         )
     accelerator.synchronize()
 
+    del model
+    accelerator.synchronize()
+
     del external_buffers
     accelerator.synchronize()
 
@@ -274,9 +278,6 @@ def test_replay_with_external_allocations() -> None:
 
     del input_tensor
     del input_buf
-    accelerator.synchronize()
-
-    del model
     accelerator.synchronize()
 
 

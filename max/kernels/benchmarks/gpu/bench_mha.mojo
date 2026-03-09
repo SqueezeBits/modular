@@ -11,25 +11,27 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import isclose, rsqrt
-from sys import env_get_bool, env_get_dtype, env_get_int
+from std.math import isclose, rsqrt
+from std.sys import get_defined_bool, get_defined_dtype, get_defined_int
 
-from benchmark import Bench, Bencher, BenchId, BenchMetric, ThroughputMeasure
-from gpu import *
-from gpu.host import DeviceContext
+from std.benchmark import (
+    Bench,
+    Bencher,
+    BenchId,
+    BenchMetric,
+    ThroughputMeasure,
+)
+from std.gpu import *
+from std.gpu.host import DeviceContext
 from internal_utils import CacheBustingBuffer, arg_parse
 from internal_utils._utils import InitializationType
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
-from memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from nn.mha import flash_attention, mha_gpu_naive
 from nn.mha_mask import CausalMask
-from nn.mha_score_mod import IdentityScoreMod
-from testing import assert_almost_equal
+from std.testing import assert_almost_equal
 
-from utils.index import Index
-from utils.numerics import min_or_neg_inf
+from std.utils.index import Index
+from std.utils.numerics import min_or_neg_inf
 
 
 fn run_mha[
@@ -75,10 +77,8 @@ fn run_mha[
     )
 
     # Allocate host memory for verification.
-    var output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
-        cb_o.alloc_size()
-    )
+    var output_ptr = alloc[Scalar[qkv_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[qkv_type]](cb_o.alloc_size())
 
     # Initialize data on the device.
     comptime random_distribution = InitializationType.uniform_distribution
@@ -140,7 +140,6 @@ fn run_mha[
                     k_device,
                     v_device,
                     CausalMask(),
-                    IdentityScoreMod(),
                     scale,
                     ctx,
                     num_partitions if num_partitions > 0 else Optional[Int](),
@@ -216,7 +215,6 @@ fn run_mha[
         k_device,
         v_device,
         CausalMask(),
-        IdentityScoreMod(),
         scale,
         ctx,
         num_partitions if num_partitions > 0 else Optional[Int](),
@@ -229,7 +227,7 @@ fn run_mha[
         ctx.enqueue_copy(flash_output_ptr, cb_o.device_buffer())
         # Allocate and initialize mask for verification
         var mask_size = batch_size * num_heads * seq_len * num_keys
-        var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(mask_size)
+        var mask_ptr = alloc[Scalar[mask_type]](mask_size)
 
         comptime layout_4d = Layout.row_major[4]()
         var mask = LayoutTensor[mask_type, layout_4d](
@@ -339,13 +337,13 @@ struct MHA_cfg(ImplicitlyCopyable):
         # fmt: on
 
 
-def main():
-    comptime qkv_type = env_get_dtype["qkv_type", DType.bfloat16]()
-    comptime mask_type = env_get_dtype["mask_type", DType.float32]()
-    comptime depth = env_get_int["depth", 128]()
-    comptime num_heads = env_get_int["num_heads", 32]()
-    comptime group = env_get_int["group", 1]()
-    comptime cache_busting = env_get_bool["cache_busting", True]()
+def main() raises:
+    comptime qkv_type = get_defined_dtype["qkv_type", DType.bfloat16]()
+    comptime mask_type = get_defined_dtype["mask_type", DType.float32]()
+    comptime depth = get_defined_int["depth", 128]()
+    comptime num_heads = get_defined_int["num_heads", 32]()
+    comptime group = get_defined_int["group", 1]()
+    comptime cache_busting = get_defined_bool["cache_busting", True]()
 
     var seq_len = Int(arg_parse("seq_len", 64))
     var num_keys = Int(arg_parse("num_keys", 64))

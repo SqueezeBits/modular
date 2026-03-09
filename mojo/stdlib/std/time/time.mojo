@@ -15,21 +15,21 @@
 You can import these APIs from the `time` package. For example:
 
 ```mojo
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 ```
 """
 
-from math import floor
-from os import abort
-from ffi import external_call
-from sys import (
+from std.math import floor
+from std.os import abort
+from std.ffi import external_call
+from std.sys import (
     CompilationTarget,
     is_amd_gpu,
     is_gpu,
     is_nvidia_gpu,
     llvm_intrinsic,
 )
-from sys._assembly import inlined_assembly
+from std.sys._assembly import inlined_assembly
 
 # ===-----------------------------------------------------------------------===#
 # Utilities
@@ -51,7 +51,7 @@ comptime _NSEC_PER_SEC = _NSEC_PER_USEC * _USEC_PER_MSEC * _MSEC_PER_SEC
 
 
 @fieldwise_init
-struct _CTimeSpec(Defaultable, Stringable, TrivialRegisterPassable, Writable):
+struct _CTimeSpec(Defaultable, TrivialRegisterPassable, Writable):
     var tv_sec: Int  # Seconds
     var tv_subsec: Int  # subsecond (nanoseconds on linux and usec on mac)
 
@@ -67,6 +67,7 @@ struct _CTimeSpec(Defaultable, Stringable, TrivialRegisterPassable, Writable):
                 self.tv_sec * _NSEC_PER_SEC + self.tv_subsec * _NSEC_PER_USEC
             )
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     @no_inline
     fn __str__(self) -> String:
         return String.write(self)
@@ -111,10 +112,7 @@ fn _gpu_clock_inst() -> StaticString:
     elif is_amd_gpu():
         return "llvm.amdgcn.s.memtime"
     else:
-        return CompilationTarget.unsupported_target_error[
-            StaticString,
-            operation="_gpu_clock",
-        ]()
+        CompilationTarget.unsupported_target_error[operation="_gpu_clock",]()
 
 
 @always_inline
@@ -373,7 +371,7 @@ fn sleep(sec: Float64):
             return
         else:
             # Other GPUs are not supported.
-            return CompilationTarget.unsupported_target_error[
+            CompilationTarget.unsupported_target_error[
                 operation="time.sleep()",
                 note="time.sleep() is only supported on NVIDIA and AMD GPUs",
             ]()

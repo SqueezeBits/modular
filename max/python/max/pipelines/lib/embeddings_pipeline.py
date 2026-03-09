@@ -38,7 +38,7 @@ from max.interfaces import (
     RequestID,
     TextGenerationRequest,
 )
-from max.nn.legacy.transformer import ReturnLogits
+from max.nn.transformer import ReturnLogits
 from max.profiler import Tracer, traced
 
 if TYPE_CHECKING:
@@ -75,7 +75,7 @@ class EmbeddingsPipeline(EmbeddingsPipelineType):
         self._weight_adapters = weight_adapters
         # Initialize Session.
         devices = load_devices(self._pipeline_config.model.device_specs)
-        session = InferenceSession(devices=devices)
+        session = InferenceSession(devices=[*devices])
         self._pipeline_config.configure_session(session)
 
         if not self._pipeline_config.model.quantization_encoding:

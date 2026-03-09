@@ -11,27 +11,20 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from utils import StaticTuple
-from math import iota, ceildiv
-from sys import is_nvidia_gpu
-
+from std.utils import StaticTuple
+from std.math import iota, ceildiv
+from std.sys import is_nvidia_gpu
 from layout import LayoutTensor, Layout, UNKNOWN_VALUE
-from memory import LegacyUnsafePointer
-from collections import OptionalReg
-
-comptime OpaquePointer = LegacyUnsafePointer[
-    mut=True, NoneType, origin=MutAnyOrigin
-]
-
-from utils.index import IndexList, Index
-from builtin.device_passable import DevicePassable
+from std.collections import OptionalReg
+from std.utils.index import IndexList, Index
+from std.builtin.device_passable import DevicePassable
 
 # ===-----------------------------------------------------------------------===#
 # MaskName
 # ===-----------------------------------------------------------------------===#
 
 
-struct MaskName(Stringable):
+struct MaskName(Writable):
     """A tile's masking status."""
 
     var name: String
@@ -46,8 +39,17 @@ struct MaskName(Stringable):
     fn __init__(out self, name: String):
         self.name = name
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     fn __str__(self) -> String:
         return self.name
+
+    fn write_to(self, mut writer: Some[Writer]):
+        """Writes the mask name.
+
+        Args:
+            writer: The writer to write to.
+        """
+        writer.write_string(self.name)
 
     fn __eq__(self, rhs: Self) -> Bool:
         return self.name == rhs.name
@@ -68,7 +70,6 @@ struct MaskName(Stringable):
 struct TileMaskStatus(
     Equatable,
     Identifiable,
-    Stringable,
     TrivialRegisterPassable,
     Writable,
 ):
@@ -99,6 +100,7 @@ struct TileMaskStatus(
     fn __is__(self, rhs: Self) -> Bool:
         return self.status == rhs.status
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     fn __str__(self) -> String:
         return String.write(self)
 
@@ -1049,8 +1051,8 @@ fn naively_compute_total_iters[
         iter_count += UInt32(
             Int(
                 mask.status(
-                    Index[dtype = DType.int32](Int(q_row), Int(kv_row)),
-                    Index[dtype = DType.int32](BM, BN),
+                    Index[dtype=DType.int32](Int(q_row), Int(kv_row)),
+                    Index[dtype=DType.int32](BM, BN),
                 )
                 != TileMaskStatus.FULL_MASK
             )
@@ -1066,8 +1068,8 @@ fn naively_get_first_nonempty_mask_col[
     var kv_row: UInt32 = 0
     while (
         mask.status(
-            Index[dtype = DType.int32](Int(q_row), Int(kv_row)),
-            Index[dtype = DType.int32](BM, BN),
+            Index[dtype=DType.int32](Int(q_row), Int(kv_row)),
+            Index[dtype=DType.int32](BM, BN),
         )
         == TileMaskStatus.FULL_MASK
     ):
@@ -1075,9 +1077,9 @@ fn naively_get_first_nonempty_mask_col[
     return kv_row
 
 
-struct MaterializedMask[dtype_: DType, layout_: Layout](
-    MHAMask, TrivialRegisterPassable
-):
+struct MaterializedMask[
+    dtype_: DType, layout_: Layout, origin_: Origin[mut=False]
+](MHAMask, TrivialRegisterPassable):
     """Mask that's backed by a materialized tensor."""
 
     comptime apply_log2e_after_mask: Bool = True
@@ -1085,8 +1087,7 @@ struct MaterializedMask[dtype_: DType, layout_: Layout](
     comptime mask_safe_out_of_bounds: Bool = False
     comptime check_mask_during_decoding: Bool = True
 
-    comptime MaskType = LayoutTensor[Self.dtype_, Self.layout_, ImmutAnyOrigin]
-    var mask_tensor: Self.MaskType
+    var mask_tensor: LayoutTensor[Self.dtype_, Self.layout_, Self.origin_]
     var start_pos: OptionalReg[
         LayoutTensor[
             DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
@@ -1109,7 +1110,7 @@ struct MaterializedMask[dtype_: DType, layout_: Layout](
 
     fn __init__(
         out self,
-        mask_tensor: Self.MaskType,
+        mask_tensor: LayoutTensor[Self.dtype_, Self.layout_, Self.origin_],
         start_pos: OptionalReg[
             LayoutTensor[
                 DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin

@@ -11,24 +11,24 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import ceildiv
-from sys import size_of
+from std.math import ceildiv
+from std.sys import size_of
 
-from gpu import barrier, block_idx, thread_idx
-from gpu.host import DeviceContext
+from std.gpu import barrier, block_idx, thread_idx
+from std.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from layout._fillers import random
 from layout._utils import ManagedLayoutTensor
 from layout.tma_async import SharedMemBarrier
-from memory import stack_allocation
-from memory.pointer import _GPUAddressSpace
-from testing import assert_equal
+from std.memory import stack_allocation
+from std.memory.pointer import _GPUAddressSpace
+from std.testing import assert_equal
 
-from utils.index import Index, IndexList
+from std.utils.index import Index, IndexList
 from layout.int_tuple import IntTuple, product, depth, to_index_list
 from layout.layout import zipped_divide, blocked_product, print_layout
 
-from random import random_si64
+from std.random import random_si64
 from linalg.arch.sm100._tma import (
     create_tma_descriptor,
     TMALoad,
@@ -36,10 +36,10 @@ from linalg.arch.sm100._tma import (
     UInt32Indices,
     to_swizzle,
 )
-from gpu.memory import AddressSpace
-from gpu.host._tensormap import SwizzleMode
-from gpu import WARP_SIZE
-from testing import assert_equal
+from std.gpu.memory import AddressSpace
+from std.gpu.host._tensormap import SwizzleMode
+from std.gpu import WARP_SIZE
+from std.testing import assert_equal
 from linalg.arch.sm100.mma import max_contiguous_tile_shape, Major
 
 
@@ -87,7 +87,7 @@ fn shared_to_global_2D[
 ](
     smem_tile: LayoutTensor,
     dst: LayoutTensor,
-    tiled_coordinate: IndexList[2, element_type = DType.uint32],
+    tiled_coordinate: IndexList[2, element_type=DType.uint32],
 ):
     comptime smem_dim0 = product(smem_tile.layout.shape[0])
     comptime smem_dim1 = product(smem_tile.layout.shape[1])
@@ -129,7 +129,7 @@ fn shared_to_global_3D[
 ](
     smem_tile: LayoutTensor,
     dst: LayoutTensor,
-    tiled_coordinate: IndexList[3, element_type = DType.uint32],
+    tiled_coordinate: IndexList[3, element_type=DType.uint32],
 ):
     comptime smem_dim0 = product(smem_tile.layout.shape[0])
     comptime smem_dim1 = product(smem_tile.layout.shape[1])
@@ -191,14 +191,14 @@ fn test_tma_load_kernel[
         dtype,
         smem_layout,
         MutAnyOrigin,
-        address_space = _GPUAddressSpace.SHARED,
+        address_space=_GPUAddressSpace.SHARED,
         alignment=128,
     ].stack_allocation()
 
     var mbar_ptr = stack_allocation[
         1,
         SharedMemBarrier,
-        address_space = _GPUAddressSpace.SHARED,
+        address_space=_GPUAddressSpace.SHARED,
         alignment=8,
     ]()
 
@@ -242,7 +242,7 @@ def test_2D_swizzle[
     swizzle_mode: SwizzleMode,
     global_shape: IntTuple,
     load_shape: IntTuple,
-](reference_tensor: LayoutTensor, result_tensor: LayoutTensor,) -> Int:
+](reference_tensor: LayoutTensor, result_tensor: LayoutTensor,) raises -> Int:
     var total_errors = 0
 
     comptime load_shape_m = product(load_shape[0])
@@ -285,7 +285,7 @@ def test_3D_swizzle[
     swizzle_mode: SwizzleMode,
     global_shape: IntTuple,
     load_shape: IntTuple,
-](reference_tensor: LayoutTensor, result_tensor: LayoutTensor,) -> Int:
+](reference_tensor: LayoutTensor, result_tensor: LayoutTensor,) raises -> Int:
     comptime load_shape_b = product(load_shape[0])
     comptime load_shape_m = product(load_shape[1])
     comptime load_shape_n = product(load_shape[2])
@@ -341,7 +341,7 @@ def test_tma_load[
     dtype: DType,
     swizzle_mode: SwizzleMode = SwizzleMode.NONE,
     OOB_access: Bool = False,
-](ctx: DeviceContext):
+](ctx: DeviceContext) raises:
     comptime assert (
         depth(global_shape) == depth(load_shape) and depth(load_shape) == 1
     ), "Global shape and SMEM shape must have the same depth"
@@ -437,7 +437,7 @@ def test_tma_load[
         assert_equal(total_errors, 0)
 
 
-def main():
+def main() raises:
     with DeviceContext() as ctx:
         print("Test TMA horizontal loads")
 
@@ -509,7 +509,7 @@ def main():
             smem_layout[SwizzleMode._32B, Major.K],
             load_tile_shape_32B_K,
             DType.bfloat16,
-            swizzle_mode = SwizzleMode._32B,
+            swizzle_mode=SwizzleMode._32B,
         ](ctx)
 
         test_tma_load[
@@ -517,7 +517,7 @@ def main():
             smem_layout[SwizzleMode._64B, Major.K],
             load_tile_shape_64B_K,
             DType.bfloat16,
-            swizzle_mode = SwizzleMode._64B,
+            swizzle_mode=SwizzleMode._64B,
         ](ctx)
 
         test_tma_load[
@@ -525,7 +525,7 @@ def main():
             smem_layout[SwizzleMode._128B, Major.K],
             load_tile_shape_128B_K,
             DType.bfloat16,
-            swizzle_mode = SwizzleMode._128B,
+            swizzle_mode=SwizzleMode._128B,
         ](ctx)
 
         print("TMA swizzle mn-major")
@@ -535,7 +535,7 @@ def main():
             smem_layout[SwizzleMode._128B, Major.K],
             load_tile_shape_128B_MN,
             DType.bfloat16,
-            swizzle_mode = SwizzleMode._128B,
+            swizzle_mode=SwizzleMode._128B,
         ](ctx)
 
         print("TMA OOB access")

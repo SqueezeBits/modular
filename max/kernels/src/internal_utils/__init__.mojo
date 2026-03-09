@@ -25,13 +25,12 @@ from ._utils import (
     Timer,
     arg_parse,
     bench_compile_time,
-    env_get_shape,
+    get_defined_shape,
     human_readable_size,
     init_vector_launch,
     int_list_to_tuple,
     parse_shape,
     update_bench_config_args,
-    ufloordiv,
 )
 from .amd_configs import TuningConfigAMD, TuningTableAMD
 from .dispatch_utils import Table, TuningConfig

@@ -11,33 +11,27 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import Optional
-from hashlib import default_comp_time_hasher
-from sys import align_of, size_of
+from std.collections import Optional
+from std.hashlib import default_comp_time_hasher
+from std.sys import align_of, size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
 from buffer import NDBuffer
 from buffer.dimlist import DimList
-from gpu.host import DeviceContext
-from gpu.host.nvidia.tma import TensorMapSwizzle
-from memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from std.gpu.host import DeviceContext
+from std.gpu.host.nvidia.tma import TensorMapSwizzle
 
 # Additional imports for testing
 from internal_utils import assert_almost_equal
-from random import rand
+from std.random import rand
 from internal_utils._utils import ValOrDim, dynamic, static
-from layout._ndbuffer_stub import from_ndbuffer_row_major
-from linalg.matmul.gpu.sm100_structured.structured_kernels.tile_types import (
-    lt_to_tt,
-)
+from layout.tile_tensor import TileTensor
 from linalg.matmul.gpu.sm100_structured.default.matmul import (
     matmul_sm100_fallback,
 )
 from linalg.utils import elementwise_epilogue_type
 
-from utils.index import Index, IndexList
+from std.utils.index import Index, IndexList
 
 
 def test_matmul_sm100_fallback[
@@ -49,7 +43,7 @@ def test_matmul_sm100_fallback[
     transpose_b: Bool = True,
     BK: Int = 64,
     use_epilogue: Bool = False,
-](ctx: DeviceContext, m: ValOrDim, n: ValOrDim, k: ValOrDim,):
+](ctx: DeviceContext, m: ValOrDim, n: ValOrDim, k: ValOrDim,) raises:
     var M = m.value
     var N = n.value
     var K = k.value
@@ -59,20 +53,20 @@ def test_matmul_sm100_fallback[
         k.dim, n.dim
     )
     comptime static_c_shape = DimList(m.dim, n.dim)
-    var dynamic_a_shape = DimList(m.value, k.value)
-    var dynamic_b_shape = DimList(n.value, k.value) if transpose_b else DimList(
-        k.value, n.value
-    )
-    var dynamic_c_shape = DimList(m.value, n.value)
+    var dynamic_a_shape = IndexList[2](m.value, k.value)
+    var dynamic_b_shape = IndexList[2](
+        n.value, k.value
+    ) if transpose_b else IndexList[2](k.value, n.value)
+    var dynamic_c_shape = IndexList[2](m.value, n.value)
 
     var a_size = m.value * k.value
     var b_size = n.value * k.value
     var c_size = m.value * n.value
 
-    var a_host_ptr = UnsafePointer[Scalar[a_type]].alloc(a_size)
-    var b_host_ptr = UnsafePointer[Scalar[b_type]].alloc(b_size)
-    var c_host_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
-    var c_host_ref_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
+    var a_host_ptr = alloc[Scalar[a_type]](a_size)
+    var b_host_ptr = alloc[Scalar[b_type]](b_size)
+    var c_host_ptr = alloc[Scalar[c_type]](c_size)
+    var c_host_ref_ptr = alloc[Scalar[c_type]](c_size)
 
     var a_host = NDBuffer[a_type, 2, _, static_a_shape](
         a_host_ptr, dynamic_a_shape
@@ -160,9 +154,9 @@ def test_matmul_sm100_fallback[
     ctx.enqueue_copy(c_device, c_host_ptr)
     ctx.enqueue_copy(c_device_ref, c_host_ref_ptr)
 
-    var a = lt_to_tt(from_ndbuffer_row_major(a_device_nd))
-    var b = lt_to_tt(from_ndbuffer_row_major(b_device_nd))
-    var c = lt_to_tt(from_ndbuffer_row_major(c_device_nd))
+    var a = TileTensor(a_device_nd)
+    var b = TileTensor(b_device_nd)
+    var c = TileTensor(c_device_nd)
 
     comptime block_tile_shape = Index(umma_shape[0], umma_shape[1], BK)
 
@@ -175,7 +169,7 @@ def test_matmul_sm100_fallback[
         block_tile_shape=block_tile_shape,
         a_swizzle=swizzle,
         b_swizzle=swizzle,
-        elementwise_lambda_fn = Optional[elementwise_epilogue_type](
+        elementwise_lambda_fn=Optional[elementwise_epilogue_type](
             epilogue_fn
         ) if use_epilogue else None,
     ](c, a, b, ctx)
@@ -224,7 +218,7 @@ def test_matmul_sm100_fallback[
     _ = c
 
 
-def main():
+def main() raises:
     with DeviceContext() as ctx:
         comptime for dtype in [DType.float8_e4m3fn, DType.bfloat16]:
             comptime for swizzle in [TensorMapSwizzle.SWIZZLE_128B]:
@@ -235,7 +229,7 @@ def main():
                     dtype,
                     dtype,
                     DType.bfloat16,
-                    umma_shape = Index(64, 128, MMA_K),
+                    umma_shape=Index(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -249,7 +243,7 @@ def main():
                     dtype,
                     dtype,
                     DType.bfloat16,
-                    umma_shape = Index(64, 128, MMA_K),
+                    umma_shape=Index(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -265,7 +259,7 @@ def main():
                     dtype,
                     dtype,
                     DType.bfloat16,
-                    umma_shape = Index(64, 128, MMA_K),
+                    umma_shape=Index(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -280,7 +274,7 @@ def main():
                     dtype,
                     dtype,
                     DType.bfloat16,
-                    umma_shape = Index(64, 128, MMA_K),
+                    umma_shape=Index(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -298,7 +292,7 @@ def main():
                         dtype,
                         dtype,
                         DType.bfloat16,
-                        umma_shape = Index(64, 128, MMA_K),
+                        umma_shape=Index(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -312,7 +306,7 @@ def main():
                         dtype,
                         dtype,
                         DType.bfloat16,
-                        umma_shape = Index(64, 128, MMA_K),
+                        umma_shape=Index(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -326,7 +320,7 @@ def main():
                         dtype,
                         dtype,
                         DType.bfloat16,
-                        umma_shape = Index(64, 128, MMA_K),
+                        umma_shape=Index(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -340,7 +334,7 @@ def main():
                         dtype,
                         dtype,
                         DType.bfloat16,
-                        umma_shape = Index(64, 128, MMA_K),
+                        umma_shape=Index(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -354,7 +348,7 @@ def main():
                         dtype,
                         dtype,
                         DType.bfloat16,
-                        umma_shape = Index(64, 128, MMA_K),
+                        umma_shape=Index(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](

@@ -11,23 +11,33 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import ceildiv, iota
-from random import random_float64, seed
+from std.math import ceildiv, iota
+from std.random import random_float64, seed
 
-from algorithm.reduction import max as reduce_max
-from benchmark import Bench, Bencher, BenchId, BenchMetric, ThroughputMeasure
+from std.algorithm.reduction import max as reduce_max
+from std.benchmark import (
+    Bench,
+    Bencher,
+    BenchId,
+    BenchMetric,
+    ThroughputMeasure,
+)
 from buffer.dimlist import DimList
-from gpu import WARP_SIZE
-from gpu.host import DeviceContext
+from std.gpu import WARP_SIZE
+from std.gpu.host import DeviceContext
 
-from layout._coord import Coord, Idx, coord_to_index_list
-from layout._layout import row_major
-from layout._tile_tensor import TileTensor
+from layout import (
+    Coord,
+    Idx,
+    TileTensor,
+    coord_to_index_list,
+    row_major,
+)
 
 from nn.topk import _top_k_cpu, _topk_gpu, topk_gpu
-from testing import assert_almost_equal, assert_equal
+from std.testing import assert_almost_equal, assert_equal
 
-from utils import IndexList
+from std.utils import IndexList
 
 comptime DEBUG_BENCH = False
 comptime PRINT_OUTPUT = False
@@ -230,7 +240,7 @@ fn test_case_batched[
             fn run_func_cpu(ctx: DeviceContext) raises:
                 _top_k_cpu[
                     dtype=dtype,
-                    out_idx_type = DType.int64,
+                    out_idx_type=DType.int64,
                     largest=largest,
                 ](
                     in_host_tt,
@@ -245,7 +255,7 @@ fn test_case_batched[
 
             time_kernel[run_func_cpu](m, ctx, "topk-cpu")
 
-        _top_k_cpu[dtype=dtype, out_idx_type = DType.int64, largest=largest](
+        _top_k_cpu[dtype=dtype, out_idx_type=DType.int64, largest=largest](
             in_host_tt,
             max_k,
             rank - 1,
@@ -412,7 +422,7 @@ fn test_case_multi_rank[
         )
         var k_host_tt = TileTensor(K_host_ptr, k_runtime_layout)
 
-        _top_k_cpu[dtype=dtype, out_idx_type = DType.int64, largest=largest](
+        _top_k_cpu[dtype=dtype, out_idx_type=DType.int64, largest=largest](
             in_host_tt,
             max_k,
             rank - 1,
@@ -581,7 +591,7 @@ fn test_min_topk[dtype: DType](ctx: DeviceContext) raises:
     test_case_batched[
         dtype,
         fill_iota,
-        out_idx_type = DType.uint64,
+        out_idx_type=DType.uint64,
     ](ctx, test_case0)
 
     comptime test_case1 = TestCase[_sampling=False, _largest=False](
@@ -648,7 +658,7 @@ fn test_multi_rank[dtype: DType, sampling: Bool](ctx: DeviceContext) raises:
     test_case_multi_rank[dtype, fill_iota](ctx, test_case_multi_rank3)
 
 
-def main():
+def main() raises:
     comptime llama3_vocab_size = 128256
     with DeviceContext() as ctx:
         comptime dtype = DType.float32
@@ -671,7 +681,7 @@ def main():
         test_case_batched[
             dtype,
             fill_iota,
-            out_idx_type = DType.uint64,
+            out_idx_type=DType.uint64,
         ](ctx, test_case0)
 
         comptime test_case1 = TestCase[_sampling=False](
@@ -684,7 +694,7 @@ def main():
         test_case_batched[
             dtype,
             fill_iota,
-            out_idx_type = DType.uint64,
+            out_idx_type=DType.uint64,
         ](ctx, test_case1)
 
         comptime test_case2 = TestCase[_sampling=False](
@@ -741,7 +751,7 @@ def main():
         test_case_batched[
             dtype,
             fill_random,
-            out_idx_type = DType.int32,
+            out_idx_type=DType.int32,
         ](ctx, test_case6)
 
         comptime test_case7 = TestCase[_sampling=False](
@@ -811,7 +821,7 @@ def main():
         test_case_batched[
             bf16_type,
             fill_iota,
-            out_idx_type = DType.uint64,
+            out_idx_type=DType.uint64,
         ](ctx, test_case13)
 
         comptime test_case14 = TestCase[_sampling=False](
@@ -843,7 +853,7 @@ def main():
         test_case_batched[
             bf16_type,
             fill_iota,
-            out_idx_type = DType.int64,
+            out_idx_type=DType.int64,
         ](ctx, test_case16)
 
         comptime test_case17 = TestCase[_sampling=False](

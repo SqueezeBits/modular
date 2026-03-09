@@ -11,11 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from ffi import external_call
-from sys import size_of
-from gpu.host import DeviceBuffer
-from gpu.host.device_context import _checked, _ConstCharPtr, _DeviceBufferPtr
-from utils import IndexList, StaticTuple
+from std.ffi import external_call
+from std.sys import size_of
+from std.gpu.host import DeviceBuffer
+from std.gpu.host.device_context import (
+    _checked,
+    _ConstCharPtr,
+    _DeviceBufferPtr,
+)
+from std.utils import IndexList, StaticTuple
 
 
 @fieldwise_init("implicit")
@@ -90,7 +94,6 @@ struct SwizzleMode(
     Equatable,
     ImplicitlyCopyable,
     Intable,
-    Stringable,
     TrivialRegisterPassable,
     Writable,
 ):
@@ -154,6 +157,7 @@ struct SwizzleMode(
         """
         return Int((2**self._value) * 16)
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     @no_inline
     fn __str__(self) -> String:
         """Convert SwizzleMode to string representation.
@@ -337,7 +341,7 @@ fn create_tensormap[
             OpaquePointer[MutAnyOrigin],  # tensorMap
             Int32,  # tensorDataType
             Int32,  # tensorRank
-            _DeviceBufferPtr,  #  globalAddress
+            type_of(global_buf._handle),  #  globalAddress
             UnsafePointer[Int64, MutAnyOrigin],  # globalDim
             UnsafePointer[Int64, MutAnyOrigin],  # globalStrides
             UnsafePointer[Int32, MutAnyOrigin],  # boxDim
@@ -452,21 +456,6 @@ fn create_tensormap_im2col[
         external_call[
             "AsyncRT_cuda_tensorMapEncodeIm2col",
             _ConstCharPtr,
-            OpaquePointer[MutAnyOrigin],  # tensorMap
-            Int32,  # tensorDataType
-            Int32,  # tensorRank
-            _DeviceBufferPtr,  # globalAddress
-            UnsafePointer[Int64, MutAnyOrigin],  # globalDim
-            UnsafePointer[Int64, MutAnyOrigin],  # globalStrides
-            UnsafePointer[Int32, MutAnyOrigin],  # pixelBoxLowerCorner
-            UnsafePointer[Int32, MutAnyOrigin],  # pixelBoxUpperCorner
-            Int32,  # channelsPerPixel
-            Int32,  # pixelsPerColumn
-            UnsafePointer[Int32, MutAnyOrigin],  # elementStrides
-            Int32,  # interleave
-            Int32,  # swizzle
-            Int32,  # l2Promotion
-            Int32,  # oobFill
         ](
             tensormap_ptr,
             DataType.from_dtype[dtype]()._value,

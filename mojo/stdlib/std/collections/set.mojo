@@ -12,17 +12,15 @@
 # ===----------------------------------------------------------------------=== #
 """Implements the  Set datatype."""
 
-from format._utils import (
+from std.format._utils import (
     write_sequence_to,
     FormatStruct,
     Named,
     TypeNames,
-    constrained_conforms_to_writable,
 )
-from hashlib import Hasher, default_hasher
+from std.hashlib import Hasher, default_hasher
 
 from .dict import Dict, KeyElement, _DictEntryIter, _DictKeyIter
-from builtin.constrained import _constrained_conforms_to
 
 
 struct Set[T: KeyElement, H: Hasher = default_hasher](
@@ -32,17 +30,15 @@ struct Set[T: KeyElement, H: Hasher = default_hasher](
     Hashable,
     Iterable,
     KeyElement,
-    Representable,
     Sized,
-    Stringable,
-    Writable,
+    Writable where conforms_to(T, Writable),
 ):
     """A set data type.
 
     O(1) average-case amortized add, remove, and membership check.
 
     ```mojo
-    from collections import Set
+    from std.collections import Set
 
     var set = { 1, 2, 3 }
     print(len(set))  # 3
@@ -308,8 +304,9 @@ struct Set[T: KeyElement, H: Hasher = default_hasher](
             hash_value ^= hash(e)
         hasher.update(hash_value)
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     @no_inline
-    fn __str__(self) -> String:
+    fn __str__(self) -> String where conforms_to(Self.T, Writable):
         """Returns the string representation of the set.
 
         Returns:
@@ -319,8 +316,9 @@ struct Set[T: KeyElement, H: Hasher = default_hasher](
         self.write_to(output)
         return output
 
+    @deprecated("Representable is deprecated. Use Writable instead.")
     @no_inline
-    fn __repr__(self) -> String:
+    fn __repr__(self) -> String where conforms_to(Self.T, Writable):
         """Returns the string representation of the set.
 
         Returns:
@@ -330,9 +328,9 @@ struct Set[T: KeyElement, H: Hasher = default_hasher](
         self.write_repr_to(output)
         return output
 
-    fn _write_self_to[*, is_repr: Bool](self, mut writer: Some[Writer]):
-        constrained_conforms_to_writable[Self.T, Parent=Self]()
-
+    fn _write_self_to[
+        *, is_repr: Bool
+    ](self, mut writer: Some[Writer]) where conforms_to(Self.T, Writable):
         var iterator = self.__iter__()
 
         @parameter
@@ -348,11 +346,10 @@ struct Set[T: KeyElement, H: Hasher = default_hasher](
         _ = iterator^
 
     @no_inline
-    fn write_to(self, mut writer: Some[Writer]):
+    fn write_to(
+        self, mut writer: Some[Writer]
+    ) where conforms_to(Self.T, Writable):
         """Write this set to a `Writer`.
-
-        Constraints:
-            `T` must conform to `Writable`.
 
         Args:
             writer: The object to write to.
@@ -360,11 +357,10 @@ struct Set[T: KeyElement, H: Hasher = default_hasher](
         self._write_self_to[is_repr=False](writer)
 
     @no_inline
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    fn write_repr_to(
+        self, mut writer: Some[Writer]
+    ) where conforms_to(Self.T, Writable):
         """Write this set to a `Writer`.
-
-        Constraints:
-            `T` must conform to `Writable`.
 
         Args:
             writer: The object to write to.

@@ -11,18 +11,18 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import Optional
-from sys import size_of
-from sys.intrinsics import readfirstlane
+from std.collections import Optional
+from std.sys import size_of
+from std.sys.intrinsics import readfirstlane
 
-from gpu.host import DeviceBuffer, DeviceContext, HostBuffer
-from gpu.intrinsics import AMDBufferResource
-from gpu.compute.mma import mma
+from std.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from std.gpu.intrinsics import AMDBufferResource
+from std.gpu.compute.mma import mma
 from layout import *
 from layout.layout_tensor import LayoutTensor, LayoutTensorIter
-from memory.unsafe import bitcast
+from std.memory.unsafe import bitcast
 
-from utils import IndexList
+from std.utils import IndexList
 
 from .int_tuple import _get_index_type, _get_layout_type, product
 
@@ -42,16 +42,16 @@ struct ManagedLayoutTensor[
         Self.dtype,
         Self.layout,
         MutAnyOrigin,
-        layout_int_type = Self.element_type,
-        linear_idx_type = Self.index_type,
+        layout_int_type=Self.element_type,
+        linear_idx_type=Self.index_type,
     ]
 
     var device_data: Optional[DeviceBuffer[Self.dtype]]
     var host_data: HostBuffer[Self.dtype]
     var runtime_layout: RuntimeLayout[
         Self.layout,
-        element_type = Self.element_type,
-        linear_idx_type = Self.index_type,
+        element_type=Self.element_type,
+        linear_idx_type=Self.index_type,
     ]
     var ctx: DeviceContext
 
@@ -140,10 +140,9 @@ struct ManagedLayoutTensor[
     fn device_tensor[
         update: Bool = True
     ](self) raises -> Self.layout_tensor_type:
-        debug_assert(
-            self.ctx.api() != "cpu",
-            "device_tensor cannot be constructed for host only tensor.",
-        )
+        assert (
+            self.ctx.api() != "cpu"
+        ), "device_tensor cannot be constructed for host only tensor."
 
         comptime if update:
             self._update_device()

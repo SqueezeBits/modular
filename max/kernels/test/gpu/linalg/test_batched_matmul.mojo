@@ -12,20 +12,19 @@
 # ===----------------------------------------------------------------------=== #
 
 
-from sys import has_nvidia_gpu_accelerator, simd_width_of
+from std.sys import has_nvidia_gpu_accelerator, simd_width_of
 
 import linalg.matmul.vendor.blas as vendor_blas
-from algorithm.functional import elementwise
+from std.algorithm.functional import elementwise
 from buffer import NDBuffer
-from gpu.host import DeviceContext, get_gpu_target
-from layout._coord import Coord, Idx
-from layout._layout import Layout, row_major
-from layout._tile_tensor import TileTensor
+from std.gpu.host import DeviceContext, get_gpu_target
+from layout import Coord, Idx, TileTensor, row_major
+from layout.tile_layout import Layout
 from linalg.bmm import _batched_matmul_gpu
 
-from random import rand
-from testing import assert_almost_equal
-from utils import IndexList
+from std.random import rand
+from std.testing import assert_almost_equal
+from std.utils import IndexList
 
 comptime epilogue_func_type = fn[
     dtype: DType, width: Int, *, alignment: Int = 1
@@ -161,7 +160,7 @@ fn run_bmm_and_check_result[
                 transpose_b=transpose_b,
             )
 
-    comptime pack_size = simd_width_of[dtype, target = get_gpu_target()]()
+    comptime pack_size = simd_width_of[dtype, target=get_gpu_target()]()
 
     @always_inline
     @__copy_capture(c_device_ref)
@@ -359,7 +358,7 @@ fn test_non_row_major_layout[
     c_host_ref_ptr.free()
 
 
-def main():
+def main() raises:
     with DeviceContext() as ctx:
         # Test zero-dimension edge cases
         test_dynamic_shapes[
@@ -414,8 +413,8 @@ def main():
                 DType.bfloat16,
                 transpose_b=True,
                 lambda_fn=elementwise_epilogue_fn,
-                N = Int(128256),
-                K = Int(4096),
+                N=Int(128256),
+                K=Int(4096),
             ](ctx, 2, 600)
 
             # tests kernels.ampere_256x64_4
@@ -423,8 +422,8 @@ def main():
                 DType.bfloat16,
                 transpose_b=True,
                 lambda_fn=elementwise_epilogue_fn,
-                N = Int(3072),
-                K = Int(12288),
+                N=Int(3072),
+                K=Int(12288),
             ](ctx, 4, 14, rtol=2e-2)
 
             # tests DeepSeek Case
@@ -432,37 +431,37 @@ def main():
                 DType.bfloat16,
                 transpose_b=True,
                 lambda_fn=elementwise_epilogue_fn,
-                N = Int(128),
-                K = Int(512),
+                N=Int(128),
+                K=Int(512),
             ](ctx, 128, 256)
 
             test_static_NK[
                 DType.bfloat16,
                 transpose_b=True,
                 lambda_fn=elementwise_epilogue_fn,
-                N = Int(512),
-                K = Int(128),
+                N=Int(512),
+                K=Int(128),
             ](ctx, 128, 256)
 
             test_static_NK[
                 DType.bfloat16,
                 transpose_b=False,
                 lambda_fn=elementwise_epilogue_fn,
-                N = Int(3072),
-                K = Int(12288),
+                N=Int(3072),
+                K=Int(12288),
             ](ctx, 4, 14, rtol=2e-2)
 
             # test non-row major layout
             test_non_row_major_layout[
                 DType.bfloat16,
-                B = Int(128),
-                N = Int(128),
-                K = Int(512),
+                B=Int(128),
+                N=Int(128),
+                K=Int(512),
             ](ctx, 22)
 
             test_non_row_major_layout[
                 DType.bfloat16,
-                B = Int(128),
-                N = Int(512),
-                K = Int(128),
+                B=Int(128),
+                N=Int(512),
+                K=Int(128),
             ](ctx, 22)

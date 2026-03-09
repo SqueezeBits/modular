@@ -11,21 +11,16 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import align_down, align_up, ceildiv
-from sys import align_of
-from sys._build import is_debug_build
-from sys.info import CompilationTarget, simd_width_of, size_of
-
-from algorithm import vectorize
+from std.math import align_down, align_up, ceildiv
+from std.sys import align_of
+from std.sys._build import is_debug_build
+from std.sys.info import CompilationTarget, simd_width_of, size_of
+from std.utils.index import Index, IndexList
+from std.algorithm import vectorize
 from buffer.buffer import NDBuffer, partial_simd_load, partial_simd_store
 from buffer.dimlist import DimList
 from layout.layout import *
 from layout.layout_tensor import LayoutTensor
-
-from memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-from utils.index import Index, IndexList
 
 comptime elementwise_epilogue_type = fn[
     dtype: DType, width: Int, *, alignment: Int = 1
@@ -114,9 +109,9 @@ struct GemmShape(TrivialRegisterPassable):
         layout_a: Layout,
         layout_b: Layout,
     ](
-        c: LayoutTensor[_, layout_c, _, ...],
-        a: LayoutTensor[_, layout_a, _, ...],
-        b: LayoutTensor[_, layout_b, _, ...],
+        c: LayoutTensor[_, layout_c, ...],
+        a: LayoutTensor[_, layout_a, ...],
+        b: LayoutTensor[_, layout_b, ...],
     ) -> GemmShape:
         """Constructor of a gemm shape record from input buffers.
 
@@ -283,7 +278,7 @@ fn _get_tile_n_k[
     kernel_cols: Int,
     transpose_b: Bool,
     layout: Layout,
-](b: LayoutTensor[b_type, layout, _, ...]) -> IndexList[2]:
+](b: LayoutTensor[b_type, layout, ...]) -> IndexList[2]:
     comptime assert b.rank == 2
     var tile_n_k: IndexList[2]
 
@@ -678,8 +673,8 @@ fn packA_i8mm[
     t0: Int,
     t1: Int,
     k: Int,
-    a_ptr: UnsafePointer[Scalar[a_type]],
-    a_packed_ptr: UnsafePointer[Scalar[a_type]],
+    a_ptr: UnsafePointer[mut=False, Scalar[a_type], ...],
+    a_packed_ptr: UnsafePointer[mut=True, Scalar[a_type], ...],
 ):
     @always_inline
     fn packA_helper[
@@ -770,7 +765,7 @@ fn apply_epilogue[
 
                 var vec = src.ptr.load[
                     width=vec_width,
-                    alignment = align_of[SIMD[src.dtype, vec_width]](),
+                    alignment=align_of[SIMD[src.dtype, vec_width]](),
                 ](src_idx)
 
                 var m = (dst_idx + offset) // N

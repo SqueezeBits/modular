@@ -11,16 +11,13 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from memory import LegacyUnsafePointer
+from std.math import exp
+from std.random import rand, random_float64, seed
+from std.sys import argv, has_amd_gpu_accelerator
 
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-from math import exp
-from random import rand, random_float64, seed
-from sys import argv, has_amd_gpu_accelerator
-
-from gpu import *
-from gpu.host import DeviceContext
-from gpu.host.info import A100, B200, H100, GPUInfo, Vendor
+from std.gpu import *
+from std.gpu.host import DeviceContext
+from std.gpu.host.info import A100, B200, H100, GPUInfo, Vendor
 from layout import LayoutTensor, Layout, RuntimeLayout, UNKNOWN_VALUE
 from nn.mha import (
     _naive_attention_with_transpose,
@@ -28,10 +25,9 @@ from nn.mha import (
     mha_gpu_naive,
 )
 from nn.mha_mask import MaterializedMask, NullMask
-from nn.mha_score_mod import IdentityScoreMod
-from testing import assert_almost_equal
+from std.testing import assert_almost_equal
 
-from utils.index import Index
+from std.utils.index import Index
 
 
 fn is_benchmark() -> Bool:
@@ -110,16 +106,16 @@ fn test[
     )
 
     # Allocate memory for all variables.
-    var q_ptr = UnsafePointer[Scalar[qkv_type]].alloc(q_size)
-    var k_ptr = UnsafePointer[Scalar[qkv_type]].alloc(k_size)
-    var v_ptr = UnsafePointer[Scalar[qkv_type]].alloc(v_size)
-    var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(mask_size)
-    var output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
+    var q_ptr = alloc[Scalar[qkv_type]](q_size)
+    var k_ptr = alloc[Scalar[qkv_type]](k_size)
+    var v_ptr = alloc[Scalar[qkv_type]](v_size)
+    var mask_ptr = alloc[Scalar[mask_type]](mask_size)
+    var output_ptr = alloc[Scalar[qkv_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[qkv_type]](o_size)
 
     # Q, K, V are randomly initialized.
     if use_index_input:
-        debug_assert(batch_size == 1)
+        assert batch_size == 1
         for i in range(seq_len):
             for h in range(num_heads):
                 for j in range(depth):
@@ -286,7 +282,6 @@ fn test[
                 k_device,
                 v_device,
                 MaterializedMask(mask3d),
-                IdentityScoreMod(),
                 scale,
                 ctx,
                 num_partitions,
@@ -298,7 +293,6 @@ fn test[
                 k_device,
                 v_device,
                 MaterializedMask(mask4d),
-                IdentityScoreMod(),
                 scale,
                 ctx,
                 num_partitions,
@@ -393,7 +387,7 @@ fn test[
                     expect,
                     atol=1e-5,
                     rtol=rtol,
-                    msg=String(h, s, d, actual, expect, rerr, sep=" "),
+                    msg=t"{h} {s} {d} {actual} {expect} {rerr}",
                 )
 
     _ = q_device_ptr
@@ -728,22 +722,20 @@ fn test_flash_attention_sink_kernel(ctx: DeviceContext, seq_len: Int) raises:
     comptime mask_type = DType.float32
     comptime scale = Float32(0.0)  # force QK logits to exactly 0
 
-    var q_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
+    var q_ptr = alloc[Scalar[qkv_type]](
         batch_size * seq_len * num_heads * depth
     )
-    var k_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
+    var k_ptr = alloc[Scalar[qkv_type]](
         batch_size * num_keys * kv_heads * depth
     )
-    var v_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
+    var v_ptr = alloc[Scalar[qkv_type]](
         batch_size * num_keys * kv_heads * depth
     )
-    var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(
-        batch_size * seq_len * num_keys
-    )
-    var out_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
+    var mask_ptr = alloc[Scalar[mask_type]](batch_size * seq_len * num_keys)
+    var out_ptr = alloc[Scalar[qkv_type]](
         batch_size * seq_len * num_heads * depth
     )
-    var sinks_ptr = UnsafePointer[Scalar[qkv_type]].alloc(num_heads)
+    var sinks_ptr = alloc[Scalar[qkv_type]](num_heads)
 
     # Q,K don't matter when scale=0, but set deterministically
     for i in range(batch_size * seq_len * num_heads * depth):
@@ -872,7 +864,6 @@ fn test_flash_attention_sink_kernel(ctx: DeviceContext, seq_len: Int) raises:
             k_device,
             v_device,
             NullMask(),
-            IdentityScoreMod(),
             scale,  # 0.0 -> all QK logits are exactly zero
             ctx,
             None,
@@ -906,7 +897,7 @@ fn test_flash_attention_sink_kernel(ctx: DeviceContext, seq_len: Int) raises:
     sinks_ptr.free()
 
 
-def main():
+def main() raises:
     with DeviceContext() as ctx:
         test_context_encoding(ctx)
         # Test flash attention with sink kernel during encoding

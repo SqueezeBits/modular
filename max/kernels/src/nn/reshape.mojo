@@ -11,12 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from layout._coord import Coord, DynamicCoord, Idx
-from layout._layout import Layout, TensorLayout
-from layout._tile_tensor import TileTensor
+from layout.coord import Coord, DynamicCoord, Idx
+from layout.tile_layout import Layout, TensorLayout
+from layout import TileTensor
 from register import register_internal
 
-from utils.index import IndexList
+from std.utils.index import IndexList
 
 
 # Reshape assumes inputs are contiguous. It should always be fused last and
@@ -33,11 +33,11 @@ fn reshape[
 ) -> TileTensor[
     dtype,
     Layout[
-        shape_types = DynamicCoord[DType.int64, output_rank].element_types,
-        stride_types = DynamicCoord[DType.int64, output_rank].element_types,
+        shape_types=DynamicCoord[DType.int64, output_rank].element_types,
+        stride_types=DynamicCoord[DType.int64, output_rank].element_types,
     ],
     input.origin,
-    address_space = input.address_space,
+    address_space=input.address_space,
 ]:
     var stride_tuple = type_of(new_shape)()
     var stride: Int = 1
@@ -67,11 +67,11 @@ fn layout_tensor_reshape[
 ) -> TileTensor[
     dtype,
     Layout[
-        shape_types = DynamicCoord[DType.int64, output_rank].element_types,
-        stride_types = DynamicCoord[DType.int64, output_rank].element_types,
+        shape_types=DynamicCoord[DType.int64, output_rank].element_types,
+        stride_types=DynamicCoord[DType.int64, output_rank].element_types,
     ],
     input.origin,
-    address_space = input.address_space,
+    address_space=input.address_space,
 ]:
     return reshape[
         output_rank,

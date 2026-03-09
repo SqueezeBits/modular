@@ -11,21 +11,16 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from memory import LegacyUnsafePointer
+from std.math import iota
+from std.random import random_float64
 
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-from math import iota
-from random import random_float64
-
-from algorithm.functional import parallelize_over_rows
-from benchmark import Bench, Bencher, BenchId
-from layout._coord import Coord, Idx
-from layout._layout import row_major
-from layout._tile_tensor import TileTensor
+from std.algorithm.functional import parallelize_over_rows
+from std.benchmark import Bench, Bencher, BenchId
+from layout import Coord, Idx, TileTensor, row_major
 from nn.toppminp import min_p_sampling, top_p_sampling
-from testing import assert_equal
+from std.testing import assert_equal
 
-from utils import IndexList
+from std.utils import IndexList
 
 comptime DEBUG_BENCH = False
 comptime PRINT_OUTPUT = False
@@ -91,7 +86,7 @@ fn test_is_sorted_descending[
 ](mut buf: TileTensor[dtype, ...], vocab_size: Int) -> Bool:
     comptime assert buf.rank == 2, "rank must be 2"
     var batch_size = buf.numel() // vocab_size
-    var sorted_flag = UnsafePointer[Bool].alloc(batch_size)
+    var sorted_flag = alloc[Bool](batch_size)
 
     # Initialize all flags to True
     for i in range(batch_size):
@@ -172,21 +167,17 @@ fn test_case_sampling[
     var m = Bench()
 
     # Create input tensors
-    var in_logits_ptr = UnsafePointer[Scalar[dtype]].alloc(
-        batch_size * vocab_size
-    )
+    var in_logits_ptr = alloc[Scalar[dtype]](batch_size * vocab_size)
     var in_logits = TileTensor(
         in_logits_ptr,
         row_major(Coord(Idx(batch_size), Idx(vocab_size))),
     )
-    var token_ids_ptr = UnsafePointer[Scalar[out_idx_type]].alloc(
-        batch_size * 1
-    )
+    var token_ids_ptr = alloc[Scalar[out_idx_type]](batch_size * 1)
     var token_ids = TileTensor(
         token_ids_ptr,
         row_major(Coord(Idx(batch_size), Idx(1))),
     )
-    var p_thresholds_ptr = UnsafePointer[Scalar[dtype]].alloc(batch_size)
+    var p_thresholds_ptr = alloc[Scalar[dtype]](batch_size)
     var p_thresholds = TileTensor(
         p_thresholds_ptr,
         row_major(Idx(batch_size)),
@@ -299,7 +290,7 @@ fn test_all_types[
     test_all_out_idx_types[DType.float32, fill_fn]()
 
 
-def main():
+def main() raises:
     print("\n====== Testing Fill Iota ======\n")
     test_all_types[fill_iota]()
     print("\n====== Testing Fill Random ======\n")

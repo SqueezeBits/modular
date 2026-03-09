@@ -23,12 +23,12 @@ Key differences from CDNA buffers:
 - Memory access patterns optimized for 16-lane unique data distribution
 """
 
-from collections import OptionalReg
-from math import ceildiv, recip
-from sys import simd_width_of
+from std.collections import OptionalReg
+from std.math import ceildiv, recip
+from std.sys import simd_width_of
 
-from gpu import barrier, lane_id
-from gpu import warp_id as get_warp_id
+from std.gpu import barrier, lane_id
+from std.gpu import warp_id as get_warp_id
 from layout import Layout, LayoutTensor
 from layout._utils import idx2crd, make_amd_buffer_resource
 from layout.layout import blocked_product
@@ -40,9 +40,9 @@ from layout.layout_tensor import (
 )
 from layout.swizzle import Swizzle
 from layout.tensor_core import TiledTensorCore
-from memory.pointer import AddressSpace as BaseAddressSpace
+from std.memory.pointer import AddressSpace as BaseAddressSpace
 
-from utils import IndexList
+from std.utils import IndexList
 
 from .buffers import KVBuffer, RegisterBuffer, RegisterMMABuffer
 from .utils import (
@@ -183,7 +183,7 @@ struct KBufferRDNA[
         Self.dtype,
         Self.smem_layout,
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
         circular=True,
     ]
 
@@ -201,11 +201,11 @@ struct KBufferRDNA[
         Self.dtype,
         Self.layout,
         Self.origin,
-        address_space = Self.address_space,
-        alignment = Self.alignment,
-        masked = Self.masked,
-        layout_int_type = Self.layout_int_type,
-        linear_idx_type = Self.linear_idx_type,
+        address_space=Self.address_space,
+        alignment=Self.alignment,
+        masked=Self.masked,
+        layout_int_type=Self.layout_int_type,
+        linear_idx_type=Self.linear_idx_type,
     ]
 
     comptime GlobalTiledIteratorType = Self.GlobalTensorType.TiledIteratorType[
@@ -224,7 +224,7 @@ struct KBufferRDNA[
         shared_ptr: UnsafePointer[
             Scalar[Self.dtype],
             MutAnyOrigin,
-            address_space = AddressSpace.SHARED,
+            address_space=AddressSpace.SHARED,
         ],
     ):
         self.load_tile = type_of(self.load_tile).stack_allocation()
@@ -248,7 +248,7 @@ struct KBufferRDNA[
     fn load_from_dram(
         mut self,
     ):
-        copy_dram_to_local[src_thread_layout = Self.thread_layout,](
+        copy_dram_to_local[src_thread_layout=Self.thread_layout,](
             self.load_tile.split[Self.num_stages]()[
                 self.load_tile_id
             ].vectorize[1, Self.simd_width](),
@@ -270,8 +270,8 @@ struct KBufferRDNA[
         var load_tile_slice = self.load_tile.split[Self.num_stages]()[tile_id]
 
         copy_local_to_shared[
-            thread_layout = Self.thread_layout,
-            swizzle = Self.swizzle,
+            thread_layout=Self.thread_layout,
+            swizzle=Self.swizzle,
             row_major=True,
         ](
             smem_tile.vectorize[1, Self.simd_width](),
@@ -390,7 +390,7 @@ struct VBufferRDNA[
         Self.dtype,
         Self.smem_layout,
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
         circular=True,
     ]
 
@@ -402,11 +402,11 @@ struct VBufferRDNA[
         Self.dtype,
         Self.layout,
         Self.origin,
-        address_space = Self.address_space,
-        alignment = Self.alignment,
-        masked = Self.masked,
-        layout_int_type = Self.layout_int_type,
-        linear_idx_type = Self.linear_idx_type,
+        address_space=Self.address_space,
+        alignment=Self.alignment,
+        masked=Self.masked,
+        layout_int_type=Self.layout_int_type,
+        linear_idx_type=Self.linear_idx_type,
     ]
 
     comptime GlobalTiledIteratorType = Self.GlobalTensorType.TiledIteratorType[
@@ -427,7 +427,7 @@ struct VBufferRDNA[
         shared_ptr: UnsafePointer[
             Scalar[Self.dtype],
             MutAnyOrigin,
-            address_space = AddressSpace.SHARED,
+            address_space=AddressSpace.SHARED,
         ],
         total_rows: OptionalReg[Int] = None,
     ):
@@ -505,7 +505,7 @@ struct VBufferRDNA[
 
                     var offset = src_row * stride + src_col
                     var data = (global_tile.ptr + offset).load[
-                        width = Self.load_width
+                        width=Self.load_width
                     ]()
 
                     comptime for j in range(Self.load_width):
@@ -719,12 +719,12 @@ struct QRegisterBufferRDNA[
                     if row < valid_rows:
                         var offset0 = warp_offset + row_offset + k_offset
                         var data0 = (tensor.ptr + offset0).load[
-                            width = Self.simd_width
+                            width=Self.simd_width
                         ]()
 
                         var offset1 = offset0 + Self.simd_width
                         var data1 = (tensor.ptr + offset1).load[
-                            width = Self.simd_width
+                            width=Self.simd_width
                         ]()
 
                         comptime for j in range(Self.simd_width):
@@ -862,7 +862,7 @@ struct PRegisterBufferRDNA[
     ]
 
     var shared_memory_ptr: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin, address_space = AddressSpace.SHARED
+        Scalar[Self.dtype], MutAnyOrigin, address_space=AddressSpace.SHARED
     ]
 
     @always_inline
@@ -871,7 +871,7 @@ struct PRegisterBufferRDNA[
         shared_ptr: UnsafePointer[
             Scalar[Self.dtype],
             MutAnyOrigin,
-            address_space = AddressSpace.SHARED,
+            address_space=AddressSpace.SHARED,
         ],
     ):
         self.reg_tile = Self.RegisterTileType.stack_allocation()

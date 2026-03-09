@@ -11,19 +11,19 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from sys import align_of
-from gpu import WARP_SIZE
-from gpu.compute.mma import mma
-from itertools import product
+from std.sys import align_of
+from std.gpu import WARP_SIZE
+from std.gpu.compute.mma import mma
+from std.itertools import product
 from layout import Layout, LayoutTensor
 from layout.int_tuple import product as prod
 from layout.layout import blocked_product
 from layout.swizzle import Swizzle
 from layout.tensor_core import num_matrix_reg, TensorCore
 from linalg.structuring import SMemTile, RegTile
-from sys._assembly import inlined_assembly
-from utils import IndexList, StaticTuple
-from gpu.intrinsics import load_acquire, store_release
+from std.sys._assembly import inlined_assembly
+from std.utils import IndexList, StaticTuple
+from std.gpu.intrinsics import load_acquire, store_release
 
 
 trait Enum(TrivialRegisterPassable):
@@ -49,7 +49,7 @@ trait Enum(TrivialRegisterPassable):
 
 
 @fieldwise_init
-struct ThreadRole(Enum, Stringable, Writable):
+struct ThreadRole(Enum, Writable):
     var _value: Int
 
     @always_inline
@@ -60,6 +60,7 @@ struct ThreadRole(Enum, Stringable, Writable):
     comptime CONSUMER = Self(1)
     comptime PRODUCER_CONSUMER = Self(2)
 
+    @deprecated("Stringable is deprecated. Use Writable instead.")
     @always_inline
     fn __str__(self) -> String:
         """Returns the string representation of this algorithm.
@@ -74,7 +75,7 @@ struct ThreadRole(Enum, Stringable, Writable):
         elif self is Self.PRODUCER_CONSUMER:
             return "PRODUCER_CONSUMER"
         else:
-            return String("UNKNOWN_ROLE: ", self._value)
+            return t"UNKNOWN_ROLE: {self._value}"
 
     @always_inline
     fn write_to[W: Writer](self, mut writer: W) -> None:
@@ -190,7 +191,7 @@ struct AMDWarpSharedMemoryBarrier[size: Int](TrivialRegisterPassable):
             UnsafePointer[
                 Scalar[DType.int32],
                 MutAnyOrigin,
-                address_space = AddressSpace.SHARED,
+                address_space=AddressSpace.SHARED,
             ]
         ](Pointer(to=self.__repr))
         bar[warp_id] += 1
@@ -330,8 +331,8 @@ struct AmdTileOperator[
         Self.OutType,
         Self._out_layout,
         MutAnyOrigin,
-        alignment = Self._type_alignment,
-        address_space = AddressSpace.LOCAL,
+        alignment=Self._type_alignment,
+        address_space=AddressSpace.LOCAL,
     ]
 
     comptime OutRegTileFragmentType = Self.OutRegTile.TileType[
@@ -418,7 +419,7 @@ struct AmdTileOperator[
         # Only load if this is the first fragment in the group
         # (tensor core loads k_group_size tiles at once)
         comptime if fragment_idx == 0:
-            Self.tensor_core.load_a[swizzle = Self.swizzle](
+            Self.tensor_core.load_a[swizzle=Self.swizzle](
                 smem_tile_a,
                 self._a_reg_tile.tile[Self.num_m_mmas, Self.simd_width](
                     group_idx, 0
@@ -426,7 +427,7 @@ struct AmdTileOperator[
                 UInt(group_idx),
             )
 
-            Self.tensor_core.load_b[swizzle = Self.swizzle](
+            Self.tensor_core.load_b[swizzle=Self.swizzle](
                 smem_tile_b,
                 self._b_reg_tile.tile[Self.num_n_mmas, Self.simd_width](
                     group_idx, 0
