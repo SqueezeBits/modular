@@ -20,6 +20,7 @@ from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.graph import TensorType, TensorValue, ops
 from max.pipelines.core import PixelContext
+from max.pipelines.lib import float32_array_to_buffer
 from max.pipelines.lib.interfaces import DiffusionPipeline
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.profiler import Tracer, traced
@@ -155,8 +156,6 @@ class Flux2Pipeline(DiffusionPipeline):
         self.build_scheduler_step()
         self.build_concat_image_latents()
         self.build_decode_latents()
-        self.build_cast_guidance()
-        self.build_cast_image_input()
         self.build_concat_packed_latents()
 
         self._cached_guidance: dict[str, Buffer] = {}
@@ -203,14 +202,15 @@ class Flux2Pipeline(DiffusionPipeline):
         if guidance_key in self._cached_guidance:
             guidance = self._cached_guidance[guidance_key]
         else:
-            guidance_input = Buffer.from_numpy(
+            guidance = float32_array_to_buffer(
                 np.full(
                     [context.num_images_per_prompt],
                     context.guidance_scale,
                     dtype=np.float32,
-                )
-            ).to(device)
-            guidance = self._cast_guidance(guidance_input)
+                ),
+                dtype=self.transformer.config.dtype,
+                device=device,
+            )
             self._cached_guidance[guidance_key] = guidance
 
         # Retrieve cached shape carriers, if possible.
@@ -290,30 +290,6 @@ class Flux2Pipeline(DiffusionPipeline):
         self.__dict__["prepare_scheduler"] = max_compile(
             self.prepare_scheduler,
             input_types=input_types,
-        )
-
-    def build_cast_guidance(self) -> None:
-        self.__dict__["_cast_guidance"] = max_compile(
-            self._cast_guidance,
-            input_types=[
-                TensorType(
-                    DType.float32,
-                    shape=["batch"],
-                    device=self.transformer.devices[0],
-                ),
-            ],
-        )
-
-    def build_cast_image_input(self) -> None:
-        self.__dict__["_cast_image_input"] = max_compile(
-            self._cast_image_input,
-            input_types=[
-                TensorType(
-                    DType.float32,
-                    shape=["batch", "channels", "height", "width"],
-                    device=self.vae.devices[0],
-                ),
-            ],
         )
 
     def build_concat_packed_latents(self) -> None:
@@ -476,12 +452,6 @@ class Flux2Pipeline(DiffusionPipeline):
 
         return image_latents
 
-    def _cast_guidance(self, guidance: TensorValue) -> TensorValue:
-        return ops.cast(guidance, self.transformer.config.dtype)
-
-    def _cast_image_input(self, image: TensorValue) -> TensorValue:
-        return ops.cast(image, self.vae.config.dtype)
-
     def _repeat_prompt_embeddings(self, repeats: int) -> Any:
         if repeats not in self._repeat_prompt_embeddings_cache:
 
@@ -567,10 +537,20 @@ class Flux2Pipeline(DiffusionPipeline):
 
         packed_latents = []
         latent_shapes = []
-
+        breakpoint()
         for image in images:
-            image = self._cast_image_input(image.to(device))
-
+            if image.dtype == dtype:
+                image = image.to(device)
+            else:
+                image_np = image.to_numpy()
+                if image_np.dtype != np.float32:
+                    image_np = image_np.astype(np.float32)
+                image = float32_array_to_buffer(
+                    image_np,
+                    dtype=dtype,
+                    device=device,
+                )
+            breakpoint()
             encoder_output = self.vae.encode(image, return_dict=True)
             if isinstance(encoder_output, dict):
                 encoder_output = encoder_output["latent_dist"]
@@ -744,7 +724,11 @@ class Flux2Pipeline(DiffusionPipeline):
         img_array = np.transpose(img_array, (2, 0, 1))
         img_array = np.expand_dims(img_array, axis=0)
         img_array = np.ascontiguousarray(img_array)
-        return Buffer.from_numpy(img_array).to(self.vae.devices[0])
+        return float32_array_to_buffer(
+            img_array,
+            dtype=self.vae.config.dtype,
+            device=self.vae.devices[0],
+        )
 
     def scheduler_step(
         self,

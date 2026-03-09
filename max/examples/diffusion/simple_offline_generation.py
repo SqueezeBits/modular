@@ -67,6 +67,13 @@ from max.pipelines.lib.pipeline_variants.pixel_generation import (
 )
 from PIL import Image
 
+_FLUX2_ARCH_NAMES = {
+    "Flux2Pipeline",
+    "Flux2KleinPipeline",
+    "Flux2Pipeline_ModuleV3",
+    "Flux2KleinPipeline_ModuleV3",
+}
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the pixel generation example.
@@ -288,10 +295,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         max_length = components_config["tokenizer"]["config_dict"].get(
             "model_max_length", None
         )
-        if arch.name in (
-            "Flux2Pipeline_ModuleV3",
-            "Flux2KleinPipeline_ModuleV3",
-        ):
+        if arch.name in _FLUX2_ARCH_NAMES:
             max_length = 512
         print(f"Using max length: {max_length} for tokenizer")
 
