@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
+import numpy as np
 from max.driver import Buffer
 from max.graph.weights import WeightData
 
@@ -15,6 +16,21 @@ def _clone_weight(weight: WeightData, new_name: str) -> WeightData:
         shape=weight.shape,
         quantization_encoding=weight.quantization_encoding,
     )
+
+
+def _legacy_fp8_scale_weight(weight: WeightData, new_name: str) -> WeightData:
+    if not weight.dtype.is_float():
+        return _clone_weight(weight, new_name)
+
+    scale_np = np.asarray(
+        Buffer.from_dlpack(weight.data).to_numpy(), dtype=np.float32
+    )
+    # BF Labs Klein FP8 checkpoints expose direct scalar scales, while MAX's
+    # static FP8 path expects inverse scales.
+    inv_scale_np = np.asarray(
+        np.reciprocal(scale_np, dtype=np.float32), dtype=np.float32
+    )
+    return WeightData.from_numpy(inv_scale_np, new_name)
 
 
 def _slice_rows(
@@ -125,7 +141,11 @@ def convert_safetensor_state_dict(
             idx, suffix = img_match.groups()
             for proj in ("to_q", "to_k", "to_v"):
                 new_name = f"transformer_blocks.{idx}.attn.{proj}.{suffix}"
-                converted[new_name] = _clone_weight(weight, new_name)
+                converted[new_name] = (
+                    _legacy_fp8_scale_weight(weight, new_name)
+                    if suffix in {"input_scale", "weight_scale"}
+                    else _clone_weight(weight, new_name)
+                )
             continue
 
         txt_match = re.fullmatch(
@@ -136,7 +156,11 @@ def convert_safetensor_state_dict(
             idx, suffix = txt_match.groups()
             for proj in ("add_q_proj", "add_k_proj", "add_v_proj"):
                 new_name = f"transformer_blocks.{idx}.attn.{proj}.{suffix}"
-                converted[new_name] = _clone_weight(weight, new_name)
+                converted[new_name] = (
+                    _legacy_fp8_scale_weight(weight, new_name)
+                    if suffix in {"input_scale", "weight_scale"}
+                    else _clone_weight(weight, new_name)
+                )
             continue
 
         replacements = (
@@ -232,7 +256,11 @@ def convert_safetensor_state_dict(
         for pattern, replacement in replacements:
             mapped = re.sub(pattern, replacement, key)
             if mapped != key:
-                converted[mapped] = _clone_weight(weight, mapped)
+                converted[mapped] = (
+                    _legacy_fp8_scale_weight(weight, mapped)
+                    if mapped.endswith((".input_scale", ".weight_scale"))
+                    else _clone_weight(weight, mapped)
+                )
                 break
 
     required_prefixes = (
