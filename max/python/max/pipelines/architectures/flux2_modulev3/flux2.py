@@ -31,7 +31,6 @@ from .layers.flux2_attention import (
 from .layers.normalizations import AdaLayerNormContinuous
 from .model_config import Flux2ConfigBase
 
-
 def get_can_use_cache(
     intermediate_residual: Tensor,
     prev_intermediate_residual: Tensor | None,
@@ -250,6 +249,7 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
             tuple[Tensor, Tensor, Tensor], tuple[Tensor, Tensor, Tensor]
         ],
         image_rotary_emb: tuple[Tensor, Tensor] | None = None,
+        position_ids: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Forward pass for dual-stream transformer block.
 
@@ -287,6 +287,7 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
             norm_hidden_states,
             norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            position_ids=position_ids,
         )
         if isinstance(attn_result, tuple):
             attn_output, context_attn_output = attn_result
@@ -372,6 +373,7 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
         encoder_hidden_states: Tensor | None = None,
         temb_mod_params: tuple[Tensor, Tensor, Tensor] | None = None,
         image_rotary_emb: tuple[Tensor, Tensor] | None = None,
+        position_ids: Tensor | None = None,
         split_hidden_states: bool = False,
         text_seq_len: int | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
@@ -416,6 +418,7 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
         attn_output = self.attn.forward(
             norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            position_ids=position_ids,
         )
 
         # Gate and residual
@@ -434,7 +437,7 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
             return hidden_states
 
 
-class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
+class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):    
     def __init__(
         self,
         config: Flux2ConfigBase,
@@ -690,6 +693,13 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
         # Concatenate text and image position IDs
         ids = F.concat([txt_ids, img_ids], axis=0)
         image_rotary_emb = self.pos_embed(ids)
+        position_ids = F.arange(
+            0, ids.shape[0], dtype=DType.uint32, device=hidden_states.device
+        )
+        position_ids = F.broadcast_to(
+            position_ids[None, :],
+            [hidden_states.shape[0], ids.shape[0]],
+        )
 
         if cache_enabled is None:
             # Standard path: no cache overhead, identical to original graph.
@@ -700,6 +710,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                     temb_mod_params_img=double_stream_mod_img,
                     temb_mod_params_txt=double_stream_mod_txt,
                     image_rotary_emb=image_rotary_emb,
+                    position_ids=position_ids,
                 )
 
             hidden_states = F.concat(
@@ -714,6 +725,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                     encoder_hidden_states=None,
                     temb_mod_params=single_stream_mod,
                     image_rotary_emb=image_rotary_emb,
+                    position_ids=position_ids,
                     split_hidden_states=False,
                 )
 
@@ -737,6 +749,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                     temb_mod_params_img=double_stream_mod_img,
                     temb_mod_params_txt=double_stream_mod_txt,
                     image_rotary_emb=image_rotary_emb,
+                    position_ids=position_ids,
                 )
 
             hidden_states = F.concat(
@@ -751,6 +764,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                     encoder_hidden_states=None,
                     temb_mod_params=single_stream_mod,
                     image_rotary_emb=image_rotary_emb,
+                    position_ids=position_ids,
                     split_hidden_states=False,
                 )
 
@@ -773,6 +787,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                 temb_mod_params_img=double_stream_mod_img,
                 temb_mod_params_txt=double_stream_mod_txt,
                 image_rotary_emb=image_rotary_emb,
+                position_ids=position_ids,
             )
             if index_block == 0:
                 first_block_residual = new_hidden_states - hidden_states
@@ -823,6 +838,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                             temb_mod_params_img=double_stream_mod_img,
                             temb_mod_params_txt=double_stream_mod_txt,
                             image_rotary_emb=image_rotary_emb,
+                            position_ids=position_ids,
                         )
                     h = F.concat([enc, h], axis=1)
                     for i in range(len(self.single_transformer_blocks)):
@@ -834,6 +850,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                             encoder_hidden_states=None,
                             temb_mod_params=single_stream_mod,
                             image_rotary_emb=image_rotary_emb,
+                            position_ids=position_ids,
                             split_hidden_states=False,
                         )
                     h = h[:, num_txt_tokens:, :]
@@ -865,9 +882,12 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
                 image_rotary_emb=image_rotary_emb,
+                position_ids=position_ids,
                 split_hidden_states=False,
             )
+
         hidden_states = hidden_states[:, num_txt_tokens:, :]
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
+
         return (output, first_block_residual)
