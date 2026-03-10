@@ -36,6 +36,9 @@ from max.interfaces.request.open_responses import (
     InputImageContent,
     InputTextContent,
 )
+from max.pipelines.architectures.qwen2_5vl.image_processor import (
+    Qwen2_5VLPromptImageProcessor,
+)
 from max.pipelines.core import PixelContext
 from transformers import AutoTokenizer
 
@@ -82,8 +85,11 @@ async def run_with_default_executor(
 
 
 class PipelineClassName(str, Enum):
+    """Known pipeline class names for image generation models."""
+
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
+    FLUX2_KLEIN = "Flux2KleinPipeline"
     ZIMAGE = "ZImagePipeline"
     QWENIMAGE = "QwenImagePipeline"
     QWENIMAGE_EDIT = "QwenImageEditPipeline"
@@ -91,6 +97,7 @@ class PipelineClassName(str, Enum):
 
     @property
     def is_qwen_image_family(self) -> bool:
+        """Returns whether the pipeline belongs to the Qwen image family."""
         return self in {
             PipelineClassName.QWENIMAGE,
             PipelineClassName.QWENIMAGE_EDIT,
@@ -153,10 +160,12 @@ class PixelGenerationTokenizer(
         max_length: int | None = None,
         secondary_max_length: int | None = None,
         trust_remote_code: bool = False,
+        default_num_inference_steps: int = 50,
         context_validators: list[Callable[[PixelContext], None]] | None = None,
         **unused_kwargs,
     ) -> None:
         self.model_path = model_path
+        self._default_num_inference_steps = default_num_inference_steps
 
         if max_length is None:
             raise ValueError(
@@ -230,14 +239,12 @@ class PixelGenerationTokenizer(
             PipelineClassName.QWENIMAGE_EDIT_PLUS.value,
         }
         self._qwen_edit_image_token_id: int | None = None
-        self._qwen_edit_image_processor: Any | None = None
+        self._qwen_edit_image_processor: (
+            Qwen2_5VLPromptImageProcessor | None
+        ) = None
         if self._is_qwen_image_edit_family:
-            from max.pipelines.architectures.qwen2_5vl.tokenizer import (
-                Qwen2_5VLImageProcessor,
-            )
-
-            self._qwen_edit_image_token_id = self.delegate.convert_tokens_to_ids(
-                "<|image_pad|>"
+            self._qwen_edit_image_token_id = (
+                self.delegate.convert_tokens_to_ids("<|image_pad|>")
             )
             text_encoder_config = (
                 self.diffusers_config.get("components", {})
@@ -245,11 +252,9 @@ class PixelGenerationTokenizer(
                 .get("config_dict", {})
             )
             vision_config = text_encoder_config.get("vision_config", {})
-            self._qwen_edit_image_processor = Qwen2_5VLImageProcessor(
+            self._qwen_edit_image_processor = Qwen2_5VLPromptImageProcessor(
                 patch_size=vision_config.get("patch_size", 14),
-                temporal_patch_size=vision_config.get(
-                    "temporal_patch_size", 2
-                ),
+                temporal_patch_size=vision_config.get("temporal_patch_size", 2),
                 merge_size=vision_config.get("spatial_merge_size", 2),
             )
 
@@ -279,8 +284,9 @@ class PixelGenerationTokenizer(
             "class_name", None
         )
         scheduler_cfg = components.get("scheduler", {}).get("config_dict", {})
-        scheduler_cfg["use_empirical_mu"] = (
-            self._pipeline_class_name == PipelineClassName.FLUX2
+        scheduler_cfg["use_empirical_mu"] = self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
         )
         self._scheduler = SchedulerFactory.create(
             class_name=scheduler_class_name,
@@ -288,13 +294,19 @@ class PixelGenerationTokenizer(
         )
 
         self._max_pixel_size = None
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             self._max_pixel_size = 1024 * 1024
 
     def _prepare_latent_image_ids(
         self, height: int, width: int, batch_size: int = 1
     ) -> npt.NDArray[np.float32]:
-        if self._pipeline_class_name == PipelineClassName.FLUX2:
+        if self._pipeline_class_name in (
+            PipelineClassName.FLUX2,
+            PipelineClassName.FLUX2_KLEIN,
+        ):
             # Create 4D coordinates using numpy (T=0, H, W, L=0)
             t_coords, h_coords, w_coords, l_coords = np.meshgrid(
                 np.array([0]),  # T dimension
@@ -321,15 +333,11 @@ class PixelGenerationTokenizer(
             h_centered = np.arange(height, dtype=np.int64) - (
                 height - height // 2
             )
-            w_centered = np.arange(width, dtype=np.int64) - (
-                width - width // 2
-            )
+            w_centered = np.arange(width, dtype=np.int64) - (width - width // 2)
             h_coords, w_coords = np.meshgrid(
                 h_centered, w_centered, indexing="ij"
             )
-            latent_image_ids = np.stack(
-                [t_coords, h_coords, w_coords], axis=-1
-            )
+            latent_image_ids = np.stack([t_coords, h_coords, w_coords], axis=-1)
             latent_image_ids = latent_image_ids.reshape(-1, 3)
 
             latent_image_ids = np.tile(
@@ -439,7 +447,9 @@ class PixelGenerationTokenizer(
     def _prepare_qwen_edit_condition_images(
         self,
         input_images: list[npt.NDArray[np.uint8]] | None,
-    ) -> tuple[list[npt.NDArray[np.uint8]] | None, list[npt.NDArray[np.uint8]] | None]:
+    ) -> tuple[
+        list[npt.NDArray[np.uint8]] | None, list[npt.NDArray[np.uint8]] | None
+    ]:
         if not input_images:
             return None, None
 
@@ -459,7 +469,9 @@ class PixelGenerationTokenizer(
         prompt_images: list[npt.NDArray[np.uint8]] | None,
     ) -> npt.NDArray[np.int64]:
         if not prompt_images:
-            raise ValueError("prompt_images are required for qwen edit tokenization")
+            raise ValueError(
+                "prompt_images are required for qwen edit tokenization"
+            )
         if self._qwen_edit_image_processor is None:
             raise ValueError("qwen edit image processor is not initialized")
         if self._qwen_edit_image_token_id is None:
@@ -477,7 +489,9 @@ class PixelGenerationTokenizer(
             images=processed_images,
             return_tensors="np",
         )
-        processed_dict = processed[0] if isinstance(processed, tuple) else processed
+        processed_dict = (
+            processed[0] if isinstance(processed, tuple) else processed
+        )
         image_grid_thw = np.asarray(
             processed_dict["image_grid_thw"], dtype=np.int64
         )
@@ -625,9 +639,8 @@ class PixelGenerationTokenizer(
         def _encode_fn(prompt_str: str) -> Any:
             assert delegate is not None
 
-            # For Flux2, use apply_chat_template with format_input
             if self._pipeline_class_name == PipelineClassName.FLUX2:
-                from max.pipelines.architectures.flux2.system_messages import (
+                from max.pipelines.architectures.flux2_modulev3.system_messages import (
                     SYSTEM_MESSAGE,
                     format_input,
                 )
@@ -637,6 +650,30 @@ class PixelGenerationTokenizer(
                     system_message=SYSTEM_MESSAGE,
                     images=None,
                 )
+
+                # Validate prompt length before truncation.
+                # apply_chat_template with truncation=True silently
+                # drops tokens; error early instead.
+                precheck = delegate.apply_chat_template(
+                    messages_batch[0],
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    return_dict=True,
+                    truncation=False,
+                )
+                precheck_ids = precheck["input_ids"]
+                precheck_len = (
+                    len(precheck_ids[0])
+                    if precheck_ids and isinstance(precheck_ids[0], list)
+                    else len(precheck_ids)
+                )
+                if max_sequence_length and precheck_len > max_sequence_length:
+                    raise ValueError(
+                        f"Prompt is too long for this model's text"
+                        f" encoder: {precheck_len} tokens exceeds"
+                        f" the maximum of {max_sequence_length}"
+                        " tokens. Please shorten your prompt."
+                    )
 
                 return delegate.apply_chat_template(
                     messages_batch[0],
@@ -648,6 +685,49 @@ class PixelGenerationTokenizer(
                     max_length=max_sequence_length,
                     return_length=False,
                     return_overflowing_tokens=False,
+                )
+            elif self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
+                from max.pipelines.architectures.flux2_modulev3.system_messages import (
+                    format_input_klein,
+                )
+
+                messages_batch = format_input_klein(
+                    prompts=[prompt_str],
+                    images=None,
+                )
+                kwargs = dict(
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                try:
+                    prompt_text = delegate.apply_chat_template(
+                        messages_batch[0],
+                        enable_thinking=False,
+                        **kwargs,
+                    )
+                except TypeError:
+                    prompt_text = delegate.apply_chat_template(
+                        messages_batch[0],
+                        **kwargs,
+                    )
+                raw_ids = delegate.encode(
+                    prompt_text,
+                    add_special_tokens=add_special_tokens,
+                )
+                if max_sequence_length and len(raw_ids) > max_sequence_length:
+                    raise ValueError(
+                        f"Prompt is too long for this model's text"
+                        f" encoder: {len(raw_ids)} tokens exceeds"
+                        f" the maximum of {max_sequence_length}"
+                        " tokens. Please shorten your prompt."
+                    )
+
+                return delegate(
+                    prompt_text,
+                    padding="max_length",
+                    max_length=max_sequence_length,
+                    truncation=True,
+                    add_special_tokens=add_special_tokens,
                 )
             elif self._pipeline_class_name.is_qwen_image_family:
                 # QwenImage wraps prompts in a Qwen2 chat template.
@@ -971,11 +1051,15 @@ class PixelGenerationTokenizer(
         prompt_images: list[npt.NDArray[np.uint8]] | None = None
         vae_images: list[npt.NDArray[np.uint8]] | None = None
         if self._is_qwen_image_edit_family:
-            prompt_images, vae_images = self._prepare_qwen_edit_condition_images(
-                preprocessed_image_arrays
+            prompt_images, vae_images = (
+                self._prepare_qwen_edit_condition_images(
+                    preprocessed_image_arrays
+                )
             )
             if prompt_images:
-                token_ids = self._prepare_qwen_edit_tokens(prompt, prompt_images)
+                token_ids = self._prepare_qwen_edit_tokens(
+                    prompt, prompt_images
+                )
                 attn_mask = np.ones_like(token_ids, dtype=np.bool_)
                 if do_true_cfg and image_options.negative_prompt is not None:
                     negative_token_ids = self._prepare_qwen_edit_tokens(
@@ -1007,7 +1091,11 @@ class PixelGenerationTokenizer(
         latent_width = 2 * (int(width) // (self._vae_scale_factor * 2))
         image_seq_len = (latent_height // 2) * (latent_width // 2)
 
-        num_inference_steps = image_options.steps
+        num_inference_steps = (
+            image_options.steps
+            if "steps" in image_options.model_fields_set
+            else self._default_num_inference_steps
+        )
         timesteps, sigmas = self._scheduler.retrieve_timesteps_and_sigmas(
             image_seq_len, num_inference_steps
         )
