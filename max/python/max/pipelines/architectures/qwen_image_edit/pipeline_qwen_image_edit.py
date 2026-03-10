@@ -498,6 +498,15 @@ class QwenImageEditPipeline(DiffusionPipeline):
         return ops.reshape(latents_bsc, (batch, h, w, channels))
 
     def _reshape_vae_latents(self, x: TensorValue) -> TensorValue:
+        x = ops.rebind(
+            x,
+            [
+                x.shape[0],
+                x.shape[1],
+                (x.shape[2] // 2) * 2,
+                (x.shape[3] // 2) * 2,
+            ],
+        )
         return ops.reshape(
             x,
             (x.shape[0], x.shape[1], x.shape[2] // 2, 2, x.shape[3] // 2, 2),
