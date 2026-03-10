@@ -591,17 +591,7 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
                     new_hidden_states - hidden_states
                 )
                 first_block_residual = intermediate_hidden_states_residual
-                can_use_cache = get_can_use_cache(
-                    intermediate_hidden_states_residual,
-                    prev_residual,
-                    rdt,
-                )
                 cache_enabled_scalar = F.squeeze(cache_enabled, 0)
-                can_use_cache = F.cast(
-                    F.cast(cache_enabled_scalar, DType.int32)
-                    * F.cast(can_use_cache, DType.int32),
-                    DType.bool,
-                )
                 output_type = TensorType(
                     self.max_dtype,
                     shape=[
@@ -654,10 +644,33 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
                         TensorValue(_first_block_residual),
                     )
 
+                def cache_enabled_then_fn(
+                    _first_block_residual: Tensor = first_block_residual,
+                    _output_type: TensorType = output_type,
+                    _residual_type: TensorType = residual_type,
+                ) -> tuple[TensorValue, TensorValue]:
+                    can_use_cache = get_can_use_cache(
+                        _first_block_residual,
+                        prev_residual,
+                        rdt,
+                    )
+                    result = F.cond(
+                        can_use_cache,
+                        [_output_type, _residual_type],
+                        then_fn,
+                        else_fn,
+                    )
+                    return (
+                        TensorValue(result[0]),
+                        TensorValue(result[1]),
+                    )
+
+                # Skip the residual-difference reduction entirely when step-cache
+                # is disabled, since the full path is required anyway.
                 result = F.cond(
-                    can_use_cache,
+                    cache_enabled_scalar,
                     [output_type, residual_type],
-                    then_fn,
+                    cache_enabled_then_fn,
                     else_fn,
                 )
                 return (result[0], result[1])
