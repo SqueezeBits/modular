@@ -21,6 +21,7 @@ from max.experimental.nn.common_layers.activation import (
     activation_function_from_name,
 )
 from max.experimental.tensor import Tensor
+from max.nn.float8_config import Float8Config
 
 from ...common_layers.fp8_linear import FP8Linear
 

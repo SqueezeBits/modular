@@ -11,10 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.nn import Linear, Module
 from max.experimental.nn.norm import LayerNorm, RMSNorm
 from max.experimental.tensor import Tensor
+from max.nn.float8_config import Float8Config
 
 from ...common_layers.fp8_linear import FP8Linear
 

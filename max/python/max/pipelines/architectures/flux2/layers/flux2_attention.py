@@ -17,6 +17,7 @@ from max.experimental.nn import Linear, Module, module_dataclass
 from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
 from max.nn.attention.mask_config import MHAMaskVariant
+from max.nn.float8_config import Float8Config
 from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
 
 from ...common_layers.fp8_linear import FP8Linear

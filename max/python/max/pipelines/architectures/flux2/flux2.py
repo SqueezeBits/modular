@@ -18,6 +18,7 @@ from max.experimental.nn.norm import LayerNorm
 from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
+from max.nn.float8_config import Float8Config
 
 from ..common_layers.fp8_linear import FP8Linear
 from .layers.embeddings import TimestepEmbedding, Timesteps
