@@ -16,6 +16,7 @@ from typing import Any
 
 from max.driver import Device
 from max.experimental import functional as F
+from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
@@ -49,11 +50,57 @@ class Flux1TransformerModel(ComponentModel):
     def load_model(self) -> Callable[..., Any]:
         state_dict = {key: value.data() for key, value in self.weights.items()}
         state_dict = convert_safetensor_state_dict(state_dict)
+        self._state_dict = state_dict
         with F.lazy():
             flux = FluxTransformer2DModel(self.config)
             flux.to(self.devices[0])
-        self.model = flux.compile(*flux.input_types(), weights=state_dict)
+        self._flux_model = flux
+        self._standard_model: Callable[..., Any] | None = None
+        self._step_cache_model: Callable[..., Any] | None = None
+        self.model = self._standard_model
         return self.model
 
-    def __call__(self, *args, **kwargs):
-        return self.model(*args, **kwargs)
+    def use_standard_model(self) -> None:
+        if self._standard_model is None:
+            self._standard_model = self._flux_model.compile(
+                *self._flux_model.input_types(step_cache_enabled=False),
+                weights=self._state_dict,
+            )
+        if self.model is self._step_cache_model:
+            self._step_cache_model = None
+        self.model = self._standard_model
+
+    def use_step_cache_model(self) -> None:
+        if self._step_cache_model is None:
+            self._step_cache_model = self._flux_model.compile(
+                *self._flux_model.input_types(step_cache_enabled=True),
+                weights=self._state_dict,
+            )
+        if self.model is self._standard_model:
+            self._standard_model = None
+        self.model = self._step_cache_model
+
+    def __call__(
+        self,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor,
+        pooled_projections: Tensor,
+        timestep: Tensor,
+        img_ids: Tensor,
+        txt_ids: Tensor,
+        guidance: Tensor | None,
+    ) -> Any:
+        return self.model(
+            hidden_states,
+            encoder_hidden_states,
+            pooled_projections,
+            timestep,
+            img_ids,
+            txt_ids,
+            guidance,
+        )
+
+    def call_with_step_cache(self, *args: Any, **kwargs: Any) -> Any:
+        if self._step_cache_model is None:
+            self.use_step_cache_model()
+        return self._step_cache_model(*args, **kwargs)
