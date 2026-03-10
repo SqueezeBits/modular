@@ -56,12 +56,12 @@ def get_can_use_cache(
         shape=reduced_last_dim_shape,
         device=dev,
     )
-    mean_diff_rows, mean_prev_rows = F.custom(
-        "mo.step_cache.mean_abs_pair_lastdim",
-        device=dev,
-        values=[intermediate_residual, prev_intermediate_residual],
-        out_types=[reduced_last_dim_type, reduced_last_dim_type],
+    # A single full-tensor reduction was slower here, so we first reduce over the
+    # last dimension and then take the global mean from the per-row results.
+    mean_diff_rows = F.mean(
+        F.abs(intermediate_residual - prev_intermediate_residual), axis=-1
     )
+    mean_prev_rows = F.mean(F.abs(prev_intermediate_residual), axis=-1)
     mean_diff = F.mean(mean_diff_rows, axis=None)
     mean_prev = F.mean(mean_prev_rows, axis=None)
     eps = 1e-9
