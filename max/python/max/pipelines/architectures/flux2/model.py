@@ -17,14 +17,21 @@ from typing import Any
 from max.driver import Device
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
-from max.graph.weights import Weights
+from max.graph.weights import WeightData, Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+import numpy as np
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
 from max.experimental.nn.common_layers.fp8_config_utils import (
+    build_legacy_scalar_fp8_config,
     validate_fp8_weight_scale_contract,
+)
+from .weight_adapters import (
+    convert_safetensor_state_dict,
+    is_bflabs_flux2_transformer_checkpoint,
+    uses_legacy_scalar_fp8_scales,
 )
 
 
@@ -50,7 +57,27 @@ class Flux2TransformerModel(ComponentModel):
         self.load_model()
 
     def load_model(self) -> Callable[..., Any]:
-        state_dict = {key: value.data() for key, value in self.weights.items()}
+        original_state_dict = {
+            key: value.data() for key, value in self.weights.items()
+        }
+        state_dict = original_state_dict
+        if is_bflabs_flux2_transformer_checkpoint(original_state_dict):
+            state_dict = convert_safetensor_state_dict(original_state_dict)
+            if self.config.float8_config is not None and uses_legacy_scalar_fp8_scales(
+                original_state_dict
+            ):
+                if hasattr(self.config, "model_copy"):
+                    self.config = self.config.model_copy(
+                        update={
+                            "float8_config": build_legacy_scalar_fp8_config(
+                                component_name="flux2.transformer"
+                            )
+                        }
+                    )
+                else:
+                    self.config.float8_config = build_legacy_scalar_fp8_config(
+                        component_name="flux2.transformer"
+                    )
         # Klein/distilled checkpoints can omit guidance embedder weights.
         has_guidance_embedder = any(
             "time_guidance_embed.guidance_embedder." in k for k in state_dict
@@ -64,7 +91,10 @@ class Flux2TransformerModel(ComponentModel):
                 )
             else:
                 self.config.guidance_embeds = False
-        if self.config.float8_config is not None:
+        if (
+            self.config.float8_config is not None
+            and self.config.float8_config.weight_scale.block_size is not None
+        ):
             validate_fp8_weight_scale_contract(
                 state_dict,
                 float8_config=self.config.float8_config,
@@ -73,6 +103,19 @@ class Flux2TransformerModel(ComponentModel):
         with F.lazy():
             flux = Flux2Transformer2DModel(self.config)
             flux.to(self.devices[0])
+            default_scale_array = np.array(1.0, dtype=np.float32)
+            for name, _ in flux.parameters:
+                if name.endswith((".input_scale", ".weight_scale")) and name not in state_dict:
+                    state_dict[name] = WeightData.from_numpy(
+                        default_scale_array, name
+                    )
+            flux.apply_to_parameters(
+                lambda name, tensor: (
+                    tensor.cast(state_dict[name].dtype)
+                    if name in state_dict and tensor.dtype != state_dict[name].dtype
+                    else tensor
+                )
+            )
         self.model = flux.compile(*flux.input_types(), weights=state_dict)
         return self.model
 

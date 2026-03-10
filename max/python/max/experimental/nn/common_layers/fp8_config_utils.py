@@ -93,6 +93,28 @@ def build_dynamic_block_fp8_config(
     )
 
 
+def build_legacy_scalar_fp8_config(*, component_name: str) -> Float8Config:
+    """Build Float8Config for legacy scalar-scale FP8 checkpoints.
+
+    These checkpoints provide per-layer scalar `input_scale` and
+    `weight_scale` tensors rather than blockwise scales.
+    """
+    return Float8Config(
+        input_scale=Float8InputScaleSpec(
+            granularity=Float8ScaleGranularity.TENSOR,
+            origin=Float8ScaleOrigin.STATIC,
+            dtype=DType.float32,
+        ),
+        weight_scale=Float8WeightScaleSpec(
+            granularity=Float8ScaleGranularity.TENSOR,
+            dtype=DType.float32,
+        ),
+        mlp_in_float8=set(),
+        attn_qkv_in_float8=set(),
+        quant_method="fp8",
+    )
+
+
 def validate_fp8_weight_scale_contract(
     state_dict: Mapping[str, Any],
     *,

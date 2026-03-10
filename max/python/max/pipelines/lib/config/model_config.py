@@ -476,6 +476,18 @@ class MAXModelConfig(MAXModelConfigBase):
         if parsed_repo_id is not None:
             self._weights_repo_id = parsed_repo_id
 
+        # Some diffusion repos only publish the transformer weights in the FP8
+        # variant and rely on the base repo for pipeline metadata plus shared
+        # components such as the VAE/text encoder. Treat the base Klein repo as
+        # the model/config source while keeping the FP8 repo as the weight source.
+        if (
+            not self.weight_path
+            and "flux.2-klein" in self.model_path.lower()
+            and self.model_path.lower().endswith("-fp8")
+        ):
+            self._weights_repo_id = self.model_path
+            self.model_path = self.model_path[:-4]
+
         # If we cannot infer the weight path, we lean on the model_path
         # to provide it.
         if len(self.weight_path) == 0:

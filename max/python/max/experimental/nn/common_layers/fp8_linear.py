@@ -17,10 +17,11 @@ from typing import Literal
 
 from max.experimental import random
 from max.dtype import DType
-from max.graph import Dim, DimLike, TensorValue
+from max.graph import DeviceRef, Dim, DimLike, TensorValue
 from max.experimental import functional as F
 from max.experimental.nn import Module
 from max.nn.float8_config import Float8Config
+from max.nn.float8_ops import matmul_float8
 from max.nn.kernels import (
     dynamic_scaled_matmul,
     quantize_dynamic_scaled_float8,
@@ -39,6 +40,7 @@ class FP8Linear(Module[[Tensor], Tensor]):
 
     weight: Tensor
     bias: Tensor | Literal[0]
+    input_scale: Tensor | None
     weight_scale: Tensor | None
     _weight_scale_cache: dict[str, Tensor]
 
@@ -60,16 +62,25 @@ class FP8Linear(Module[[Tensor], Tensor]):
         )
         self.float8_config = float8_config
 
-        # In FP8 mode, this must be replaced by a checkpoint tensor.
+        # In FP8 mode, these tensors must be replaced by checkpoint values.
         if float8_config is not None:
-            assert float8_config.weight_scale.block_size is not None
-            block_n, block_k = float8_config.weight_scale.block_size
-            out_blocks = (int(out_dim) + block_n - 1) // block_n
-            in_blocks = (int(in_dim) + block_k - 1) // block_k
-            self.weight_scale = Tensor.ones(
-                [out_blocks, in_blocks], dtype=DType.float32
-            )
+            if float8_config.is_static:
+                self.input_scale = Tensor.ones([], dtype=DType.float32)
+            else:
+                self.input_scale = None
+
+            if float8_config.weight_scale.is_tensor:
+                self.weight_scale = Tensor.ones([], dtype=DType.float32)
+            else:
+                assert float8_config.weight_scale.block_size is not None
+                block_n, block_k = float8_config.weight_scale.block_size
+                out_blocks = (int(out_dim) + block_n - 1) // block_n
+                in_blocks = (int(in_dim) + block_k - 1) // block_k
+                self.weight_scale = Tensor.ones(
+                    [out_blocks, in_blocks], dtype=DType.float32
+                )
         else:
+            self.input_scale = None
             self.weight_scale = None
         # Cache per-device scale tensors to avoid repeated H2D copies.
         self._weight_scale_cache = {}
@@ -109,6 +120,23 @@ class FP8Linear(Module[[Tensor], Tensor]):
             and self.weight_scale is not None
             and self.weight.dtype.is_float8()
         ):
+            if self.float8_config.is_static:
+                if self.input_scale is None:
+                    raise ValueError("input_scale is required for static FP8.")
+                out = matmul_float8(
+                    TensorValue(x_2d),
+                    TensorValue(self.weight),
+                    TensorValue(self.weight_scale.to(DeviceRef.CPU())),
+                    TensorValue(self.input_scale.to(DeviceRef.CPU())),
+                    self.float8_config,
+                )
+                if isinstance(self.bias, Tensor):
+                    out = out + TensorValue(self.bias).to(out.device)
+                out_t = Tensor.from_graph_value(out)
+                if not is_rank2:
+                    out_t = F.reshape(out_t, (*orig_shape[:-1], self.out_dim))
+                return out_t
+
             x_q, x_scales = quantize_dynamic_scaled_float8(
                 TensorValue(x_2d),
                 self.float8_config.input_scale,

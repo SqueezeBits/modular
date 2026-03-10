@@ -296,7 +296,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         ),
     )
     arch = PIPELINE_REGISTRY.retrieve_architecture(
-        config.model.huggingface_weight_repo,
+        config.model.huggingface_model_repo,
         prefer_module_v3=config.runtime.prefer_module_v3,
         task=PipelineTask.PIXEL_GENERATION,
     )
@@ -342,7 +342,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         )
 
     tokenizer = PixelGenerationTokenizer(
-        model_path=args.model,
+        model_path=config.model.model_path,
         pipeline_config=config,
         subfolder="tokenizer",  # Tokenizer is in a subfolder for diffusion models
         max_length=max_length,

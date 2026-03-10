@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Queue
 from typing import Any, Literal, cast
 
@@ -23,8 +24,10 @@ from max.driver import CPU, Buffer
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
+from max.graph.weights import WeightsFormat, load_weights
 from max.interfaces import TokenBuffer
 from max.pipelines.core import PixelContext
+from max.pipelines.lib.hf_utils import HuggingFaceRepo, download_weight_files
 from max.pipelines.lib.interfaces import PixelModelInputs
 from max.profiler import Tracer
 from PIL import Image
@@ -68,6 +71,117 @@ class Flux2KleinPipeline(Flux2Pipeline):
         "text_encoder": Qwen3TextEncoderKleinModel,
         "transformer": Flux2Pipeline.components["transformer"],
     }
+
+    def _base_klein_repo(self) -> str | None:
+        model_repo_id = self.pipeline_config.model.model_path
+        weight_repo_id = self.pipeline_config.model.huggingface_weight_repo_id
+        if (
+            model_repo_id != weight_repo_id
+            and "flux.2-klein" in model_repo_id.lower()
+        ):
+            return model_repo_id
+        return None
+
+    def _resolve_component_paths_for_repo(
+        self, repo: HuggingFaceRepo, component_name: str
+    ) -> list[Path]:
+        filenames = [
+            filename
+            for filename in repo.weight_files.get(WeightsFormat.safetensors, [])
+            if filename.startswith(f"{component_name}/")
+        ]
+        if not filenames:
+            raise ValueError(
+                f"No safetensor weights found for component '{component_name}' in fallback repo '{repo.repo_id}'."
+            )
+
+        if repo.repo_type == "online":
+            return download_weight_files(
+                huggingface_model_id=repo.repo_id,
+                filenames=filenames,
+                revision=repo.revision,
+                force_download=self.pipeline_config.model.force_download,
+            )
+
+        repo_root = Path(repo.repo_id)
+        return [repo_root / filename for filename in filenames]
+
+    def _load_sub_models(
+        self, weight_paths: list[Path]
+    ) -> dict[str, Any]:
+        base_repo_id = self._base_klein_repo()
+        if base_repo_id is None:
+            return super()._load_sub_models(weight_paths)
+
+        diffusers_config = self.pipeline_config.model.diffusers_config
+        if not diffusers_config:
+            raise ValueError(
+                "diffusers_config is required for DiffusionPipeline."
+            )
+        components_config = diffusers_config.get("components")
+        if not components_config:
+            raise ValueError("diffusers_config['components'] is missing.")
+
+        base_repo = HuggingFaceRepo(
+            repo_id=base_repo_id,
+            revision=self.pipeline_config.model.huggingface_model_revision,
+            trust_remote_code=self.pipeline_config.model.trust_remote_code,
+        )
+
+        try:
+            relative_paths = self._resolve_relative_component_paths()
+        except ValueError:
+            # FP8 Klein checkpoints can ship a flat transformer-only safetensors
+            # file instead of diffusers-style component/<file> paths.
+            relative_paths = {}
+        loaded_sub_models: dict[str, Any] = {}
+
+        for name, component_cls in self.components.items():
+            primary_component = components_config.get(name, {})
+            config_dict = primary_component.get("config_dict") or {}
+            component_weight_paths = relative_paths.get(name)
+            component_encoding = self.pipeline_config.model.quantization_encoding
+
+            if name in {"vae", "text_encoder"}:
+                component_weight_paths = None
+                component_encoding = "bfloat16"
+
+            if not config_dict:
+                raise ValueError(f"Missing config_dict for component '{name}'.")
+
+            if component_weight_paths is None:
+                abs_paths = self._resolve_component_paths_for_repo(base_repo, name)
+            else:
+                abs_paths = self._resolve_absolute_paths(
+                    weight_paths, component_weight_paths
+                )
+
+            if name == "transformer" and not component_weight_paths:
+                abs_paths = weight_paths
+
+            if name == "transformer":
+                quant_cfg = config_dict.get("quantization_config")
+                if (
+                    not quant_cfg
+                    and isinstance(config_dict.get("text_config"), dict)
+                ):
+                    quant_cfg = config_dict["text_config"].get(
+                        "quantization_config"
+                    )
+                if (
+                    isinstance(quant_cfg, dict)
+                    and quant_cfg.get("quant_method") == "fp8"
+                ):
+                    component_encoding = "float8_e4m3fn"
+
+            loaded_sub_models[name] = component_cls(
+                config=config_dict,
+                encoding=component_encoding,
+                devices=self.devices,
+                weights=load_weights(abs_paths),
+            )
+
+        return loaded_sub_models
 
     def prepare_inputs(self, context: PixelContext) -> Flux2KleinModelInputs:  # type: ignore[override]
         pil_image = None
