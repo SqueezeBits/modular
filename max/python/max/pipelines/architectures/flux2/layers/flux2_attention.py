@@ -20,7 +20,7 @@ from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.float8_config import Float8Config
 from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
 
-from ...common_layers.fp8_linear import FP8Linear
+from max.experimental.nn.common_layers.fp8_linear import FP8Linear
 flash_attention_gpu = F.functional(_flash_attention_gpu)
 
 from max.experimental.nn.norm import RMSNorm

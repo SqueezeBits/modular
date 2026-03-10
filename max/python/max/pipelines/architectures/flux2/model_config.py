@@ -21,7 +21,9 @@ from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from pydantic import Field
 
-from ..common_layers.fp8_config_utils import build_dynamic_block_fp8_config
+from max.experimental.nn.common_layers.fp8_config_utils import (
+    build_dynamic_block_fp8_config,
+)
 
 
 class Flux2ConfigBase(MAXModelConfigBase):

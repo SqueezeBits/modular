@@ -19,7 +19,7 @@ from max.experimental import random
 from max.dtype import DType
 from max.graph import Dim, DimLike, TensorValue
 from max.experimental import functional as F
-from max.nn.module_v3 import Module
+from max.experimental.nn import Module
 from max.nn.float8_config import Float8Config
 from max.nn.kernels import (
     dynamic_scaled_matmul,

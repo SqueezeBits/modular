@@ -65,9 +65,13 @@ flux2_klein_arch = SupportedArchitecture(
     name="Flux2KleinPipeline",
     task=PipelineTask.PIXEL_GENERATION,
     default_encoding="bfloat16",
-    supported_encodings={"bfloat16"},
+    supported_encodings={
+        "bfloat16": [],
+        "float8_e4m3fn": [],
+    },
     example_repo_ids=[
         "black-forest-labs/FLUX.2-klein-4B",
+        "black-forest-labs/FLUX.2-klein-4B-FP8",
         "black-forest-labs/FLUX.2-klein-9B",
         "black-forest-labs/FLUX.2-klein-base-4B",
         "black-forest-labs/FLUX.2-klein-base-9B",

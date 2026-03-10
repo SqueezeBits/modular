@@ -108,6 +108,15 @@ class FluxPipeline(DiffusionPipeline):
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
 
+    def _activation_dtype(self, dtype: DType) -> DType:
+        """Return the runtime activation dtype for a component.
+
+        FP8-backed models generally still consume/produce BF16 activations at
+        graph boundaries. Keep those interfaces in BF16 while allowing the
+        module internals to use FP8 kernels.
+        """
+        return DType.bfloat16 if dtype.is_float8() else dtype
+
     def prepare_inputs(
         self, context: PixelGenerationContext
     ) -> FluxModelInputs:
@@ -118,16 +127,18 @@ class FluxPipeline(DiffusionPipeline):
     # -------------------------------------------------------------------------
 
     def build_prepare_prompt_embeddings(self) -> None:
+        t5_output_dtype = self._activation_dtype(self.text_encoder_2.config.dtype)
+        clip_output_dtype = self._activation_dtype(self.text_encoder.config.dtype)
         input_types = [
             TensorType(
-                self.text_encoder_2.config.dtype,
+                t5_output_dtype,
                 shape=["batch", "seq_len", "hidden_dim"],
                 device=self.text_encoder_2.devices[0],
             ),
             TensorType(
-                self.text_encoder_2.config.dtype,
+                clip_output_dtype,
                 shape=["batch", "pooled_dim"],
-                device=self.text_encoder_2.devices[0],
+                device=self.text_encoder.devices[0],
             ),
         ]
         self.__dict__["_prepare_prompt_embeddings"] = max_compile(
@@ -163,7 +174,7 @@ class FluxPipeline(DiffusionPipeline):
         )
 
     def build_scheduler_step(self) -> None:
-        dtype = self.transformer.config.dtype
+        dtype = self._activation_dtype(self.transformer.config.dtype)
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -180,7 +191,7 @@ class FluxPipeline(DiffusionPipeline):
         )
 
     def build_decode_latents(self) -> None:
-        dtype = self.transformer.config.dtype
+        dtype = self._activation_dtype(self.transformer.config.dtype)
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -209,7 +220,9 @@ class FluxPipeline(DiffusionPipeline):
 
     def _pack_latents(self, latents: Tensor) -> Tensor:
         """Pack 6D latents (B,C,H//2,2,W//2,2) into sequence (B,H//2*W//2,C*4)."""
-        latents = latents.cast(self.transformer.config.dtype)
+        latents = latents.cast(
+            self._activation_dtype(self.transformer.config.dtype)
+        )
         batch = latents.shape[0]
         c = latents.shape[1]
         h2 = latents.shape[2]
@@ -343,7 +356,6 @@ class FluxPipeline(DiffusionPipeline):
     ) -> Tensor | np.ndarray:
         if output_type == "latent":
             return latents
-        latents = Tensor.from_dlpack(latents)
         batch_size = int(latents.shape[0])
         ch_size = int(latents.shape[2])
         h = 2 * (height // (self.vae_scale_factor * 2))
@@ -390,6 +402,9 @@ class FluxPipeline(DiffusionPipeline):
             )
 
         # 2. Prepare latents
+        transformer_input_dtype = self._activation_dtype(
+            self.transformer.config.dtype
+        )
         dtype = prompt_embeds.dtype
         latents, latent_image_ids = self.preprocess_latents(
             model_inputs.latents, model_inputs.latent_image_ids
@@ -405,13 +420,13 @@ class FluxPipeline(DiffusionPipeline):
                     [batch_size],
                     model_inputs.guidance_scale,
                     device=self._transformer_device,
-                    dtype=dtype,
+                    dtype=transformer_input_dtype,
                 )
             else:
                 self._cached_guidance[guidance_key] = Tensor.zeros(
                     [batch_size],
                     device=self._transformer_device,
-                    dtype=dtype,
+                    dtype=transformer_input_dtype,
                 )
         guidance = self._cached_guidance[guidance_key]
 

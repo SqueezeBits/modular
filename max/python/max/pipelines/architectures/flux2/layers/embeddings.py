@@ -23,7 +23,7 @@ from max.experimental.nn.common_layers.activation import (
 from max.experimental.tensor import Tensor
 from max.nn.float8_config import Float8Config
 
-from ...common_layers.fp8_linear import FP8Linear
+from max.experimental.nn.common_layers.fp8_linear import FP8Linear
 
 def get_timestep_embedding(
     timesteps: Tensor,

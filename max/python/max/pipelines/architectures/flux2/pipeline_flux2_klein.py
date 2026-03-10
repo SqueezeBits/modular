@@ -130,7 +130,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
             )
 
         prompt_embeds = prompt_embeds.to(self.transformer.devices[0]).cast(
-            self.transformer.config.dtype
+            self._activation_dtype(self.transformer.config.dtype)
         )
         batch_size = int(prompt_embeds.shape[0])
         seq_len = int(prompt_embeds.shape[1])
@@ -198,6 +198,9 @@ class Flux2KleinPipeline(Flux2Pipeline):
         with Tracer("prepare_latents_and_conditioning"):
             batch_size = int(prompt_embeds.shape[0])
             dtype = prompt_embeds.dtype
+            transformer_input_dtype = self._activation_dtype(
+                self.transformer.config.dtype
+            )
             device = self.transformer.devices[0]
 
             image_latents = None
@@ -230,7 +233,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
                 guidance = Tensor.zeros(
                     [latents.shape[0]],
                     device=device,
-                    dtype=dtype,
+                    dtype=transformer_input_dtype,
                 )
                 self._cached_guidance[guidance_key] = guidance
 

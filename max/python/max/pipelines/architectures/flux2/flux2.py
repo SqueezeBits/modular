@@ -20,7 +20,7 @@ from max.experimental.tensor import Tensor
 from max.graph import TensorType
 from max.nn.float8_config import Float8Config
 
-from ..common_layers.fp8_linear import FP8Linear
+from max.experimental.nn.common_layers.fp8_linear import FP8Linear
 from .layers.embeddings import TimestepEmbedding, Timesteps
 from .layers.flux2_attention import (
     Flux2Attention,

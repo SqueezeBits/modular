@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
+from PIL import Image
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.experimental import functional as F
@@ -164,6 +165,10 @@ class Flux2Pipeline(DiffusionPipeline):
         self._cached_sigmas: dict[str, Tensor] = {}
         self._cached_shape_carriers: dict[int, Tensor] = {}
 
+    def _activation_dtype(self, dtype: DType) -> DType:
+        """Return the runtime activation dtype for a component."""
+        return DType.bfloat16 if dtype.is_float8() else dtype
+
     @traced
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:  # type: ignore[override]
         """Convert a PixelContext into Flux2ModelInputs."""
@@ -178,6 +183,7 @@ class Flux2Pipeline(DiffusionPipeline):
         if context.sigmas.size == 0:
             raise ValueError(
                 "Flux2Pipeline requires non-empty sigmas in PixelContext"
+            )
         # Convert numpy array back to PIL.Image temporarily for Flux2ModelInputs
         pil_image = None
         if context.input_image is not None and isinstance(
@@ -198,21 +204,15 @@ class Flux2Pipeline(DiffusionPipeline):
         return result
 
     def build_prepare_prompt_embeddings(self) -> None:
-        # Text encoder outputs bf16 even for fp8-only models (Mistral3 doesn't
-        # quantize activations to fp8). Use bf16 when config dtype is float8 so
-        # the compiled _prepare_prompt_embeddings matches actual text encoder
-        # output and the transformer's expected encoder_hidden_states dtype.
-        input_dtype = (
-            DType.bfloat16
-            if self.text_encoder.config.dtype.is_float8()
-            else self.text_encoder.config.dtype
-        )
+        input_dtype = self._activation_dtype(self.text_encoder.config.dtype)
         input_types = [
             TensorType(
                 input_dtype,
                 shape=["seq_len", "hidden_dim"],
                 device=self.text_encoder.devices[0],
             )
+            for _ in range(3)
+        ]
 
         device = self.transformer.devices[0]
 
@@ -240,7 +240,7 @@ class Flux2Pipeline(DiffusionPipeline):
                 [context.num_images_per_prompt],
                 context.guidance_scale,
                 device=device,
-                dtype=self.transformer.config.dtype,
+                dtype=self._activation_dtype(self.transformer.config.dtype),
             )
             self._cached_guidance[guidance_key] = guidance
 
@@ -328,12 +328,7 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
     def build_scheduler_step(self) -> None:
-        transformer_dtype = self.transformer.config.dtype
-        dtype = (
-            DType.bfloat16
-            if transformer_dtype.is_float8()
-            else transformer_dtype
-        )
+        dtype = self._activation_dtype(self.transformer.config.dtype)
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -350,7 +345,7 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
     def build_concat_image_latents(self) -> None:
-        dtype = self.transformer.config.dtype
+        dtype = self._activation_dtype(self.transformer.config.dtype)
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -631,13 +626,9 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def _patchify_and_pack(self, latents: Tensor) -> Tensor:
         """Patchify (B,C,H,W)->(B,C*4,H//2,W//2) then pack to (B,H//2*W//2,C*4)."""
-        transformer_dtype = self.transformer.config.dtype
-        input_dtype = (
-            DType.bfloat16
-            if transformer_dtype.is_float8()
-            else transformer_dtype
+        latents = latents.cast(
+            self._activation_dtype(self.transformer.config.dtype)
         )
-        latents = latents.cast(input_dtype)
         batch = latents.shape[0]
         c = latents.shape[1]
         h = latents.shape[2]
@@ -707,13 +698,9 @@ class Flux2Pipeline(DiffusionPipeline):
         sigmas_curr = F.slice_tensor(sigmas, [slice(0, -1)])
         sigmas_next = F.slice_tensor(sigmas, [slice(1, None)])
         all_dt = F.sub(sigmas_next, sigmas_curr)
-        transformer_dtype = self.transformer.config.dtype
-        input_dtype = (
-            DType.bfloat16
-            if transformer_dtype.is_float8()
-            else transformer_dtype
+        all_timesteps = sigmas_curr.cast(
+            self._activation_dtype(self.transformer.config.dtype)
         )
-        all_timesteps = sigmas_curr.cast(input_dtype)
         return all_timesteps, all_dt
 
     @traced

@@ -23,7 +23,9 @@ from max.pipelines.lib.interfaces.component_model import ComponentModel
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
-from ..common_layers.fp8_config_utils import validate_fp8_weight_scale_contract
+from max.experimental.nn.common_layers.fp8_config_utils import (
+    validate_fp8_weight_scale_contract,
+)
 
 
 class Flux2TransformerModel(ComponentModel):
