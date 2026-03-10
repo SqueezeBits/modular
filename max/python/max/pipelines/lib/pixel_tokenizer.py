@@ -36,13 +36,11 @@ from max.interfaces.request.open_responses import (
     InputImageContent,
     InputTextContent,
 )
-from max.pipelines.architectures.qwen2_5vl.image_processor import (
-    Qwen2_5VLPromptImageProcessor,
-)
 from max.pipelines.core import PixelContext
 from transformers import AutoTokenizer
 
 from .diffusion_schedulers import SchedulerFactory
+from .qwen_image_processor import Qwen2_5VLPromptImageProcessor
 
 if TYPE_CHECKING:
     import PIL.Image
@@ -364,6 +362,37 @@ class PixelGenerationTokenizer(
         rng = np.random.RandomState(seed)
         return rng.standard_normal(shape).astype(np.float32)
 
+    @staticmethod
+    def _resize_with_center_crop(
+        image: PIL.Image.Image, target_width: int, target_height: int
+    ) -> PIL.Image.Image:
+        ratio = target_width / target_height
+        src_ratio = image.width / image.height
+
+        src_w = (
+            target_width
+            if ratio > src_ratio
+            else image.width * target_height // image.height
+        )
+        src_h = (
+            target_height
+            if ratio <= src_ratio
+            else image.height * target_width // image.width
+        )
+
+        resized = image.resize(
+            (src_w, src_h), resample=PIL.Image.Resampling.LANCZOS
+        )
+        canvas = PIL.Image.new("RGB", (target_width, target_height))
+        canvas.paste(
+            resized,
+            box=(
+                target_width // 2 - src_w // 2,
+                target_height // 2 - src_h // 2,
+            ),
+        )
+        return canvas
+
     def _preprocess_input_image(
         self,
         image: PIL.Image.Image | npt.NDArray[np.uint8],
@@ -372,13 +401,14 @@ class PixelGenerationTokenizer(
     ) -> PIL.Image.Image:
         """Preprocess input image for image-to-image generation.
 
-        This method preprocesses images for condition-based image-to-image generation.
-        Matching diffusers behavior: resizes large images, ensures dimensions are multiples
-        of vae_scale_factor * 2, and optionally resizes to target dimensions.
+        Matches the shared image-to-image behavior by default:
+        - cap image area when needed
+        - floor dimensions to multiples of vae_scale_factor * 2
+        - apply aspect-ratio preserving center-crop resize to the floored size
 
-        Note: This is a simplified version compared to pipeline_flux2.py which uses
-        image_processor.preprocess. This tokenizer-level preprocessing is sufficient
-        for the Max framework's condition-based approach.
+        Qwen image edit is the exception. It preserves the requested output
+        size separately and uses explicit target resize here only for the
+        condition image branch.
 
         Args:
             image: PIL Image or numpy array (uint8) to preprocess.
@@ -388,12 +418,9 @@ class PixelGenerationTokenizer(
         Returns:
             Preprocessed PIL Image with adjusted dimensions.
         """
-        import PIL.Image
-
         if isinstance(image, np.ndarray):
             image = PIL.Image.fromarray(image.astype(np.uint8))
 
-        # Ensure RGB mode (e.g. RGBA PNGs would break 3-channel VAE input)
         if image.mode != "RGB":
             image = image.convert("RGB")
 
@@ -412,18 +439,34 @@ class PixelGenerationTokenizer(
                 )
                 image_width, image_height = image.size
 
-        image_width = (image_width // multiple_of) * multiple_of
-        image_height = (image_height // multiple_of) * multiple_of
+        if target_height is None:
+            image_height = max(
+                (image_height // multiple_of) * multiple_of, multiple_of
+            )
+        else:
+            image_height = max(
+                (target_height // multiple_of) * multiple_of, multiple_of
+            )
 
-        if target_height is not None:
-            image_height = (target_height // multiple_of) * multiple_of
-        if target_width is not None:
-            image_width = (target_width // multiple_of) * multiple_of
+        if target_width is None:
+            image_width = max(
+                (image_width // multiple_of) * multiple_of, multiple_of
+            )
+        else:
+            image_width = max(
+                (target_width // multiple_of) * multiple_of, multiple_of
+            )
 
         if image.size != (image_width, image_height):
-            image = image.resize(
-                (image_width, image_height), PIL.Image.Resampling.LANCZOS
-            )
+            if target_height is None and target_width is None:
+                image = self._resize_with_center_crop(
+                    image, image_width, image_height
+                )
+            else:
+                image = image.resize(
+                    (image_width, image_height),
+                    PIL.Image.Resampling.LANCZOS,
+                )
 
         return image
 
@@ -457,11 +500,11 @@ class PixelGenerationTokenizer(
             self._resize_image_to_area(image, QWEN_EDIT_PROMPT_IMAGE_SIZE)
             for image in input_images
         ]
-        vae_images = [
+        vae_condition_images = [
             self._resize_image_to_area(image, QWEN_EDIT_VAE_IMAGE_SIZE)
             for image in input_images
         ]
-        return prompt_images, vae_images
+        return prompt_images, vae_condition_images
 
     def _prepare_qwen_edit_tokens(
         self,
@@ -1049,9 +1092,9 @@ class PixelGenerationTokenizer(
                 )
 
         prompt_images: list[npt.NDArray[np.uint8]] | None = None
-        vae_images: list[npt.NDArray[np.uint8]] | None = None
+        vae_condition_images: list[npt.NDArray[np.uint8]] | None = None
         if self._is_qwen_image_edit_family:
-            prompt_images, vae_images = (
+            prompt_images, vae_condition_images = (
                 self._prepare_qwen_edit_condition_images(
                     preprocessed_image_arrays
                 )
@@ -1134,7 +1177,7 @@ class PixelGenerationTokenizer(
             model_name=request.body.model,
             input_images=preprocessed_image_arrays,
             prompt_images=prompt_images,
-            vae_images=vae_images,
+            vae_condition_images=vae_condition_images,
         )
 
         for validator in self._context_validators:

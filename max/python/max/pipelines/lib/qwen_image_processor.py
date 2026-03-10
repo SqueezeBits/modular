@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""MAX-native image preprocessing helpers for Qwen image prompt assembly."""
+"""MAX-native image preprocessing helpers for Qwen image pipelines."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ import numpy.typing as npt
 from max.pipelines.lib import float32_to_bfloat16_as_uint16
 from PIL import Image
 
-# Pre-computed normalization constants for ImageNet.
 _IMAGENET_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 _IMAGENET_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 _NORM_SCALE = (1.0 / (255.0 * _IMAGENET_STD)).astype(np.float32)
@@ -135,4 +134,5 @@ class Qwen2_5VLPromptImageProcessor:
         return_tensors: str = "np",
         **kwargs: Any,
     ) -> tuple[dict[str, npt.NDArray[Any]], list[npt.NDArray[np.uint16]]]:
+        """Alias matching the HuggingFace image processor API."""
         return self(images, return_tensors=return_tensors, **kwargs)
