@@ -736,8 +736,15 @@ class PixelContext:
     prompt_images: list[npt.NDArray[np.uint8]] | None = field(default=None)
     """Optional prompt-conditioning images prepared by the tokenizer."""
 
-    vae_images: list[npt.NDArray[np.uint8]] | None = field(default=None)
-    """Optional VAE-conditioning images prepared by the tokenizer."""
+    vae_condition_images: list[npt.NDArray[np.uint8]] | None = field(
+        default=None
+    )
+    """Optional VAE-conditioning images prepared by the tokenizer.
+
+    Qwen image edit keeps prompt-conditioning images and VAE-conditioning
+    images separate because the multimodal prompt encoder and the VAE latent
+    conditioning path use different resize targets.
+    """
 
     status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
 

@@ -65,7 +65,7 @@ class QwenImageEditModelInputs(PixelModelInputs):
     num_inference_steps: int = 50
     num_images_per_prompt: int = 1
     prompt_images: list[npt.NDArray[np.uint8]] | None = None
-    vae_images: list[npt.NDArray[np.uint8]] | None = None
+    vae_condition_images: list[npt.NDArray[np.uint8]] | None = None
 
 
 @dataclass
@@ -216,8 +216,12 @@ class QwenImageEditPipeline(DiffusionPipeline):
         model_inputs: QwenImageEditModelInputs,
     ) -> tuple[list[npt.NDArray[np.uint8]], list[npt.NDArray[np.uint8]]]:
         prompt_images = model_inputs.prompt_images or model_inputs.input_images or []
-        vae_images = model_inputs.vae_images or model_inputs.input_images or []
-        return prompt_images, vae_images
+        vae_condition_images = (
+            model_inputs.vae_condition_images
+            or model_inputs.input_images
+            or []
+        )
+        return prompt_images, vae_condition_images
 
     def _prepare_negative_prompt_embeddings(
         self,
@@ -242,14 +246,17 @@ class QwenImageEditPipeline(DiffusionPipeline):
     def _prepare_condition_latents(
         self,
         *,
-        vae_images: list[npt.NDArray[np.uint8]],
+        vae_condition_images: list[npt.NDArray[np.uint8]],
         batch_size: int,
         device: Device,
     ) -> tuple[Buffer | None, Buffer | None]:
-        if not vae_images:
+        if not vae_condition_images:
             return None, None
 
-        image_bufs = [self._numpy_image_to_buffer(image) for image in vae_images]
+        image_bufs = [
+            self._numpy_image_to_buffer(image)
+            for image in vae_condition_images
+        ]
         return self.prepare_image_latents(
             images=image_bufs,
             batch_size=batch_size,
@@ -798,7 +805,9 @@ class QwenImageEditPipeline(DiffusionPipeline):
     ) -> QwenImageEditPipelineOutput:
         """Run the QwenImageEdit denoising loop and decode outputs."""
         device = self.transformer.devices[0]
-        prompt_images, vae_images = self._resolve_condition_images(model_inputs)
+        prompt_images, vae_condition_images = self._resolve_condition_images(
+            model_inputs
+        )
         has_images = bool(prompt_images)
         prompt_encoder = self._get_prompt_encoder() if has_images else None
 
@@ -822,7 +831,7 @@ class QwenImageEditPipeline(DiffusionPipeline):
         )
 
         image_latents, image_latent_ids = self._prepare_condition_latents(
-            vae_images=vae_images,
+            vae_condition_images=vae_condition_images,
             batch_size=batch_size,
             device=device,
         )
