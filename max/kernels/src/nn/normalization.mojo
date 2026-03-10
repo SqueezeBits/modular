@@ -946,9 +946,7 @@ fn mean_abs_pair_lastdim_gpu[
         indices[rank - 1] = col
         output_1_fn[_simd_width, rank, alignment](indices.canonicalize(), val)
 
-    comptime native_simd_width = simd_width_of[
-        dtype, target = get_gpu_target()
-    ]()
+    comptime native_simd_width = simd_width_of[dtype, target=get_gpu_target()]()
     comptime max_warps_per_block = (
         ctx.default_device_info.max_thread_block_size // WARP_SIZE
     )

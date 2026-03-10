@@ -388,6 +388,7 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.in_channels = in_channels
         self.joint_attention_dim = joint_attention_dim
         self.pooled_projection_dim = pooled_projection_dim
+
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for the model.
 

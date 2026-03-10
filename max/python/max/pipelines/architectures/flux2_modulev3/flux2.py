@@ -31,6 +31,7 @@ from .layers.flux2_attention import (
 from .layers.normalizations import AdaLayerNormContinuous
 from .model_config import Flux2ConfigBase
 
+
 def get_can_use_cache(
     intermediate_residual: Tensor,
     prev_intermediate_residual: Tensor | None,
@@ -437,7 +438,7 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
             return hidden_states
 
 
-class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):    
+class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
     def __init__(
         self,
         config: Flux2ConfigBase,
@@ -756,10 +757,10 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                 [encoder_hidden_states, hidden_states], axis=1
             )
             for i in range(len(self.single_transformer_blocks)):
-                single_block: Flux2SingleTransformerBlock = (
+                fallback_single_block: Flux2SingleTransformerBlock = (
                     self.single_transformer_blocks[i]
                 )
-                hidden_states = single_block(  # type: ignore[assignment]
+                hidden_states = fallback_single_block(  # type: ignore[assignment]
                     hidden_states=hidden_states,
                     encoder_hidden_states=None,
                     temb_mod_params=single_stream_mod,

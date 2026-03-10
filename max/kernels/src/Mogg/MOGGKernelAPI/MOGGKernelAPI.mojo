@@ -2859,10 +2859,18 @@ struct StepCacheMeanAbsPairLastDim:
         rank: Int,
         target: StaticString,
     ](
-        output_abs_diff: FusedOutputTensor[dtype=dtype, rank=rank, static_spec=...],
-        output_abs_prev: FusedOutputTensor[dtype=dtype, rank=rank, static_spec=...],
-        current_residual: FusedInputTensor[dtype=dtype, rank=rank, static_spec=...],
-        previous_residual: FusedInputTensor[dtype=dtype, rank=rank, static_spec=...],
+        output_abs_diff: FusedOutputTensor[
+            dtype=dtype, rank=rank, static_spec=...
+        ],
+        output_abs_prev: FusedOutputTensor[
+            dtype=dtype, rank=rank, static_spec=...
+        ],
+        current_residual: FusedInputTensor[
+            dtype=dtype, rank=rank, static_spec=...
+        ],
+        previous_residual: FusedInputTensor[
+            dtype=dtype, rank=rank, static_spec=...
+        ],
         ctx: DeviceContextPtr,
     ) capturing raises:
         if current_residual.shape() != previous_residual.shape():

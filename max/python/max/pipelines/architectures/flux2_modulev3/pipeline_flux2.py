@@ -739,7 +739,9 @@ class Flux2Pipeline(DiffusionPipeline):
         cfg = self._transformer_config
         inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
         out_dim = (
-            cfg.patch_size * cfg.patch_size * (cfg.out_channels or cfg.in_channels)
+            cfg.patch_size
+            * cfg.patch_size
+            * (cfg.out_channels or cfg.in_channels)
         )
         step_cache_flag = Tensor.full(
             [1],

@@ -1495,9 +1495,7 @@ def rope_ragged_with_position_ids(
             ],
             axis=0,
         )
-        start_pos = ops.constant(
-            [0], dtype=DType.uint32, device=input.device
-        )
+        start_pos = ops.constant([0], dtype=DType.uint32, device=input.device)
         return ops.custom(
             "mo.rope.ragged.with_position_id",
             device=input.device,
