@@ -66,10 +66,7 @@ class Flux2TransformerModel(ComponentModel):
             flux = Flux2Transformer2DModel(self.config)
             flux.to(self.devices[0])
         self._flux_model = flux
-        self._standard_model = flux.compile(
-            *flux.input_types(step_cache_enabled=False),
-            weights=state_dict,
-        )
+        self._standard_model: Callable[..., Any] | None = None
         self._step_cache_model: Callable[..., Any] | None = None
         self.model = self._standard_model
         return self.model
