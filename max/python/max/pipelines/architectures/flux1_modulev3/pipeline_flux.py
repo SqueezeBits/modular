@@ -516,18 +516,20 @@ class FluxPipeline(DiffusionPipeline):
             dt = dts_seq[i : i + 1]
 
             if step_cache_enabled:
-                noise_pred, new_residual = self.transformer.call_with_step_cache(
-                    latents,
-                    prompt_embeds,
-                    pooled_prompt_embeds,
-                    timestep,
-                    latent_image_ids,
-                    text_ids,
-                    guidance,
-                    prev_residual,
-                    prev_output,
-                    step_cache_flag,
-                    rdt_tensor,
+                noise_pred, new_residual = (
+                    self.transformer.call_with_step_cache(
+                        latents,
+                        prompt_embeds,
+                        pooled_prompt_embeds,
+                        timestep,
+                        latent_image_ids,
+                        text_ids,
+                        guidance,
+                        prev_residual,
+                        prev_output,
+                        step_cache_flag,
+                        rdt_tensor,
+                    )
                 )
             else:
                 noise_pred = self.transformer(

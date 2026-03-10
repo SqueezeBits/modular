@@ -27,6 +27,12 @@ from .weight_adapters import convert_safetensor_state_dict
 
 
 class Flux1TransformerModel(ComponentModel):
+    def _model_not_loaded(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(
+            "Flux1 transformer model is not ready yet. "
+            "Call use_standard_model or use_step_cache_model first."
+        )
+
     def __init__(
         self,
         config: dict[str, Any],
@@ -57,28 +63,36 @@ class Flux1TransformerModel(ComponentModel):
         self._flux_model = flux
         self._standard_model: Callable[..., Any] | None = None
         self._step_cache_model: Callable[..., Any] | None = None
-        self.model = self._standard_model
+        self.model = self._model_not_loaded
         return self.model
 
-    def use_standard_model(self) -> None:
+    def _ensure_standard_model(self) -> Callable[..., Any]:
         if self._standard_model is None:
             self._standard_model = self._flux_model.compile(
                 *self._flux_model.input_types(step_cache_enabled=False),
                 weights=self._state_dict,
             )
-        if self.model is self._step_cache_model:
-            self._step_cache_model = None
-        self.model = self._standard_model
+        return self._standard_model
 
-    def use_step_cache_model(self) -> None:
+    def _ensure_step_cache_model(self) -> Callable[..., Any]:
         if self._step_cache_model is None:
             self._step_cache_model = self._flux_model.compile(
                 *self._flux_model.input_types(step_cache_enabled=True),
                 weights=self._state_dict,
             )
+        return self._step_cache_model
+
+    def use_standard_model(self) -> None:
+        standard_model = self._ensure_standard_model()
+        if self.model is self._step_cache_model:
+            self._step_cache_model = None
+        self.model = standard_model
+
+    def use_step_cache_model(self) -> None:
+        step_cache_model = self._ensure_step_cache_model()
         if self.model is self._standard_model:
             self._standard_model = None
-        self.model = self._step_cache_model
+        self.model = step_cache_model
 
     def __call__(
         self,
@@ -90,7 +104,12 @@ class Flux1TransformerModel(ComponentModel):
         txt_ids: Tensor,
         guidance: Tensor | None,
     ) -> Any:
-        return self.model(
+        model = (
+            self._ensure_standard_model()
+            if self.model is self._model_not_loaded
+            else self.model
+        )
+        return model(
             hidden_states,
             encoder_hidden_states,
             pooled_projections,
@@ -101,6 +120,5 @@ class Flux1TransformerModel(ComponentModel):
         )
 
     def call_with_step_cache(self, *args: Any, **kwargs: Any) -> Any:
-        if self._step_cache_model is None:
-            self.use_step_cache_model()
-        return self._step_cache_model(*args, **kwargs)
+        model = self._ensure_step_cache_model()
+        return model(*args, **kwargs)
