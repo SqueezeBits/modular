@@ -177,6 +177,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Relative-difference threshold for step cache.",
     )
+    parser.add_argument(
+        "--taylorseer",
+        action="store_true",
+        help="Enable TaylorSeer cache optimization.",
+    )
+    parser.add_argument(
+        "--taylorseer-cache-interval",
+        type=int,
+        default=5,
+        help="Steps between full computations for TaylorSeer (default: 5).",
+    )
+    parser.add_argument(
+        "--taylorseer-warmup-steps",
+        type=int,
+        default=3,
+        help="Warmup steps for TaylorSeer factor gathering (default: 3).",
+    )
+    parser.add_argument(
+        "--taylorseer-max-order",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Taylor expansion order: 1=linear, 2=quadratic (default: 1).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -192,6 +216,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     assert args.guidance_scale > 0.0, "guidance-scale must be positive."
     if args.rdt is not None:
         assert args.rdt >= 0.0, "rdt must be non-negative."
+    assert args.taylorseer_cache_interval >= 1, (
+        "taylorseer-cache-interval must be >= 1."
+    )
+    assert args.taylorseer_warmup_steps >= 1, (
+        "taylorseer-warmup-steps must be >= 1."
+    )
 
     return args
 
@@ -402,6 +432,10 @@ async def generate_image(args: argparse.Namespace) -> None:
     context.step_cache = args.step_cache
     if args.rdt is not None:
         context.rdt = args.rdt
+    context.taylorseer = args.taylorseer
+    context.taylorseer_cache_interval = args.taylorseer_cache_interval
+    context.taylorseer_warmup_steps = args.taylorseer_warmup_steps
+    context.taylorseer_max_order = args.taylorseer_max_order
 
     print(
         f"Context created: {context.height}x{context.width}, {context.num_inference_steps} steps"
@@ -409,6 +443,12 @@ async def generate_image(args: argparse.Namespace) -> None:
     if args.step_cache:
         rdt_info = f", rdt={args.rdt}" if args.rdt is not None else ""
         print(f"Step cache enabled{rdt_info}.")
+    if args.taylorseer:
+        print(
+            f"TaylorSeer enabled: order={args.taylorseer_max_order}, "
+            f"interval={args.taylorseer_cache_interval}, "
+            f"warmup={args.taylorseer_warmup_steps}."
+        )
 
     # Step 6: Prepare inputs for the pipeline
     # Create a batch with a single context
