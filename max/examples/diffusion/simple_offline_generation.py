@@ -56,6 +56,7 @@ from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import PixelGenerationTokenizer
 from max.pipelines.lib.interfaces import DiffusionPipeline
+from max.pipelines.lib.interfaces.cache_mixin import CacheConfig
 from max.pipelines.lib.pipeline_runtime_config import PipelineRuntimeConfig
 from max.pipelines.lib.pipeline_variants.pixel_generation import (
     PixelGenerationPipeline,
@@ -359,9 +360,18 @@ async def generate_image(args: argparse.Namespace) -> None:
             f"{arch.pipeline_model}"
         )
     pipeline_model = cast(type[DiffusionPipeline], arch.pipeline_model)
+    cache_config = CacheConfig(
+        step_cache=args.step_cache,
+        rdt=args.rdt,
+        taylorseer=args.taylorseer,
+        taylorseer_cache_interval=args.taylorseer_cache_interval,
+        taylorseer_warmup_steps=args.taylorseer_warmup_steps,
+        taylorseer_max_order=args.taylorseer_max_order,
+    )
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
         pipeline_model=pipeline_model,
+        cache_config=cache_config,
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")
@@ -429,13 +439,6 @@ async def generate_image(args: argparse.Namespace) -> None:
     # latent initialization, and all other preprocessing
     # Image is now extracted from the message content automatically
     context = await tokenizer.new_context(request)
-    context.step_cache = args.step_cache
-    if args.rdt is not None:
-        context.rdt = args.rdt
-    context.taylorseer = args.taylorseer
-    context.taylorseer_cache_interval = args.taylorseer_cache_interval
-    context.taylorseer_warmup_steps = args.taylorseer_warmup_steps
-    context.taylorseer_max_order = args.taylorseer_max_order
 
     print(
         f"Context created: {context.height}x{context.width}, {context.num_inference_steps} steps"
@@ -480,9 +483,6 @@ async def generate_image(args: argparse.Namespace) -> None:
         context_warmup = await tokenizer.new_context(
             request_warmup, input_image=input_image
         )
-        context_warmup.step_cache = args.step_cache
-        if args.rdt is not None:
-            context_warmup.rdt = args.rdt
         inputs_warmup = PixelGenerationInputs[PixelContext](
             batch={context_warmup.request_id: context_warmup}
         )

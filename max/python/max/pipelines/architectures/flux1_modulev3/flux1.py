@@ -37,38 +37,7 @@ from .model_config import FluxConfig
 logger = logging.getLogger(__name__)
 
 
-def get_can_use_cache(
-    intermediate_residual: Tensor,
-    prev_intermediate_residual: Tensor | None,
-    rdt: Tensor,
-) -> Tensor:
-    """Return whether previous residual cache is reusable."""
-    dev = intermediate_residual.device
-    if (
-        prev_intermediate_residual is None
-        or intermediate_residual.shape != prev_intermediate_residual.shape
-    ):
-        return F.constant(False, DType.bool, device=dev)
-
-    reduced_last_dim_shape = tuple(intermediate_residual.shape[:-1]) + (1,)
-    reduced_last_dim_type = TensorType(
-        intermediate_residual.dtype,
-        shape=reduced_last_dim_shape,
-        device=dev,
-    )
-    # A single full-tensor reduction was slower here, so we first reduce over the
-    # last dimension and then take the global mean from the per-row results.
-    mean_diff_rows = F.mean(
-        F.abs(intermediate_residual - prev_intermediate_residual), axis=-1
-    )
-    mean_prev_rows = F.mean(F.abs(prev_intermediate_residual), axis=-1)
-    mean_diff = F.mean(mean_diff_rows, axis=None)
-    mean_prev = F.mean(mean_prev_rows, axis=None)
-    eps = 1e-9
-    relative_diff = mean_diff / (mean_prev + eps)
-    pred = relative_diff < F.cast(rdt, relative_diff.dtype)
-    # cond predicate must be scalar bool.
-    return F.squeeze(pred, 0)
+from max.pipelines.lib.interfaces.cache_mixin import CacheMixin, can_use_step_cache
 
 
 class FluxSingleTransformerBlock(Module[..., tuple[Tensor, Tensor]]):
@@ -654,13 +623,13 @@ class FluxTransformer2DModel(Module[..., Sequence[Tensor]]):
                     _output_type: TensorType = output_type,
                     _residual_type: TensorType = residual_type,
                 ) -> tuple[TensorValue, TensorValue]:
-                    can_use_cache = get_can_use_cache(
+                    use_step_cache = can_use_step_cache(
                         _first_block_residual,
                         prev_residual,
                         rdt,
                     )
                     result = F.cond(
-                        can_use_cache,
+                        use_step_cache,
                         [_output_type, _residual_type],
                         then_fn,
                         else_fn,

@@ -89,8 +89,12 @@ class Flux1TransformerModel(ComponentModel):
         img_ids: Tensor,
         txt_ids: Tensor,
         guidance: Tensor | None,
+        prev_residual: Tensor | None = None,
+        prev_output: Tensor | None = None,
+        step_cache_flag: Tensor | None = None,
+        rdt: Tensor | None = None,
     ) -> Any:
-        return self.model(
+        args = (
             hidden_states,
             encoder_hidden_states,
             pooled_projections,
@@ -99,8 +103,6 @@ class Flux1TransformerModel(ComponentModel):
             txt_ids,
             guidance,
         )
-
-    def call_with_step_cache(self, *args: Any, **kwargs: Any) -> Any:
-        if self._step_cache_model is None:
-            self.use_step_cache_model()
-        return self._step_cache_model(*args, **kwargs)
+        if prev_residual is not None:
+            args += (prev_residual, prev_output, step_cache_flag, rdt)
+        return self.model(*args)
