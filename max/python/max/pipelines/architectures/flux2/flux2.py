@@ -577,6 +577,8 @@ class Flux2Transformer2DModel(Module[..., tuple[Tensor]]):
         )
 
         # Store config for input_types
+        self.max_device = device
+        self.device = device
         self.max_dtype = dtype
         self.max_input_dtype = (
             DType.bfloat16 if dtype.is_float8() else dtype
