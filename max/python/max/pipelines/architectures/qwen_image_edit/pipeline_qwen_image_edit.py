@@ -33,7 +33,6 @@ from max.interfaces import TokenBuffer
 from max.pipelines.core import PixelContext
 from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
 from max.pipelines.lib.interfaces.diffusion_pipeline import (
-    CompileWrapper,
     max_compile,
 )
 from max.profiler import Tracer, traced
@@ -123,12 +122,16 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.build_scheduler_step()
         self.build_postprocess_latents()
         self.build_cfg_blend()
+        self.build_reshape_latents()
+        self.build_vae_reshape()
         self.build_normalize_and_pack()
         self.build_concat_image_latents()
+        self.build_concat_image_sequences()
 
         self._cached_sigmas: dict[str, Buffer] = {}
         self._cached_text_ids: dict[str, Buffer] = {}
         self._cached_fns: dict[str, Any] = {}
+        self._cached_shape_carriers: dict[int, Buffer] = {}
 
         diffusers_config = self.pipeline_config.model.diffusers_config
         components_config = diffusers_config.get("components", {})
@@ -347,6 +350,37 @@ class QwenImageEditPipeline(DiffusionPipeline):
             ],
         )
 
+    def build_reshape_latents(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        packed_channels = self.transformer.config.in_channels
+        self.__dict__["_reshape_latents"] = max_compile(
+            self._reshape_latents,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["batch", "seq", packed_channels],
+                    device=device,
+                ),
+                TensorType(DType.float32, shape=["packed_h"], device=CPU()),
+                TensorType(DType.float32, shape=["packed_w"], device=CPU()),
+            ],
+        )
+
+    def build_vae_reshape(self) -> None:
+        dtype = self.vae.config.dtype
+        device = self.vae.devices[0]
+        self.__dict__["_reshape_vae_latents"] = max_compile(
+            self._reshape_vae_latents,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["batch", "channels", "height", "width"],
+                    device=device,
+                )
+            ],
+        )
+
     def build_normalize_and_pack(self) -> None:
         dtype = self.vae.config.dtype
         device = self.vae.devices[0]
@@ -370,6 +404,21 @@ class QwenImageEditPipeline(DiffusionPipeline):
                 TensorType(dtype, shape=["batch", "img_seq", "channels"], device=device),
                 TensorType(DType.int64, shape=["batch", "seq", 3], device=device),
                 TensorType(DType.int64, shape=["batch", "img_seq", 3], device=device),
+            ],
+        )
+
+    def build_concat_image_sequences(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        self.__dict__["_concat_image_sequences"] = max_compile(
+            self._concat_image_sequences,
+            input_types=[
+                TensorType(
+                    dtype, shape=["batch", "seq", "channels"], device=device
+                ),
+                TensorType(
+                    dtype, shape=["batch", "img_seq", "channels"], device=device
+                ),
             ],
         )
 
@@ -435,6 +484,25 @@ class QwenImageEditPipeline(DiffusionPipeline):
         scale = ops.cast(cfg_scale, cond_pred.dtype)
         return uncond_pred + scale * (cond_pred - uncond_pred)
 
+    def _reshape_latents(
+        self,
+        latents_bsc: TensorValue,
+        h_carrier: TensorValue,
+        w_carrier: TensorValue,
+    ) -> TensorValue:
+        batch = latents_bsc.shape[0]
+        h = h_carrier.shape[0]
+        w = w_carrier.shape[0]
+        channels = latents_bsc.shape[2]
+        latents_bsc = ops.rebind(latents_bsc, [batch, h * w, channels])
+        return ops.reshape(latents_bsc, (batch, h, w, channels))
+
+    def _reshape_vae_latents(self, x: TensorValue) -> TensorValue:
+        return ops.reshape(
+            x,
+            (x.shape[0], x.shape[1], x.shape[2] // 2, 2, x.shape[3] // 2, 2),
+        )
+
     def concat_image_latents(
         self,
         latents: TensorValue,
@@ -446,6 +514,11 @@ class QwenImageEditPipeline(DiffusionPipeline):
             ops.concat([latents, image_latents], axis=1),
             ops.concat([latent_image_ids, image_latent_ids], axis=1),
         )
+
+    def _concat_image_sequences(
+        self, left: TensorValue, right: TensorValue
+    ) -> TensorValue:
+        return ops.concat([left, right], axis=1)
 
     def scheduler_step(
         self,
@@ -631,24 +704,7 @@ class QwenImageEditPipeline(DiffusionPipeline):
         )
         raw_b, raw_c, raw_h, raw_w = raw_buf.shape
 
-        reshape_key = f"vae_reshape_{raw_b}_{raw_c}_{raw_h}_{raw_w}"
-        if reshape_key not in self._cached_fns:
-            vae_dtype = self.vae.config.dtype
-
-            def _reshape_6d(x: TensorValue) -> TensorValue:
-                return ops.reshape(x, (raw_b, raw_c, raw_h // 2, 2, raw_w // 2, 2))
-
-            self._cached_fns[reshape_key] = max_compile(
-                _reshape_6d,
-                input_types=[
-                    TensorType(
-                        vae_dtype,
-                        shape=[raw_b, raw_c, raw_h, raw_w],
-                        device=device,
-                    )
-                ],
-            )
-        latents_6d = self._cached_fns[reshape_key](raw_buf)
+        latents_6d = self._reshape_vae_latents(raw_buf)
         image_latents = self._normalize_and_pack_image_latent(
             latents_6d, latents_mean, latents_std
         )
@@ -674,7 +730,7 @@ class QwenImageEditPipeline(DiffusionPipeline):
         if len(all_latents) == 1:
             image_latents, image_ids = all_latents[0], all_ids[0]
         else:
-            image_latents = self._concat_buffers_seq(all_latents, device)
+            image_latents = self._concat_buffers_seq(all_latents)
             id_arrays = [np.from_dlpack(ids.to(CPU())) for ids in all_ids]
             image_ids = Buffer.from_dlpack(
                 np.ascontiguousarray(np.concatenate(id_arrays, axis=1))
@@ -692,57 +748,26 @@ class QwenImageEditPipeline(DiffusionPipeline):
 
         return image_latents, image_ids
 
-    def _concat_buffers_seq(self, buffers: list[Buffer], device: Device) -> Buffer:
+    def _concat_buffers_seq(self, buffers: list[Buffer]) -> Buffer:
         result = buffers[0]
         for i in range(1, len(buffers)):
-            result = self._compiled_seq_concat(result, buffers[i], device)
+            result = self._concat_image_sequences(result, buffers[i])
         return result
-
-    def _compiled_seq_concat(self, a: Buffer, b: Buffer, device: Device) -> Buffer:
-        s1, s2, c = a.shape[1], b.shape[1], a.shape[2]
-        key = f"seq_concat_{s1}_{s2}_{c}"
-        if key not in self._cached_fns:
-            dtype = self.transformer.config.dtype
-
-            def _concat_fn(x: TensorValue, y: TensorValue) -> TensorValue:
-                return ops.concat([x, y], axis=1)
-
-            self._cached_fns[key] = max_compile(
-                _concat_fn,
-                input_types=[
-                    TensorType(dtype, shape=["batch", s1, c], device=device),
-                    TensorType(dtype, shape=["batch", s2, c], device=device),
-                ],
-            )
-        return self._cached_fns[key](a, b)
 
     # ── decode ────────────────────────────────────────────────────────────
 
-    def _get_reshape_fn(self, h_latent: int, w_latent: int) -> CompileWrapper:
-        """Get or create a compiled reshape function for (B,S,C) -> (B,H,W,C)."""
-        key = f"reshape_{h_latent}_{w_latent}"
-        if key not in self._cached_fns:
-            dtype = self.transformer.config.dtype
-            device = self.transformer.devices[0]
-            packed_channels = self.transformer.config.in_channels
-            seq_len = h_latent * w_latent
-
-            def _reshape_fn(x: TensorValue) -> TensorValue:
-                return ops.reshape(
-                    x, (x.shape[0], h_latent, w_latent, packed_channels)
+    def _get_shape_carriers(
+        self, h_latent: int, w_latent: int
+    ) -> tuple[Buffer, Buffer]:
+        for n in (h_latent, w_latent):
+            if n not in self._cached_shape_carriers:
+                self._cached_shape_carriers[n] = Buffer.from_dlpack(
+                    np.empty(n, dtype=np.float32)
                 )
-
-            self._cached_fns[key] = max_compile(
-                _reshape_fn,
-                input_types=[
-                    TensorType(
-                        dtype,
-                        shape=["batch", seq_len, packed_channels],
-                        device=device,
-                    )
-                ],
-            )
-        return self._cached_fns[key]
+        return (
+            self._cached_shape_carriers[h_latent],
+            self._cached_shape_carriers[w_latent],
+        )
 
     def decode_latents(
         self,
@@ -763,7 +788,8 @@ class QwenImageEditPipeline(DiffusionPipeline):
         if latents_mean is None or latents_std is None:
             raise ValueError("VAE latents_mean/latents_std not loaded.")
 
-        latents_bhwc = self._get_reshape_fn(h_latent, w_latent)(latents)
+        h_carrier, w_carrier = self._get_shape_carriers(h_latent, w_latent)
+        latents_bhwc = self._reshape_latents(latents, h_carrier, w_carrier)
         latents_decoded = self._postprocess_latents(
             latents_bhwc, latents_mean, latents_std
         )
