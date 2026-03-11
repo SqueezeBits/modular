@@ -27,6 +27,8 @@ import numpy.typing as npt
 from max._core.driver import Device
 from max.driver import CPU, Accelerator
 from max.engine import InferenceSession, Model
+from max.experimental.nn import Module
+from max.experimental.tensor import Tensor
 from max.graph import Graph, TensorType
 from max.graph.weights import load_weights
 from max.interfaces import PixelGenerationContext
@@ -41,7 +43,7 @@ if TYPE_CHECKING:
 
     from ..config import PipelineConfig
 
-CompileTarget: TypeAlias = Callable[..., Any]
+CompileTarget: TypeAlias = Callable[..., Any] | Module[..., Any]
 CompileDecorator: TypeAlias = Callable[[CompileTarget], "CompileWrapper"]
 
 
@@ -52,6 +54,12 @@ class DiffusionPipeline(ABC):
     """
 
     components: dict[str, type[ComponentModel]] | None = None
+
+    default_num_inference_steps: int = 50
+    """Default number of denoising steps when the user does not specify one.
+
+    Subclasses may override this to provide a model-appropriate default.
+    """
 
     def __init__(
         self,
@@ -349,6 +357,11 @@ class PixelModelInputs:
     - Must be > 0.
     - For video generation, the naming may still be used for historical compatibility.
     """
+    input_image: Image.Image | None = None
+    """
+    Optional input image for image-to-image generation (PIL.Image.Image).
+    """
+
     input_images: list[Any] | None = None
     """
     Optional list of input images for image-to-image generation.
@@ -442,6 +455,8 @@ class PixelModelInputs:
 
 
 class CompileWrapper:
+    """Wraps a compile target with optional input type annotations."""
+
     def __init__(
         self,
         compile_target: CompileTarget,
@@ -456,14 +471,23 @@ class CompileWrapper:
         Raises:
             ValueError: If input_types is not provided.
         """
-        target_name = compile_target.__name__
+        target_name = (
+            compile_target.__name__
+            if not isinstance(compile_target, Module)
+            else type(compile_target).__name__
+        )
         if input_types is None:
             raise ValueError(
                 f"input_types must be provided for compilation of {target_name}."
             )
 
         input_types_tuple = tuple(input_types)
+        self._compiled_module: Callable[..., Any] | None = None
         self._compiled_model: Model | None = None
+
+        if isinstance(compile_target, Module):
+            self._compiled_module = compile_target.compile(*input_types_tuple)
+            return
 
         with Graph(
             compile_target.__name__, input_types=input_types_tuple
@@ -493,6 +517,9 @@ class CompileWrapper:
         Returns:
             The result of the session execution.
         """
+        if self._compiled_module is not None:
+            return self._compiled_module(*args, **kwargs)
+
         if self._compiled_model is None:
             raise RuntimeError("CompileWrapper has no compiled target.")
 
@@ -500,7 +527,8 @@ class CompileWrapper:
         normalized_kwargs = {
             key: self._unwrap_tensor(val) for key, val in kwargs.items()
         }
-        outputs = self._compiled_model(*normalized_args, **normalized_kwargs)
+        buffers = self._compiled_model(*normalized_args, **normalized_kwargs)
+        outputs = [Tensor.from_dlpack(buffer) for buffer in buffers]
         return outputs[0] if len(outputs) == 1 else outputs
 
     @staticmethod
