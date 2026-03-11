@@ -63,7 +63,7 @@ def apply_rotary_emb(
 
     Because MAX graph has no complex dtype we expand the multiplication
     manually:  ``(x_re + i·x_im)(cos + i·sin)``
-             = ``(x_re·cos − x_im·sin) + i·(x_re·sin + x_im·cos)``
+             = ``(x_re·cos - x_im·sin) + i·(x_re·sin + x_im·cos)``
 
     Args:
         x: Input tensor [B, S, H, D] (sequence_dim=1).
@@ -82,9 +82,7 @@ def apply_rotary_emb(
         cos = ops.unsqueeze(ops.unsqueeze(cos, 0), 2)
         sin = ops.unsqueeze(ops.unsqueeze(sin, 0), 2)
     else:
-        raise ValueError(
-            f"`sequence_dim={sequence_dim}` but should be 1 or 2."
-        )
+        raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
 
     input_dtype = x.dtype
     x_shape = list(x.shape)

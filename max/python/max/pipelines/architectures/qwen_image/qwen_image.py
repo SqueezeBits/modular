@@ -32,7 +32,10 @@ from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm import RMSNorm
 
-from .layers.embeddings import QwenImagePosEmbed, QwenImageTimestepProjEmbeddings
+from .layers.embeddings import (
+    QwenImagePosEmbed,
+    QwenImageTimestepProjEmbeddings,
+)
 from .layers.normalizations import AdaLayerNormContinuous
 from .layers.qwen_image_attention import QwenImageTransformerBlock
 from .model_config import QwenImageConfigBase

@@ -14,7 +14,7 @@
 from collections.abc import Callable
 from typing import Any
 
-from max.driver import Device
+from max.driver import Buffer, Device
 from max.engine import InferenceSession, Model
 from max.graph import Graph
 from max.graph.weights import Weights
@@ -73,11 +73,11 @@ class QwenImageTransformerModel(ComponentModel):
 
     def __call__(
         self,
-        hidden_states,
-        encoder_hidden_states,
-        timestep,
-        img_ids,
-        txt_ids,
+        hidden_states: Buffer,
+        encoder_hidden_states: Buffer,
+        timestep: Buffer,
+        img_ids: Buffer,
+        txt_ids: Buffer,
     ) -> Any:
         return self.model.execute(
             hidden_states,

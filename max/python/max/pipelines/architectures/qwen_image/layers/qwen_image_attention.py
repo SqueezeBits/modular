@@ -31,7 +31,6 @@ from max.nn.norm import RMSNorm
 from .embeddings import apply_rotary_emb
 from .normalizations import LayerNormNoAffine
 
-
 # ---------------------------------------------------------------------------
 # FeedForward (matches diffusers naming: net.0.proj, net.2)
 # ---------------------------------------------------------------------------
@@ -261,9 +260,7 @@ class QwenImageAttention(Module):
         query = ops.reshape(
             query, [batch_size, seq_len, self.heads, self.head_dim]
         )
-        key = ops.reshape(
-            key, [batch_size, seq_len, self.heads, self.head_dim]
-        )
+        key = ops.reshape(key, [batch_size, seq_len, self.heads, self.head_dim])
         value = ops.reshape(
             value, [batch_size, seq_len, self.heads, self.head_dim]
         )
@@ -309,12 +306,8 @@ class QwenImageAttention(Module):
 
         original_dtype = query.dtype
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(
-                query, image_rotary_emb, sequence_dim=1
-            )
-            key = apply_rotary_emb(
-                key, image_rotary_emb, sequence_dim=1
-            )
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
             if query.dtype != original_dtype:
                 query = ops.cast(query, original_dtype)
             if key.dtype != original_dtype:
@@ -579,7 +572,9 @@ class QwenImageTransformerBlock(Module):
                 norm_hidden_states, img_mod, img_mod_zero, num_noise_tokens, 0
             )
         else:
-            norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+            norm_hidden_states = (
+                1 + scale_msa
+            ) * norm_hidden_states + shift_msa
 
         # Text stream - Attention
         norm_encoder_hidden_states = self.txt_norm1(encoder_hidden_states)
@@ -611,7 +606,9 @@ class QwenImageTransformerBlock(Module):
                 norm_hidden_states, img_mod, img_mod_zero, num_noise_tokens, 3
             )
         else:
-            norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+            norm_hidden_states = (
+                norm_hidden_states * (1 + scale_mlp) + shift_mlp
+            )
 
         ff_output = self.img_mlp(norm_hidden_states)
         if img_mod_zero is not None and num_noise_tokens is not None:
@@ -638,11 +635,7 @@ class QwenImageTransformerBlock(Module):
         )
 
         if encoder_hidden_states.dtype == DType.float16:
-            encoder_hidden_states = ops.max(
-                encoder_hidden_states, -65504.0
-            )
-            encoder_hidden_states = ops.min(
-                encoder_hidden_states, 65504.0
-            )
+            encoder_hidden_states = ops.max(encoder_hidden_states, -65504.0)
+            encoder_hidden_states = ops.min(encoder_hidden_states, 65504.0)
 
         return encoder_hidden_states, hidden_states
