@@ -28,9 +28,11 @@ import numpy as np
 import numpy.typing as npt
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType, TensorValue, ops
+from max.graph import TensorType, TensorValue, ops
+from max.graph.ops import shape_to_tensor
 from max.interfaces import TokenBuffer
 from max.pipelines.core import PixelContext
+from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
 from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
 from max.pipelines.lib.interfaces.diffusion_pipeline import (
     max_compile,
@@ -39,8 +41,8 @@ from max.profiler import Tracer, traced
 
 from ..autoencoders.autoencoder_kl_qwen_image import AutoencoderKLQwenImageModel
 from ..qwen2_5vl.encoder import (
-    Qwen25VLMultimodalEncoderModel,
     Qwen25VLEncoderModel,
+    Qwen25VLMultimodalEncoderModel,
 )
 from .model import QwenImageEditTransformerModel
 
@@ -123,15 +125,24 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.build_postprocess_latents()
         self.build_cfg_blend()
         self.build_reshape_latents()
+        self.build_trim_prompt_embeddings()
+        self.build_repeat_prompt_embeddings()
         self.build_vae_reshape()
         self.build_normalize_and_pack()
         self.build_concat_image_latents()
         self.build_concat_image_sequences()
+        self.build_concat_image_ids()
+        self.build_repeat_condition_latents()
+        self.build_repeat_condition_ids()
 
         self._cached_sigmas: dict[str, Buffer] = {}
         self._cached_text_ids: dict[str, Buffer] = {}
         self._cached_fns: dict[str, Any] = {}
         self._cached_shape_carriers: dict[int, Buffer] = {}
+        self._cached_cfg_scales: dict[float, Buffer] = {}
+        self._cached_condition_image_ids: dict[tuple[int, int, int], Buffer] = {}
+        self._cached_latent_image_ids: dict[tuple[int, int, int], Buffer] = {}
+        self._cached_prompt_tokens: dict[tuple[int, ...], Buffer] = {}
 
         diffusers_config = self.pipeline_config.model.diffusers_config
         components_config = diffusers_config.get("components", {})
@@ -160,12 +171,14 @@ class QwenImageEditPipeline(DiffusionPipeline):
         # loaded component A", which is more confusing than keeping the assembly
         # here in the edit pipeline.
         from max.graph.weights import load_weights
+
         if self._prompt_encoder_config is None:
             raise ValueError("prompt encoder config is not initialized")
         if self._prompt_encoder_weight_paths is None:
             raise ValueError("prompt encoder weight paths are not initialized")
 
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(
             self.pipeline_config.model.model_path,
             subfolder="tokenizer",
@@ -218,11 +231,11 @@ class QwenImageEditPipeline(DiffusionPipeline):
     def _resolve_condition_images(
         model_inputs: QwenImageEditModelInputs,
     ) -> tuple[list[npt.NDArray[np.uint8]], list[npt.NDArray[np.uint8]]]:
-        prompt_images = model_inputs.prompt_images or model_inputs.input_images or []
+        prompt_images = (
+            model_inputs.prompt_images or model_inputs.input_images or []
+        )
         vae_condition_images = (
-            model_inputs.vae_condition_images
-            or model_inputs.input_images
-            or []
+            model_inputs.vae_condition_images or model_inputs.input_images or []
         )
         return prompt_images, vae_condition_images
 
@@ -257,8 +270,7 @@ class QwenImageEditPipeline(DiffusionPipeline):
             return None, None
 
         image_bufs = [
-            self._numpy_image_to_buffer(image)
-            for image in vae_condition_images
+            self._numpy_image_to_buffer(image) for image in vae_condition_images
         ]
         return self.prepare_image_latents(
             images=image_bufs,
@@ -317,10 +329,15 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.__dict__["scheduler_step"] = max_compile(
             self.scheduler_step,
             input_types=[
-                TensorType(dtype, shape=["batch", "seq", "channels"], device=device),
-                TensorType(dtype, shape=["batch", "pred_seq", "channels"], device=device),
+                TensorType(
+                    dtype, shape=["batch", "seq", "channels"], device=device
+                ),
+                TensorType(
+                    dtype,
+                    shape=["batch", "pred_seq", "channels"],
+                    device=device,
+                ),
                 TensorType(DType.float32, shape=[1], device=device),
-                TensorType(DType.int64, shape=[], device=DeviceRef.CPU()),
             ],
         )
 
@@ -332,7 +349,11 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.__dict__["_postprocess_latents"] = max_compile(
             self._postprocess_latents,
             input_types=[
-                TensorType(dtype, shape=["batch", "height", "width", packed_channels], device=device),
+                TensorType(
+                    dtype,
+                    shape=["batch", "height", "width", packed_channels],
+                    device=device,
+                ),
                 TensorType(dtype, shape=[z_dim], device=device),
                 TensorType(dtype, shape=[z_dim], device=device),
             ],
@@ -344,8 +365,12 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.__dict__["_cfg_blend"] = max_compile(
             self._cfg_blend,
             input_types=[
-                TensorType(dtype, shape=["batch", "seq", "channels"], device=device),
-                TensorType(dtype, shape=["batch", "seq", "channels"], device=device),
+                TensorType(
+                    dtype, shape=["batch", "seq", "channels"], device=device
+                ),
+                TensorType(
+                    dtype, shape=["batch", "seq", "channels"], device=device
+                ),
                 TensorType(DType.float32, shape=[1], device=device),
             ],
         )
@@ -364,6 +389,36 @@ class QwenImageEditPipeline(DiffusionPipeline):
                 ),
                 TensorType(DType.float32, shape=["packed_h"], device=CPU()),
                 TensorType(DType.float32, shape=["packed_w"], device=CPU()),
+            ],
+        )
+
+    def build_trim_prompt_embeddings(self) -> None:
+        dtype = self.text_encoder.config.dtype
+        device = self.text_encoder.devices[0]
+        hidden_size = self.text_encoder.config.hidden_size
+        self.__dict__["_trim_prompt_embeddings"] = max_compile(
+            self._trim_prompt_embeddings,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["seq", hidden_size],
+                    device=device,
+                )
+            ],
+        )
+
+    def build_repeat_prompt_embeddings(self) -> None:
+        dtype = self.text_encoder.config.dtype
+        device = self.text_encoder.devices[0]
+        hidden_size = self.text_encoder.config.hidden_size
+        self.__dict__["_repeat_two_prompt_embeddings"] = max_compile(
+            self._repeat_two_prompt_embeddings,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=[1, "trimmed_seq_len", hidden_size],
+                    device=device,
+                )
             ],
         )
 
@@ -388,7 +443,11 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.__dict__["_normalize_and_pack_image_latent"] = max_compile(
             self._normalize_and_pack_image_latent,
             input_types=[
-                TensorType(dtype, shape=["batch", z_dim, "height", 2, "width", 2], device=device),
+                TensorType(
+                    dtype,
+                    shape=["batch", z_dim, "height", 2, "width", 2],
+                    device=device,
+                ),
                 TensorType(dtype, shape=[z_dim], device=device),
                 TensorType(dtype, shape=[z_dim], device=device),
             ],
@@ -400,10 +459,18 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.__dict__["concat_image_latents"] = max_compile(
             self.concat_image_latents,
             input_types=[
-                TensorType(dtype, shape=["batch", "seq", "channels"], device=device),
-                TensorType(dtype, shape=["batch", "img_seq", "channels"], device=device),
-                TensorType(DType.int64, shape=["batch", "seq", 3], device=device),
-                TensorType(DType.int64, shape=["batch", "img_seq", 3], device=device),
+                TensorType(
+                    dtype, shape=["batch", "seq", "channels"], device=device
+                ),
+                TensorType(
+                    dtype, shape=["batch", "img_seq", "channels"], device=device
+                ),
+                TensorType(
+                    DType.int64, shape=["batch", "seq", 3], device=device
+                ),
+                TensorType(
+                    DType.int64, shape=["batch", "img_seq", 3], device=device
+                ),
             ],
         )
 
@@ -419,6 +486,46 @@ class QwenImageEditPipeline(DiffusionPipeline):
                 TensorType(
                     dtype, shape=["batch", "img_seq", "channels"], device=device
                 ),
+            ],
+        )
+
+    def build_concat_image_ids(self) -> None:
+        device = self.transformer.devices[0]
+        self.__dict__["_concat_image_ids"] = max_compile(
+            self._concat_image_ids,
+            input_types=[
+                TensorType(
+                    DType.int64, shape=["batch", "seq", 3], device=device
+                ),
+                TensorType(
+                    DType.int64, shape=["batch", "img_seq", 3], device=device
+                ),
+            ],
+        )
+
+    def build_repeat_condition_latents(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        channels = self.transformer.config.in_channels
+        self.__dict__["_repeat_two_condition_latents"] = max_compile(
+            self._repeat_two_condition_latents,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=[1, "img_seq", channels],
+                    device=device,
+                )
+            ],
+        )
+
+    def build_repeat_condition_ids(self) -> None:
+        device = self.transformer.devices[0]
+        self.__dict__["_repeat_two_condition_ids"] = max_compile(
+            self._repeat_two_condition_ids,
+            input_types=[
+                TensorType(
+                    DType.int64, shape=[1, "img_seq", 3], device=device
+                )
             ],
         )
 
@@ -529,14 +636,27 @@ class QwenImageEditPipeline(DiffusionPipeline):
     ) -> TensorValue:
         return ops.concat([left, right], axis=1)
 
+    def _concat_image_ids(
+        self, left: TensorValue, right: TensorValue
+    ) -> TensorValue:
+        return ops.concat([left, right], axis=1)
+
+    def _repeat_two_condition_latents(
+        self, image_latents: TensorValue
+    ) -> TensorValue:
+        return ops.tile(image_latents, (2, 1, 1))
+
+    def _repeat_two_condition_ids(self, image_ids: TensorValue) -> TensorValue:
+        return ops.tile(image_ids, (2, 1, 1))
+
     def scheduler_step(
         self,
         latents: TensorValue,
         noise_pred: TensorValue,
         dt: TensorValue,
-        num_noise_tokens: int,
     ) -> TensorValue:
         """Single Euler step that only updates the noise tokens."""
+        num_noise_tokens = shape_to_tensor([latents.shape[1]])
         lat = ops.slice_tensor(
             latents,
             [slice(None), (slice(0, num_noise_tokens), "n"), slice(None)],
@@ -565,6 +685,18 @@ class QwenImageEditPipeline(DiffusionPipeline):
 
     PROMPT_TEMPLATE_DROP_IDX = 34
 
+    def _trim_prompt_embeddings(self, hidden_states: TensorValue) -> TensorValue:
+        trimmed = ops.slice_tensor(
+            hidden_states,
+            [slice(self.PROMPT_TEMPLATE_DROP_IDX, None), slice(None)],
+        )
+        return ops.unsqueeze(trimmed, 0)
+
+    def _repeat_two_prompt_embeddings(
+        self, prompt_embeddings: TensorValue
+    ) -> TensorValue:
+        return ops.tile(prompt_embeddings, (2, 1, 1))
+
     def prepare_prompt_embeddings(
         self,
         tokens: TokenBuffer,
@@ -572,12 +704,21 @@ class QwenImageEditPipeline(DiffusionPipeline):
     ) -> Buffer:
         device = self.text_encoder.devices[0]
         text_input_ids_np = np.asarray(tokens.array).flatten()
-        token_buf = Buffer.from_dlpack(
-            np.ascontiguousarray(text_input_ids_np)
-        ).to(device)
+        token_key = tuple(int(token) for token in text_input_ids_np.tolist())
+        if token_key not in self._cached_prompt_tokens:
+            self._cached_prompt_tokens[token_key] = Buffer.from_dlpack(
+                np.ascontiguousarray(text_input_ids_np)
+            ).to(device)
+        token_buf = self._cached_prompt_tokens[token_key]
 
         hidden_states_all = self.text_encoder(token_buf)
         hs_buf = hidden_states_all[-1]
+
+        trimmed = self._trim_prompt_embeddings(hs_buf)
+        if num_images_per_prompt == 1:
+            return trimmed
+        if num_images_per_prompt == 2:
+            return self._repeat_two_prompt_embeddings(trimmed)
 
         hs_cpu = hs_buf.to(CPU())
         if self.text_encoder.config.dtype == DType.bfloat16:
@@ -588,22 +729,19 @@ class QwenImageEditPipeline(DiffusionPipeline):
         else:
             hs_np = np.from_dlpack(hs_cpu).astype(np.float32)
 
-        hs_np = hs_np[self.PROMPT_TEMPLATE_DROP_IDX:]
+        hs_np = hs_np[self.PROMPT_TEMPLATE_DROP_IDX :]
         hs_np = hs_np[np.newaxis, :, :]
 
         if num_images_per_prompt != 1:
             hs_np = np.tile(hs_np, (num_images_per_prompt, 1, 1))
 
-        from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
         if self.text_encoder.config.dtype == DType.bfloat16:
             result_u16 = float32_to_bfloat16_as_uint16(
                 np.ascontiguousarray(hs_np)
             )
             buf = Buffer.from_numpy(result_u16).to(device)
             return buf.view(dtype=DType.bfloat16, shape=hs_np.shape)
-        return Buffer.from_numpy(
-            np.ascontiguousarray(hs_np)
-        ).to(device)
+        return Buffer.from_numpy(np.ascontiguousarray(hs_np)).to(device)
 
     # ── position ID helpers ───────────────────────────────────────────────
 
@@ -613,7 +751,9 @@ class QwenImageEditPipeline(DiffusionPipeline):
     ) -> Buffer:
         """Create 3D text position IDs in (T, H, W) format."""
         tok_positions = np.arange(seq_len, dtype=np.int64) + max_vid_index
-        coords = np.stack([tok_positions, tok_positions, tok_positions], axis=-1)
+        coords = np.stack(
+            [tok_positions, tok_positions, tok_positions], axis=-1
+        )
         return Buffer.from_dlpack(
             np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
         ).to(device)
@@ -627,14 +767,19 @@ class QwenImageEditPipeline(DiffusionPipeline):
         h_c = np.arange(height, dtype=np.int64) - (height - height // 2)
         w_c = np.arange(width, dtype=np.int64) - (width - width // 2)
         h_coords, w_coords = np.meshgrid(h_c, w_c, indexing="ij")
-        coords = np.stack([t_coords, h_coords, w_coords], axis=-1).reshape(-1, 3)
+        coords = np.stack([t_coords, h_coords, w_coords], axis=-1).reshape(
+            -1, 3
+        )
         return Buffer.from_dlpack(
             np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
         ).to(device)
 
     @staticmethod
     def _prepare_condition_image_ids(
-        batch_size: int, height: int, width: int, device: Device,
+        batch_size: int,
+        height: int,
+        width: int,
+        device: Device,
         image_index: int = 0,
     ) -> Buffer:
         """Condition-image IDs with T=image_index+1 (noise tokens use T=0).
@@ -647,10 +792,28 @@ class QwenImageEditPipeline(DiffusionPipeline):
         h_c = np.arange(height, dtype=np.int64) - (height - height // 2)
         w_c = np.arange(width, dtype=np.int64) - (width - width // 2)
         h_coords, w_coords = np.meshgrid(h_c, w_c, indexing="ij")
-        coords = np.stack([t_coords, h_coords, w_coords], axis=-1).reshape(-1, 3)
+        coords = np.stack([t_coords, h_coords, w_coords], axis=-1).reshape(
+            -1, 3
+        )
         return Buffer.from_dlpack(
             np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
         ).to(device)
+
+    def _get_condition_image_ids(
+        self, height: int, width: int, device: Device, image_index: int = 0
+    ) -> Buffer:
+        cache_key = (height, width, image_index)
+        if cache_key not in self._cached_condition_image_ids:
+            self._cached_condition_image_ids[cache_key] = (
+                self._prepare_condition_image_ids(
+                    1,
+                    height,
+                    width,
+                    device,
+                    image_index=image_index,
+                )
+            )
+        return self._cached_condition_image_ids[cache_key]
 
     # ── latent preprocessing ──────────────────────────────────────────────
 
@@ -666,9 +829,12 @@ class QwenImageEditPipeline(DiffusionPipeline):
         latents_packed = self._patchify_and_pack(
             Buffer.from_dlpack(np.ascontiguousarray(latents_6d)).to(device)
         )
-        ids_buf = Buffer.from_dlpack(
-            np.asarray(latent_image_ids, dtype=np.int64)
-        ).to(device)
+        ids_key = (b, h, w)
+        if ids_key not in self._cached_latent_image_ids:
+            self._cached_latent_image_ids[ids_key] = Buffer.from_dlpack(
+                np.asarray(latent_image_ids, dtype=np.int64)
+            ).to(device)
+        ids_buf = self._cached_latent_image_ids[ids_key]
         return latents_packed, ids_buf
 
     # ── image conditioning ────────────────────────────────────────────────
@@ -683,10 +849,6 @@ class QwenImageEditPipeline(DiffusionPipeline):
         vae_dtype = self.vae.config.dtype
         device = self.vae.devices[0]
         if vae_dtype == DType.bfloat16:
-            from max.pipelines.lib.bfloat16_utils import (
-                float32_to_bfloat16_as_uint16,
-            )
-
             u16 = float32_to_bfloat16_as_uint16(img_array)
             buf = Buffer.from_numpy(u16).to(device)
             return buf.view(dtype=DType.bfloat16, shape=img_array.shape)
@@ -711,14 +873,13 @@ class QwenImageEditPipeline(DiffusionPipeline):
             if hasattr(raw_latents, "driver_tensor")
             else raw_latents
         )
-        raw_b, raw_c, raw_h, raw_w = raw_buf.shape
+        _, _, raw_h, raw_w = raw_buf.shape
 
         latents_6d = self._reshape_vae_latents(raw_buf)
         image_latents = self._normalize_and_pack_image_latent(
             latents_6d, latents_mean, latents_std
         )
-        image_ids = self._prepare_condition_image_ids(
-            1,
+        image_ids = self._get_condition_image_ids(
             raw_h // 2,
             raw_w // 2,
             device,
@@ -740,12 +901,16 @@ class QwenImageEditPipeline(DiffusionPipeline):
             image_latents, image_ids = all_latents[0], all_ids[0]
         else:
             image_latents = self._concat_buffers_seq(all_latents)
-            id_arrays = [np.from_dlpack(ids.to(CPU())) for ids in all_ids]
-            image_ids = Buffer.from_dlpack(
-                np.ascontiguousarray(np.concatenate(id_arrays, axis=1))
-            ).to(device)
+            image_ids = all_ids[0]
+            for ids in all_ids[1:]:
+                image_ids = self._concat_image_ids(image_ids, ids)
 
         if batch_size > 1:
+            if batch_size == 2:
+                return (
+                    self._repeat_two_condition_latents(image_latents),
+                    self._repeat_two_condition_ids(image_ids),
+                )
             lat_np = np.from_dlpack(image_latents.to(CPU()))
             image_latents = Buffer.from_dlpack(
                 np.ascontiguousarray(np.tile(lat_np, (batch_size, 1, 1)))
@@ -901,60 +1066,72 @@ class QwenImageEditPipeline(DiffusionPipeline):
             all_timesteps, all_dts = self.prepare_scheduler(
                 self._cached_sigmas[sigmas_key]
             )
+            timesteps_seq: Any = all_timesteps
+            dts_seq: Any = all_dts
+            if hasattr(timesteps_seq, "driver_tensor"):
+                timesteps_seq = timesteps_seq.driver_tensor
+            if hasattr(dts_seq, "driver_tensor"):
+                dts_seq = dts_seq.driver_tensor
 
-        num_noise_tokens = latents.shape[1]
         cfg_scale_buf: Buffer | None = None
         if do_true_cfg:
-            cfg_scale_buf = Buffer.from_dlpack(
-                np.array([model_inputs.true_cfg_scale], dtype=np.float32)
-            ).to(device)
+            cfg_scale = float(model_inputs.true_cfg_scale)
+            if cfg_scale not in self._cached_cfg_scales:
+                self._cached_cfg_scales[cfg_scale] = Buffer.from_dlpack(
+                    np.array([cfg_scale], dtype=np.float32)
+                ).to(device)
+            cfg_scale_buf = self._cached_cfg_scales[cfg_scale]
 
-        nnt = num_noise_tokens if image_latents is not None else None
+        nnt = int(latents.shape[1]) if image_latents is not None else None
+        ids_in = latent_image_ids
+        if image_latents is not None and image_latent_ids is not None:
+            ids_in = self._concat_image_ids(latent_image_ids, image_latent_ids)
 
         with Tracer("denoising_loop"):
-            logger.debug("Starting denoising loop (%d steps)", num_inference_steps)
             for i in range(num_inference_steps):
-                logger.debug("Denoising step %d/%d", i + 1, num_inference_steps)
-                timestep = all_timesteps[i : i + 1]
-                dt = all_dts[i : i + 1]
+                with Tracer(f"denoising_step_{i}"):
+                    timestep = timesteps_seq[i : i + 1]
+                    dt = dts_seq[i : i + 1]
 
-                if image_latents is not None and image_latent_ids is not None:
-                    latents_in, ids_in = self.concat_image_latents(
-                        latents, image_latents, latent_image_ids, image_latent_ids
-                    )
-                else:
-                    latents_in, ids_in = latents, latent_image_ids
+                    if image_latents is not None:
+                        latents_in = self._concat_image_sequences(
+                            latents, image_latents
+                        )
+                    else:
+                        latents_in = latents
 
-                with Tracer("transformer_pos"):
-                    noise_pred = self.transformer(
-                        latents_in, prompt_embeds, timestep, ids_in, text_ids,
-                        num_noise_tokens=nnt,
-                    )[0]
-
-                if (
-                    do_true_cfg
-                    and negative_prompt_embeds is not None
-                    and negative_text_ids is not None
-                    and cfg_scale_buf is not None
-                ):
-                    with Tracer("transformer_neg"):
-                        noise_pred_uncond = self.transformer(
+                    with Tracer("transformer_pos"):
+                        noise_pred = self.transformer(
                             latents_in,
-                            negative_prompt_embeds,
+                            prompt_embeds,
                             timestep,
                             ids_in,
-                            negative_text_ids,
+                            text_ids,
                             num_noise_tokens=nnt,
                         )[0]
-                    with Tracer("cfg_blend"):
-                        noise_pred = self._cfg_blend(
-                            noise_pred, noise_pred_uncond, cfg_scale_buf
-                        )
 
-                with Tracer("scheduler_step"):
-                    latents = self.scheduler_step(
-                        latents, noise_pred, dt, num_noise_tokens
-                    )
+                    if (
+                        do_true_cfg
+                        and negative_prompt_embeds is not None
+                        and negative_text_ids is not None
+                        and cfg_scale_buf is not None
+                    ):
+                        with Tracer("transformer_neg"):
+                            noise_pred_uncond = self.transformer(
+                                latents_in,
+                                negative_prompt_embeds,
+                                timestep,
+                                ids_in,
+                                negative_text_ids,
+                                num_noise_tokens=nnt,
+                            )[0]
+                        with Tracer("cfg_blend"):
+                            noise_pred = self._cfg_blend(
+                                noise_pred, noise_pred_uncond, cfg_scale_buf
+                            )
+
+                    with Tracer("scheduler_step"):
+                        latents = self.scheduler_step(latents, noise_pred, dt)
 
             if callback_queue is not None:
                 callback_queue.put_nowait(
