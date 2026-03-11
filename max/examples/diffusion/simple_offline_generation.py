@@ -366,11 +366,7 @@ async def generate_image(args: argparse.Namespace) -> None:
     is_qwen_image_edit_family = arch.name in QWEN_IMAGE_EDIT_ARCH_NAMES
     guidance_scale = args.guidance_scale
     if guidance_scale is None:
-        guidance_scale = (
-            QWEN_DEFAULT_GUIDANCE_SCALE
-            if is_qwen_image_edit_family
-            else 3.5
-        )
+        guidance_scale = QWEN_DEFAULT_GUIDANCE_SCALE if is_qwen_image_edit_family else 3.5
 
     true_cfg_scale = args.true_cfg_scale
     if true_cfg_scale is None:

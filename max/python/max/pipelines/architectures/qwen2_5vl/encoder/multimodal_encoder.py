@@ -352,7 +352,9 @@ class Qwen25VLMultimodalEncoderModel:
                     np.ascontiguousarray(cu_window_seqlens.astype(np.uint32))
                 ).to(device),
                 Buffer.from_numpy(np.array([max_seqlen], dtype=np.uint32)),
-                Buffer.from_numpy(np.array([max_window_seqlen], dtype=np.uint32)),
+                Buffer.from_numpy(
+                    np.array([max_window_seqlen], dtype=np.uint32)
+                ),
                 Buffer.from_numpy(np.array(max_grid_size, dtype=np.int32)),
             )
         (

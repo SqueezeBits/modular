@@ -19,4 +19,3 @@ __all__ = [
     "qwen_image_edit_arch",
     "qwen_image_edit_plus_arch",
 ]
-

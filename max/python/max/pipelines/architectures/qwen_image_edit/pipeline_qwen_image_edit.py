@@ -140,7 +140,9 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self._cached_fns: dict[str, Any] = {}
         self._cached_shape_carriers: dict[int, Buffer] = {}
         self._cached_cfg_scales: dict[float, Buffer] = {}
-        self._cached_condition_image_ids: dict[tuple[int, int, int], Buffer] = {}
+        self._cached_condition_image_ids: dict[
+            tuple[int, int, int], Buffer
+        ] = {}
         self._cached_latent_image_ids: dict[tuple[int, int, int], Buffer] = {}
         self._cached_prompt_tokens: dict[tuple[int, ...], Buffer] = {}
 
@@ -523,9 +525,7 @@ class QwenImageEditPipeline(DiffusionPipeline):
         self.__dict__["_repeat_two_condition_ids"] = max_compile(
             self._repeat_two_condition_ids,
             input_types=[
-                TensorType(
-                    DType.int64, shape=[1, "img_seq", 3], device=device
-                )
+                TensorType(DType.int64, shape=[1, "img_seq", 3], device=device)
             ],
         )
 
@@ -685,7 +685,9 @@ class QwenImageEditPipeline(DiffusionPipeline):
 
     PROMPT_TEMPLATE_DROP_IDX = 34
 
-    def _trim_prompt_embeddings(self, hidden_states: TensorValue) -> TensorValue:
+    def _trim_prompt_embeddings(
+        self, hidden_states: TensorValue
+    ) -> TensorValue:
         trimmed = ops.slice_tensor(
             hidden_states,
             [slice(self.PROMPT_TEMPLATE_DROP_IDX, None), slice(None)],

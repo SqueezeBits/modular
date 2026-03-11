@@ -21,7 +21,7 @@ only known at the first ``execute()`` call, the graph is compiled lazily.
 from collections.abc import Callable
 from typing import Any
 
-from max.driver import Device
+from max.driver import Buffer, Device
 from max.engine import InferenceSession, Model
 from max.graph import Graph
 from max.graph.weights import Weights
@@ -55,7 +55,9 @@ class QwenImageEditTransformerModel(ComponentModel):
         # Prepare weights + nn_model but do NOT compile the graph yet.
         state_dict = {key: value.data() for key, value in self.weights.items()}
         self._nn_model = QwenImageTransformer2DModel(self.config)
-        self._nn_model.load_state_dict(state_dict, weight_alignment=1, strict=True)
+        self._nn_model.load_state_dict(
+            state_dict, weight_alignment=1, strict=True
+        )
         self._state_dict = self._nn_model.state_dict()
 
         # Compiled models keyed by num_noise_tokens
@@ -77,7 +79,8 @@ class QwenImageEditTransformerModel(ComponentModel):
                 else:
                     graph.output(outputs)
             self._compiled[key] = self.session.load(
-                graph, weights_registry=self._state_dict,
+                graph,
+                weights_registry=self._state_dict,
             )
         return self._compiled[key]
 
@@ -87,11 +90,11 @@ class QwenImageEditTransformerModel(ComponentModel):
 
     def __call__(
         self,
-        hidden_states,
-        encoder_hidden_states,
-        timestep,
-        img_ids,
-        txt_ids,
+        hidden_states: Buffer,
+        encoder_hidden_states: Buffer,
+        timestep: Buffer,
+        img_ids: Buffer,
+        txt_ids: Buffer,
         num_noise_tokens: int | None = None,
     ) -> Any:
         model = self._get_model(num_noise_tokens)

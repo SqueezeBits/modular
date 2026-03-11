@@ -48,4 +48,3 @@ qwen_image_edit_plus_arch = SupportedArchitecture(
     tokenizer=PixelGenerationTokenizer,
     config=QwenImageArchConfig,
 )
-
