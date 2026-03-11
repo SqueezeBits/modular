@@ -25,12 +25,11 @@ import numpy as np
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
 from max.experimental.nn.common_layers.fp8_config_utils import (
+    build_dynamic_block_fp8_config,
     build_legacy_scalar_fp8_config,
     validate_fp8_weight_scale_contract,
 )
 from .weight_adapters import (
-    convert_safetensor_state_dict,
-    is_bflabs_flux2_transformer_checkpoint,
     uses_legacy_scalar_fp8_scales,
 )
 
@@ -57,27 +56,60 @@ class Flux2TransformerModel(ComponentModel):
         self.load_model()
 
     def load_model(self) -> Callable[..., Any]:
-        original_state_dict = {
-            key: value.data() for key, value in self.weights.items()
-        }
-        state_dict = original_state_dict
-        if is_bflabs_flux2_transformer_checkpoint(original_state_dict):
-            state_dict = convert_safetensor_state_dict(original_state_dict)
-            if self.config.float8_config is not None and uses_legacy_scalar_fp8_scales(
-                original_state_dict
+        state_dict = {key: value.data() for key, value in self.weights.items()}
+        requested_activation_scheme = getattr(
+            self.config, "activation_scheme", None
+        )
+        if (
+            requested_activation_scheme == "static"
+            and not uses_legacy_scalar_fp8_scales(state_dict)
+        ):
+            raise ValueError(
+                "flux2.transformer: activation_scheme='static' requested, "
+                "but the loaded checkpoint does not provide legacy scalar "
+                "input_scale/weight_scale tensors."
+            )
+
+        if (
+            self.encoding == "float8_e4m3fn"
+            and self.config.float8_config is None
+            and requested_activation_scheme != "static"
+        ):
+            if any(
+                key.endswith(".weight_scale")
+                and len(getattr(value, "shape", ())) == 2
+                for key, value in state_dict.items()
             ):
-                if hasattr(self.config, "model_copy"):
-                    self.config = self.config.model_copy(
-                        update={
-                            "float8_config": build_legacy_scalar_fp8_config(
-                                component_name="flux2.transformer"
-                            )
+                self.config.float8_config = build_dynamic_block_fp8_config(
+                    {
+                        "quantization_config": {
+                            "quant_method": "fp8",
+                            "activation_scheme": "dynamic",
+                            "weight_block_size": [128, 128],
                         }
-                    )
-                else:
-                    self.config.float8_config = build_legacy_scalar_fp8_config(
-                        component_name="flux2.transformer"
-                    )
+                    },
+                    component_name="flux2.transformer",
+                )
+        if (
+            requested_activation_scheme is None
+            and (
+                self.config.float8_config is not None
+                or self.encoding == "float8_e4m3fn"
+            )
+            and uses_legacy_scalar_fp8_scales(state_dict)
+        ):
+            if hasattr(self.config, "model_copy"):
+                self.config = self.config.model_copy(
+                    update={
+                        "float8_config": build_legacy_scalar_fp8_config(
+                            component_name="flux2.transformer"
+                        )
+                    }
+                )
+            else:
+                self.config.float8_config = build_legacy_scalar_fp8_config(
+                    component_name="flux2.transformer"
+                )
         # Klein/distilled checkpoints can omit guidance embedder weights.
         has_guidance_embedder = any(
             "time_guidance_embed.guidance_embedder." in k for k in state_dict
@@ -103,9 +135,21 @@ class Flux2TransformerModel(ComponentModel):
         with F.lazy():
             flux = Flux2Transformer2DModel(self.config)
             flux.to(self.devices[0])
-            default_scale_array = np.array(1.0, dtype=np.float32)
             for name, _ in flux.parameters:
                 if name.endswith((".input_scale", ".weight_scale")) and name not in state_dict:
+                    parameter = getattr(flux, name.split(".")[0], None)
+                    shape = None
+                    for param_name, tensor in flux.parameters:
+                        if param_name == name:
+                            shape = tuple(int(dim) for dim in tensor.shape)
+                            break
+                    if shape is None:
+                        raise ValueError(
+                            f"could not infer shape for missing scale parameter '{name}'"
+                        )
+                    default_scale_array = np.ones(
+                        shape if shape else (), dtype=np.float32
+                    )
                     state_dict[name] = WeightData.from_numpy(
                         default_scale_array, name
                     )

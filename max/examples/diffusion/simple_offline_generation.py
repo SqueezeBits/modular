@@ -200,6 +200,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "If not set, encoding is auto-resolved from available weights."
         ),
     )
+    parser.add_argument(
+        "--activation-scheme",
+        choices=("static", "dynamic"),
+        default=None,
+        help=(
+            "Optional FP8 activation scaling override. "
+            "If not set, the model keeps its default activation scaling mode."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -290,6 +299,7 @@ async def generate_image(args: argparse.Namespace) -> None:
                 if args.quantization_encoding is not None
                 else None
             ),
+            fp8_activation_scheme=args.activation_scheme,
         ),
         runtime=PipelineRuntimeConfig(
             prefer_module_v3=True,

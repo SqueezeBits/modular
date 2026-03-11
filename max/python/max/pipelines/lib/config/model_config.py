@@ -19,7 +19,7 @@ import logging
 import os
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from huggingface_hub import constants as hf_hub_constants
 from max.config import ConfigFileModel
@@ -157,6 +157,15 @@ class MAXModelConfig(MAXModelConfigBase):
         description="Weight encoding type.",
     )
     """The weight encoding type."""
+
+    fp8_activation_scheme: Literal["static", "dynamic"] | None = Field(
+        default=None,
+        description=(
+            "Optional activation scaling scheme override for FP8 pipelines. "
+            "When unset, each architecture keeps its existing default behavior."
+        ),
+    )
+    """Optional activation scaling scheme override for FP8 pipelines."""
 
     allow_safetensors_weights_fp32_bf6_bidirectional_cast: bool = Field(
         default=False,

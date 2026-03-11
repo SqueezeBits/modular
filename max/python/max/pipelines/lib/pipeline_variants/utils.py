@@ -176,13 +176,53 @@ def get_weight_paths(model_config: MAXModelConfig) -> list[Path]:
     weight_repo = model_config.huggingface_weight_repo
     if weight_repo.repo_type == "online":
         # Download weight files if not existent.
-        return download_weight_files(
+        weight_paths = download_weight_files(
             huggingface_model_id=weight_repo.repo_id,
             filenames=[str(x) for x in model_config.weight_path],
             revision=model_config.huggingface_weight_revision,
             force_download=model_config.force_download,
         )
+        return _maybe_adapt_flux2_klein_fp8_weight_paths(
+            model_config, weight_paths
+        )
     else:
         # Use the resolved repo_id (which points to local cache in offline mode)
         local_path = Path(weight_repo.repo_id)
-        return [local_path / x for x in model_config.weight_path]
+        weight_paths = [local_path / x for x in model_config.weight_path]
+        return _maybe_adapt_flux2_klein_fp8_weight_paths(
+            model_config, weight_paths
+        )
+
+
+def _maybe_adapt_flux2_klein_fp8_weight_paths(
+    model_config: MAXModelConfig, weight_paths: list[Path]
+) -> list[Path]:
+    model_path = model_config.model_path.lower()
+    weight_repo_id = model_config.huggingface_weight_repo_id.lower()
+
+    if (
+        "flux.2-klein" not in model_path
+        and "flux.2-klein" not in weight_repo_id
+    ):
+        return weight_paths
+
+    if not any("fp8" in path.name.lower() for path in weight_paths):
+        return weight_paths
+
+    if not all(path.suffix == ".safetensors" for path in weight_paths):
+        return weight_paths
+
+    if any(len(p.parts) > 1 for p in model_config.weight_path):
+        return weight_paths
+
+    from max.pipelines.architectures.flux2.weight_adapters import (
+        adapt_bflabs_flux2_transformer_weights,
+    )
+
+    activation_scheme = model_config.fp8_activation_scheme or "dynamic"
+    return [
+        adapt_bflabs_flux2_transformer_weights(
+            path, activation_scheme=activation_scheme
+        )
+        for path in weight_paths
+    ]

@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from typing import Any
+from typing import Any, Literal
 
 from max.driver import Device
 from max.dtype import DType
@@ -23,6 +23,7 @@ from pydantic import Field
 
 from max.experimental.nn.common_layers.fp8_config_utils import (
     build_dynamic_block_fp8_config,
+    build_legacy_scalar_fp8_config,
 )
 
 
@@ -45,6 +46,7 @@ class Flux2ConfigBase(MAXModelConfigBase):
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
     quantization_config: dict[str, Any] | None = None
+    activation_scheme: Literal["static", "dynamic"] | None = None
     float8_config: Float8Config | None = None
 
 
@@ -68,12 +70,18 @@ class Flux2Config(Flux2ConfigBase):
             }
         )
         if encoding == "float8_e4m3fn":
-            try:
-                init_dict["float8_config"] = build_dynamic_block_fp8_config(
-                    config_dict, component_name="flux2.transformer"
+            activation_scheme = init_dict.get("activation_scheme")
+            if activation_scheme == "static":
+                init_dict["float8_config"] = build_legacy_scalar_fp8_config(
+                    component_name="flux2.transformer"
                 )
-            except ValueError:
-                # Legacy FP8 checkpoints may not provide quantization metadata.
-                # Keep runtime in metadata-less fallback mode in this case.
-                init_dict["float8_config"] = None
+            else:
+                try:
+                    init_dict["float8_config"] = build_dynamic_block_fp8_config(
+                        config_dict, component_name="flux2.transformer"
+                    )
+                except ValueError:
+                    # Legacy FP8 checkpoints may not provide quantization metadata.
+                    # Keep runtime in metadata-less fallback mode in this case.
+                    init_dict["float8_config"] = None
         return Flux2ConfigBase(**init_dict)

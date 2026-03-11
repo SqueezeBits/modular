@@ -137,18 +137,13 @@ class Flux2KleinPipeline(Flux2Pipeline):
         loaded_sub_models: dict[str, Any] = {}
 
         for name, component_cls in self.components.items():
-            primary_component = components_config.get(name, {})
-            config_dict = primary_component.get("config_dict") or {}
+            config_dict = self._get_component_config_dict(components_config, name)
             component_weight_paths = relative_paths.get(name)
             component_encoding = self.pipeline_config.model.quantization_encoding
 
             if name in {"vae", "text_encoder"}:
                 component_weight_paths = None
                 component_encoding = "bfloat16"
-
-            if not config_dict:
-                raise ValueError(f"Missing config_dict for component '{name}'.")
-
             if component_weight_paths is None:
                 abs_paths = self._resolve_component_paths_for_repo(base_repo, name)
             else:

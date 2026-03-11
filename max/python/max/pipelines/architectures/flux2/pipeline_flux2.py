@@ -11,6 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -144,6 +145,28 @@ class Flux2Pipeline(DiffusionPipeline):
         "text_encoder": Mistral3TextEncoderModel,
         "transformer": Flux2TransformerModel,
     }
+
+    def _get_component_config_dict(
+        self, components_config: dict[str, Any], name: str
+    ) -> dict[str, Any]:
+        config_dict = super()._get_component_config_dict(components_config, name)
+        if name != "transformer":
+            return config_dict
+
+        activation_scheme = self.pipeline_config.model.fp8_activation_scheme
+        if activation_scheme is None:
+            return config_dict
+
+        config_dict = deepcopy(config_dict)
+        quant_cfg = dict(config_dict.get("quantization_config") or {})
+        quant_cfg["quant_method"] = "fp8"
+        quant_cfg["activation_scheme"] = activation_scheme
+        if activation_scheme == "dynamic":
+            quant_cfg.setdefault("weight_block_size", [128, 128])
+
+        config_dict["quantization_config"] = quant_cfg
+        config_dict["activation_scheme"] = activation_scheme
+        return config_dict
 
     def init_remaining_components(self) -> None:
         """Initialize derived attributes that depend on loaded components."""
