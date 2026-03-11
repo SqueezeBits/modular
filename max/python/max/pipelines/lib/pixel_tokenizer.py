@@ -268,7 +268,6 @@ class PixelGenerationTokenizer(
         if block_out_channels:
             self._vae_scale_factor = 2 ** (len(block_out_channels) - 1)
         elif self._pipeline_class_name.is_qwen_image_family:
-            # QwenImage VAE: dim_mult [1,2,4,4] with 3 spatial downsample stages = 2^3 = 8
             self._vae_scale_factor = 8
         else:
             self._vae_scale_factor = 8
@@ -323,10 +322,6 @@ class PixelGenerationTokenizer(
             )
             return latent_image_ids
         elif self._pipeline_class_name.is_qwen_image_family:
-            # QwenImage uses centered RoPE (scale_rope=True in diffusers).
-            # H positions: [-(h - h//2), ..., -1, 0, 1, ..., h//2 - 1]
-            # W positions: [-(w - w//2), ..., -1, 0, 1, ..., w//2 - 1]
-            # T positions: frame index (0 for single image)
             t_coords = np.zeros((height, width), dtype=np.int64)
             h_centered = np.arange(height, dtype=np.int64) - (
                 height - height // 2
@@ -337,11 +332,10 @@ class PixelGenerationTokenizer(
             )
             latent_image_ids = np.stack([t_coords, h_coords, w_coords], axis=-1)
             latent_image_ids = latent_image_ids.reshape(-1, 3)
-
             latent_image_ids = np.tile(
                 latent_image_ids[np.newaxis, :, :], (batch_size, 1, 1)
             )
-            return latent_image_ids
+            return latent_image_ids.astype(np.float32, copy=False)
         else:
             latent_image_ids = np.zeros((height, width, 3))
             latent_image_ids[..., 1] = (
@@ -401,14 +395,10 @@ class PixelGenerationTokenizer(
     ) -> PIL.Image.Image:
         """Preprocess input image for image-to-image generation.
 
-        Matches the shared image-to-image behavior by default:
+        Matches the shared image-to-image behavior:
         - cap image area when needed
         - floor dimensions to multiples of vae_scale_factor * 2
         - apply aspect-ratio preserving center-crop resize to the floored size
-
-        Qwen image edit is the exception. It preserves the requested output
-        size separately and uses explicit target resize here only for the
-        condition image branch.
 
         Args:
             image: PIL Image or numpy array (uint8) to preprocess.
@@ -773,9 +763,6 @@ class PixelGenerationTokenizer(
                     add_special_tokens=add_special_tokens,
                 )
             elif self._pipeline_class_name.is_qwen_image_family:
-                # QwenImage wraps prompts in a Qwen2 chat template.
-                # The template adds a system message prefix (~34 tokens)
-                # which is dropped after text encoding.
                 template = (
                     "<|im_start|>system\n"
                     "Describe the image by detailing the color, shape, "
@@ -956,8 +943,12 @@ class PixelGenerationTokenizer(
 
         images: list[PIL.Image.Image] = []
         for item in first_message.content:
-            if isinstance(item, InputImageContent):
-                image_url = item.image_url
+            image_type = getattr(item, "type", None)
+            image_url = getattr(item, "image_url", None)
+            if (
+                isinstance(item, InputImageContent)
+                or image_type == "input_image"
+            ) and isinstance(image_url, str):
                 if image_url.startswith("data:"):
                     _, base64_data = image_url.split(",", 1)
                     image_bytes = base64.b64decode(base64_data)
@@ -1078,9 +1069,6 @@ class PixelGenerationTokenizer(
                 preprocessed_image = self._preprocess_input_image(
                     img, target_height, target_width
                 )
-                # Non-edit pipelines derive output dimensions from the
-                # preprocessed conditioning image. Qwen image edit keeps the
-                # requested output size and resizes condition inputs later.
                 if (
                     not preprocessed_image_arrays
                     and not self._is_qwen_image_edit_family

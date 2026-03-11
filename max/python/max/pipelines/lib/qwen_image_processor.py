@@ -106,6 +106,7 @@ class Qwen2_5VLPromptImageProcessor:
         return_tensors: str = "np",
         **kwargs: Any,
     ) -> tuple[dict[str, npt.NDArray[Any]], list[npt.NDArray[np.uint16]]]:
+        """Preprocess one or more prompt images and return patch tensors."""
         del return_tensors, kwargs
         if isinstance(images, Image.Image):
             images = [images]
