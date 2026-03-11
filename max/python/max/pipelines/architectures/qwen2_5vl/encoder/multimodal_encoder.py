@@ -25,18 +25,17 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-from PIL import Image
-
-from max.driver import Buffer, CPU, Device
+from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.engine import InferenceSession, Model
-from max.graph import DeviceRef, Graph, TensorType
+from max.graph import DeviceRef, Graph, TensorType, ops
 from max.graph.weights import WeightData, Weights
 from max.interfaces import TokenBuffer
 from max.nn.comm import Signals
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
+from PIL import Image
 
 from ..model_config import VisionConfig
 from ..nn.data_processing import (
@@ -73,6 +72,12 @@ class Qwen25VLMultimodalEncoderModel:
         self.session = session
         self.tokenizer = tokenizer
         self.lang_config = text_encoder.config
+        self._cached_vision_inputs: dict[
+            tuple[int, ...],
+            tuple[Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer],
+        ] = {}
+        self._cached_scatter_indices: dict[tuple[int, ...], Buffer] = {}
+        self._cached_token_buffers: dict[tuple[int, ...], Buffer] = {}
 
         self._image_token_id = self.tokenizer.convert_tokens_to_ids(
             "<|image_pad|>"
@@ -95,7 +100,8 @@ class Qwen25VLMultimodalEncoderModel:
                 "out_hidden_size", self.lang_config.hidden_size
             ),
             fullatt_block_indexes=vision_cfg.get(
-                "fullatt_block_indexes", [7, 15, 23, 31],
+                "fullatt_block_indexes",
+                [7, 15, 23, 31],
             ),
             rms_norm_eps=vision_cfg.get("rms_norm_eps", 1e-6),
             window_size=vision_cfg.get("window_size", 112),
@@ -108,6 +114,9 @@ class Qwen25VLMultimodalEncoderModel:
         )
 
         self._compile_vision_encoder(weights)
+        self._compile_hidden_state_trimmer()
+        self._compile_vision_merger()
+        self._compile_hidden_state_tiler()
 
     def _compile_vision_encoder(self, weights: Weights) -> None:
         device_ref = DeviceRef.from_device(self.devices[0])
@@ -196,6 +205,86 @@ class Qwen25VLMultimodalEncoderModel:
         )
         self._vision_signals = signals
 
+    def _compile_hidden_state_trimmer(self) -> None:
+        device_ref = DeviceRef.from_device(self.devices[0])
+        hidden_size = self.lang_config.hidden_size
+
+        with Graph(
+            "qwen_edit_trim_hidden_states",
+            input_types=[
+                TensorType(
+                    self.lang_config.dtype,
+                    shape=["total_seq_len", hidden_size],
+                    device=device_ref,
+                )
+            ],
+        ) as graph:
+            hidden_states = graph.inputs[0].tensor
+            trimmed = ops.slice_tensor(
+                hidden_states,
+                [slice(PROMPT_TEMPLATE_DROP_IDX, None), slice(None)],
+            )
+            graph.output(ops.unsqueeze(trimmed, 0))
+
+        self._hidden_state_trimmer: Model = self.session.load(graph)
+
+    def _compile_vision_merger(self) -> None:
+        device_ref = DeviceRef.from_device(self.devices[0])
+        hidden_size = self.lang_config.hidden_size
+
+        with Graph(
+            "qwen_edit_merge_vision_embeddings",
+            input_types=[
+                TensorType(
+                    self.lang_config.dtype,
+                    shape=["total_seq_len", hidden_size],
+                    device=device_ref,
+                ),
+                TensorType(
+                    self.lang_config.dtype,
+                    shape=["num_image_tokens", hidden_size],
+                    device=device_ref,
+                ),
+                TensorType(
+                    DType.int64,
+                    shape=["num_image_tokens", hidden_size],
+                    device=device_ref,
+                ),
+            ],
+        ) as graph:
+            hidden_states = graph.inputs[0].tensor
+            vision_embeds = graph.inputs[1].tensor
+            image_token_indices = graph.inputs[2].tensor
+            graph.output(
+                ops.scatter(
+                    input=hidden_states,
+                    updates=vision_embeds,
+                    indices=image_token_indices,
+                    axis=0,
+                )
+            )
+
+        self._vision_merger: Model = self.session.load(graph)
+
+    def _compile_hidden_state_tiler(self) -> None:
+        device_ref = DeviceRef.from_device(self.devices[0])
+        hidden_size = self.lang_config.hidden_size
+
+        with Graph(
+            "qwen_edit_tile_hidden_states",
+            input_types=[
+                TensorType(
+                    self.lang_config.dtype,
+                    shape=[1, "trimmed_seq_len", hidden_size],
+                    device=device_ref,
+                )
+            ],
+        ) as graph:
+            hidden_states = graph.inputs[0].tensor
+            graph.output(ops.tile(hidden_states, (2, 1, 1)))
+
+        self._repeat_two_hidden_states: Model = self.session.load(graph)
+
     def _prepare_images(
         self, images: list[npt.NDArray[np.uint8]]
     ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.uint16]]:
@@ -203,8 +292,12 @@ class Qwen25VLMultimodalEncoderModel:
             fetch_image({"image": Image.fromarray(image).convert("RGB")})
             for image in images
         ]
-        processed = self.image_processor(images=processed_images, return_tensors="np")
-        processed_dict = processed[0] if isinstance(processed, tuple) else processed
+        processed = self.image_processor(
+            images=processed_images, return_tensors="np"
+        )
+        processed_dict = (
+            processed[0] if isinstance(processed, tuple) else processed
+        )
         image_grid_thw = np.asarray(
             processed_dict["image_grid_thw"], dtype=np.int64
         )
@@ -226,7 +319,7 @@ class Qwen25VLMultimodalEncoderModel:
         self,
         image_grid_thw: npt.NDArray[np.int64],
         pixel_values_u16: npt.NDArray[np.uint16],
-    ) -> npt.NDArray[np.float32]:
+    ) -> Buffer:
         vc = self.vision_config
         device = self.devices[0]
 
@@ -242,6 +335,35 @@ class Qwen25VLMultimodalEncoderModel:
             get_seqlens(image_grid_thw, cu_win_seqlens)
         )
         max_grid_size = int(image_grid_thw[:, 1:].max())
+        grid_key = tuple(int(x) for x in image_grid_thw.reshape(-1))
+
+        if grid_key not in self._cached_vision_inputs:
+            self._cached_vision_inputs[grid_key] = (
+                Buffer.from_numpy(
+                    np.ascontiguousarray(rot_pos_ids.astype(np.int64))
+                ).to(device),
+                Buffer.from_numpy(
+                    np.ascontiguousarray(window_idx.astype(np.int64))
+                ).to(device),
+                Buffer.from_numpy(
+                    np.ascontiguousarray(cu_seqlens.astype(np.uint32))
+                ).to(device),
+                Buffer.from_numpy(
+                    np.ascontiguousarray(cu_window_seqlens.astype(np.uint32))
+                ).to(device),
+                Buffer.from_numpy(np.array([max_seqlen], dtype=np.uint32)),
+                Buffer.from_numpy(np.array([max_window_seqlen], dtype=np.uint32)),
+                Buffer.from_numpy(np.array(max_grid_size, dtype=np.int32)),
+            )
+        (
+            rot_pos_ids_buf,
+            window_idx_buf,
+            cu_seqlens_buf,
+            cu_window_seqlens_buf,
+            max_seqlen_buf,
+            max_window_seqlen_buf,
+            max_grid_size_buf,
+        ) = self._cached_vision_inputs[grid_key]
 
         if vc.dtype == DType.bfloat16:
             pv_buf = Buffer.from_numpy(
@@ -256,29 +378,22 @@ class Qwen25VLMultimodalEncoderModel:
             )
             if vc.dtype == DType.float16:
                 pixel_values = pixel_values.astype(np.float16)
-            pv_buf = Buffer.from_numpy(
-                np.ascontiguousarray(pixel_values)
-            ).to(device)
+            pv_buf = Buffer.from_numpy(np.ascontiguousarray(pixel_values)).to(
+                device
+            )
 
         result = self._vision_model.execute(
             pv_buf,
-            Buffer.from_numpy(np.ascontiguousarray(rot_pos_ids.astype(np.int64))).to(device),
-            Buffer.from_numpy(np.ascontiguousarray(window_idx.astype(np.int64))).to(device),
-            Buffer.from_numpy(np.ascontiguousarray(cu_seqlens.astype(np.uint32))).to(device),
-            Buffer.from_numpy(np.ascontiguousarray(cu_window_seqlens.astype(np.uint32))).to(device),
-            Buffer.from_numpy(np.array([max_seqlen], dtype=np.uint32)),
-            Buffer.from_numpy(np.array([max_window_seqlen], dtype=np.uint32)),
-            Buffer.from_numpy(np.array(max_grid_size, dtype=np.int32)),
+            rot_pos_ids_buf,
+            window_idx_buf,
+            cu_seqlens_buf,
+            cu_window_seqlens_buf,
+            max_seqlen_buf,
+            max_window_seqlen_buf,
+            max_grid_size_buf,
             *self._vision_signals.buffers(),
         )
-        result_cpu = result[0].to(CPU())
-
-        if vc.dtype == DType.bfloat16:
-            result_u16 = np.from_dlpack(
-                result_cpu.view(dtype=DType.uint16, shape=result_cpu.shape)
-            )
-            return (result_u16.astype(np.uint32) << 16).view(np.float32)
-        return np.from_dlpack(result_cpu).astype(np.float32)
+        return result[0]
 
     def encode(
         self,
@@ -293,27 +408,43 @@ class Qwen25VLMultimodalEncoderModel:
         if images:
             image_grid_thw, pixel_values_u16 = self._prepare_images(images)
 
-        input_ids = np.asarray(tokens.array).flatten().astype(np.int64, copy=False)
-        token_buf = Buffer.from_numpy(np.ascontiguousarray(input_ids)).to(device)
+        input_ids = (
+            np.asarray(tokens.array).flatten().astype(np.int64, copy=False)
+        )
+        token_key = tuple(int(token) for token in input_ids.tolist())
+        if token_key not in self._cached_token_buffers:
+            self._cached_token_buffers[token_key] = Buffer.from_numpy(
+                np.ascontiguousarray(input_ids)
+            ).to(device)
+        token_buf = self._cached_token_buffers[token_key]
         embed_result = self.text_encoder._embed_model.execute(token_buf)
-        embed_cpu = embed_result[0].to(CPU())
-
         lc = self.lang_config
-        if lc.dtype == DType.bfloat16:
-            embed_u16 = np.from_dlpack(
-                embed_cpu.view(dtype=DType.uint16, shape=embed_cpu.shape)
-            )
-            text_emb = (embed_u16.astype(np.uint32) << 16).view(np.float32)
-        else:
-            text_emb = np.from_dlpack(embed_cpu).astype(np.float32)
+        merged_buf = embed_result[0]
 
         if images:
             if image_grid_thw is None or pixel_values_u16 is None:
                 raise ValueError("vision inputs are required when images exist")
-            vision_emb = self._run_vision_encoder(image_grid_thw, pixel_values_u16)
+            vision_emb = self._run_vision_encoder(
+                image_grid_thw, pixel_values_u16
+            )
             pad_positions = np.where(input_ids == self._image_token_id)[0]
             if len(pad_positions) == vision_emb.shape[0]:
-                text_emb[pad_positions, :] = vision_emb
+                scatter_key = tuple(int(x) for x in pad_positions.tolist())
+                if scatter_key not in self._cached_scatter_indices:
+                    scatter_indices = np.tile(
+                        pad_positions[:, np.newaxis],
+                        (1, vision_emb.shape[1]),
+                    ).astype(np.int64, copy=False)
+                    self._cached_scatter_indices[scatter_key] = (
+                        Buffer.from_numpy(
+                            np.ascontiguousarray(scatter_indices)
+                        ).to(device)
+                    )
+                merged_buf = self._vision_merger.execute(
+                    merged_buf,
+                    vision_emb,
+                    self._cached_scatter_indices[scatter_key],
+                )[0]
             else:
                 logger.warning(
                     "Vision token mismatch: %d pads vs %d embeddings. Skipping merge.",
@@ -321,16 +452,13 @@ class Qwen25VLMultimodalEncoderModel:
                     vision_emb.shape[0],
                 )
 
-        if lc.dtype == DType.bfloat16:
-            merged_u16 = float32_to_bfloat16_as_uint16(
-                np.ascontiguousarray(text_emb)
-            )
-            merged_buf = Buffer.from_numpy(merged_u16).to(device)
-            merged_buf = merged_buf.view(dtype=DType.bfloat16, shape=text_emb.shape)
-        else:
-            merged_buf = Buffer.from_numpy(np.ascontiguousarray(text_emb)).to(device)
-
         hs_buf = self.text_encoder._transform_model.execute(merged_buf)[0]
+        trimmed_buf = self._hidden_state_trimmer.execute(hs_buf)[0]
+        if num_images_per_prompt == 1:
+            return trimmed_buf
+        if num_images_per_prompt == 2:
+            return self._repeat_two_hidden_states.execute(trimmed_buf)[0]
+
         hs_cpu = hs_buf.to(CPU())
         if lc.dtype == DType.bfloat16:
             hs_u16 = np.from_dlpack(
@@ -342,11 +470,12 @@ class Qwen25VLMultimodalEncoderModel:
 
         hs_np = hs_np[PROMPT_TEMPLATE_DROP_IDX:]
         hs_np = hs_np[np.newaxis, :, :]
-        if num_images_per_prompt != 1:
-            hs_np = np.repeat(hs_np, num_images_per_prompt, axis=0)
+        hs_np = np.repeat(hs_np, num_images_per_prompt, axis=0)
 
         if lc.dtype == DType.bfloat16:
-            result_u16 = float32_to_bfloat16_as_uint16(np.ascontiguousarray(hs_np))
+            result_u16 = float32_to_bfloat16_as_uint16(
+                np.ascontiguousarray(hs_np)
+            )
             buf = Buffer.from_numpy(result_u16).to(device)
             return buf.view(dtype=DType.bfloat16, shape=hs_np.shape)
         return Buffer.from_numpy(np.ascontiguousarray(hs_np)).to(device)
