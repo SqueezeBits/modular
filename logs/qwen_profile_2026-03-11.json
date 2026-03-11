@@ -1,0 +1,149 @@
+{
+  "date_utc": "2026-03-11",
+  "command": "env MODULAR_ENABLE_PROFILING=detailed nsys profile -o /root/modular/qwen_full_e2e_profile_detailed --force-overwrite true --sample=none --trace=cuda,nvtx,osrt bash -lc './bazelw run //max/examples/diffusion:simple_offline_generation -- --model Qwen/Qwen-Image-2512 --prompt \"A young woman with long brown curly pigtails, pastel striped shirt, standing outdoors, photorealistic\" --negative-prompt \"low quality\" --width 768 --height 1024 --num-inference-steps 30 --true-cfg-scale 4.0 --seed 0 --output woman_e2e.png && ./bazelw run //max/examples/diffusion:simple_offline_generation -- --model Qwen/Qwen-Image-2512 --prompt \"A man wearing a plain white t-shirt and jeans, standing outdoors, photorealistic\" --negative-prompt \"low quality\" --width 768 --height 1024 --num-inference-steps 30 --true-cfg-scale 4.0 --seed 1 --output man_e2e.png && ./bazelw run //max/examples/diffusion:simple_offline_generation -- --model Qwen/Qwen-Image-Edit-2511 --prompt \"Place these two people side by side in a natural outdoor portrait photo.\" --negative-prompt \"duplicate person, extra limbs, distorted body\" --negative-prompt \" \" --input-image woman_e2e.png --input-image man_e2e.png --width 1536 --height 1024 --num-inference-steps 40 --guidance-scale 1.0 --true-cfg-scale 4.0 --seed 0 --output output_combined_e2e.png'",
+  "artifacts": {
+    "nsys_report": "/root/modular/qwen_full_e2e_profile_detailed.nsys-rep",
+    "nsys_sqlite": "/root/modular/qwen_full_e2e_profile_detailed.sqlite"
+  },
+  "runs": [
+    {
+      "name": "woman_t2i",
+      "model": "Qwen/Qwen-Image-2512",
+      "prompt": "A young woman with long brown curly pigtails, pastel striped shirt, standing outdoors, photorealistic",
+      "negative_prompt": "low quality",
+      "width": 768,
+      "height": 1024,
+      "num_inference_steps": 30,
+      "true_cfg_scale": 4.0,
+      "seed": 0,
+      "output_image": "/root/modular/woman_e2e.png"
+    },
+    {
+      "name": "man_t2i",
+      "model": "Qwen/Qwen-Image-2512",
+      "prompt": "A man wearing a plain white t-shirt and jeans, standing outdoors, photorealistic",
+      "negative_prompt": "low quality",
+      "width": 768,
+      "height": 1024,
+      "num_inference_steps": 30,
+      "true_cfg_scale": 4.0,
+      "seed": 1,
+      "output_image": "/root/modular/man_e2e.png"
+    },
+    {
+      "name": "combined_edit",
+      "model": "Qwen/Qwen-Image-Edit-2511",
+      "prompt": "Place these two people side by side in a natural outdoor portrait photo.",
+      "negative_prompt": "duplicate person, extra limbs, distorted body",
+      "input_images": [
+        "/root/modular/woman_e2e.png",
+        "/root/modular/man_e2e.png"
+      ],
+      "width": 1536,
+      "height": 1024,
+      "num_inference_steps": 40,
+      "guidance_scale": 1.0,
+      "true_cfg_scale": 4.0,
+      "seed": 0,
+      "output_image": "/root/modular/output_combined_e2e.png"
+    }
+  ],
+  "summary": {
+    "scope": "global",
+    "scope_note": "This report was captured from one combined nsys run, so the timing values below apply to the full woman/man/edit sequence.",
+    "total_kernel_ms": 87113.19,
+    "runtime_api": {
+      "cuLaunchKernelEx": {
+        "calls": 582549,
+        "total_ms": 66210.81
+      },
+      "cuMemcpyHtoDAsync_v2": {
+        "calls": 7866,
+        "total_ms": 22297.49
+      },
+      "cuStreamSynchronize": {
+        "calls": 8085,
+        "total_ms": 9372.84
+      }
+    },
+    "memcpy": {
+      "1": {
+        "calls": 7866,
+        "total_ms": 21809.71,
+        "total_mib": 158843.89
+      },
+      "2": {
+        "calls": 9,
+        "total_ms": 3.33,
+        "total_mib": 48.11
+      }
+    }
+  },
+  "top_kernels": [
+    {
+      "name": "nn_mha_sm90__mha_sm90_DType6A6A6A6AcB6A6AsA_e609e354331829ff",
+      "calls": 12000,
+      "total_ms": 21707.48,
+      "avg_us": 1808.96
+    },
+    {
+      "name": "linalg_matmul_gpu_sm90_matmu6A6A6A6A6A6A6A6A_6effb095107ff004",
+      "calls": 12000,
+      "total_ms": 14027.5,
+      "avg_us": 1168.96
+    },
+    {
+      "name": "linalg_matmul_gpu_sm90_matmu6A6A6A6A6A6A6A6A_ab3d09c1c88076f3",
+      "calls": 19200,
+      "total_ms": 9717.83,
+      "avg_us": 506.14
+    },
+    {
+      "name": "nn_concat__fused_concat_inner_6A6A6A6A_2c56d37f507dad26",
+      "calls": 24000,
+      "total_ms": 7489.97,
+      "avg_us": 312.08
+    },
+    {
+      "name": "linalg_matmul_gpu_sm90_matmu6A6A6A6A6A6A6A6A_ddf5a62230c7bb48",
+      "calls": 4800,
+      "total_ms": 7324.38,
+      "avg_us": 1525.91
+    },
+    {
+      "name": "linalg_matmul_gpu_sm90_matmu6A6A6A6A6A6A6A6A_c5018a11ce849709",
+      "calls": 28800,
+      "total_ms": 3217.21,
+      "avg_us": 111.71
+    },
+    {
+      "name": "std_algorithm_backend_gpu_el6A6A6A6A6A6A6A6A_0aa393558e370523",
+      "calls": 24000,
+      "total_ms": 2685.18,
+      "avg_us": 111.88
+    },
+    {
+      "name": "std_algorithm_backend_gpu_el6A6A6A6A6A6A6A6A_f850c1afcb142161",
+      "calls": 24000,
+      "total_ms": 2680.57,
+      "avg_us": 111.69
+    },
+    {
+      "name": "linalg_matmul_gpu_sm90_matmu6A6A6A6A6A6A6A6A_6ba045ef370f502a",
+      "calls": 7200,
+      "total_ms": 2226.81,
+      "avg_us": 309.28
+    },
+    {
+      "name": "nn_normalization_rms_norm_gpu_6A6A6A6A_d916bc089e667269",
+      "calls": 48000,
+      "total_ms": 1464.59,
+      "avg_us": 30.51
+    }
+  ],
+  "notes": [
+    "copyKind 1 is HtoD, copyKind 2 is DtoH",
+    "NVTX rows were not present in this sqlite export",
+    "Current dominant costs are kernel launch count and HtoD uploads"
+  ]
+}
