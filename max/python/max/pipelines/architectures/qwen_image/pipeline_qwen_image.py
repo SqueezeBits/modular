@@ -21,6 +21,7 @@ Key differences from Flux2Pipeline:
 - 3D position IDs (T, H, W) instead of 4D (T, H, W, L)
 """
 
+import logging
 from dataclasses import dataclass
 from queue import Queue
 from typing import Any, Literal, cast
@@ -29,19 +30,20 @@ import numpy as np
 import numpy.typing as npt
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType, TensorValue, ops
+from max.graph import TensorType, TensorValue, ops
+from max.graph.ops import shape_to_tensor
 from max.interfaces import TokenBuffer
 from max.pipelines.core import PixelContext
+from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
 from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.profiler import Tracer, traced
-import logging
 
 logger = logging.getLogger(__name__)
 
 from ..autoencoders.autoencoder_kl_qwen_image import AutoencoderKLQwenImageModel
-from .model import QwenImageTransformerModel
 from ..qwen2_5vl.encoder import Qwen25VLEncoderModel
+from .model import QwenImageTransformerModel
 
 
 @dataclass(kw_only=True)
@@ -97,10 +99,15 @@ class QwenImagePipeline(DiffusionPipeline):
         self.build_decode_latents()
         self.build_cfg_blend()
         self.build_reshape_latents()
+        self.build_trim_prompt_embeddings()
+        self.build_repeat_prompt_embeddings()
 
         self._cached_sigmas: dict[str, Buffer] = {}
         self._cached_text_ids: dict[str, Buffer] = {}
         self._cached_shape_carriers: dict[int, Buffer] = {}
+        self._cached_cfg_scales: dict[float, Buffer] = {}
+        self._cached_latent_image_ids: dict[tuple[int, int, int], Buffer] = {}
+        self._cached_prompt_tokens: dict[tuple[int, ...], Buffer] = {}
 
     def prepare_inputs(self, context: PixelContext) -> QwenImageModelInputs:  # type: ignore[override]
         """Convert a PixelContext into QwenImageModelInputs."""
@@ -144,7 +151,6 @@ class QwenImagePipeline(DiffusionPipeline):
                 dtype, shape=["batch", "pred_seq", "channels"], device=device
             ),
             TensorType(DType.float32, shape=[1], device=device),
-            TensorType(DType.int64, shape=[], device=DeviceRef.CPU()),
         ]
         self.__dict__["scheduler_step"] = max_compile(
             self.scheduler_step,
@@ -155,7 +161,9 @@ class QwenImagePipeline(DiffusionPipeline):
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
         z_dim = 16  # VAE latent channels
-        packed_channels = self.transformer.config.in_channels  # 64 = z_dim * patch_size^2
+        packed_channels = (
+            self.transformer.config.in_channels
+        )  # 64 = z_dim * patch_size^2
 
         input_types = [
             TensorType(
@@ -210,6 +218,36 @@ class QwenImagePipeline(DiffusionPipeline):
             ],
         )
 
+    def build_trim_prompt_embeddings(self) -> None:
+        dtype = self.text_encoder.config.dtype
+        device = self.text_encoder.devices[0]
+        hidden_size = self.text_encoder.config.hidden_size
+        self.__dict__["_trim_prompt_embeddings"] = max_compile(
+            self._trim_prompt_embeddings,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["seq", hidden_size],
+                    device=device,
+                )
+            ],
+        )
+
+    def build_repeat_prompt_embeddings(self) -> None:
+        dtype = self.text_encoder.config.dtype
+        device = self.text_encoder.devices[0]
+        hidden_size = self.text_encoder.config.hidden_size
+        self.__dict__["_repeat_two_prompt_embeddings"] = max_compile(
+            self._repeat_two_prompt_embeddings,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=[1, "trimmed_seq_len", hidden_size],
+                    device=device,
+                )
+            ],
+        )
+
     def _cfg_blend(
         self,
         cond_pred: TensorValue,
@@ -222,6 +260,18 @@ class QwenImagePipeline(DiffusionPipeline):
     # Number of chat template prefix tokens to drop from encoder output.
     # Matches diffusers' prompt_template_encode_start_idx = 34.
     PROMPT_TEMPLATE_DROP_IDX = 34
+
+    def _trim_prompt_embeddings(self, hidden_states: TensorValue) -> TensorValue:
+        trimmed = ops.slice_tensor(
+            hidden_states,
+            [slice(self.PROMPT_TEMPLATE_DROP_IDX, None), slice(None)],
+        )
+        return ops.unsqueeze(trimmed, 0)
+
+    def _repeat_two_prompt_embeddings(
+        self, prompt_embeddings: TensorValue
+    ) -> TensorValue:
+        return ops.tile(prompt_embeddings, (2, 1, 1))
 
     def prepare_prompt_embeddings(
         self,
@@ -236,12 +286,21 @@ class QwenImagePipeline(DiffusionPipeline):
         """
         device = self.text_encoder.devices[0]
         text_input_ids_np = np.asarray(tokens.array).flatten()
-        token_buf = Buffer.from_dlpack(
-            np.ascontiguousarray(text_input_ids_np)
-        ).to(device)
+        token_key = tuple(int(token) for token in text_input_ids_np.tolist())
+        if token_key not in self._cached_prompt_tokens:
+            self._cached_prompt_tokens[token_key] = Buffer.from_dlpack(
+                np.ascontiguousarray(text_input_ids_np)
+            ).to(device)
+        token_buf = self._cached_prompt_tokens[token_key]
 
         hidden_states_all = self.text_encoder(token_buf)
         hs_buf = hidden_states_all[-1]
+
+        trimmed = self._trim_prompt_embeddings(hs_buf)
+        if num_images_per_prompt == 1:
+            return trimmed
+        if num_images_per_prompt == 2:
+            return self._repeat_two_prompt_embeddings(trimmed)
 
         hs_cpu = hs_buf.to(CPU())
         if self.text_encoder.config.dtype == DType.bfloat16:
@@ -252,15 +311,11 @@ class QwenImagePipeline(DiffusionPipeline):
         else:
             hs_np = np.from_dlpack(hs_cpu).astype(np.float32)
 
-        hs_np = hs_np[self.PROMPT_TEMPLATE_DROP_IDX:]
+        hs_np = hs_np[self.PROMPT_TEMPLATE_DROP_IDX :]
         hs_np = hs_np[np.newaxis, :, :]
 
         if num_images_per_prompt != 1:
             hs_np = np.tile(hs_np, (num_images_per_prompt, 1, 1))
-
-        from max.pipelines.lib.bfloat16_utils import (
-            float32_to_bfloat16_as_uint16,
-        )
 
         if self.text_encoder.config.dtype == DType.bfloat16:
             result_u16 = float32_to_bfloat16_as_uint16(
@@ -303,12 +358,8 @@ class QwenImagePipeline(DiffusionPipeline):
         QwenImage scale_rope=True behavior.
         """
         t_coords = np.zeros((height, width), dtype=np.int64)
-        h_centered = np.arange(height, dtype=np.int64) - (
-            height - height // 2
-        )
-        w_centered = np.arange(width, dtype=np.int64) - (
-            width - width // 2
-        )
+        h_centered = np.arange(height, dtype=np.int64) - (height - height // 2)
+        w_centered = np.arange(width, dtype=np.int64) - (width - width // 2)
         h_coords, w_coords = np.meshgrid(
             h_centered,
             w_centered,
@@ -362,9 +413,7 @@ class QwenImagePipeline(DiffusionPipeline):
         latents_mean = self.vae.latents_mean_tensor
         latents_std = self.vae.latents_std_tensor
         if latents_mean is None or latents_std is None:
-            raise ValueError(
-                "VAE latents_mean/latents_std not loaded."
-            )
+            raise ValueError("VAE latents_mean/latents_std not loaded.")
 
         h_carrier, w_carrier = self._get_shape_carriers(h_latent, w_latent)
         latents_bhwc = self._reshape_latents(latents, h_carrier, w_carrier)
@@ -413,14 +462,12 @@ class QwenImagePipeline(DiffusionPipeline):
             from max.experimental.tensor import Tensor as _Tensor
 
             if isinstance(cpu_image, _Tensor):
-                return np.from_dlpack(
-                    cpu_image.cast(DType.float32)
-                ).astype(np.float32)
+                return np.from_dlpack(cpu_image.cast(DType.float32)).astype(
+                    np.float32
+                )
             # Buffer bfloat16: wrap in v1 Tensor to cast
             t = _Tensor(storage=cpu_image)
-            return np.from_dlpack(
-                t.cast(DType.float32)
-            ).astype(np.float32)
+            return np.from_dlpack(t.cast(DType.float32)).astype(np.float32)
 
     @staticmethod
     def _image_to_flat_hwc(image: np.ndarray) -> np.ndarray:
@@ -448,9 +495,16 @@ class QwenImagePipeline(DiffusionPipeline):
         latents_packed = self._patchify_and_pack(latents_6d_buf)
 
         latent_image_ids_int64 = np.asarray(latent_image_ids, dtype=np.int64)
-        latent_image_ids_buf = Buffer.from_dlpack(
-            latent_image_ids_int64
-        ).to(self.transformer.devices[0])
+        ids_key = (
+            int(latent_image_ids_int64.shape[0]),
+            int(latent_image_ids_int64.shape[1]),
+            int(latent_image_ids_int64.shape[2]),
+        )
+        if ids_key not in self._cached_latent_image_ids:
+            self._cached_latent_image_ids[ids_key] = Buffer.from_dlpack(
+                latent_image_ids_int64
+            ).to(self.transformer.devices[0])
+        latent_image_ids_buf = self._cached_latent_image_ids[ids_key]
         return latents_packed, latent_image_ids_buf
 
     def _patchify_and_pack(self, latents: TensorValue) -> TensorValue:
@@ -475,9 +529,9 @@ class QwenImagePipeline(DiffusionPipeline):
         latents: TensorValue,
         noise_pred: TensorValue,
         dt: TensorValue,
-        num_noise_tokens: int,
     ) -> TensorValue:
         """Apply a single Euler update step."""
+        num_noise_tokens = shape_to_tensor([latents.shape[1]])
         latents_sliced = ops.slice_tensor(
             latents,
             [
@@ -554,7 +608,7 @@ class QwenImagePipeline(DiffusionPipeline):
         max_vid_index = max(h_latent // 2, w_latent // 2)
 
         # Prepare text IDs with RoPE offset
-        text_seq_len = prompt_embeds.shape[1]
+        text_seq_len = int(prompt_embeds.shape[1])
         text_ids_key = f"{batch_size}_{text_seq_len}_{max_vid_index}"
         if text_ids_key in self._cached_text_ids:
             text_ids = self._cached_text_ids[text_ids_key]
@@ -570,7 +624,7 @@ class QwenImagePipeline(DiffusionPipeline):
         # Negative text IDs (may differ in seq_len)
         negative_text_ids: Buffer | None = None
         if do_true_cfg and negative_prompt_embeds is not None:
-            neg_text_seq_len = negative_prompt_embeds.shape[1]
+            neg_text_seq_len = int(negative_prompt_embeds.shape[1])
             neg_text_ids_key = (
                 f"{batch_size}_{neg_text_seq_len}_{max_vid_index}"
             )
@@ -596,59 +650,62 @@ class QwenImagePipeline(DiffusionPipeline):
             self._cached_sigmas[sigmas_key] = sigmas
         with Tracer("prepare_scheduler"):
             all_timesteps, all_dts = self.prepare_scheduler(sigmas)
-
-        # 5) Denoising loop
-        num_noise_tokens = latents.shape[1]
+            timesteps_seq: Any = all_timesteps
+            dts_seq: Any = all_dts
+            if hasattr(timesteps_seq, "driver_tensor"):
+                timesteps_seq = timesteps_seq.driver_tensor
+            if hasattr(dts_seq, "driver_tensor"):
+                dts_seq = dts_seq.driver_tensor
 
         cfg_scale_buf: Buffer | None = None
         if do_true_cfg:
-            cfg_scale_buf = Buffer.from_dlpack(
-                np.array([model_inputs.true_cfg_scale], dtype=np.float32)
-            ).to(device)
+            cfg_scale = float(model_inputs.true_cfg_scale)
+            if cfg_scale not in self._cached_cfg_scales:
+                self._cached_cfg_scales[cfg_scale] = Buffer.from_dlpack(
+                    np.array([cfg_scale], dtype=np.float32)
+                ).to(device)
+            cfg_scale_buf = self._cached_cfg_scales[cfg_scale]
 
         with Tracer("denoising_loop"):
-            logger.debug("Starting denoising loop (%d steps)", num_inference_steps)
             for i in range(num_inference_steps):
-                logger.debug("Denoising step %d/%d", i + 1, num_inference_steps)
-                timestep = all_timesteps[i : i + 1]
-                dt = all_dts[i : i + 1]
+                with Tracer(f"denoising_step_{i}"):
+                    timestep = timesteps_seq[i : i + 1]
+                    dt = dts_seq[i : i + 1]
 
-                with Tracer("transformer_pos"):
-                    noise_pred = self.transformer(
-                        latents,
-                        prompt_embeds,
-                        timestep,
-                        latent_image_ids,
-                        text_ids,
-                    )[0]
-
-                # True CFG: second forward pass with negative prompt
-                if (
-                    do_true_cfg
-                    and negative_prompt_embeds is not None
-                    and negative_text_ids is not None
-                    and cfg_scale_buf is not None
-                ):
-                    with Tracer("transformer_neg"):
-                        noise_pred_uncond = self.transformer(
+                    with Tracer("transformer_pos"):
+                        noise_pred = self.transformer(
                             latents,
-                            negative_prompt_embeds,
+                            prompt_embeds,
                             timestep,
                             latent_image_ids,
-                            negative_text_ids,
+                            text_ids,
                         )[0]
 
-                    with Tracer("cfg_blend"):
-                        noise_pred = self._cfg_blend(
-                            noise_pred,
-                            noise_pred_uncond,
-                            cfg_scale_buf,
-                        )
+                    # True CFG: second forward pass with negative prompt
+                    if (
+                        do_true_cfg
+                        and negative_prompt_embeds is not None
+                        and negative_text_ids is not None
+                        and cfg_scale_buf is not None
+                    ):
+                        with Tracer("transformer_neg"):
+                            noise_pred_uncond = self.transformer(
+                                latents,
+                                negative_prompt_embeds,
+                                timestep,
+                                latent_image_ids,
+                                negative_text_ids,
+                            )[0]
 
-                with Tracer("scheduler_step"):
-                    latents = self.scheduler_step(
-                        latents, noise_pred, dt, num_noise_tokens
-                    )
+                        with Tracer("cfg_blend"):
+                            noise_pred = self._cfg_blend(
+                                noise_pred,
+                                noise_pred_uncond,
+                                cfg_scale_buf,
+                            )
+
+                    with Tracer("scheduler_step"):
+                        latents = self.scheduler_step(latents, noise_pred, dt)
 
             if callback_queue is not None:
                 callback_queue.put_nowait(
