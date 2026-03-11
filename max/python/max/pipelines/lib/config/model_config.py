@@ -124,6 +124,24 @@ class MAXModelConfig(MAXModelConfigBase):
             raise ValueError("max_length must be non-negative")
         return v
 
+    secondary_max_length: int | None = Field(
+        default=None,
+        description=(
+            "Maximum sequence length for a secondary tokenizer, if the "
+            "architecture uses one. If not specified, defaults to the "
+            "architecture-specific secondary tokenizer limit."
+        ),
+    )
+    """The maximum sequence length for a secondary tokenizer."""
+
+    @field_validator("secondary_max_length")
+    @classmethod
+    def validate_secondary_max_length(cls, v: int | None) -> int | None:
+        """Validate that secondary_max_length is non-negative if provided."""
+        if v is not None and v < 0:
+            raise ValueError("secondary_max_length must be non-negative")
+        return v
+
     # NOTE: model_path is made a str of "" by default, to avoid having
     # it be Optional to check for None and then littering the codebase with
     # asserts just to keep mypy happy.

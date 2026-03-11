@@ -42,7 +42,21 @@ class FluxArchConfig(ArchConfig):
     def initialize(cls, pipeline_config: PipelineConfig) -> Self:
         if len(pipeline_config.model.device_specs) != 1:
             raise ValueError("Flux1 is only supported on a single device")
-        return cls()
+        resolved_max_seq_len = (
+            pipeline_config.model.max_length or cls.max_seq_len
+        )
+        resolved_secondary_max_seq_len = (
+            pipeline_config.model.secondary_max_length
+            or cls.secondary_max_seq_len
+        )
+        pipeline_config.model.max_length = resolved_max_seq_len
+        pipeline_config.model.secondary_max_length = (
+            resolved_secondary_max_seq_len
+        )
+        return cls(
+            max_seq_len=resolved_max_seq_len,
+            secondary_max_seq_len=resolved_secondary_max_seq_len,
+        )
 
 
 flux1_modulev3_arch = SupportedArchitecture(

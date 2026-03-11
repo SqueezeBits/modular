@@ -44,6 +44,9 @@ from max.pipelines.architectures.flux1_modulev3.pipeline_flux import (
 from max.pipelines.architectures.flux2_modulev3.pipeline_flux2 import (
     Flux2Pipeline,
 )
+from max.pipelines.architectures.flux2_modulev3.pipeline_flux2_klein import (
+    Flux2KleinPipeline,
+)
 from max.pipelines.architectures.internvl.tokenizer import InternVLProcessor
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import (
@@ -1159,6 +1162,9 @@ class ImageGenerationOracle(PipelineOracle):
             runtime=PipelineRuntimeConfig(prefer_module_v3=True),
         )
 
+        is_flux2_klein = self.model_path.startswith(
+            "black-forest-labs/FLUX.2-klein"
+        )
         is_flux2 = self.model_path.startswith("black-forest-labs/FLUX.2")
         if is_flux2:
             tokenizer = PixelGenerationTokenizer(
@@ -1167,9 +1173,12 @@ class ImageGenerationOracle(PipelineOracle):
                 subfolder="tokenizer",
                 max_length=512,
             )
+            pipeline_model = (
+                Flux2KleinPipeline if is_flux2_klein else Flux2Pipeline
+            )
             pipeline = PixelGenerationPipeline[PixelContext](
                 pipeline_config=config,
-                pipeline_model=Flux2Pipeline,
+                pipeline_model=pipeline_model,
             )
         else:
             tokenizer = PixelGenerationTokenizer(
@@ -1201,11 +1210,13 @@ class ImageGenerationOracle(PipelineOracle):
         revision = hf_repo_lock.revision_for_hf_repo(self.model_path)
 
         # Load the exact pipeline class from model config.
-        # AutoPipelineForText2Image in diffusers==0.36.0 cannot resolve FLUX2.
+        # AutoPipelineForText2Image cannot resolve FLUX2.
         pipeline = diffusers.DiffusionPipeline.from_pretrained(
             self.model_path,
             revision=revision,
-            torch_dtype=ENCODING_TO_TORCH_DTYPE.get(encoding, torch.bfloat16),  # type: ignore
+            torch_dtype=ENCODING_TO_TORCH_DTYPE.get(
+                encoding, torch.bfloat16
+            ),  # type: ignore[arg-type]
         )
         pipeline = pipeline.to(device)
 
@@ -1232,8 +1243,6 @@ class ImageGenerationOracle(PipelineOracle):
             num_steps=num_steps,
             print_outputs=True,
         )
-
-
 PIPELINE_ORACLES: Mapping[str, PipelineOracle] = {
     "allenai/OLMo-1B-hf": GenericOracle(
         model_path="allenai/OLMo-1B-hf",
@@ -1747,5 +1756,10 @@ PIPELINE_ORACLES: Mapping[str, PipelineOracle] = {
     "black-forest-labs/FLUX.2-dev-i2i": ImageGenerationOracle(
         "black-forest-labs/FLUX.2-dev",
         requests=test_data.FLUX2_PIXEL_GENERATION_I2I,
+    ),
+    "black-forest-labs/FLUX.2-klein-4B": ImageGenerationOracle(
+        "black-forest-labs/FLUX.2-klein-4B",
+        num_steps=4,
+        requests=test_data.FLUX2_KLEIN_PIXEL_GENERATION,
     ),
 }

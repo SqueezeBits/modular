@@ -59,6 +59,10 @@ class Mistral3TextEncoderModel(ComponentModel):
         )
         self.load_model()
 
+    @property
+    def target_prompt_seq_len(self) -> int | None:
+        return self.config.target_prompt_seq_len
+
     def load_model(self) -> Callable[..., Any]:
         """Load and compile the Mistral3 text encoder.
 
@@ -81,6 +85,13 @@ class Mistral3TextEncoderModel(ComponentModel):
         return self.model
 
     def __call__(self, tokens: Tensor) -> Tensor:
+        target_seq_len = self.target_prompt_seq_len
+        if target_seq_len is not None and int(tokens.shape[0]) > target_seq_len:
+            raise ValueError(
+                "Prompt token sequence length exceeds configured target "
+                f"length ({int(tokens.shape[0])} > {target_seq_len})."
+            )
+
         outputs = self.model(tokens)
         if isinstance(outputs, (list, tuple)):
             return outputs[0]

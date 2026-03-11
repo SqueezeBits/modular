@@ -76,18 +76,20 @@ class EncoderTransformerBlock(Module[..., Tensor]):
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def forward(self, x: Tensor, rope: RotaryEmbedding) -> Tensor:
+    def forward(
+        self, x: Tensor, rope: RotaryEmbedding, valid_length: Tensor
+    ) -> Tensor:
         """Forward pass without KV cache.
 
         Args:
-            x: Input hidden states [seq_len, hidden_dim]
+            x: Input hidden states [batch, seq_len, hidden_dim]
             rope: RoPE embedding module
         Returns:
-            Output hidden states [seq_len, hidden_dim]
+            Output hidden states [batch, seq_len, hidden_dim]
         """
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, rope)
+        x = self.self_attn(x, rope, valid_length)
         x = residual + x
 
         residual = x
@@ -120,6 +122,7 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
                 range(config.num_hidden_layers)
             )
         self._hidden_state_layers = set(self._sorted_hidden_state_layers)
+        self.target_prompt_seq_len = config.target_prompt_seq_len
 
         self.rope = RotaryEmbedding(
             dim=config.hidden_size,
@@ -147,31 +150,59 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
 
         self.embed_tokens = Embedding(config.vocab_size, dim=config.hidden_size)
 
+    def _pad_prompt_embeddings(self, prompt_embeds: Tensor) -> Tensor:
+        target_seq_len = self.target_prompt_seq_len
+        if target_seq_len is None:
+            return prompt_embeds
+
+        # Flux2 Klein uses right padding, so any shorter-than-target embedding
+        # sequence must be restored by suffix-padding zeros up to max length.
+        right_pad = Tensor.zeros(
+            [
+                prompt_embeds.shape[0],
+                target_seq_len - prompt_embeds.shape[1],
+                prompt_embeds.shape[2],
+            ],
+            dtype=prompt_embeds.dtype,
+            device=prompt_embeds.device,
+        )
+        return F.concat([prompt_embeds, right_pad], axis=1)
+
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for compilation."""
         return (
             TensorType(
                 DType.int64,
-                shape=["total_seq_len"],
+                shape=["batch", "total_seq_len"],
+                device=self.device,
+            ),
+            TensorType(
+                DType.uint32,
+                shape=["batch"],
                 device=self.device,
             ),
         )
 
-    def forward(self, tokens: Tensor) -> tuple[Tensor, ...]:
+    def forward(
+        self, tokens: Tensor, valid_length: Tensor
+    ) -> tuple[Tensor, ...]:
         """Forward pass returning fused prompt embeddings.
 
         Args:
-            tokens: Input token IDs [total_seq_len]
+            tokens: Input token IDs [batch, total_seq_len]
+            valid_length: Number of valid prefix tokens for padded attention.
 
         Returns:
-            Tuple containing one tensor shaped [1, seq_len, num_layers * hidden_dim].
+            Tensor of shape [1, seq_len, num_layers * hidden_dim] when prompt
+            padding restoration is disabled, or [1, target_seq_len,
+            num_layers * hidden_dim] when enabled.
         """
         h = self.embed_tokens(tokens)
 
         selected: dict[int, Tensor] = {}
         max_layer = self._sorted_hidden_state_layers[-1]
         for i, layer in enumerate(self.layers):
-            h = layer(h, self.rope)
+            h = layer(h, self.rope, valid_length)
             if i in self._hidden_state_layers:
                 selected[i] = h
             if i == max_layer:
@@ -179,12 +210,15 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
 
         hidden_states = [selected[i] for i in self._sorted_hidden_state_layers]
 
-        stacked = F.stack(hidden_states, axis=0)  # [L, S, D]
-        stacked = F.unsqueeze(stacked, axis=0)  # [1, L, S, D]
-        stacked = F.permute(stacked, [0, 2, 1, 3])  # [1, S, L, D]
+        stacked = F.stack(hidden_states, axis=0)  # [L, B, S, D]
+        stacked = F.permute(stacked, [1, 2, 0, 3])  # [B, S, L, D]
         seq_len = stacked.shape[1]
-        return (
-            F.reshape(
-                stacked, [1, seq_len, stacked.shape[2] * stacked.shape[3]]
-            ),
+        prompt_embeds = F.reshape(
+            stacked,
+            [
+                stacked.shape[0],
+                seq_len,
+                stacked.shape[2] * stacked.shape[3],
+            ],
         )
+        return (self._pad_prompt_embeddings(prompt_embeds),)

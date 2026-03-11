@@ -62,52 +62,57 @@ class EncoderAttention(Module[..., Tensor]):
         """Repeat KV heads for GQA (Grouped Query Attention).
 
         Args:
-            x: Input tensor with shape [seq_len, n_kv_heads, head_dim]
+            x: Input tensor with shape [batch, seq_len, n_kv_heads, head_dim]
             n_rep: Number of times to repeat each head
 
         Returns:
-            Tensor with shape [seq_len, n_kv_heads * n_rep, head_dim]
+            Tensor with shape [batch, seq_len, n_kv_heads * n_rep, head_dim]
         """
         if n_rep == 1:
             return x
 
-        seq_len = x.shape[0]
-        n_kv_heads = x.shape[1]
-        head_dim = x.shape[2]
+        batch = x.shape[0]
+        seq_len = x.shape[1]
+        n_kv_heads = x.shape[2]
+        head_dim = x.shape[3]
 
-        # [S, H_kv, D] -> [S, H_kv, 1, D] -> [S, H_kv, n_rep, D] -> [S, H, D]
-        x = F.unsqueeze(x, 2)
-        x = F.tile(x, [1, 1, n_rep, 1])
-        x = F.reshape(x, (seq_len, n_kv_heads * n_rep, head_dim))
+        # [B, S, H_kv, D] -> [B, S, H_kv, 1, D] -> [B, S, H_kv, n_rep, D]
+        # -> [B, S, H, D]
+        x = F.unsqueeze(x, 3)
+        x = F.tile(x, [1, 1, 1, n_rep, 1])
+        x = F.reshape(x, (batch, seq_len, n_kv_heads * n_rep, head_dim))
 
         return x
 
-    def forward(self, x: Tensor, rope: RotaryEmbedding) -> Tensor:
+    def forward(
+        self, x: Tensor, rope: RotaryEmbedding, valid_length: Tensor
+    ) -> Tensor:
         """Forward pass computing causal self-attention.
 
         Args:
-            x: Input tensor with shape [total_seq_len, hidden_dim]
+            x: Input tensor with shape [batch, total_seq_len, hidden_dim]
             rope: RotaryEmbedding module
+            valid_length: Valid token count tensor with shape [batch]
         Returns:
-            Output tensor with shape [total_seq_len, hidden_dim]
+            Output tensor with shape [batch, total_seq_len, hidden_dim]
         """
-        total_seq_len = x.shape[0]
+        batch = x.shape[0]
+        total_seq_len = x.shape[1]
 
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        q = F.reshape(q, (total_seq_len, self.n_heads, self.head_dim))
-        k = F.reshape(k, (total_seq_len, self.n_kv_heads, self.head_dim))
-        v = F.reshape(v, (total_seq_len, self.n_kv_heads, self.head_dim))
+        q = F.reshape(q, (batch, total_seq_len, self.n_heads, self.head_dim))
+        k = F.reshape(k, (batch, total_seq_len, self.n_kv_heads, self.head_dim))
+        v = F.reshape(v, (batch, total_seq_len, self.n_kv_heads, self.head_dim))
 
         # Qwen3: norm over head_dim (per-head), then RoPE
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # module_v3.common_layers RotaryEmbedding.forward expects 4D (B, S, H, D); add batch dim
-        q = F.squeeze(rope(F.unsqueeze(q, 0)), 0)
-        k = F.squeeze(rope(F.unsqueeze(k, 0)), 0)
+        q = rope(q)
+        k = rope(k)
 
         # GQA: expand K, V if needed
         if self.n_kv_heads != self.n_heads:
@@ -115,10 +120,7 @@ class EncoderAttention(Module[..., Tensor]):
             k = self._repeat_kv(k, n_rep)
             v = self._repeat_kv(v, n_rep)
 
-        # flash_attention_gpu expects [B, S, heads, head_dim]
-        q = F.unsqueeze(q, 0)
-        k = F.unsqueeze(k, 0)
-        v = F.unsqueeze(v, 0)
+        valid_length = F.rebind(valid_length, [batch])
 
         attn_out = flash_attention_gpu(
             q,
@@ -126,8 +128,8 @@ class EncoderAttention(Module[..., Tensor]):
             v,
             mask_variant=MHAMaskVariant.CAUSAL_MASK,
             scale=self.scale,
+            valid_length=valid_length,
         )
 
-        attn_out = F.squeeze(attn_out, 0)
-        attn_out = F.reshape(attn_out, (total_seq_len, -1))
+        attn_out = F.reshape(attn_out, (batch, total_seq_len, -1))
         return self.o_proj(attn_out)

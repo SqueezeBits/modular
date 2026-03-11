@@ -21,7 +21,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from max.driver import Device
+import numpy as np
+from max.driver import Buffer, Device
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
@@ -62,7 +63,12 @@ class Qwen3TextEncoderModel(ComponentModel):
             devices,
         )
         self.config.hidden_state_layers = self._resolve_hidden_state_layers()
+        self._cached_valid_lengths: dict[int, Tensor] = {}
         self.load_model()
+
+    @property
+    def target_prompt_seq_len(self) -> int | None:
+        return self.config.target_prompt_seq_len
 
     def _resolve_hidden_state_layers(self) -> list[int]:
         raw_layers = list(self.config.hidden_state_layers)
@@ -126,25 +132,43 @@ class Qwen3TextEncoderModel(ComponentModel):
     def __call__(
         self,
         tokens: Tensor,
-        attention_mask: Tensor | None = None,
+        valid_length: Tensor | None = None,
         *,
         hidden_state_index: int | None = None,
     ):
-        if tokens.rank == 2:
+        if tokens.rank == 1:
+            tokens = F.unsqueeze(tokens, 0)
+        elif tokens.rank == 2:
             if int(tokens.shape[0]) != 1:
                 raise ValueError(
                     "Qwen3TextEncoderModel expects batch_size=1 for 2D token input."
                 )
-            tokens = tokens[0]
-
-        if attention_mask is not None:
+        else:
             raise ValueError(
-                "Qwen3TextEncoderModel does not support `attention_mask` in "
-                "the execution path. Compact tokens with the mask before calling "
-                "the encoder."
+                "Qwen3TextEncoderModel expects rank-1 or rank-2 token input, "
+                f"got rank {tokens.rank}."
             )
 
-        outputs = self.model(tokens)
+        target_seq_len = self.target_prompt_seq_len
+        if target_seq_len is not None and int(tokens.shape[1]) > target_seq_len:
+            raise ValueError(
+                "Prompt token sequence length exceeds configured target "
+                f"length ({int(tokens.shape[1])} > {target_seq_len})."
+            )
+
+        if valid_length is None:
+            seq_len = int(tokens.shape[1])
+            cached = self._cached_valid_lengths.get(seq_len)
+            if cached is None:
+                cached = Tensor(
+                    storage=Buffer.from_dlpack(
+                        np.array([seq_len], dtype=np.uint32)
+                    ).to(self.devices[0])
+                )
+                self._cached_valid_lengths[seq_len] = cached
+            valid_length = cached
+
+        outputs = self.model(tokens, valid_length)
         if isinstance(outputs, list):
             outputs = tuple(outputs)
 

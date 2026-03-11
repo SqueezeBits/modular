@@ -114,6 +114,7 @@ class Mistral3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
         self.device = config.device
         self._hidden_state_layers = set(config.hidden_state_layers)
         self._sorted_hidden_state_layers = sorted(config.hidden_state_layers)
+        self.target_prompt_seq_len = config.target_prompt_seq_len
 
         self.rope = RotaryEmbedding(
             dim=config.hidden_size,
@@ -142,6 +143,24 @@ class Mistral3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
 
         self.embed_tokens = Embedding(config.vocab_size, dim=config.hidden_size)
 
+    def _pad_prompt_embeddings(self, prompt_embeds: Tensor) -> Tensor:
+        target_seq_len = self.target_prompt_seq_len
+        if target_seq_len is None:
+            return prompt_embeds
+
+        # FLUX.2-dev uses left padding, so compact text-encoder outputs must be
+        # restored by prefix-padding zeros up to the tokenizer's max length.
+        left_pad = Tensor.zeros(
+            [
+                prompt_embeds.shape[0],
+                target_seq_len - prompt_embeds.shape[1],
+                prompt_embeds.shape[2],
+            ],
+            dtype=prompt_embeds.dtype,
+            device=prompt_embeds.device,
+        )
+        return F.concat([left_pad, prompt_embeds], axis=1)
+
     def input_types(self) -> tuple[TensorType, ...]:
         """Define input tensor types for compilation."""
         return (
@@ -163,9 +182,11 @@ class Mistral3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
             tokens: Input token IDs [total_seq_len]
 
         Returns:
-            Tensor of shape [1, seq_len, num_layers * hidden_dim] with the
-            selected hidden states stacked and the layer/hidden dimensions
-            merged, ready for the diffusion transformer.
+            Tensor of shape [1, seq_len, num_layers * hidden_dim] when prompt
+            padding restoration is disabled, or [1, target_seq_len,
+            num_layers * hidden_dim] when enabled, with the selected hidden
+            states stacked and the layer/hidden dimensions merged, ready for
+            the diffusion transformer.
         """
         h = self.embed_tokens(tokens)
 
@@ -188,8 +209,7 @@ class Mistral3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
         # Read L and D directly from the tensor dims to avoid any Python-side
         # constant that could force a device sync at eager execution time.
         seq_len = stacked.shape[1]
-        return (
-            F.reshape(
-                stacked, [1, seq_len, stacked.shape[2] * stacked.shape[3]]
-            ),
+        prompt_embeds = F.reshape(
+            stacked, [1, seq_len, stacked.shape[2] * stacked.shape[3]]
         )
+        return (self._pad_prompt_embeddings(prompt_embeds),)

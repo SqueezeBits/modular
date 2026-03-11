@@ -23,6 +23,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, get_args
 
+
+def _prioritize_bundled_site_packages() -> None:
+    """Prefer Bazel-bundled dependency overrides when running from a .venv.
+
+    The generated `.venv` for direct execution includes both its regular
+    `site-packages` and Bazel runfiles override wheels on `sys.path`, but the
+    regular `site-packages` can appear first. Move the known override paths to
+    the front so direct `python .../generate_llm_logits.py` behaves like
+    `bazel run`.
+    """
+
+    override_markers = (
+        "/transformers_v4/site-packages",
+        "/huggingface_hub_v0/site-packages",
+    )
+    override_paths = [
+        path
+        for path in sys.path
+        if any(marker in path for marker in override_markers)
+    ]
+    for path in reversed(override_paths):
+        sys.path.remove(path)
+        sys.path.insert(0, path)
+
+
+_prioritize_bundled_site_packages()
+
 # 3rd-party
 import click
 import torch

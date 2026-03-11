@@ -42,6 +42,9 @@ class Flux2ModelInputs:
     tokens: Tensor
     """Primary encoder token IDs on device."""
 
+    prompt_valid_length: Tensor | None = None
+    """Optional valid token count for padded text-encoder execution."""
+
     latents: Tensor
     """Initial latent noise tensor on device."""
 
@@ -135,6 +138,7 @@ class Flux2Pipeline(DiffusionPipeline):
     """
 
     default_num_inference_steps = 28
+    default_text_encoder_prompt_seq_len = 512
 
     vae: AutoencoderKLFlux2Model
     text_encoder: Mistral3TextEncoderModel
@@ -145,6 +149,27 @@ class Flux2Pipeline(DiffusionPipeline):
         "text_encoder": Mistral3TextEncoderModel,
         "transformer": Flux2TransformerModel,
     }
+
+    def _get_component_config_dict(
+        self, components_config: dict[str, Any], name: str
+    ) -> dict[str, Any]:
+        config_dict = super()._get_component_config_dict(components_config, name)
+        if name != "text_encoder":
+            return config_dict
+
+        resolved_config = dict(config_dict)
+        target_prompt_seq_len = self._resolve_text_encoder_prompt_seq_len()
+        text_config = resolved_config.get("text_config")
+        if isinstance(text_config, dict):
+            resolved_text_config = dict(text_config)
+            resolved_text_config["target_prompt_seq_len"] = (
+                target_prompt_seq_len
+            )
+            resolved_config["text_config"] = resolved_text_config
+        else:
+            resolved_config["target_prompt_seq_len"] = target_prompt_seq_len
+
+        return resolved_config
 
     def init_remaining_components(self) -> None:
         """Initialize derived attributes that depend on loaded components."""
@@ -165,6 +190,48 @@ class Flux2Pipeline(DiffusionPipeline):
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
         self._cached_shape_carriers: dict[int, Tensor] = {}
+        self._cached_text_valid_lengths: dict[int, Tensor] = {}
+
+    def _resolve_text_encoder_prompt_seq_len(self) -> int:
+        configured_max_length = self.pipeline_config.model.max_length
+        if configured_max_length is not None:
+            return configured_max_length
+        return self.default_text_encoder_prompt_seq_len
+
+    def _prepare_text_valid_length(
+        self, mask: npt.NDArray[np.bool_] | None
+    ) -> Tensor | None:
+        if mask is None:
+            return None
+        if mask.ndim != 1:
+            raise ValueError(
+                "Flux2Pipeline expects a rank-1 attention mask for text "
+                f"encoding, got shape {mask.shape}."
+            )
+
+        valid_length = int(np.count_nonzero(mask))
+        if valid_length > 0 and not np.all(mask[:valid_length]):
+            raise ValueError(
+                "Flux2Pipeline valid_length execution requires text masks to "
+                "contain a contiguous valid prefix."
+            )
+        if valid_length < mask.shape[0] and np.any(mask[valid_length:]):
+            raise ValueError(
+                "Flux2Pipeline valid_length execution requires right-padded "
+                "text masks without valid tokens after the padded suffix."
+            )
+
+        cached = self._cached_text_valid_lengths.get(valid_length)
+        if cached is not None:
+            return cached
+
+        tensor = Tensor(
+            storage=Buffer.from_dlpack(
+                np.array([valid_length], dtype=np.uint32)
+            ).to(self.text_encoder.devices[0])
+        )
+        self._cached_text_valid_lengths[valid_length] = tensor
+        return tensor
 
     @traced
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:  # type: ignore[override]
@@ -229,6 +296,7 @@ class Flux2Pipeline(DiffusionPipeline):
                     self.text_encoder.devices[0]
                 )
             ),
+            prompt_valid_length=self._prepare_text_valid_length(context.mask),
             latents=Tensor(
                 storage=Buffer.from_dlpack(context.latents).to(device)
             ),
@@ -488,16 +556,20 @@ class Flux2Pipeline(DiffusionPipeline):
     def prepare_prompt_embeddings(
         self,
         tokens: Tensor,
+        valid_length: Tensor | None = None,
         num_images_per_prompt: int = 1,
     ) -> tuple[Tensor, Tensor]:
         """Create prompt embeddings and text position IDs for the transformer.
 
         The text encoder returns fused prompt embeddings directly, with hidden
         states from the configured layers already stacked and merged across the
-        layer/hidden dimensions.
+        layer/hidden dimensions. Some text encoders also accept a valid token
+        count so padded execution can stay inside the compiled graph.
 
         Args:
             tokens: Token ID tensor of shape (S,) on the text encoder device.
+            valid_length: Optional number of valid prefix tokens for padded
+                text-encoder execution.
             num_images_per_prompt: Number of image generations per prompt.
 
         Returns:
@@ -505,14 +577,17 @@ class Flux2Pipeline(DiffusionPipeline):
                 - prompt_embeds: Tensor of shape (B', S, L*D)
                 - text_ids: Tensor[int64] of shape (B', S, 4)
         """
-        # Shape metadata is host-side; this does not trigger a GPU sync.
-        seq_len = int(tokens.shape[0])
-        batch_size = 1  # text encoder always outputs a single batch
-
         with Tracer("text_encoder"):
-            prompt_embeds = self.text_encoder(tokens)
+            if valid_length is None:
+                prompt_embeds = self.text_encoder(tokens)
+            else:
+                prompt_embeds = self.text_encoder(
+                    tokens, valid_length=valid_length
+                )
 
         with Tracer("post_process"):
+            batch_size = int(prompt_embeds.shape[0])
+            seq_len = int(prompt_embeds.shape[1])
             if num_images_per_prompt != 1:
                 prompt_embeds = F.tile(
                     prompt_embeds, (1, num_images_per_prompt, 1)
@@ -686,7 +761,7 @@ class Flux2Pipeline(DiffusionPipeline):
             num_images_per_prompt=model_inputs.num_images_per_prompt,
         )
         batch_size = int(prompt_embeds.shape[0])
-
+        save_as_torch(prompt_embeds, "flux2dev_max_prompt_embeds.pt")
         image_latents = None
         image_latent_ids = None
         if model_inputs.input_image is not None:
@@ -760,3 +835,9 @@ class Flux2Pipeline(DiffusionPipeline):
             )
 
         return Flux2PipelineOutput(images=images)
+
+import torch
+
+
+def save_as_torch(v, path):
+    torch.save(torch.from_dlpack(v).cpu(), path)

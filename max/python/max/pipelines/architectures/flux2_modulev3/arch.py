@@ -41,7 +41,13 @@ class Flux2ArchConfig(ArchConfig):
     def initialize(cls, pipeline_config: PipelineConfig) -> Self:
         if len(pipeline_config.model.device_specs) != 1:
             raise ValueError("Flux2 is only supported on a single device")
-        return cls()
+        resolved_max_seq_len = (
+            pipeline_config.model.max_length or cls.max_seq_len
+        )
+        # Keep downstream pipeline components aligned with the tokenizer's
+        # resolved prompt-length contract for this architecture.
+        pipeline_config.model.max_length = resolved_max_seq_len
+        return cls(max_seq_len=resolved_max_seq_len)
 
 
 flux2_modulev3_arch = SupportedArchitecture(

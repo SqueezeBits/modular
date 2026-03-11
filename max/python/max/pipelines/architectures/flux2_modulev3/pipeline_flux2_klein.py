@@ -37,6 +37,9 @@ class Flux2KleinModelInputs(Flux2ModelInputs):
     negative_tokens: Tensor | None = None
     """Negative prompt token IDs on device (for classifier-free guidance)."""
 
+    negative_prompt_valid_length: Tensor | None = None
+    """Optional valid token count for the negative prompt."""
+
     guidance_scale: float = 4.0
     """Guidance scale for classifier-free guidance."""
 
@@ -135,6 +138,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
 
         return Flux2KleinModelInputs(
             tokens=base_inputs.tokens,
+            prompt_valid_length=base_inputs.prompt_valid_length,
             latents=base_inputs.latents,
             latent_image_ids=base_inputs.latent_image_ids,
             sigmas=base_inputs.sigmas,
@@ -150,6 +154,9 @@ class Flux2KleinPipeline(Flux2Pipeline):
             num_images_per_prompt=base_inputs.num_images_per_prompt,
             input_image=base_inputs.input_image,
             negative_tokens=negative_tokens,
+            negative_prompt_valid_length=self._prepare_text_valid_length(
+                context.negative_mask
+            ),
             guidance_scale=context.guidance_scale,
             is_distilled=is_distilled,
         )
@@ -167,9 +174,11 @@ class Flux2KleinPipeline(Flux2Pipeline):
         # 1) Encode prompts.
         prompt_embeds, text_ids = self.prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
+            valid_length=model_inputs.prompt_valid_length,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
         )
         batch_size = int(prompt_embeds.shape[0])
+        save_as_torch(prompt_embeds, "max_prompt_embeds.pt")
 
         # Encode negative prompts for CFG.
         negative_prompt_embeds: Tensor | None = None
@@ -179,6 +188,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
             negative_prompt_embeds, negative_text_ids = (
                 self.prepare_prompt_embeddings(
                     tokens=model_inputs.negative_tokens,
+                    valid_length=model_inputs.negative_prompt_valid_length,
                     num_images_per_prompt=model_inputs.num_images_per_prompt,
                 )
             )
@@ -235,6 +245,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
         is_img2img = image_latents is not None
         with Tracer("denoising_loop"):
             for i in range(model_inputs.num_inference_steps):
+                save_as_torch(latents, f"max_latent_model_input_{i}.pt")
                 with Tracer(f"denoising_step_{i}"):
                     timestep = timesteps_seq[i : i + 1]
                     dt = dts_seq[i : i + 1]
@@ -263,6 +274,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
                             text_ids,
                             guidance,
                         )[0]
+                    save_as_torch(noise_pred, f"max_noise_pred_{i}.pt")
 
                     if do_cfg:
                         assert negative_prompt_embeds is not None
@@ -296,3 +308,10 @@ class Flux2KleinPipeline(Flux2Pipeline):
             )
 
         return Flux2PipelineOutput(images=images)
+
+
+import torch
+
+
+def save_as_torch(v, path):
+    torch.save(torch.from_dlpack(v).cpu(), path)

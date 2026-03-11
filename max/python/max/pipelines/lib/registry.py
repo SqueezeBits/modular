@@ -787,9 +787,11 @@ class PipelineRegistry:
 
             if has_tokenizer_2:
                 tokenizer_kwargs["subfolder_2"] = "tokenizer_2"
-                secondary_max_length = getattr(
-                    arch_config, "secondary_max_seq_len", None
-                )
+                secondary_max_length = pipeline_config.model.secondary_max_length
+                if secondary_max_length is None:
+                    secondary_max_length = getattr(
+                        arch_config, "secondary_max_seq_len", None
+                    )
                 if secondary_max_length is None:
                     raise ValueError(
                         "secondary_max_seq_len must be set in ArchConfig if tokenizer_2 is present"

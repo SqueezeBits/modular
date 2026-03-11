@@ -642,7 +642,8 @@ class PixelGenerationTokenizer(
                 f"length ({input_ids_array.shape[0]} != {attention_mask_array.shape[0]})."
             )
 
-        # FLUX.2 uses compact token IDs; FLUX.2-Klein keeps full tokenizer output.
+        # FLUX.2 uses compact token IDs in execution, with prompt embedding
+        # padding restored later inside the text encoder.
         if self._pipeline_class_name == PipelineClassName.FLUX2:
             input_ids_array = input_ids_array[attention_mask_array]
             attention_mask_array = np.ones(
@@ -866,7 +867,7 @@ class PixelGenerationTokenizer(
             token_ids_2,
             _attn_mask_2,
             negative_token_ids,
-            _negative_attn_mask,
+            negative_attn_mask,
             negative_token_ids_2,
         ) = await self._generate_tokens_ids(
             prompt,
@@ -949,6 +950,7 @@ class PixelGenerationTokenizer(
             mask=attn_mask,
             tokens_2=token_buffer_2,
             negative_tokens=negative_token_buffer,
+            negative_mask=negative_attn_mask,
             negative_tokens_2=negative_token_buffer_2,
             timesteps=timesteps,
             sigmas=sigmas,

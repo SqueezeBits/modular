@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import click
+import numpy as np
 from generate_llm_logits import Flake, generate_llm_logits
 from max.pipelines.lib.device_specs import (
     device_specs_from_normalized_device_handle,
@@ -46,6 +47,7 @@ from test_common.process_isolation import run_in_isolated_process
 from test_common.storage import load_from_tar
 from verify import DiscrepancyReport, verify
 from verify import ModelModality as Modality
+from PIL import Image
 
 # This is far from a universal standard, but this is the closest to a standard
 # that I could find: BSD-derived programs sometimes use exit codes from
@@ -171,6 +173,77 @@ def load_verdicts_from_json(filepath: Path) -> dict[str, VerificationVerdict]:
     except Exception as e:
         print(f"Error loading verdicts from JSON: {e}", file=sys.stderr)
         return {}
+
+
+def _safe_path_component(value: str, *, max_length: int = 64) -> str:
+    sanitized = "".join(
+        char if char.isalnum() or char in ("-", "_") else "_"
+        for char in value
+    ).strip("_")
+    if not sanitized:
+        return "item"
+    return sanitized[:max_length]
+
+
+def _save_pixel_outputs(
+    *,
+    results: Sequence[ModelOutput],
+    pipeline: str,
+    encoding: SupportedEncoding,
+    framework_label: str,
+) -> Path:
+    output_dir = (
+        Path("/tmp/verify_pipeline_images")
+        / pipeline.replace("/", "__")
+        / str(encoding)
+        / framework_label
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for pattern in ("*.png", "*.txt"):
+        for stale_file in output_dir.glob(pattern):
+            stale_file.unlink()
+
+    for index, result in enumerate(results):
+        image = result.get("images")
+        if image is None:
+            continue
+
+        prompt = result["prompt"]
+        prompt_stub = _safe_path_component(prompt, max_length=48)
+        image_array = _to_uint8_image(image)
+
+        image_path = output_dir / f"{index:03d}_{prompt_stub}.png"
+        prompt_path = output_dir / f"{index:03d}_{prompt_stub}.txt"
+        Image.fromarray(image_array).save(image_path)
+        prompt_path.write_text(prompt)
+
+    print(
+        f"Saved {framework_label} pixel outputs to {output_dir}",
+        flush=True,
+    )
+    return output_dir
+
+
+def _to_uint8_image(image: np.ndarray) -> np.ndarray:
+    image_array = image
+    if image_array.ndim == 4:
+        image_array = image_array[0]
+    if image_array.ndim == 3 and image_array.shape[2] == 1:
+        image_array = image_array[:, :, 0]
+
+    if np.issubdtype(image_array.dtype, np.floating):
+        image_min = float(np.min(image_array))
+        image_max = float(np.max(image_array))
+        if image_min >= 0.0 and image_max <= 1.0:
+            image_array = image_array * 255.0
+        elif image_min >= -1.0 and image_max <= 1.0:
+            image_array = (image_array * 0.5 + 0.5) * 255.0
+
+    if image_array.dtype != np.uint8:
+        image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+
+    return image_array
 
 
 def display_name(name: str) -> str:
@@ -644,6 +717,12 @@ def _run_llm_verification(
     torch_results: list[ModelOutput] = NumpyDecoder().decode(
         torch_golden_path.read_text()
     )
+    _save_pixel_outputs(
+        results=torch_results,
+        pipeline=config.pipeline,
+        encoding=encoding,
+        framework_label="diffusers",
+    )
 
     absolute_tolerance = config.absolute_tolerance
     relative_tolerance = config.relative_tolerance
@@ -778,6 +857,12 @@ def run_v2_v3_comparison(
 
     torch_results: list[ModelOutput] = NumpyDecoder().decode(
         torch_golden_path.read_text()
+    )
+    _save_pixel_outputs(
+        results=torch_results,
+        pipeline=pipeline,
+        encoding=encoding,
+        framework_label="diffusers",
     )
 
     if find_tolerances:
@@ -929,6 +1014,12 @@ def _run_pixel_generation_verification(
     torch_results: list[ModelOutput] = NumpyDecoder().decode(
         torch_golden_path.read_text()
     )
+    _save_pixel_outputs(
+        results=torch_results,
+        pipeline=config.pipeline,
+        encoding=encoding,
+        framework_label="diffusers",
+    )
 
     absolute_tolerance = config.absolute_tolerance
     relative_tolerance = config.relative_tolerance
@@ -953,6 +1044,15 @@ def _run_pixel_generation_verification(
         output_path=max_golden_path,
         reference=torch_results,
         timeout=config.timeout,
+    )
+    max_results: list[ModelOutput] = NumpyDecoder().decode(
+        max_golden_path.read_text()
+    )
+    _save_pixel_outputs(
+        results=max_results,
+        pipeline=config.pipeline,
+        encoding=encoding,
+        framework_label="max",
     )
 
     eval_metrics = []
