@@ -38,13 +38,23 @@ from .qwen25vl import Qwen25VLTextEncoderTransformer
 class _EmbedOnly(Module):
     """Token embedding only (module v2)."""
 
-    def __init__(self, vocab_size, hidden_size, *, dtype, device):
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        *,
+        dtype: DType,
+        device: DeviceRef,
+    ) -> None:
         super().__init__()
         self.embed_tokens = Embedding(
-            vocab_size, hidden_size, dtype=dtype, device=device,
+            vocab_size,
+            hidden_size,
+            dtype=dtype,
+            device=device,
         )
 
-    def __call__(self, tokens):
+    def __call__(self, tokens: Any) -> Any:
         return self.embed_tokens(tokens)
 
 
@@ -96,8 +106,7 @@ class Qwen25VLEncoderModel(ComponentModel):
                 continue
 
             # Strip "model." prefix
-            if adapted_key.startswith("model."):
-                adapted_key = adapted_key[len("model."):]
+            adapted_key = adapted_key.removeprefix("model.")
 
             if adapted_key.startswith("embed_tokens."):
                 embed_state[adapted_key] = wd
@@ -124,7 +133,7 @@ class Qwen25VLEncoderModel(ComponentModel):
 
         session = self.session
         if session is None:
-            session = InferenceSession()
+            session = InferenceSession(devices=self.devices)
 
         self._embed_model: Model = session.load(
             g, weights_registry=embed_model.state_dict(),
@@ -151,7 +160,7 @@ class Qwen25VLEncoderModel(ComponentModel):
 
         return self._embed_model
 
-    def __call__(self, token_input):
+    def __call__(self, token_input: Any) -> tuple[Any]:
         """Run text encoder: embed_tokens → transformer → normed output.
 
         Accepts both Buffer (v2) and experimental Tensor (v3 compat).
