@@ -28,7 +28,7 @@ Weight transformations in load_model():
 
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from max.driver import Buffer, Device
@@ -86,8 +86,8 @@ class NCHWRMSNorm(Module):
         dim: int,
         eps: float = 1e-6,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         self.eps = eps
@@ -112,9 +112,7 @@ class NCHWRMSNorm(Module):
                 ops.constant(
                     self.eps, dtype=x_perm.dtype, device=DeviceRef.CPU()
                 ),
-                ops.constant(
-                    0.0, dtype=x_perm.dtype, device=DeviceRef.CPU()
-                ),
+                ops.constant(0.0, dtype=x_perm.dtype, device=DeviceRef.CPU()),
             ],
             [
                 TensorType(
@@ -141,13 +139,11 @@ class ResBlock(Module):
         out_ch: int,
         eps: float = 1e-6,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
-        self.norm1 = NCHWRMSNorm(
-            in_ch, eps, dtype=dtype, device=device
-        )
+        self.norm1 = NCHWRMSNorm(in_ch, eps, dtype=dtype, device=device)
         self.conv1 = Conv2d(
             kernel_size=3,
             in_channels=in_ch,
@@ -158,9 +154,7 @@ class ResBlock(Module):
             has_bias=True,
             permute=True,
         )
-        self.norm2 = NCHWRMSNorm(
-            out_ch, eps, dtype=dtype, device=device
-        )
+        self.norm2 = NCHWRMSNorm(out_ch, eps, dtype=dtype, device=device)
         self.conv2 = Conv2d(
             kernel_size=3,
             in_channels=out_ch,
@@ -207,15 +201,13 @@ class Attention(Module):
         dim: int,
         eps: float = 1e-6,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         self._dim = dim
         self.scale = 1.0 / math.sqrt(dim)
-        self.norm = NCHWRMSNorm(
-            dim, eps, dtype=dtype, device=device
-        )
+        self.norm = NCHWRMSNorm(dim, eps, dtype=dtype, device=device)
         self.to_q = Conv2d(
             kernel_size=1,
             in_channels=dim,
@@ -313,8 +305,8 @@ class Upsampler(Module):
         in_ch: int,
         out_ch: int,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         self.resample = LayerList(
@@ -347,8 +339,8 @@ class Downsampler(Module):
         in_ch: int,
         out_ch: int,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         self.resample = LayerList(
@@ -385,18 +377,14 @@ class MidBlock(Module):
         dim: int,
         eps: float = 1e-6,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         self.resnets = LayerList(
             [
-                ResBlock(
-                    dim, dim, eps, dtype=dtype, device=device
-                ),
-                ResBlock(
-                    dim, dim, eps, dtype=dtype, device=device
-                ),
+                ResBlock(dim, dim, eps, dtype=dtype, device=device),
+                ResBlock(dim, dim, eps, dtype=dtype, device=device),
             ]
         )
         self.attentions = LayerList(
@@ -424,17 +412,15 @@ class UpBlock(Module):
         upsample_out_ch: int | None = None,
         eps: float = 1e-6,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         resnets = []
         for i in range(num_resnets):
             res_in = in_ch if i == 0 else out_ch
             resnets.append(
-                ResBlock(
-                    res_in, out_ch, eps, dtype=dtype, device=device
-                )
+                ResBlock(res_in, out_ch, eps, dtype=dtype, device=device)
             )
         self.resnets = LayerList(resnets)
 
@@ -470,28 +456,22 @@ class DownBlock(Module):
         add_downsample: bool,
         eps: float = 1e-6,
         *,
-        dtype: DType | None = None,
-        device: DeviceRef | None = None,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         resnets = []
         for i in range(num_resnets):
             res_in = in_ch if i == 0 else out_ch
             resnets.append(
-                ResBlock(
-                    res_in, out_ch, eps, dtype=dtype, device=device
-                )
+                ResBlock(res_in, out_ch, eps, dtype=dtype, device=device)
             )
         self.resnets = LayerList(resnets)
 
         self.downsamplers: LayerList | None = None
         if add_downsample:
             self.downsamplers = LayerList(
-                [
-                    Downsampler(
-                        out_ch, out_ch, dtype=dtype, device=device
-                    )
-                ]
+                [Downsampler(out_ch, out_ch, dtype=dtype, device=device)]
             )
 
     def __call__(self, x: TensorValue) -> TensorValue:
@@ -547,7 +527,7 @@ class QwenImageEncoder3d(Module):
             for resnet in block.resnets:
                 flat_down_blocks.append(resnet)
             if block.downsamplers is not None:
-                flat_down_blocks.append(block.downsamplers[0])
+                flat_down_blocks.append(cast(Module, block.downsamplers[0]))
 
         self.down_blocks = LayerList(flat_down_blocks)
 
@@ -756,9 +736,7 @@ def _transform_decoder_weights(
             wd = wd.astype(DType.float32)
         return np.from_dlpack(wd.data)  # type: ignore
 
-    def _to_weight_data(
-        arr: np.ndarray, name: str, dtype: DType
-    ) -> WeightData:
+    def _to_weight_data(arr: np.ndarray, name: str, dtype: DType) -> WeightData:
         """Convert numpy array to WeightData at target dtype."""
         wd = WeightData.from_numpy(np.ascontiguousarray(arr), name)
         if dtype != DType.float32:
@@ -911,7 +889,7 @@ class AutoencoderKLQwenImageModel(ComponentModel):
 
         session = self.session
         if session is None:
-            session = InferenceSession()
+            session = InferenceSession(devices=self.devices)
 
         with Graph(
             "qwen_image_vae_encoder",
@@ -959,20 +937,22 @@ class AutoencoderKLQwenImageModel(ComponentModel):
         arr = np.asarray(values, dtype=np.float32)
         if target_dtype == DType.bfloat16:
             u16 = float32_to_bfloat16_as_uint16(arr)
-            return Buffer.from_numpy(u16).to(self.devices[0]).view(
-                dtype=DType.bfloat16, shape=arr.shape
+            return (
+                Buffer.from_numpy(u16)
+                .to(self.devices[0])
+                .view(dtype=DType.bfloat16, shape=arr.shape)
             )
         if target_dtype == DType.float16:
             arr = arr.astype(np.float16)
         return Buffer.from_dlpack(arr).to(self.devices[0])
 
-    def encode(self, image) -> Buffer:
+    def encode(self, image: Buffer) -> Buffer:
         result = self.encoder.execute(image)
         return result[0] if isinstance(result, (list, tuple)) else result
 
-    def decode(self, z) -> Buffer:
+    def decode(self, z: Buffer) -> Buffer:
         result = self.model.execute(z)
         return result[0] if isinstance(result, (list, tuple)) else result
 
-    def __call__(self, z) -> Buffer:
+    def __call__(self, z: Buffer) -> Buffer:
         return self.decode(z)
