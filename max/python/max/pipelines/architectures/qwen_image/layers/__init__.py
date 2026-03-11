@@ -12,11 +12,14 @@
 # ===----------------------------------------------------------------------=== #
 
 from .embeddings import QwenImagePosEmbed, QwenImageTimestepProjEmbeddings
-from .qwen_image_attention import QwenImageFeedForward, QwenImageTransformerBlock
+from .qwen_image_attention import (
+    QwenImageFeedForward,
+    QwenImageTransformerBlock,
+)
 
 __all__ = [
+    "QwenImageFeedForward",
     "QwenImagePosEmbed",
     "QwenImageTimestepProjEmbeddings",
-    "QwenImageFeedForward",
     "QwenImageTransformerBlock",
 ]

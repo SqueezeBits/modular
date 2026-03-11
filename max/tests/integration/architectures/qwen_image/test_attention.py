@@ -63,8 +63,7 @@ def generate_torch_outputs(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run diffusers QwenImageTransformerBlock and return outputs."""
     inner_dim = (
-        qwen_config["num_attention_heads"]
-        * qwen_config["attention_head_dim"]
+        qwen_config["num_attention_heads"] * qwen_config["attention_head_dim"]
     )
 
     layer = (
@@ -101,8 +100,7 @@ def generate_max_outputs(
     """Run MAX QwenImageTransformerBlock and return outputs."""
     device_ref = Accelerator()
     inner_dim = (
-        qwen_config["num_attention_heads"]
-        * qwen_config["attention_head_dim"]
+        qwen_config["num_attention_heads"] * qwen_config["attention_head_dim"]
     )
 
     with F.lazy():

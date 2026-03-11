@@ -49,9 +49,7 @@ def _compute_reference_sigmas(
     image_seq_len = (latent_h // PATCH_SIZE) * (latent_w // PATCH_SIZE)
 
     # Base sigmas: linearly spaced from 1.0 to 1/N
-    sigmas = np.linspace(
-        1.0, 1.0 / num_inference_steps, num_inference_steps
-    )
+    sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
 
     # Dynamic shifting: compute mu from linear interpolation
     slope = (QWEN_MAX_SHIFT - QWEN_BASE_SHIFT) / (
@@ -63,9 +61,9 @@ def _compute_reference_sigmas(
 
     # Exponential time shift: sigma(t) = exp(mu) / (exp(mu) + (1/t - 1))
     t_safe = np.clip(sigmas.astype(np.float64), 1e-7, 1.0)
-    sigmas = (
-        np.exp(mu) / (np.exp(mu) + (1.0 / t_safe - 1.0))
-    ).astype(np.float32)
+    sigmas = (np.exp(mu) / (np.exp(mu) + (1.0 / t_safe - 1.0))).astype(
+        np.float32
+    )
 
     # Terminal stretching: stretch so last sigma = shift_terminal
     shift_terminal = QWEN_SHIFT_TERMINAL

@@ -167,10 +167,7 @@ def test_text_encoder_matches_hf() -> None:
     # Global cosine similarity
     cos_global = float(
         np.dot(hf_np.flatten(), max_np.flatten())
-        / (
-            np.linalg.norm(hf_np.flatten())
-            * np.linalg.norm(max_np.flatten())
-        )
+        / (np.linalg.norm(hf_np.flatten()) * np.linalg.norm(max_np.flatten()))
     )
     assert cos_global > 0.99, (
         f"Global cosine similarity {cos_global:.6f} < 0.99"

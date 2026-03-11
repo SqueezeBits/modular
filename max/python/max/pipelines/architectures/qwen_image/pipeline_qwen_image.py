@@ -261,7 +261,9 @@ class QwenImagePipeline(DiffusionPipeline):
     # Matches diffusers' prompt_template_encode_start_idx = 34.
     PROMPT_TEMPLATE_DROP_IDX = 34
 
-    def _trim_prompt_embeddings(self, hidden_states: TensorValue) -> TensorValue:
+    def _trim_prompt_embeddings(
+        self, hidden_states: TensorValue
+    ) -> TensorValue:
         trimmed = ops.slice_tensor(
             hidden_states,
             [slice(self.PROMPT_TEMPLATE_DROP_IDX, None), slice(None)],

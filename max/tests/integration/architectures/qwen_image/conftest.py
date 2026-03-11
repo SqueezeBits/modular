@@ -40,8 +40,7 @@ def hidden_states(qwen_config: dict[str, Any]) -> torch.Tensor:
     """
     torch.manual_seed(42)
     inner_dim = (
-        qwen_config["num_attention_heads"]
-        * qwen_config["attention_head_dim"]
+        qwen_config["num_attention_heads"] * qwen_config["attention_head_dim"]
     )
     # Use 256 image tokens (small 128x128 latent, 64x64 patches)
     return torch.randn(1, 256, inner_dim).to(torch.bfloat16).to("cuda")
@@ -57,8 +56,7 @@ def encoder_hidden_states(qwen_config: dict[str, Any]) -> torch.Tensor:
     """
     torch.manual_seed(43)
     inner_dim = (
-        qwen_config["num_attention_heads"]
-        * qwen_config["attention_head_dim"]
+        qwen_config["num_attention_heads"] * qwen_config["attention_head_dim"]
     )
     return torch.randn(1, 64, inner_dim).to(torch.bfloat16).to("cuda")
 
@@ -71,8 +69,7 @@ def temb(qwen_config: dict[str, Any]) -> torch.Tensor:
     """
     torch.manual_seed(44)
     inner_dim = (
-        qwen_config["num_attention_heads"]
-        * qwen_config["attention_head_dim"]
+        qwen_config["num_attention_heads"] * qwen_config["attention_head_dim"]
     )
     return torch.randn(1, inner_dim).to(torch.bfloat16).to("cuda")
 
@@ -87,7 +84,8 @@ def _compute_rope_freqs(
     pos_index = torch.arange(seq_len, dtype=torch.float32)
     half_dim = head_dim // 2
     freq_base = 1.0 / torch.pow(
-        theta, torch.arange(0, half_dim * 2, 2, dtype=torch.float32) / (half_dim * 2)
+        theta,
+        torch.arange(0, half_dim * 2, 2, dtype=torch.float32) / (half_dim * 2),
     )
     freqs = torch.outer(pos_index, freq_base)
     return torch.polar(torch.ones_like(freqs), freqs)
@@ -138,8 +136,7 @@ def block_weights(qwen_config: dict[str, Any]) -> dict[str, torch.Tensor]:
     Uses realistic weight statistics (std, mean) from actual model weights.
     """
     inner_dim = (
-        qwen_config["num_attention_heads"]
-        * qwen_config["attention_head_dim"]
+        qwen_config["num_attention_heads"] * qwen_config["attention_head_dim"]
     )
     head_dim = qwen_config["attention_head_dim"]
     mlp_hidden_dim = int(inner_dim * 4.0)
