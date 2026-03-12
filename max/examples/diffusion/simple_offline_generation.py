@@ -28,51 +28,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import os
-from io import BytesIO
-from typing import cast
 
-from max.driver import DeviceSpec
+from max.examples.diffusion.libs.runtime_libs import (
+    preload_bundled_nvidia_runtime_libraries,
+)
+from max.examples.diffusion.offline_generation_utils import (
+    build_context_and_inputs,
+    build_generation_request,
+    build_pipeline_and_tokenizer,
+    load_input_image_data_uris,
+    postprocess_output,
+    save_generation_output,
+)
 from max.examples.diffusion.profiler import profile_execute
-from max.interfaces import (
-    PipelineTask,
-    PixelGenerationInputs,
-    RequestID,
-)
-from max.interfaces.provider_options import (
-    ImageProviderOptions,
-    ProviderOptions,
-)
-from max.interfaces.request import OpenResponsesRequest
-from max.interfaces.request.open_responses import (
-    InputImageContent,
-    InputTextContent,
-    OpenResponsesRequestBody,
-    OutputImageContent,
-    UserMessage,
-)
-from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
-from max.pipelines.core import PixelContext
-from max.pipelines.lib import PixelGenerationTokenizer
-from max.pipelines.lib.interfaces import DiffusionPipeline
-from max.pipelines.lib.pipeline_runtime_config import PipelineRuntimeConfig
-from max.pipelines.lib.pipeline_variants.pixel_generation import (
-    PixelGenerationPipeline,
-)
-from PIL import Image
-
-QWEN_IMAGE_ARCH_NAMES = {
-    "QwenImagePipeline",
-    "QwenImageEditPipeline",
-    "QwenImageEditPlusPipeline",
-}
-QWEN_IMAGE_EDIT_ARCH_NAMES = {
-    "QwenImageEditPipeline",
-    "QwenImageEditPlusPipeline",
-}
-QWEN_DEFAULT_GUIDANCE_SCALE = 1.0
-QWEN_DEFAULT_TRUE_CFG_SCALE = 4.0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -212,277 +181,67 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def save_image(image_data: str, output_path: str) -> None:
-    """Save base64-encoded image data to a file.
-
-    Args:
-        image_data: Base64-encoded image data string
-        output_path: Path where the image should be saved
-
-    Raises:
-        ImportError: If PIL is not available
-    """
-    try:
-        from PIL import Image
-
-        image_bytes = base64.b64decode(image_data)
-        image = Image.open(BytesIO(image_bytes))
-        image.save(output_path)
-        print(f"Image saved to: {output_path}")
-    except ImportError:
-        print("WARNING: PIL not available, cannot save image")
-        print(f"Base64 data length: {len(image_data)} chars")
-
-
-def load_image_as_data_uri(image_path: str | None) -> str | None:
-    """Load an image from a file and convert to base64 data URI.
-
-    Args:
-        image_path: Path to the image file.
-
-    Returns:
-        Base64 data URI string, or None if no path provided.
-    """
-    if image_path is None:
-        return None
-
-    # Load image
-    image = Image.open(image_path)
-
-    # Convert to bytes
-    buffer = BytesIO()
-    image_format = image.format or "PNG"
-    image.save(buffer, format=image_format)
-    image_bytes = buffer.getvalue()
-
-    # Encode as base64
-    base64_data = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Determine MIME type
-    mime_type = f"image/{image_format.lower()}"
-
-    # Return as data URI
-    return f"data:{mime_type};base64,{base64_data}"
-
-
 async def generate_image(args: argparse.Namespace) -> None:
     """Main generation logic.
 
     Args:
         args: Parsed command-line arguments
     """
+    preload_bundled_nvidia_runtime_libraries()
+
     print(f"Loading model: {args.model}")
-
-    # Step 1: Initialize pipeline configuration
-    config = PipelineConfig(
-        model=MAXModelConfig(
-            model_path=args.model,
-            device_specs=[DeviceSpec.accelerator()],
-        ),
-        runtime=PipelineRuntimeConfig(
-            prefer_module_v3=True,
-        ),
-    )
-    arch = PIPELINE_REGISTRY.retrieve_architecture(
-        config.model.huggingface_weight_repo,
-        prefer_module_v3=config.runtime.prefer_module_v3,
-        task=PipelineTask.PIXEL_GENERATION,
-    )
-    assert arch is not None, (
-        "No matching diffusion architecture found for the provided model."
-    )
-
-    # Step 2: Initialize the tokenizer
-    # The tokenizer handles prompt encoding and context preparation
-    has_tokenizer_2 = False
-    diffusers_config = config.model.diffusers_config
-    max_length = args.max_length
-    secondary_max_length = args.secondary_max_length
-    if (
-        max_length is None
-        and diffusers_config is not None
-        and (components_config := diffusers_config.get("components", None))
-        and (components_config.get("tokenizer", None) is not None)
-    ):
-        max_length = components_config["tokenizer"]["config_dict"].get(
-            "model_max_length", None
-        )
-        if arch.name in (
-            "Flux2Pipeline_ModuleV3",
-            "Flux2KleinPipeline_ModuleV3",
-        ):
-            max_length = 512
-        elif arch.name in QWEN_IMAGE_ARCH_NAMES:
-            max_length = 512
-        print(f"Using max length: {max_length} for tokenizer")
-
-    if (
-        secondary_max_length is None
-        and diffusers_config is not None
-        and (components_config := diffusers_config.get("components", None))
-        and (components_config.get("tokenizer_2", None) is not None)
-    ):
-        has_tokenizer_2 = True
-        secondary_max_length = components_config["tokenizer_2"][
-            "config_dict"
-        ].get("model_max_length", None)
-        print(
-            f"Using secondary max length: {secondary_max_length} for tokenizer_2"
-        )
-
-    tokenizer = PixelGenerationTokenizer(
-        model_path=args.model,
-        pipeline_config=config,
-        subfolder="tokenizer",  # Tokenizer is in a subfolder for diffusion models
-        max_length=max_length,
-        subfolder_2="tokenizer_2" if has_tokenizer_2 else None,
-        secondary_max_length=secondary_max_length if has_tokenizer_2 else None,
-    )
-
-    # Step 3: Initialize the pipeline
-    # The pipeline executes the diffusion model
-    if not issubclass(arch.pipeline_model, DiffusionPipeline):
-        raise TypeError(
-            "Selected architecture does not implement DiffusionPipeline: "
-            f"{arch.pipeline_model}"
-        )
-    pipeline_model = cast(type[DiffusionPipeline], arch.pipeline_model)
-    pipeline = PixelGenerationPipeline[PixelContext](
-        pipeline_config=config,
-        pipeline_model=pipeline_model,
+    _, arch, tokenizer, pipeline = build_pipeline_and_tokenizer(
+        args.model,
+        max_length=args.max_length,
+        secondary_max_length=args.secondary_max_length,
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")
 
-    # Step 4: Create an OpenResponsesRequest
-    # Load input images if provided and convert to data URIs
-    input_image_data_uris: list[str] = []
-    if args.input_image:
-        for img_path in args.input_image:
-            uri = load_image_as_data_uri(img_path)
-            if uri is not None:
-                input_image_data_uris.append(uri)
-
-    is_qwen_image_family = arch.name in QWEN_IMAGE_ARCH_NAMES
-    guidance_scale = args.guidance_scale
-    if guidance_scale is None:
-        guidance_scale = (
-            QWEN_DEFAULT_GUIDANCE_SCALE if is_qwen_image_family else 3.5
-        )
-
-    true_cfg_scale = args.true_cfg_scale
-    if true_cfg_scale is None:
-        if is_qwen_image_family and args.negative_prompt is not None:
-            true_cfg_scale = QWEN_DEFAULT_TRUE_CFG_SCALE
-        else:
-            true_cfg_scale = 1.0
-
-    # Create request with structured message if images are provided
-    if input_image_data_uris:
-        # Image-to-image: Use structured message with InputImageContent + InputTextContent
-        image_content_items: list[InputImageContent | InputTextContent] = [
-            InputImageContent(
-                type="input_image",
-                image_url=uri,
-            )
-            for uri in input_image_data_uris
-        ]
-        image_content_items.append(
-            InputTextContent(
-                type="input_text",
-                text=args.prompt,
-            )
-        )
-        body = OpenResponsesRequestBody(
-            model=args.model,
-            input=[
-                UserMessage(
-                    role="user",
-                    content=image_content_items,
-                )
-            ],
-            seed=args.seed,
-            provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    true_cfg_scale=true_cfg_scale,
-                )
-            ),
-        )
-    else:
-        # Text-to-image: Use simple string prompt
-        body = OpenResponsesRequestBody(
-            model=args.model,
-            input=args.prompt,
-            seed=args.seed,
-            provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    true_cfg_scale=true_cfg_scale,
-                )
-            ),
-        )
-
-    request = OpenResponsesRequest(request_id=RequestID(), body=body)
+    input_image_data_uris = load_input_image_data_uris(args.input_image)
+    request, guidance_scale, true_cfg_scale = build_generation_request(
+        arch_name=arch.name,
+        model_path=args.model,
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        width=args.width,
+        height=args.height,
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        true_cfg_scale=args.true_cfg_scale,
+        seed=args.seed,
+        input_image_data_uris=input_image_data_uris,
+    )
 
     print(
         "Parameters: "
         f"steps={args.num_inference_steps}, guidance={guidance_scale}, true_cfg={true_cfg_scale}"
     )
 
-    # Step 5: Create a PixelContext object from the request
-    # The tokenizer handles prompt tokenization, timestep scheduling,
-    # latent initialization, and all other preprocessing
-    # Image is now extracted from the message content automatically
-    context = await tokenizer.new_context(request)
-
+    context, inputs = await build_context_and_inputs(tokenizer, request)
     print(
-        f"Context created: {context.height}x{context.width}, {context.num_inference_steps} steps"
-    )
-
-    # Step 6: Prepare inputs for the pipeline
-    # Create a batch with a single context
-    inputs = PixelGenerationInputs[PixelContext](
-        batch={context.request_id: context}
+        f"Context created: {context.height}x{context.width}, "
+        f"{context.num_inference_steps} steps"
     )
 
     # Step 6-1: Warmup — run before profiling or timed execution so that JIT
     # compilation completes and steady-state performance can be measured.
     if args.num_warmups > 0:
-        body_warmup = OpenResponsesRequestBody(
-            model=args.model,
-            input=args.prompt,
+        request_warmup, _, _ = build_generation_request(
+            arch_name=arch.name,
+            model_path=args.model,
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            width=args.width,
+            height=args.height,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
             seed=args.seed,
-            provider_options=ProviderOptions(
-                image=ImageProviderOptions(
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    steps=args.num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    true_cfg_scale=true_cfg_scale,
-                )
-            ),
+            input_image_data_uris=input_image_data_uris,
         )
-        request_warmup = OpenResponsesRequest(
-            request_id=RequestID(), body=body_warmup
-        )
-        warmup_image = (
-            Image.open(args.input_image[0]) if args.input_image else None
-        )
-        context_warmup = await tokenizer.new_context(
-            request_warmup, input_image=warmup_image
-        )
-        inputs_warmup = PixelGenerationInputs[PixelContext](
-            batch={context_warmup.request_id: context_warmup}
+        _, inputs_warmup = await build_context_and_inputs(
+            tokenizer, request_warmup
         )
         for i in range(args.num_warmups):
             print(f"Running warmup {i + 1} of {args.num_warmups}")
@@ -503,8 +262,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         outputs = pipeline.execute(inputs)
 
     # Step 8: Get the output for our request
-    output = outputs[context.request_id]
-    output = await tokenizer.postprocess(output)
+    output = await postprocess_output(tokenizer, outputs, context)
 
     # Check if generation completed successfully
     if not output.is_done:
@@ -513,36 +271,7 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     print("Generation complete!")
 
-    # Step 9: Extract and save images from OutputImageContent
-    # The output now contains a list of OutputImageContent objects with base64-encoded images
-    if not output.output:
-        print("ERROR: No images generated")
-        return
-
-    # Save each generated image
-    for idx, image_content in enumerate(output.output):
-        # Narrow type for mypy - we expect OutputImageContent for pixel generation
-        if not isinstance(image_content, OutputImageContent):
-            print(
-                f"ERROR: Expected OutputImageContent, got {type(image_content)}"
-            )
-            continue
-
-        # Determine output filename
-        if len(output.output) > 1:
-            # Multiple images: add index to filename
-            base_name, ext = os.path.splitext(args.output)
-            output_path = f"{base_name}_{idx}{ext}"
-        else:
-            output_path = args.output
-
-        # Save the image
-        if image_content.image_data:
-            save_image(image_content.image_data, output_path)
-        elif image_content.image_url:
-            print(f"Image available at URL: {image_content.image_url}")
-        else:
-            print("ERROR: No image data or URL in output")
+    save_generation_output(output, args.output)
 
 
 def main(argv: list[str] | None = None) -> int:
