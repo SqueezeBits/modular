@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import logging
 import os
 from io import BytesIO
 from typing import cast
@@ -150,6 +151,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--profile-timings",
         action="store_true",
         help="Profile timings of the pipeline.",
+    )
+    parser.add_argument(
+        "--profile-compilation",
+        action="store_true",
+        help="Print compilation and startup phase timings for the diffusion pipeline.",
     )
     parser.add_argument(
         "--num-warmups",
@@ -518,6 +524,13 @@ def main(argv: list[str] | None = None) -> int:
         Process exit code. 0 indicates success.
     """
     args = parse_args(argv)
+    if args.profile_compilation:
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            force=True,
+        )
+        logging.getLogger("max.pipelines").setLevel(logging.INFO)
 
     try:
         asyncio.run(generate_image(args))

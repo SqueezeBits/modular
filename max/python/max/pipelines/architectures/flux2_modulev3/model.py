@@ -12,6 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from collections.abc import Callable
+import logging
 from typing import Any
 
 from max.driver import Device
@@ -20,9 +21,13 @@ from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from max.pipelines.lib.utils import CompilationTimer
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
+
+
+logger = logging.getLogger("max.pipelines")
 
 
 class Flux2TransformerModel(ComponentModel):
@@ -53,6 +58,7 @@ class Flux2TransformerModel(ComponentModel):
         self.load_model()
 
     def load_model(self) -> Callable[..., Any]:
+        logger.info("Preparing %s weights and lazy module...", type(self).__name__)
         state_dict = {key: value.data() for key, value in self.weights.items()}
         self._state_dict = state_dict
         # Klein/distilled checkpoints can omit guidance embedder weights.
@@ -75,23 +81,32 @@ class Flux2TransformerModel(ComponentModel):
         self._standard_model: Callable[..., Any] | None = None
         self._step_cache_model: Callable[..., Any] | None = None
         self.model = self._model_not_loaded
+        logger.info("%s lazy module is ready", type(self).__name__)
         return self.model
 
     def _ensure_standard_model(self) -> Callable[..., Any]:
         if self._standard_model is None:
+            timer = CompilationTimer(
+                f"{type(self).__name__} standard transformer"
+            )
             self._standard_model = self._flux_model.compile(
                 *self._flux_model.input_types(step_cache_enabled=False),
                 weights=self._state_dict,
             )
+            timer.done()
         return self._standard_model
 
     def _ensure_step_cache_model(self) -> Callable[..., Any]:
         if self._step_cache_model is None:
             assert self._flux_model is not None
+            timer = CompilationTimer(
+                f"{type(self).__name__} step-cache transformer"
+            )
             self._step_cache_model = self._flux_model.compile(
                 *self._flux_model.input_types(step_cache_enabled=True),
                 weights=self._state_dict,
             )
+            timer.done()
         return self._step_cache_model
 
     def use_standard_model(self) -> None:

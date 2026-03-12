@@ -12,6 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from collections.abc import Callable
+import logging
 from typing import Any
 
 from max.driver import Device
@@ -20,9 +21,13 @@ from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from max.pipelines.lib.utils import CompilationTimer
 
 from .model_config import AutoencoderKLConfigBase
 from .vae import DiagonalGaussianDistribution
+
+
+logger = logging.getLogger("max.pipelines")
 
 
 class BaseAutoencoderModel(ComponentModel):
@@ -69,6 +74,7 @@ class BaseAutoencoderModel(ComponentModel):
         Returns:
             Compiled decoder model callable.
         """
+        decoder_timer = CompilationTimer(f"{type(self).__name__} decoder")
         decoder_state_dict = {}
         encoder_state_dict = {}
         target_dtype = self.config.dtype
@@ -94,16 +100,23 @@ class BaseAutoencoderModel(ComponentModel):
             autoencoder = self.autoencoder_class(self.config)
 
             autoencoder.decoder.to(self.devices[0])
+            decoder_timer.mark_build_complete()
             self.model = autoencoder.decoder.compile(
                 *autoencoder.decoder.input_types(), weights=decoder_state_dict
             )
+            decoder_timer.done()
             # Flux.1 does not have an encoder.
             if encoder_state_dict and hasattr(autoencoder, "encoder"):
+                encoder_timer = CompilationTimer(
+                    f"{type(self).__name__} encoder"
+                )
                 autoencoder.encoder.to(self.devices[0])
+                encoder_timer.mark_build_complete()
                 self.encoder_model = autoencoder.encoder.compile(
                     *autoencoder.encoder.input_types(),
                     weights=encoder_state_dict,
                 )
+                encoder_timer.done()
 
         return self.model
 

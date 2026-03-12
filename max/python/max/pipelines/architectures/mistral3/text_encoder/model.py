@@ -19,6 +19,7 @@ This module provides a ComponentModel wrapper for Mistral3 text encoder.
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 from typing import Any
 
 from max.driver import Device
@@ -27,10 +28,14 @@ from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from max.pipelines.lib.utils import CompilationTimer
 
 from ..weight_adapters import MISTRAL_SAFETENSOR_MAP
 from .mistral3 import Mistral3TextEncoderTransformer
 from .model_config import Mistral3TextEncoderConfig
+
+
+logger = logging.getLogger("max.pipelines")
 
 
 class Mistral3TextEncoderModel(ComponentModel):
@@ -65,6 +70,7 @@ class Mistral3TextEncoderModel(ComponentModel):
         Returns:
             Compiled model callable.
         """
+        timer = CompilationTimer(type(self).__name__)
         state_dict = {}
         for key, value in self.weights.items():
             adapted_key = key
@@ -77,7 +83,9 @@ class Mistral3TextEncoderModel(ComponentModel):
             model = Mistral3TextEncoderTransformer(self.config)
             model.to(self.devices[0])
 
+        timer.mark_build_complete()
         self.model = model.compile(*model.input_types(), weights=state_dict)
+        timer.done()
         return self.model
 
     def __call__(self, tokens: Tensor) -> Tensor:

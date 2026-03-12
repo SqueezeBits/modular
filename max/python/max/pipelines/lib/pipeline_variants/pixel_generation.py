@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Generic
 
 import numpy as np
@@ -63,24 +64,46 @@ class PixelGenerationPipeline(
     ) -> None:
         from max.engine import InferenceSession  # local import to avoid cycles
 
+        init_start = time.perf_counter()
         self._pipeline_config = pipeline_config
         model_config = pipeline_config.model
         self._devices = load_devices(pipeline_config.model.device_specs)
 
         # Initialize Session.
+        session_start = time.perf_counter()
         session = InferenceSession(devices=[*self._devices])
 
         # Configure session with pipeline settings.
         self._pipeline_config.configure_session(session)
+        logger.info(
+            "Initialized pixel-generation session in %.1f seconds",
+            time.perf_counter() - session_start,
+        )
 
         # Download weights if required and get absolute weight paths.
+        weight_paths_start = time.perf_counter()
         weight_paths: list[Path] = get_weight_paths(model_config)
+        logger.info(
+            "Resolved %d pixel-generation weight files in %.1f seconds",
+            len(weight_paths),
+            time.perf_counter() - weight_paths_start,
+        )
 
+        model_start = time.perf_counter()
         self._pipeline_model = pipeline_model(
             pipeline_config=self._pipeline_config,
             session=session,
             devices=self._devices,
             weight_paths=weight_paths,
+        )
+        logger.info(
+            "Initialized pixel-generation model %s in %.1f seconds",
+            pipeline_model.__name__,
+            time.perf_counter() - model_start,
+        )
+        logger.info(
+            "Pixel-generation pipeline startup took %.1f seconds",
+            time.perf_counter() - init_start,
         )
 
     @property

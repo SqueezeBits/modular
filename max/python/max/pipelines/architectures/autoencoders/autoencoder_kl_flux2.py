@@ -23,6 +23,7 @@ from max.experimental.tensor import Tensor
 from max.graph import DeviceRef, TensorType
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
+from max.pipelines.lib.utils import CompilationTimer
 
 from .model import BaseAutoencoderModel
 from .model_config import AutoencoderKLFlux2Config
@@ -275,6 +276,7 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             Compiled callable taking (latents_bsc, h_carrier, w_carrier)
             and returning the decoded image tensor.
         """
+        timer = CompilationTimer(f"{type(self).__name__} fused decode")
         dtype = self.config.dtype
         device_ref = DeviceRef.from_device(device)
 
@@ -307,10 +309,12 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
                 dtype=dtype,
             )
             fused.to(device)
+            timer.mark_build_complete()
             self._fused_model = fused.compile(
                 *fused.input_types(), weights=fused_weights
             )
 
+        timer.done()
         return self._fused_model
 
     @property

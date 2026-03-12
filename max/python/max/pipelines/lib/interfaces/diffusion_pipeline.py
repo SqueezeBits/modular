@@ -18,7 +18,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import MISSING, dataclass, field, fields
+import logging
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Any, TypeAlias, overload
 
 import numpy as np
@@ -33,6 +35,7 @@ from max.graph.weights import load_weights
 from max.interfaces import PixelGenerationContext
 from max.interfaces.tokens import TokenBuffer
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from max.pipelines.lib.utils import CompilationTimer
 from PIL import Image
 from tqdm import tqdm
 from typing_extensions import Self
@@ -44,6 +47,7 @@ if TYPE_CHECKING:
 
 CompileTarget: TypeAlias = Callable[..., Any] | Module[..., Any]
 CompileDecorator: TypeAlias = Callable[[CompileTarget], "CompileWrapper"]
+logger = logging.getLogger("max.pipelines")
 
 
 class DiffusionPipeline(ABC):
@@ -139,12 +143,33 @@ class DiffusionPipeline(ABC):
             abs_paths = self._resolve_absolute_paths(
                 weight_paths, relative_paths[name]
             )
+            component_start = time.perf_counter()
+            logger.info(
+                "Loading diffusion component '%s' from %d weight files...",
+                name,
+                len(abs_paths),
+            )
+            weights_start = time.perf_counter()
+            weights = load_weights(abs_paths)
+            weights_end = time.perf_counter()
+            logger.info(
+                "Loaded diffusion component '%s' weights in %.1f seconds",
+                name,
+                weights_end - weights_start,
+            )
 
             loaded_sub_models[name] = component_cls(
                 config=config_dict,
                 encoding=self.pipeline_config.model.quantization_encoding,
                 devices=self.devices,
-                weights=load_weights(abs_paths),
+                weights=weights,
+            )
+            component_end = time.perf_counter()
+            logger.info(
+                "Initialized diffusion component '%s' in %.1f seconds (total %.1f seconds)",
+                name,
+                component_end - weights_end,
+                component_end - component_start,
             )
 
         return loaded_sub_models
@@ -472,9 +497,11 @@ class CompileWrapper:
         input_types_tuple = tuple(input_types)
         self._compiled_module: Callable[..., Any] | None = None
         self._compiled_model: Model | None = None
+        timer = CompilationTimer(f"diffusion target '{target_name}'")
 
         if isinstance(compile_target, Module):
             self._compiled_module = compile_target.compile(*input_types_tuple)
+            timer.done()
             return
 
         with Graph(
@@ -486,6 +513,7 @@ class CompileWrapper:
             else:
                 graph.output(output)
             compiled_graph = graph
+        timer.mark_build_complete()
 
         device: CPU | Accelerator
         if any(input_type.device.is_gpu() for input_type in input_types_tuple):
@@ -494,6 +522,7 @@ class CompileWrapper:
             device = CPU()
         session = InferenceSession([device])
         self._compiled_model = session.load(compiled_graph)
+        timer.done()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Execute the compiled session with the given arguments.
