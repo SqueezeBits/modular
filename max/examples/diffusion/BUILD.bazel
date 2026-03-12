@@ -2,6 +2,49 @@ load("//bazel:api.bzl", "modular_py_binary", "modular_py_library", "requirement"
 
 package(default_visibility = ["//visibility:private"])
 
+_NVIDIA_CUBLAS_CU12 = "@modular_pip_lock_file_repo//deps:nvidia-cublas-cu12@12.8.4.1"
+
+_NVIDIA_CUDA_RUNTIME_CU12 = "@modular_pip_lock_file_repo//deps:nvidia-cuda-runtime-cu12@12.8.90"
+
+_NVIDIA_CUDNN_CU12 = "@modular_pip_lock_file_repo//deps:nvidia-cudnn-cu12@9.10.2.21"
+
+_DIFFUSION_RUNTIME_DATA = [
+    _NVIDIA_CUBLAS_CU12,
+    _NVIDIA_CUDA_RUNTIME_CU12,
+    _NVIDIA_CUDNN_CU12,
+]
+
+_DIFFUSION_RUNTIME_ENV = {
+    # The current Bazel lockfile only carries CUDA 12 NVIDIA user-space wheels,
+    # so keep these pinned to the lockfile versions and preload them directly
+    # instead of depending on torch's bundled copies.
+    "MODULAR_DIFFUSION_NVIDIA_CUBLAS_ROOT": "$(rootpath {})".format(_NVIDIA_CUBLAS_CU12),
+    "MODULAR_DIFFUSION_NVIDIA_CUDA_RUNTIME_ROOT": "$(rootpath {})".format(_NVIDIA_CUDA_RUNTIME_CU12),
+    "MODULAR_DIFFUSION_NVIDIA_CUDNN_ROOT": "$(rootpath {})".format(_NVIDIA_CUDNN_CU12),
+}
+
+modular_py_library(
+    name = "runtime_libs",
+    srcs = [
+        "libs/__init__.py",
+        "libs/runtime_libs.py",
+    ],
+)
+
+modular_py_library(
+    name = "offline_generation_utils",
+    srcs = [
+        "offline_generation_utils.py",
+    ],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("pillow"),
+    ],
+)
+
 modular_py_library(
     name = "profiler",
     srcs = [
@@ -10,7 +53,6 @@ modular_py_library(
     ],
     deps = [
         "//max/python/max:tensor",  # Provides max.functional and max.tensor.Tensor
-        requirement("torch"),
     ],
 )
 
@@ -32,16 +74,27 @@ modular_py_binary(
 modular_py_binary(
     name = "simple_offline_generation",
     srcs = ["simple_offline_generation.py"],
+    data = _DIFFUSION_RUNTIME_DATA,
+    env = _DIFFUSION_RUNTIME_ENV,
     tags = ["no-pydeps"],  # TODO: Fix and re-enable
     deps = [
+        ":offline_generation_utils",
         ":profiler",
-        "//max/python/max/interfaces",
-        "//max/python/max/pipelines",
-        "//max/python/max/pipelines/core",
-        "//max/python/max/pipelines/lib",
+        ":runtime_libs",
         requirement("numpy"),
-        requirement("pillow"),
         requirement("sentencepiece"),
-        requirement("torch"),  # for test
+    ],
+)
+
+modular_py_binary(
+    name = "same_process_multi_shape_runner",
+    srcs = ["same_process_multi_shape_runner.py"],
+    data = _DIFFUSION_RUNTIME_DATA,
+    env = _DIFFUSION_RUNTIME_ENV,
+    tags = ["no-pydeps"],  # TODO: Fix and re-enable
+    deps = [
+        ":offline_generation_utils",
+        ":runtime_libs",
+        requirement("sentencepiece"),
     ],
 )
