@@ -21,10 +21,8 @@ Key differences from Flux2Pipeline:
 - 3D position IDs (T, H, W) instead of 4D (T, H, W, L)
 """
 
-import logging
-from dataclasses import dataclass
-from queue import Queue
-from typing import Any, Literal, cast
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -38,8 +36,6 @@ from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
 from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.profiler import Tracer, traced
-
-logger = logging.getLogger(__name__)
 
 from ..autoencoders.autoencoder_kl_qwen_image import AutoencoderKLQwenImageModel
 from ..qwen2_5vl.encoder import Qwen25VLEncoderModel
@@ -68,6 +64,20 @@ class QwenImagePipelineOutput:
     images: np.ndarray | list
 
 
+@dataclass
+class QwenImageCache:
+    """Runtime cache for reusable Qwen image buffers."""
+
+    sigmas: dict[str, Buffer] = field(default_factory=dict)
+    text_ids: dict[str, Buffer] = field(default_factory=dict)
+    shape_carriers: dict[int, Buffer] = field(default_factory=dict)
+    cfg_scales: dict[float, Buffer] = field(default_factory=dict)
+    latent_image_ids: dict[tuple[int, int, int], Buffer] = field(
+        default_factory=dict
+    )
+    prompt_tokens: dict[tuple[int, ...], Buffer] = field(default_factory=dict)
+
+
 class QwenImagePipeline(DiffusionPipeline):
     """Diffusion pipeline for QwenImage text-to-image generation.
 
@@ -93,119 +103,88 @@ class QwenImagePipeline(DiffusionPipeline):
         # Spatial scale factor = 2^3 = 8
         self.vae_scale_factor = 8
 
-        self.build_preprocess_latents()
-        self.build_prepare_scheduler()
-        self.build_scheduler_step()
-        self.build_decode_latents()
-        self.build_cfg_blend()
-        self.build_reshape_latents()
-        self.build_trim_prompt_embeddings()
-        self.build_repeat_prompt_embeddings()
-
-        self._cached_sigmas: dict[str, Buffer] = {}
-        self._cached_text_ids: dict[str, Buffer] = {}
-        self._cached_shape_carriers: dict[int, Buffer] = {}
-        self._cached_cfg_scales: dict[float, Buffer] = {}
-        self._cached_latent_image_ids: dict[tuple[int, int, int], Buffer] = {}
-        self._cached_prompt_tokens: dict[tuple[int, ...], Buffer] = {}
+        self._compile_runtime_helpers()
+        self._compile_cfg_fastpath_helpers()
+        self.cache: QwenImageCache = QwenImageCache()
 
     def prepare_inputs(self, context: PixelContext) -> QwenImageModelInputs:  # type: ignore[override]
         """Convert a PixelContext into QwenImageModelInputs."""
         return QwenImageModelInputs.from_context(context)
 
-    def build_preprocess_latents(self) -> None:
+    def _compile_runtime_helpers(self) -> None:
+        """Compile the core runtime helper graphs used by QwenImage."""
         device = self.transformer.devices[0]
-        input_types = [
-            TensorType(
-                DType.float32,
-                shape=["batch", "channels", "height", 2, "width", 2],
-                device=device,
-            ),
-        ]
-        self.__dict__["_patchify_and_pack"] = max_compile(
+        self.cached_patchify_and_pack = max_compile(
             self._patchify_and_pack,
-            input_types=input_types,
+            input_types=[
+                TensorType(
+                    DType.float32,
+                    shape=["batch", "channels", "height", 2, "width", 2],
+                    device=device,
+                ),
+            ],
         )
 
-    def build_prepare_scheduler(self) -> None:
-        input_types = [
-            TensorType(
-                DType.float32,
-                shape=["num_sigmas"],
-                device=self.transformer.devices[0],
-            ),
-        ]
-        self.__dict__["prepare_scheduler"] = max_compile(
+        self.cached_prepare_scheduler = max_compile(
             self.prepare_scheduler,
-            input_types=input_types,
+            input_types=[
+                TensorType(
+                    DType.float32,
+                    shape=["num_sigmas"],
+                    device=device,
+                ),
+            ],
         )
 
-    def build_scheduler_step(self) -> None:
         dtype = self.transformer.config.dtype
-        device = self.transformer.devices[0]
-        input_types = [
-            TensorType(
-                dtype, shape=["batch", "seq", "channels"], device=device
-            ),
-            TensorType(
-                dtype, shape=["batch", "pred_seq", "channels"], device=device
-            ),
-            TensorType(DType.float32, shape=[1], device=device),
-        ]
-        self.__dict__["scheduler_step"] = max_compile(
-            self.scheduler_step,
-            input_types=input_types,
-        )
-
-    def build_decode_latents(self) -> None:
-        dtype = self.transformer.config.dtype
-        device = self.transformer.devices[0]
-        z_dim = 16  # VAE latent channels
-        packed_channels = (
-            self.transformer.config.in_channels
-        )  # 64 = z_dim * patch_size^2
-
-        input_types = [
-            TensorType(
-                dtype,
-                shape=["batch", "height", "width", packed_channels],
-                device=device,
-            ),
-            TensorType(dtype, shape=[z_dim], device=device),
-            TensorType(dtype, shape=[z_dim], device=device),
-        ]
-
-        self.__dict__["_postprocess_latents"] = max_compile(
-            self._postprocess_latents,
-            input_types=input_types,
-        )
-
-    def build_cfg_blend(self) -> None:
-        dtype = self.transformer.config.dtype
-        device = self.transformer.devices[0]
-        input_types = [
-            TensorType(
-                dtype,
-                shape=["batch", "seq", "channels"],
-                device=device,
-            ),
-            TensorType(
-                dtype,
-                shape=["batch", "seq", "channels"],
-                device=device,
-            ),
-            TensorType(DType.float32, shape=[1], device=device),
-        ]
-        self.__dict__["_cfg_blend"] = max_compile(
-            self._cfg_blend,
-            input_types=input_types,
-        )
-
-    def build_reshape_latents(self) -> None:
-        dtype = self.transformer.config.dtype
-        device = self.transformer.devices[0]
         packed_channels = self.transformer.config.in_channels
-        self.__dict__["_reshape_latents"] = max_compile(
+        self.cached_scheduler_step = max_compile(
+            self.scheduler_step,
+            input_types=[
+                TensorType(
+                    dtype, shape=["batch", "seq", "channels"], device=device
+                ),
+                TensorType(
+                    dtype,
+                    shape=["batch", "pred_seq", "channels"],
+                    device=device,
+                ),
+                TensorType(DType.float32, shape=[1], device=device),
+            ],
+        )
+
+        z_dim = 16  # VAE latent channels
+        self.cached_postprocess_latents = max_compile(
+            self._postprocess_latents,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["batch", "height", "width", packed_channels],
+                    device=device,
+                ),
+                TensorType(dtype, shape=[z_dim], device=device),
+                TensorType(dtype, shape=[z_dim], device=device),
+            ],
+        )
+
+        self.cached_cfg_blend = max_compile(
+            self._cfg_blend,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["batch", "seq", "channels"],
+                    device=device,
+                ),
+                TensorType(
+                    dtype,
+                    shape=["batch", "seq", "channels"],
+                    device=device,
+                ),
+                TensorType(DType.float32, shape=[1], device=device),
+            ],
+        )
+
+        self.cached_reshape_latents = max_compile(
             self._reshape_latents,
             input_types=[
                 TensorType(
@@ -218,31 +197,130 @@ class QwenImagePipeline(DiffusionPipeline):
             ],
         )
 
-    def build_trim_prompt_embeddings(self) -> None:
-        dtype = self.text_encoder.config.dtype
-        device = self.text_encoder.devices[0]
         hidden_size = self.text_encoder.config.hidden_size
-        self.__dict__["_trim_prompt_embeddings"] = max_compile(
+        text_dtype = self.text_encoder.config.dtype
+        text_device = self.text_encoder.devices[0]
+        self.cached_trim_prompt_embeddings = max_compile(
             self._trim_prompt_embeddings,
             input_types=[
                 TensorType(
-                    dtype,
+                    text_dtype,
                     shape=["seq", hidden_size],
+                    device=text_device,
+                )
+            ],
+        )
+
+        def duplicate_batch(value: TensorValue) -> TensorValue:
+            return ops.concat([value, value], axis=0)
+
+        self.cached_duplicate_prompt_embeddings = max_compile(
+            duplicate_batch,
+            input_types=[
+                TensorType(
+                    text_dtype,
+                    shape=[1, "trimmed_seq_len", hidden_size],
+                    device=text_device,
+                )
+            ],
+        )
+
+    def _compile_cfg_fastpath_helpers(self) -> None:
+        """Compile the small helper graphs used by the CFG fast path."""
+
+        def duplicate_batch(value: TensorValue) -> TensorValue:
+            return ops.concat([value, value], axis=0)
+
+        def concat_batch_pair(
+            first_value: TensorValue,
+            second_value: TensorValue,
+        ) -> TensorValue:
+            return ops.concat([first_value, second_value], axis=0)
+
+        def split_cfg_predictions(
+            batched_predictions: TensorValue,
+        ) -> tuple[TensorValue, TensorValue]:
+            positive_prediction = ops.slice_tensor(
+                batched_predictions,
+                [slice(0, 1), slice(None), slice(None)],
+            )
+            negative_prediction = ops.slice_tensor(
+                batched_predictions,
+                [slice(1, 2), slice(None), slice(None)],
+            )
+            return positive_prediction, negative_prediction
+
+        text_dtype = self.text_encoder.config.dtype
+        text_device = self.text_encoder.devices[0]
+        hidden_size = self.text_encoder.config.hidden_size
+        self.cached_concat_cfg_prompt_embeddings = max_compile(
+            concat_batch_pair,
+            input_types=[
+                TensorType(
+                    text_dtype,
+                    shape=[1, "trimmed_seq_len", hidden_size],
+                    device=text_device,
+                ),
+                TensorType(
+                    text_dtype,
+                    shape=[1, "trimmed_seq_len", hidden_size],
+                    device=text_device,
+                ),
+            ],
+        )
+
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        packed_channels = self.transformer.config.in_channels
+        self.cached_duplicate_cfg_latents = max_compile(
+            duplicate_batch,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=[1, "seq", packed_channels],
                     device=device,
                 )
             ],
         )
 
-    def build_repeat_prompt_embeddings(self) -> None:
-        dtype = self.text_encoder.config.dtype
-        device = self.text_encoder.devices[0]
-        hidden_size = self.text_encoder.config.hidden_size
-        self.__dict__["_repeat_two_prompt_embeddings"] = max_compile(
-            self._repeat_two_prompt_embeddings,
+        self.cached_concat_cfg_ids = max_compile(
+            concat_batch_pair,
+            input_types=[
+                TensorType(
+                    DType.int64,
+                    shape=[1, "seq", 3],
+                    device=device,
+                ),
+                TensorType(
+                    DType.int64,
+                    shape=[1, "seq", 3],
+                    device=device,
+                ),
+            ],
+        )
+
+        self.cached_duplicate_cfg_timesteps = max_compile(
+            duplicate_batch,
+            input_types=[TensorType(dtype, shape=[1], device=device)],
+        )
+
+        self.cached_duplicate_cfg_ids = max_compile(
+            duplicate_batch,
+            input_types=[
+                TensorType(
+                    DType.int64,
+                    shape=[1, "seq", 3],
+                    device=device,
+                )
+            ],
+        )
+
+        self.cached_split_cfg_predictions = max_compile(
+            split_cfg_predictions,
             input_types=[
                 TensorType(
                     dtype,
-                    shape=[1, "trimmed_seq_len", hidden_size],
+                    shape=[2, "seq", packed_channels],
                     device=device,
                 )
             ],
@@ -270,11 +348,6 @@ class QwenImagePipeline(DiffusionPipeline):
         )
         return ops.unsqueeze(trimmed, 0)
 
-    def _repeat_two_prompt_embeddings(
-        self, prompt_embeddings: TensorValue
-    ) -> TensorValue:
-        return ops.tile(prompt_embeddings, (2, 1, 1))
-
     def prepare_prompt_embeddings(
         self,
         tokens: TokenBuffer,
@@ -289,20 +362,20 @@ class QwenImagePipeline(DiffusionPipeline):
         device = self.text_encoder.devices[0]
         text_input_ids_np = np.asarray(tokens.array).flatten()
         token_key = tuple(int(token) for token in text_input_ids_np.tolist())
-        if token_key not in self._cached_prompt_tokens:
-            self._cached_prompt_tokens[token_key] = Buffer.from_dlpack(
+        if token_key not in self.cache.prompt_tokens:
+            self.cache.prompt_tokens[token_key] = Buffer.from_dlpack(
                 np.ascontiguousarray(text_input_ids_np)
             ).to(device)
-        token_buf = self._cached_prompt_tokens[token_key]
+        token_buf = self.cache.prompt_tokens[token_key]
 
         hidden_states_all = self.text_encoder(token_buf)
         hs_buf = hidden_states_all[-1]
 
-        trimmed = self._trim_prompt_embeddings(hs_buf)
+        trimmed = self.cached_trim_prompt_embeddings(hs_buf)
         if num_images_per_prompt == 1:
             return trimmed
         if num_images_per_prompt == 2:
-            return self._repeat_two_prompt_embeddings(trimmed)
+            return self.cached_duplicate_prompt_embeddings(trimmed)
 
         hs_cpu = hs_buf.to(CPU())
         if self.text_encoder.config.dtype == DType.bfloat16:
@@ -317,7 +390,10 @@ class QwenImagePipeline(DiffusionPipeline):
         hs_np = hs_np[np.newaxis, :, :]
 
         if num_images_per_prompt != 1:
-            hs_np = np.tile(hs_np, (num_images_per_prompt, 1, 1))
+            hs_np = np.broadcast_to(
+                hs_np,
+                (num_images_per_prompt, hs_np.shape[1], hs_np.shape[2]),
+            ).copy()
 
         if self.text_encoder.config.dtype == DType.bfloat16:
             result_u16 = float32_to_bfloat16_as_uint16(
@@ -344,33 +420,11 @@ class QwenImagePipeline(DiffusionPipeline):
         coords = np.stack(
             [tok_positions, tok_positions, tok_positions], axis=-1
         )
-        text_ids = np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
+        text_ids = np.broadcast_to(
+            coords[np.newaxis, :, :],
+            (batch_size, coords.shape[0], coords.shape[1]),
+        ).copy()
         return Buffer.from_dlpack(text_ids).to(device)
-
-    @staticmethod
-    def _prepare_image_ids(
-        batch_size: int,
-        height: int,
-        width: int,
-        device: Device,
-    ) -> Buffer:
-        """Create 3D image position IDs in (T, H, W) format.
-
-        For image tokens: T=0, H/W use centered coordinates to match
-        QwenImage scale_rope=True behavior.
-        """
-        t_coords = np.zeros((height, width), dtype=np.int64)
-        h_centered = np.arange(height, dtype=np.int64) - (height - height // 2)
-        w_centered = np.arange(width, dtype=np.int64) - (width - width // 2)
-        h_coords, w_coords = np.meshgrid(
-            h_centered,
-            w_centered,
-            indexing="ij",
-        )
-        coords = np.stack([t_coords, h_coords, w_coords], axis=-1)
-        coords = coords.reshape(-1, 3)
-        image_ids = np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
-        return Buffer.from_dlpack(image_ids).to(device)
 
     def _reshape_latents(
         self,
@@ -389,13 +443,13 @@ class QwenImagePipeline(DiffusionPipeline):
         self, h_latent: int, w_latent: int
     ) -> tuple[Buffer, Buffer]:
         for n in (h_latent, w_latent):
-            if n not in self._cached_shape_carriers:
-                self._cached_shape_carriers[n] = Buffer.from_dlpack(
+            if n not in self.cache.shape_carriers:
+                self.cache.shape_carriers[n] = Buffer.from_dlpack(
                     np.empty(n, dtype=np.float32)
                 )
         return (
-            self._cached_shape_carriers[h_latent],
-            self._cached_shape_carriers[w_latent],
+            self.cache.shape_carriers[h_latent],
+            self.cache.shape_carriers[w_latent],
         )
 
     def decode_latents(
@@ -418,9 +472,11 @@ class QwenImagePipeline(DiffusionPipeline):
             raise ValueError("VAE latents_mean/latents_std not loaded.")
 
         h_carrier, w_carrier = self._get_shape_carriers(h_latent, w_latent)
-        latents_bhwc = self._reshape_latents(latents, h_carrier, w_carrier)
+        latents_bhwc = self.cached_reshape_latents(
+            latents, h_carrier, w_carrier
+        )
 
-        latents_decoded = self._postprocess_latents(
+        latents_decoded = self.cached_postprocess_latents(
             latents_bhwc, latents_mean, latents_std
         )
 
@@ -494,7 +550,7 @@ class QwenImagePipeline(DiffusionPipeline):
         latents_6d_buf = Buffer.from_dlpack(
             np.ascontiguousarray(latents_6d)
         ).to(self.transformer.devices[0])
-        latents_packed = self._patchify_and_pack(latents_6d_buf)
+        latents_packed = self.cached_patchify_and_pack(latents_6d_buf)
 
         latent_image_ids_int64 = np.asarray(latent_image_ids, dtype=np.int64)
         ids_key = (
@@ -502,11 +558,11 @@ class QwenImagePipeline(DiffusionPipeline):
             int(latent_image_ids_int64.shape[1]),
             int(latent_image_ids_int64.shape[2]),
         )
-        if ids_key not in self._cached_latent_image_ids:
-            self._cached_latent_image_ids[ids_key] = Buffer.from_dlpack(
+        if ids_key not in self.cache.latent_image_ids:
+            self.cache.latent_image_ids[ids_key] = Buffer.from_dlpack(
                 latent_image_ids_int64
             ).to(self.transformer.devices[0])
-        latent_image_ids_buf = self._cached_latent_image_ids[ids_key]
+        latent_image_ids_buf = self.cache.latent_image_ids[ids_key]
         return latents_packed, latent_image_ids_buf
 
     def _patchify_and_pack(self, latents: TensorValue) -> TensorValue:
@@ -569,7 +625,6 @@ class QwenImagePipeline(DiffusionPipeline):
     def execute(  # type: ignore[override]
         self,
         model_inputs: QwenImageModelInputs,
-        callback_queue: Queue[np.ndarray] | None = None,
         output_type: Literal["np", "latent"] = "np",
     ) -> QwenImagePipelineOutput:
         """Run the QwenImage denoising loop and decode outputs.
@@ -577,153 +632,173 @@ class QwenImagePipeline(DiffusionPipeline):
         Supports true classifier-free guidance with separate positive and
         negative prompt forward passes.
         """
-        # 1) Encode positive prompt
+        # Phase 1: prompt and latent preparation.
         prompt_embeds = self.prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
         )
-        batch_size = prompt_embeds.shape[0]
+        batch_size = int(prompt_embeds.shape[0])
         device = self.transformer.devices[0]
 
-        # 2) Determine if we should do true CFG
+        latents, latent_image_ids = self.preprocess_latents(
+            model_inputs.latents, model_inputs.latent_image_ids
+        )
+
+        h_latent = model_inputs.height // (self.vae_scale_factor * 2)
+        w_latent = model_inputs.width // (self.vae_scale_factor * 2)
+        max_vid_index = max(h_latent // 2, w_latent // 2)
+        text_ids_key = (
+            f"{batch_size}_{int(prompt_embeds.shape[1])}_{max_vid_index}"
+        )
+        if text_ids_key not in self.cache.text_ids:
+            self.cache.text_ids[text_ids_key] = self._prepare_text_ids(
+                batch_size=batch_size,
+                seq_len=int(prompt_embeds.shape[1]),
+                device=device,
+                max_vid_index=max_vid_index,
+            )
+        text_ids = self.cache.text_ids[text_ids_key]
+
+        # Phase 2: CFG setup.
         do_true_cfg = (
             model_inputs.true_cfg_scale > 1.0
             and model_inputs.negative_tokens is not None
         )
-
-        # Encode negative prompt if doing true CFG
         negative_prompt_embeds: Buffer | None = None
+        negative_text_ids: Buffer | None = None
+        cfg_scale_buf: Buffer | None = None
+        batched_prompt_embeds: Buffer | None = None
+        batched_text_ids: Buffer | None = None
+        batched_latent_image_ids: Buffer | None = None
         if do_true_cfg and model_inputs.negative_tokens is not None:
             negative_prompt_embeds = self.prepare_prompt_embeddings(
                 tokens=model_inputs.negative_tokens,
                 num_images_per_prompt=model_inputs.num_images_per_prompt,
             )
-
-        # 3) Prepare latents and conditioning
-        latents, latent_image_ids = self.preprocess_latents(
-            model_inputs.latents, model_inputs.latent_image_ids
-        )
-
-        # Compute max_vid_index for text RoPE offset (scale_rope=True)
-        h_latent = model_inputs.height // (self.vae_scale_factor * 2)
-        w_latent = model_inputs.width // (self.vae_scale_factor * 2)
-        max_vid_index = max(h_latent // 2, w_latent // 2)
-
-        # Prepare text IDs with RoPE offset
-        text_seq_len = int(prompt_embeds.shape[1])
-        text_ids_key = f"{batch_size}_{text_seq_len}_{max_vid_index}"
-        if text_ids_key in self._cached_text_ids:
-            text_ids = self._cached_text_ids[text_ids_key]
-        else:
-            text_ids = self._prepare_text_ids(
-                batch_size=batch_size,
-                seq_len=text_seq_len,
-                device=device,
-                max_vid_index=max_vid_index,
-            )
-            self._cached_text_ids[text_ids_key] = text_ids
-
-        # Negative text IDs (may differ in seq_len)
-        negative_text_ids: Buffer | None = None
-        if do_true_cfg and negative_prompt_embeds is not None:
-            neg_text_seq_len = int(negative_prompt_embeds.shape[1])
-            neg_text_ids_key = (
-                f"{batch_size}_{neg_text_seq_len}_{max_vid_index}"
-            )
-            if neg_text_ids_key in self._cached_text_ids:
-                negative_text_ids = self._cached_text_ids[neg_text_ids_key]
-            else:
-                negative_text_ids = self._prepare_text_ids(
-                    batch_size=batch_size,
-                    seq_len=neg_text_seq_len,
-                    device=device,
-                    max_vid_index=max_vid_index,
+            negative_text_ids_key = f"{batch_size}_{int(negative_prompt_embeds.shape[1])}_{max_vid_index}"
+            if negative_text_ids_key not in self.cache.text_ids:
+                self.cache.text_ids[negative_text_ids_key] = (
+                    self._prepare_text_ids(
+                        batch_size=batch_size,
+                        seq_len=int(negative_prompt_embeds.shape[1]),
+                        device=device,
+                        max_vid_index=max_vid_index,
+                    )
                 )
-                self._cached_text_ids[neg_text_ids_key] = negative_text_ids
+            negative_text_ids = self.cache.text_ids[negative_text_ids_key]
 
-        # 4) Prepare scheduler
-        num_inference_steps = model_inputs.num_inference_steps
-        image_seq_len = latents.shape[1]
-        sigmas_key = f"{num_inference_steps}_{image_seq_len}"
-        if sigmas_key in self._cached_sigmas:
-            sigmas = self._cached_sigmas[sigmas_key]
-        else:
-            sigmas = Buffer.from_dlpack(model_inputs.sigmas).to(device)
-            self._cached_sigmas[sigmas_key] = sigmas
-        with Tracer("prepare_scheduler"):
-            all_timesteps, all_dts = self.prepare_scheduler(sigmas)
-            timesteps_seq: Any = all_timesteps
-            dts_seq: Any = all_dts
-            if hasattr(timesteps_seq, "driver_tensor"):
-                timesteps_seq = timesteps_seq.driver_tensor
-            if hasattr(dts_seq, "driver_tensor"):
-                dts_seq = dts_seq.driver_tensor
-
-        cfg_scale_buf: Buffer | None = None
-        if do_true_cfg:
             cfg_scale = float(model_inputs.true_cfg_scale)
-            if cfg_scale not in self._cached_cfg_scales:
-                self._cached_cfg_scales[cfg_scale] = Buffer.from_dlpack(
+            if cfg_scale not in self.cache.cfg_scales:
+                self.cache.cfg_scales[cfg_scale] = Buffer.from_dlpack(
                     np.array([cfg_scale], dtype=np.float32)
                 ).to(device)
-            cfg_scale_buf = self._cached_cfg_scales[cfg_scale]
+            cfg_scale_buf = self.cache.cfg_scales[cfg_scale]
 
+            if (
+                batch_size == 1
+                and prompt_embeds.shape[1] == negative_prompt_embeds.shape[1]
+            ):
+                batched_prompt_embeds = (
+                    self.cached_concat_cfg_prompt_embeddings(
+                        prompt_embeds,
+                        negative_prompt_embeds,
+                    )
+                )
+                batched_text_ids = self.cached_concat_cfg_ids(
+                    text_ids,
+                    negative_text_ids,
+                )
+                batched_latent_image_ids = self.cached_duplicate_cfg_ids(
+                    latent_image_ids
+                )
+
+        # Phase 3: scheduler setup.
+        sigmas_key = (
+            f"{model_inputs.num_inference_steps}_{int(latents.shape[1])}"
+        )
+        if sigmas_key not in self.cache.sigmas:
+            self.cache.sigmas[sigmas_key] = Buffer.from_dlpack(
+                model_inputs.sigmas
+            ).to(device)
+        sigmas = self.cache.sigmas[sigmas_key]
+
+        with Tracer("prepare_scheduler"):
+            all_timesteps, all_dts = self.cached_prepare_scheduler(sigmas)
+            timesteps_seq = all_timesteps.driver_tensor
+            dts_seq = all_dts.driver_tensor
+
+        # Phase 4: denoising loop.
         with Tracer("denoising_loop"):
-            for i in range(num_inference_steps):
+            for i in range(model_inputs.num_inference_steps):
                 with Tracer(f"denoising_step_{i}"):
                     timestep = timesteps_seq[i : i + 1]
                     dt = dts_seq[i : i + 1]
 
-                    with Tracer("transformer_pos"):
-                        noise_pred = self.transformer(
-                            latents,
-                            prompt_embeds,
-                            timestep,
-                            latent_image_ids,
-                            text_ids,
-                        )[0]
-
-                    # True CFG: second forward pass with negative prompt
                     if (
-                        do_true_cfg
-                        and negative_prompt_embeds is not None
-                        and negative_text_ids is not None
+                        batched_prompt_embeds is not None
+                        and batched_text_ids is not None
+                        and batched_latent_image_ids is not None
                         and cfg_scale_buf is not None
                     ):
-                        with Tracer("transformer_neg"):
-                            noise_pred_uncond = self.transformer(
-                                latents,
-                                negative_prompt_embeds,
-                                timestep,
-                                latent_image_ids,
-                                negative_text_ids,
+                        with Tracer("transformer_cfg"):
+                            batched_predictions = self.transformer(
+                                self.cached_duplicate_cfg_latents(latents),
+                                batched_prompt_embeds,
+                                self.cached_duplicate_cfg_timesteps(timestep),
+                                batched_latent_image_ids,
+                                batched_text_ids,
                             )[0]
-
+                        positive_prediction, negative_prediction = (
+                            self.cached_split_cfg_predictions(
+                                batched_predictions
+                            )
+                        )
                         with Tracer("cfg_blend"):
-                            noise_pred = self._cfg_blend(
-                                noise_pred,
-                                noise_pred_uncond,
+                            noise_pred = self.cached_cfg_blend(
+                                positive_prediction,
+                                negative_prediction,
                                 cfg_scale_buf,
                             )
+                    else:
+                        with Tracer("transformer_pos"):
+                            noise_pred = self.transformer(
+                                latents,
+                                prompt_embeds,
+                                timestep,
+                                latent_image_ids,
+                                text_ids,
+                            )[0]
+
+                        if (
+                            do_true_cfg
+                            and negative_prompt_embeds is not None
+                            and negative_text_ids is not None
+                            and cfg_scale_buf is not None
+                        ):
+                            with Tracer("transformer_neg"):
+                                negative_prediction = self.transformer(
+                                    latents,
+                                    negative_prompt_embeds,
+                                    timestep,
+                                    latent_image_ids,
+                                    negative_text_ids,
+                                )[0]
+                            with Tracer("cfg_blend"):
+                                noise_pred = self.cached_cfg_blend(
+                                    noise_pred,
+                                    negative_prediction,
+                                    cfg_scale_buf,
+                                )
 
                     with Tracer("scheduler_step"):
-                        latents = self.scheduler_step(latents, noise_pred, dt)
-
-            if callback_queue is not None:
-                callback_queue.put_nowait(
-                    cast(
-                        np.ndarray,
-                        self.decode_latents(
+                        latents = self.cached_scheduler_step(
                             latents,
-                            model_inputs.height,
-                            model_inputs.width,
-                            output_type=output_type,
-                        ),
-                    )
-                )
+                            noise_pred,
+                            dt,
+                        )
 
-        # 6) Decode final outputs
-        image_list = []
+        # Phase 5: decode outputs.
+        image_list: list[np.ndarray | Buffer] = []
         if batch_size == 1:
             image_list.append(
                 self.decode_latents(
@@ -734,15 +809,16 @@ class QwenImagePipeline(DiffusionPipeline):
                 )
             )
         else:
-            # For multi-batch, cast to float32 on CPU for numpy slicing
-            lat_np = np.from_dlpack(latents.to(CPU())).astype(np.float32)
-            for b in range(batch_size):
-                latents_b = Buffer.from_dlpack(
-                    np.ascontiguousarray(lat_np[b : b + 1])
+            latents_np = np.from_dlpack(latents.to(CPU())).astype(np.float32)
+            for batch_index in range(batch_size):
+                batch_latents = Buffer.from_dlpack(
+                    np.ascontiguousarray(
+                        latents_np[batch_index : batch_index + 1]
+                    )
                 ).to(device)
                 image_list.append(
                     self.decode_latents(
-                        latents_b,
+                        batch_latents,
                         model_inputs.height,
                         model_inputs.width,
                         output_type=output_type,
