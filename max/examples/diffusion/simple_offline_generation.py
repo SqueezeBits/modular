@@ -192,8 +192,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--taylorseer-warmup-steps",
         type=int,
-        default=3,
-        help="Warmup steps for TaylorSeer factor gathering (default: 3).",
+        default=4,
+        help="Warmup steps for TaylorSeer factor gathering (default: 4).",
     )
     parser.add_argument(
         "--taylorseer-max-order",
