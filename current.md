@@ -36,6 +36,13 @@
   - [`profile-qwen-short.sh`](./profile-qwen-short.sh)
 - Warmup + profile:
   - [`profile-qwen-warm.sh`](./profile-qwen-warm.sh)
+- Same-process multi-shape runner:
+  - [`max/examples/diffusion/same_process_multi_shape_runner.py`](./max/examples/diffusion/same_process_multi_shape_runner.py)
+  - Supports explicit `--case WIDTHxHEIGHT:STEPS`
+  - Supports auto-generated case matrices via repeated
+    `--shape WIDTHxHEIGHT` and `--step-count N`
+  - Prints `InferenceSession.load` proxy counts during same-process runs to
+    help spot compile/recompile behavior across cases
 - Perfetto exporter:
   - [`tools/export_qwen_profile_perfetto.py`](./tools/export_qwen_profile_perfetto.py)
 - Summary JSON exporter:
@@ -110,6 +117,36 @@
 - Reduced some repeated host scalar / token / id uploads via caching.
 - Switched scheduler token counting away from host `int(...)` into shape-driven logic.
 - Added denoising step tracer structure closer to Flux2.
+- Removed the edit transformer's shape-keyed lazy compile path:
+  - `QwenImageEditTransformerModel` now compiles once and reuses a single
+    module-v2/MAX-native graph.
+  - `zero_cond_t` condition-token handling is now derived dynamically from
+    image-token `T` IDs instead of a host `num_noise_tokens` scalar.
+- Switched Qwen image block split modulation / gating to device-side
+  `condition_token_mask` application via `ops.where(...)`, keeping the edit
+  path shape-dynamic across sequential runs with different image sizes.
+- Moved edit image-latent concatenation out of the denoising loop:
+  - the combined latent/image sequence is now built once before the loop
+  - scheduler updates preserve condition tokens using the precomputed image
+    IDs
+- Added a MAX-native Qwen t2i CFG fast path for the common single-image case:
+  - when positive/negative prompt embedding lengths match, the transformer
+    runs one batched CFG forward instead of two separate forwards
+  - otherwise it safely falls back to the existing two-pass path
+
+## Latest Validation
+
+- `python -m compileall` passes for the touched Qwen image/edit pipeline files.
+- Local diagnostics were clean for the touched pipeline/model files.
+- `./bazelw run //max/examples/diffusion:simple_offline_generation -- --help`
+  succeeds after the changes.
+- `./bazelw run //max/examples/diffusion:same_process_multi_shape_runner -- ...`
+  succeeds for multi-shape same-process smoke runs on both:
+  - `Qwen/Qwen-Image-2512`
+  - `Qwen/Qwen-Image-Edit-2511`
+- Smoke runs succeeded:
+  - `Qwen/Qwen-Image-2512`, 1-step t2i, profiling enabled
+  - `Qwen/Qwen-Image-Edit-2511`, 1-step edit, profiling enabled
 
 ## Best Next Steps
 
