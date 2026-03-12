@@ -45,3 +45,14 @@ modular_py_binary(
         requirement("torch"),  # for test
     ],
 )
+
+modular_py_binary(
+    name = "tensor_creation_benchmark",
+    srcs = ["tensor_creation_benchmark.py"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max:tensor",
+        requirement("torch"),
+    ],
+)
