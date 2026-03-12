@@ -116,6 +116,26 @@ class PixelGenerationPipeline(
         inputs: PixelGenerationInputs[PixelGenerationContextType],
     ) -> PipelineOutputsDict[GenerationOutput]:
         """Runs the pixel generation pipeline for the given inputs."""
+        pixel_outputs = self.execute_images(inputs)
+
+        responses: dict[RequestID, GenerationOutput] = {}
+        for request_id, pixel_data in pixel_outputs.items():
+            responses[request_id] = GenerationOutput(
+                request_id=request_id,
+                final_status=GenerationStatus.END_OF_SEQUENCE,
+                output=[
+                    OutputImageContent.from_numpy(img, format="png")
+                    for img in pixel_data
+                ],
+            )
+
+        return responses
+
+    def execute_images(
+        self,
+        inputs: PixelGenerationInputs[PixelGenerationContextType],
+    ) -> dict[RequestID, np.ndarray]:
+        """Runs the model and returns uint8 image tensors grouped by request."""
         model_inputs, flat_batch = self.prepare_batch(inputs.batch)
         if not flat_batch or model_inputs is None:
             return {}
@@ -138,27 +158,36 @@ class PixelGenerationPipeline(
             )
             raise
 
-        images = model_outputs.images
         num_images_per_prompt = model_inputs.num_images_per_prompt
         expected_images = len(flat_batch) * num_images_per_prompt
+        image_list = self._to_image_list(model_outputs.images, expected_images)
 
-        # Handle both numpy array (NHWC) and list of images
+        responses: dict[RequestID, np.ndarray] = {}
+        for index, (request_id, _context) in enumerate(flat_batch):
+            offset = index * num_images_per_prompt
+            responses[request_id] = np.stack(
+                image_list[offset : offset + num_images_per_prompt], axis=0
+            )
+        return responses
+
+    @staticmethod
+    def _to_image_list(
+        images: np.ndarray | list[np.ndarray],
+        expected_images: int,
+    ) -> list[np.ndarray]:
+        """Normalize model outputs into NHWC uint8 images."""
         if isinstance(images, np.ndarray):
             if images.dtype == np.uint8:
                 # Already NHWC uint8 [0, 255] from GPU post-processing.
                 image_list = [images[i] for i in range(images.shape[0])]
             else:
                 # images shape: (batch_size, H, W, C) or (batch_size, C, H, W)
-                # Convert NCHW to NHWC if needed
                 if images.ndim == 4 and images.shape[1] in (1, 3, 4):
-                    # Likely NCHW format, convert to NHWC
                     images = np.transpose(images, (0, 2, 3, 1))
-                # Denormalize [-1, 1] -> [0, 255] uint8
                 images = np.clip(images * 0.5 + 0.5, 0.0, 1.0)
                 images = (images * 255).astype(np.uint8)
                 image_list = [images[i] for i in range(images.shape[0])]
         else:
-            # Denormalize each image from [-1, 1] to [0, 255] uint8
             image_list = [
                 (
                     np.clip(
@@ -176,25 +205,7 @@ class PixelGenerationPipeline(
                 "Unexpected number of images returned from pipeline: "
                 f"expected {expected_images}, got {len(image_list)}."
             )
-
-        responses: dict[RequestID, GenerationOutput] = {}
-        for index, (request_id, _context) in enumerate(flat_batch):
-            offset = index * num_images_per_prompt
-            # Select images for this request (already in NHWC format)
-            pixel_data = np.stack(
-                image_list[offset : offset + num_images_per_prompt], axis=0
-            )
-
-            responses[request_id] = GenerationOutput(
-                request_id=request_id,
-                final_status=GenerationStatus.END_OF_SEQUENCE,
-                output=[
-                    OutputImageContent.from_numpy(img, format="png")
-                    for img in pixel_data
-                ],
-            )
-
-        return responses
+        return image_list
 
     def prepare_batch(
         self,

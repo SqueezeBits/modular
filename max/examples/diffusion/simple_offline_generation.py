@@ -34,6 +34,8 @@ import os
 from io import BytesIO
 from typing import cast
 
+import numpy as np
+import numpy.typing as npt
 from max.driver import DeviceSpec
 from max.examples.diffusion.profiler import profile_execute
 from max.interfaces import (
@@ -208,20 +210,19 @@ def save_image(image_data: str, output_path: str) -> None:
     Args:
         image_data: Base64-encoded image data string
         output_path: Path where the image should be saved
-
-    Raises:
-        ImportError: If PIL is not available
     """
-    try:
-        from PIL import Image
+    image_bytes = base64.b64decode(image_data)
+    with open(output_path, "wb") as f:
+        f.write(image_bytes)
+    print(f"Image saved to: {output_path}")
 
-        image_bytes = base64.b64decode(image_data)
-        image = Image.open(BytesIO(image_bytes))
-        image.save(output_path)
-        print(f"Image saved to: {output_path}")
-    except ImportError:
-        print("WARNING: PIL not available, cannot save image")
-        print(f"Base64 data length: {len(image_data)} chars")
+
+def save_image_array(
+    image_data: npt.NDArray[np.uint8], output_path: str
+) -> None:
+    """Save a uint8 image array directly without OpenResponses re-encoding."""
+    Image.fromarray(image_data).save(output_path)
+    print(f"Image saved to: {output_path}")
 
 
 def load_image_as_data_uri(image_path: str | None) -> str | None:
@@ -454,7 +455,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         )
         for i in range(args.num_warmups):
             print(f"Running warmup {i + 1} of {args.num_warmups}")
-            pipeline.execute(inputs_warmup)
+            pipeline.execute_images(inputs_warmup)
         print("Warmup complete")
 
     # Step 7: Execute the pipeline
@@ -467,50 +468,58 @@ async def generate_image(args: argparse.Namespace) -> None:
                 )
                 outputs = pipeline.execute(inputs)
         prof.report(unit="ms")
-    else:
-        outputs = pipeline.execute(inputs)
+        # Step 8: Get the output for our request
+        output = outputs[context.request_id]
+        output = await tokenizer.postprocess(output)
 
-    # Step 8: Get the output for our request
-    output = outputs[context.request_id]
-    output = await tokenizer.postprocess(output)
+        # Check if generation completed successfully
+        if not output.is_done:
+            print(f"WARNING: Generation status: {output.final_status}")
+            return
 
-    # Check if generation completed successfully
-    if not output.is_done:
-        print(f"WARNING: Generation status: {output.final_status}")
+        print("Generation complete!")
+
+        # Step 9: Extract and save images from OutputImageContent
+        if not output.output:
+            print("ERROR: No images generated")
+            return
+
+        for idx, image_content in enumerate(output.output):
+            if not isinstance(image_content, OutputImageContent):
+                print(
+                    f"ERROR: Expected OutputImageContent, got {type(image_content)}"
+                )
+                continue
+
+            if len(output.output) > 1:
+                base_name, ext = os.path.splitext(args.output)
+                output_path = f"{base_name}_{idx}{ext}"
+            else:
+                output_path = args.output
+
+            if image_content.image_data:
+                save_image(image_content.image_data, output_path)
+            elif image_content.image_url:
+                print(f"Image available at URL: {image_content.image_url}")
+            else:
+                print("ERROR: No image data or URL in output")
+        return
+
+    pixel_outputs = pipeline.execute_images(inputs)
+    pixel_data = pixel_outputs.get(context.request_id)
+    if pixel_data is None or len(pixel_data) == 0:
+        print("ERROR: No images generated")
         return
 
     print("Generation complete!")
 
-    # Step 9: Extract and save images from OutputImageContent
-    # The output now contains a list of OutputImageContent objects with base64-encoded images
-    if not output.output:
-        print("ERROR: No images generated")
-        return
-
-    # Save each generated image
-    for idx, image_content in enumerate(output.output):
-        # Narrow type for mypy - we expect OutputImageContent for pixel generation
-        if not isinstance(image_content, OutputImageContent):
-            print(
-                f"ERROR: Expected OutputImageContent, got {type(image_content)}"
-            )
-            continue
-
-        # Determine output filename
-        if len(output.output) > 1:
-            # Multiple images: add index to filename
+    for idx, image_data in enumerate(pixel_data):
+        if len(pixel_data) > 1:
             base_name, ext = os.path.splitext(args.output)
             output_path = f"{base_name}_{idx}{ext}"
         else:
             output_path = args.output
-
-        # Save the image
-        if image_content.image_data:
-            save_image(image_content.image_data, output_path)
-        elif image_content.image_url:
-            print(f"Image available at URL: {image_content.image_url}")
-        else:
-            print("ERROR: No image data or URL in output")
+        save_image_array(image_data, output_path)
 
 
 def main(argv: list[str] | None = None) -> int:

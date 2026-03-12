@@ -157,6 +157,7 @@ class Flux2Pipeline(DiffusionPipeline):
         # Store derived config/device references before unwrapping.
         self._transformer_config = self.transformer.config
         self._transformer_devices = self.transformer.devices
+        self._decode_host_buffer: Buffer | None = None
 
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1)
@@ -175,6 +176,16 @@ class Flux2Pipeline(DiffusionPipeline):
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
         self._cached_shape_carriers: dict[int, Tensor] = {}
+
+        # Prime the pinned host allocator outside the profiled steady-state path.
+        if not self._transformer_devices[0].is_host:
+            prime = Buffer(
+                shape=[1],
+                dtype=DType.uint8,
+                device=self._transformer_devices[0],
+                pinned=True,
+            )
+            del prime
 
     @traced
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:  # type: ignore[override]
@@ -566,8 +577,28 @@ class Flux2Pipeline(DiffusionPipeline):
             uint8 NumPy array of shape (B, H, W, C) with values in [0, 255].
         """
         decoded = self._postprocess_and_decode(latents, h_carrier, w_carrier)
+        decoded_buffer = (
+            decoded.driver_tensor if isinstance(decoded, Tensor) else decoded
+        )
+        if decoded_buffer.device.is_host:
+            return decoded_buffer.to_numpy()  # (B, H, W, C)
 
-        return np.from_dlpack(decoded)  # (B, H, W, C)
+        host_buffer = self._decode_host_buffer
+        if (
+            host_buffer is None
+            or tuple(host_buffer.shape) != tuple(decoded_buffer.shape)
+            or host_buffer.dtype != decoded_buffer.dtype
+        ):
+            host_buffer = Buffer(
+                shape=decoded_buffer.shape,
+                dtype=decoded_buffer.dtype,
+                device=decoded_buffer.device,
+                pinned=True,
+            )
+            self._decode_host_buffer = host_buffer
+
+        host_buffer.inplace_copy_from(decoded_buffer)
+        return host_buffer.to_numpy()  # (B, H, W, C)
 
     @staticmethod
     def _prepare_text_ids(
