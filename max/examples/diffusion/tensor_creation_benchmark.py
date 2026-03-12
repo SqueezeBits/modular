@@ -24,8 +24,10 @@ from time import perf_counter
 from typing import Any
 
 import torch
+from max import driver, engine
 from max.driver import Accelerator, Buffer, CPU, Device, accelerator_count
 from max.dtype import DType
+from max.experimental import realization_context as rc
 from max.experimental.tensor import Tensor
 
 
@@ -177,6 +179,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the Torch reference benchmark.",
     )
+    parser.add_argument(
+        "--session-num-threads",
+        type=int,
+        help=(
+            "Override the MAX eager InferenceSession thread count. If unset, "
+            "the runtime default is used."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -194,6 +204,21 @@ def _resolve_torch_device(args: argparse.Namespace) -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeError("Torch CUDA is unavailable for --device=gpu")
     return torch.device(f"cuda:{args.device_id}")
+
+
+def _configure_eager_session(num_threads: int | None) -> engine.InferenceSession | None:
+    if num_threads is None:
+        return None
+    if num_threads <= 0:
+        raise ValueError("--session-num-threads must be positive")
+
+    device_specs = driver.scan_available_devices()
+    if (cpu := driver.DeviceSpec.cpu()) not in device_specs:
+        device_specs.append(cpu)
+    devices = driver.load_devices(device_specs)
+    session = engine.InferenceSession(devices=devices, num_threads=num_threads)
+    rc._SESSION.set(session)
+    return session
 
 
 def _make_tensor(case: BenchmarkCase, device: Device) -> Tensor:
@@ -458,6 +483,7 @@ def main() -> int:
     args = parse_args()
     device = _resolve_device(args)
     torch_device = _resolve_torch_device(args)
+    eager_session = _configure_eager_session(args.session_num_threads)
 
     selected_cases = (
         args.case
@@ -476,6 +502,10 @@ def main() -> int:
         f"{device.architecture_name if not device.is_host else 'cpu'})"
     )
     print(f"Torch device: {torch_device}")
+    print(
+        "MAX eager session threads: "
+        f"{eager_session.num_threads if eager_session else 'default'}"
+    )
     print(f"Iterations: {args.iterations}, warmups: {args.warmups}")
     print()
 

@@ -52,6 +52,7 @@ modular_py_binary(
     deps = [
         "//max/python/max/driver",
         "//max/python/max/dtype",
+        "//max/python/max/engine",
         "//max/python/max:tensor",
         requirement("torch"),
     ],
