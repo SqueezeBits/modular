@@ -187,6 +187,15 @@ def parse_args() -> argparse.Namespace:
             "the runtime default is used."
         ),
     )
+    parser.add_argument(
+        "--session-num-threads-sweep",
+        type=int,
+        nargs="+",
+        help=(
+            "Run the benchmark once per supplied eager-session thread count. "
+            "For example: --session-num-threads-sweep 1 4 8 16 32"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -479,24 +488,18 @@ def _print_ratio_table(
     print()
 
 
-def main() -> int:
-    args = parse_args()
-    device = _resolve_device(args)
-    torch_device = _resolve_torch_device(args)
-    eager_session = _configure_eager_session(args.session_num_threads)
-
-    selected_cases = (
-        args.case
-        if args.case
-        else [
-            "prev_residual",
-            "prev_output",
-            "step_cache_flag",
-            "rdt_tensor",
-        ]
-    )
-    cases = [_CASES[name] for name in selected_cases]
-
+def _run_benchmark(
+    device: Device,
+    torch_device: torch.device,
+    cases: list[BenchmarkCase],
+    *,
+    iterations: int,
+    warmups: int,
+    skip_buffer: bool,
+    skip_torch: bool,
+    session_num_threads: int | None,
+) -> None:
+    eager_session = _configure_eager_session(session_num_threads)
     print(
         f"Device: {device} (api={device.api}, arch="
         f"{device.architecture_name if not device.is_host else 'cpu'})"
@@ -506,14 +509,14 @@ def main() -> int:
         "MAX eager session threads: "
         f"{eager_session.num_threads if eager_session else 'default'}"
     )
-    print(f"Iterations: {args.iterations}, warmups: {args.warmups}")
+    print(f"Iterations: {iterations}, warmups: {warmups}")
     print()
 
     sync_only = _measure_sync_only(
         device,
         torch_device,
-        iterations=args.iterations,
-        warmups=args.warmups,
+        iterations=iterations,
+        warmups=warmups,
     )
     print("Sync Only Baseline")
     print(
@@ -535,8 +538,8 @@ def main() -> int:
                 case,
                 device,
                 torch_device,
-                iterations=args.iterations,
-                warmups=args.warmups,
+                iterations=iterations,
+                warmups=warmups,
             ),
         )
         for case in cases
@@ -547,7 +550,7 @@ def main() -> int:
     )
 
     buffer_results: list[tuple[BenchmarkCase, BenchmarkResult]] | None = None
-    if not args.skip_buffer:
+    if not skip_buffer:
         buffer_results = [
             (
                 case,
@@ -555,8 +558,8 @@ def main() -> int:
                     case,
                     device,
                     torch_device,
-                    iterations=args.iterations,
-                    warmups=args.warmups,
+                    iterations=iterations,
+                    warmups=warmups,
                 ),
             )
             for case in cases
@@ -572,7 +575,7 @@ def main() -> int:
         )
 
     torch_results: list[tuple[BenchmarkCase, BenchmarkResult]] | None = None
-    if not args.skip_torch:
+    if not skip_torch:
         torch_results = [
             (
                 case,
@@ -580,8 +583,8 @@ def main() -> int:
                     case,
                     device,
                     torch_device,
-                    iterations=args.iterations,
-                    warmups=args.warmups,
+                    iterations=iterations,
+                    warmups=warmups,
                 ),
             )
             for case in cases
@@ -592,6 +595,45 @@ def main() -> int:
         )
 
     _print_ratio_table(tensor_results, buffer_results, torch_results)
+
+
+def main() -> int:
+    args = parse_args()
+    device = _resolve_device(args)
+    torch_device = _resolve_torch_device(args)
+
+    selected_cases = (
+        args.case
+        if args.case
+        else [
+            "prev_residual",
+            "prev_output",
+            "step_cache_flag",
+            "rdt_tensor",
+        ]
+    )
+    cases = [_CASES[name] for name in selected_cases]
+
+    thread_counts = (
+        args.session_num_threads_sweep
+        if args.session_num_threads_sweep
+        else [args.session_num_threads]
+    )
+
+    for index, session_num_threads in enumerate(thread_counts):
+        if index:
+            print("=" * 80)
+            print()
+        _run_benchmark(
+            device,
+            torch_device,
+            cases,
+            iterations=args.iterations,
+            warmups=args.warmups,
+            skip_buffer=args.skip_buffer,
+            skip_torch=args.skip_torch,
+            session_num_threads=session_num_threads,
+        )
     return 0
 
 
