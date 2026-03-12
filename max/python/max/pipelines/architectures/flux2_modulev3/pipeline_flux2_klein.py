@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 from max.dtype import DType
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
@@ -36,6 +37,12 @@ class Flux2KleinModelInputs(Flux2ModelInputs):
 
     negative_tokens: Tensor | None = None
     """Negative prompt token IDs on device (for classifier-free guidance)."""
+
+    attention_mask: np.ndarray | None = None
+    """Tokenizer-generated mask for the padded positive prompt sequence."""
+
+    negative_attention_mask: np.ndarray | None = None
+    """Tokenizer-generated mask for the padded negative prompt sequence."""
 
     guidance_scale: float = 4.0
     """Guidance scale for classifier-free guidance."""
@@ -152,6 +159,8 @@ class Flux2KleinPipeline(Flux2Pipeline):
             num_images_per_prompt=base_inputs.num_images_per_prompt,
             input_image=base_inputs.input_image,
             negative_tokens=negative_tokens,
+            attention_mask=context.mask,
+            negative_attention_mask=getattr(context, "negative_mask", None),
             guidance_scale=context.guidance_scale,
             is_distilled=is_distilled,
         )
@@ -166,10 +175,12 @@ class Flux2KleinPipeline(Flux2Pipeline):
         Follows the parent Flux2Pipeline execution flow, adding
         classifier-free guidance support for non-distilled models.
         """
+        self.transformer.use_standard_model()
         # 1) Encode prompts.
         prompt_embeds, text_ids = self.prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
+            attention_mask=model_inputs.attention_mask,
         )
         batch_size = int(prompt_embeds.shape[0])
 
@@ -182,6 +193,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
                 self.prepare_prompt_embeddings(
                     tokens=model_inputs.negative_tokens,
                     num_images_per_prompt=model_inputs.num_images_per_prompt,
+                    attention_mask=model_inputs.negative_attention_mask,
                 )
             )
         elif (

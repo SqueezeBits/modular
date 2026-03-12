@@ -17,6 +17,9 @@ import numpy as np
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from max.pipelines.dataprocessing import causal_attention_mask
+from max.pipelines.dataprocessing.causal_attention_mask import (
+    causal_attention_mask_with_token_mask,
+)
 
 _T = TypeVar("_T")
 
@@ -103,3 +106,33 @@ def test_causal_mask__does_not_mask_prior_tokens(
     for m, sp in zip(mask, start_pos, strict=True):
         for pos, sequence_mask in enumerate(m):
             assert np.all(sequence_mask[: sp + pos + 1] == 0.0)
+
+
+def test_causal_mask_with_token_mask__matches_expected_values() -> None:
+    mask = causal_attention_mask_with_token_mask(
+        [0],
+        np.array([True, False, True], dtype=np.bool_),
+    )
+
+    expected = np.array(
+        [
+            [
+                [0.0, FILL_VAL, FILL_VAL],
+                [0.0, FILL_VAL, FILL_VAL],
+                [0.0, FILL_VAL, 0.0],
+            ]
+        ],
+        dtype=np.float32,
+    )
+
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_causal_mask_with_token_mask__masks_invalid_key_columns() -> None:
+    mask = causal_attention_mask_with_token_mask(
+        [0],
+        np.array([True, False, True, False], dtype=np.bool_),
+    )
+
+    assert np.all(mask[0, :, 1] == FILL_VAL)
+    assert np.all(mask[0, :, 3] == FILL_VAL)

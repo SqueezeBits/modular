@@ -1859,6 +1859,78 @@ def flash_attention_gpu(
     )[0].tensor
 
 
+def masked_flash_attention_gpu(
+    q: TensorValue,
+    k: TensorValue,
+    v: TensorValue,
+    mask: TensorValue,
+    scale: float,
+) -> TensorValue:
+    """Computes masked flash attention using the fused GPU kernel."""
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError(
+            "q, k, v must have matching dtypes. Got "
+            f"q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}"
+        )
+
+    expected_rank = 4
+    for name, tensor in [("q", q), ("k", k), ("v", v)]:
+        if tensor.rank != expected_rank:
+            raise ValueError(
+                f"{name} must be rank {expected_rank}, got {tensor.rank}"
+            )
+
+    head_dim = q.shape[-1]
+    if k.shape[-1] != head_dim or v.shape[-1] != head_dim:
+        raise ValueError(
+            "All inputs must have same head_dim. Got "
+            f"q: {head_dim}, k: {k.shape[-1]}, v: {v.shape[-1]}"
+        )
+
+    assert_same_device(q=q, k=k, v=v, mask=mask)
+
+    if mask.rank == 3:
+        if mask.shape[0] != q.shape[0]:
+            raise ValueError(
+                f"mask batch size ({mask.shape[0]}) must match q batch size ({q.shape[0]})"
+            )
+        if mask.shape[1] != q.shape[1] or mask.shape[2] != k.shape[1]:
+            raise ValueError(
+                "mask shape must be [batch, q_seq_len, kv_seq_len]. Got "
+                f"mask={mask.shape}, q={q.shape}, k={k.shape}"
+            )
+    elif mask.rank == 4:
+        if mask.shape[0] != q.shape[0]:
+            raise ValueError(
+                f"mask batch size ({mask.shape[0]}) must match q batch size ({q.shape[0]})"
+            )
+        if mask.shape[1] not in (1, q.shape[2]):
+            raise ValueError(
+                "mask head dimension must be 1 or match q heads. Got "
+                f"mask={mask.shape}, q={q.shape}"
+            )
+        if mask.shape[2] != q.shape[1] or mask.shape[3] != k.shape[1]:
+            raise ValueError(
+                "mask shape must be [batch, heads|1, q_seq_len, kv_seq_len]. Got "
+                f"mask={mask.shape}, q={q.shape}, k={k.shape}"
+            )
+    else:
+        raise ValueError(f"mask must be rank 3 or 4, got rank {mask.rank}")
+
+    return ops.custom(
+        "masked_flash_attention_gpu",
+        values=[
+            q,
+            k,
+            v,
+            mask,
+            ops.constant(scale, dtype=DType.float32, device=DeviceRef.CPU()),
+        ],
+        out_types=[TensorType(dtype=q.dtype, shape=q.shape, device=q.device)],
+        device=q.device,
+    )[0].tensor
+
+
 def flash_attention_ragged(
     kv_params: KVCacheParams,
     input: TensorValue,
