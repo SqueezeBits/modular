@@ -49,19 +49,31 @@ class Qwen25VLEncoderAttention(Module):
         kv_dim = head_dim * num_key_value_heads
 
         self.q_proj = Linear(
-            hidden_size, q_dim, dtype=dtype, device=device,
+            hidden_size,
+            q_dim,
+            dtype=dtype,
+            device=device,
             has_bias=attention_bias,
         )
         self.k_proj = Linear(
-            hidden_size, kv_dim, dtype=dtype, device=device,
+            hidden_size,
+            kv_dim,
+            dtype=dtype,
+            device=device,
             has_bias=attention_bias,
         )
         self.v_proj = Linear(
-            hidden_size, kv_dim, dtype=dtype, device=device,
+            hidden_size,
+            kv_dim,
+            dtype=dtype,
+            device=device,
             has_bias=attention_bias,
         )
         self.o_proj = Linear(
-            q_dim, hidden_size, dtype=dtype, device=device,
+            q_dim,
+            hidden_size,
+            dtype=dtype,
+            device=device,
             has_bias=False,
         )
 
@@ -103,7 +115,9 @@ class Qwen25VLEncoderAttention(Module):
         v = ops.unsqueeze(v, 0)
 
         attn_out = flash_attention_gpu(
-            q, k, v,
+            q,
+            k,
+            v,
             mask_variant=MHAMaskVariant.CAUSAL_MASK,
             scale=self.scale,
         )

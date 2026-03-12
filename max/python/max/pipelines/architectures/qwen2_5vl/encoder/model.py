@@ -71,7 +71,9 @@ class Qwen25VLEncoderModel(ComponentModel):
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = Qwen25VLTextEncoderConfig.generate(
-            config, encoding, devices,
+            config,
+            encoding,
+            devices,
         )
         self.session = session
         self.load_model()
@@ -94,7 +96,7 @@ class Qwen25VLEncoderModel(ComponentModel):
             # Key mapping
             adapted_key = key
             if adapted_key.startswith("model.language_model."):
-                adapted_key = adapted_key[len("model.language_model."):]
+                adapted_key = adapted_key[len("model.language_model.") :]
             else:
                 for before, after in QWEN_SAFETENSOR_MAP.items():
                     adapted_key = adapted_key.replace(before, after)
@@ -110,9 +112,11 @@ class Qwen25VLEncoderModel(ComponentModel):
 
             if adapted_key.startswith("embed_tokens."):
                 embed_state[adapted_key] = wd
-            elif adapted_key.startswith("layers.") or adapted_key.startswith(
-                "norm."
-            ) or adapted_key.startswith("rope."):
+            elif (
+                adapted_key.startswith("layers.")
+                or adapted_key.startswith("norm.")
+                or adapted_key.startswith("rope.")
+            ):
                 transform_state[adapted_key] = wd
 
         lc = self.config
@@ -120,10 +124,14 @@ class Qwen25VLEncoderModel(ComponentModel):
 
         # --- Compile embed_tokens ---
         embed_model = _EmbedOnly(
-            lc.vocab_size, lc.hidden_size,
-            dtype=lc.dtype, device=device_ref,
+            lc.vocab_size,
+            lc.hidden_size,
+            dtype=lc.dtype,
+            device=device_ref,
         )
-        embed_model.load_state_dict(embed_state, weight_alignment=1, strict=True)
+        embed_model.load_state_dict(
+            embed_state, weight_alignment=1, strict=True
+        )
         embed_input_types = [
             TensorType(DType.int64, shape=["total_seq_len"], device=device_ref),
         ]
@@ -136,13 +144,16 @@ class Qwen25VLEncoderModel(ComponentModel):
             session = InferenceSession(devices=self.devices)
 
         self._embed_model: Model = session.load(
-            g, weights_registry=embed_model.state_dict(),
+            g,
+            weights_registry=embed_model.state_dict(),
         )
 
         # --- Compile transformer layers + norm ---
         transform_model = Qwen25VLTextEncoderTransformer(lc)
         transform_model.load_state_dict(
-            transform_state, weight_alignment=1, strict=True,
+            transform_state,
+            weight_alignment=1,
+            strict=True,
         )
         transform_input_types = [
             TensorType(
@@ -155,7 +166,8 @@ class Qwen25VLEncoderModel(ComponentModel):
             out = transform_model(*(v.tensor for v in g.inputs))
             g.output(out)
         self._transform_model: Model = session.load(
-            g, weights_registry=transform_model.state_dict(),
+            g,
+            weights_registry=transform_model.state_dict(),
         )
 
         return self._embed_model
@@ -176,6 +188,7 @@ class Qwen25VLEncoderModel(ComponentModel):
 
         if is_tensor:
             from max.experimental.tensor import Tensor as _Tensor
+
             return (_Tensor(storage=result_buf),)
 
         return (result_buf,)

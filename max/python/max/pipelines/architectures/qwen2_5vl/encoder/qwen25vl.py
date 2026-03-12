@@ -32,6 +32,7 @@ from .layers import Qwen25VLEncoderAttention
 if TYPE_CHECKING:
     from max.dtype import DType
     from max.graph import DeviceRef
+
     from .model_config import Qwen25VLTextEncoderConfigBase
 
 
@@ -39,20 +40,33 @@ class Qwen25VLMLP(Module):
     """Qwen2.5-VL MLP with SiLU gate activation (module v2)."""
 
     def __init__(
-        self, hidden_size: int, intermediate_size: int,
-        *, dtype: DType, device: DeviceRef,
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        dtype: DType,
+        device: DeviceRef,
     ) -> None:
         super().__init__()
         self.gate_proj = Linear(
-            hidden_size, intermediate_size, dtype=dtype, device=device,
+            hidden_size,
+            intermediate_size,
+            dtype=dtype,
+            device=device,
             has_bias=False,
         )
         self.up_proj = Linear(
-            hidden_size, intermediate_size, dtype=dtype, device=device,
+            hidden_size,
+            intermediate_size,
+            dtype=dtype,
+            device=device,
             has_bias=False,
         )
         self.down_proj = Linear(
-            intermediate_size, hidden_size, dtype=dtype, device=device,
+            intermediate_size,
+            hidden_size,
+            dtype=dtype,
+            device=device,
             has_bias=False,
         )
 
@@ -91,16 +105,24 @@ class Qwen25VLEncoderTransformerBlock(Module):
             device=device,
         )
         self.mlp = Qwen25VLMLP(
-            hidden_size, intermediate_size,
-            dtype=dtype, device=device,
+            hidden_size,
+            intermediate_size,
+            dtype=dtype,
+            device=device,
         )
-        self.input_layernorm = RMSNorm(hidden_size, dtype=dtype, eps=rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            hidden_size, dtype=dtype, eps=rms_norm_eps
+        )
         self.post_attention_layernorm = RMSNorm(
-            hidden_size, dtype=dtype, eps=rms_norm_eps,
+            hidden_size,
+            dtype=dtype,
+            eps=rms_norm_eps,
         )
 
     def __call__(
-        self, x: TensorValue, rope: RotaryEmbedding,
+        self,
+        x: TensorValue,
+        rope: RotaryEmbedding,
     ) -> TensorValue:
         residual = x
         x = self.input_layernorm(x)
@@ -153,7 +175,9 @@ class Qwen25VLTextEncoderTransformer(Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, dtype=dtype, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size, dtype=dtype, eps=config.rms_norm_eps
+        )
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
         """Run transformer layers + norm on pre-embedded hidden states."""
