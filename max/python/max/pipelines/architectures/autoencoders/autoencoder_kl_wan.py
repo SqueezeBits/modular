@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from itertools import pairwise
 from typing import Any, Literal
@@ -26,11 +27,11 @@ from max.graph import DeviceRef, Graph, TensorType, TensorValue, Weight, ops
 from max.graph.buffer_utils import cast_dlpack_to
 from max.graph.type import ConvInputLayout, FilterLayout
 from max.graph.weights import Weights
+from max.experimental.functional import concat, pad
+from max.experimental.tensor import Tensor
 from max.nn.layer import LayerList, Module
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
-from max.experimental.tensor import Tensor
-from max.experimental import functional as F
 
 from .model_config import AutoencoderKLWanConfig
 
@@ -42,11 +43,15 @@ WAN_DECODER_CACHE_SLOTS = 32
 
 def _zero_cache_for(x: TensorValue) -> TensorValue:
     """Create a zero cache tensor shaped for a causal conv input."""
-    shape = [int(x.shape[0]), int(x.shape[1]), CACHE_T, int(x.shape[3]), int(x.shape[4])]
-    return ops.constant(
-        np.zeros(shape, dtype=np.float32),
-        dtype=x.dtype,
-        device=x.device,
+    shape = [
+        int(x.shape[0]),
+        int(x.shape[1]),
+        CACHE_T,
+        int(x.shape[3]),
+        int(x.shape[4]),
+    ]
+    return ops.constant(0.0, dtype=x.dtype, device=x.device).broadcast_to(
+        shape
     )
 
 
@@ -89,8 +94,8 @@ class WanCausalConv3d(Module):
     (temporal) dimension is padded on the left only, which the conv3d
     padding parameter supports directly.
 
-    Weights stay in FCQRS (PyTorch) layout. Input is permuted from
-    NCDHW to NDHWC before conv, and back after.
+    Input is permuted from NCDHW to NDHWC before conv, and back after.
+    Weights use MAX's native QRSCF layout [D, H, W, C, F].
     """
 
     def __init__(
@@ -122,10 +127,10 @@ class WanCausalConv3d(Module):
 
         dev_ref = device if device is not None else DeviceRef.CPU()
         dt = dtype or DType.float32
-        # Weight in FCQRS layout (PyTorch convention)
-        f, c = out_channels, in_channels
         d, h, w = kernel_size
-        self.filter = Weight("weight", dt, [f, c, d, h, w], dev_ref)
+        self.filter = Weight(
+            "weight", dt, [d, h, w, in_channels, out_channels], dev_ref
+        )
         self._has_bias = has_bias
         if has_bias:
             self.bias = Weight("bias", dt, [out_channels], dev_ref)
@@ -138,7 +143,7 @@ class WanCausalConv3d(Module):
             self.filter,
             stride=self._stride,
             padding=self._padding,
-            filter_layout=FilterLayout.FCQRS,
+            filter_layout=FilterLayout.QRSCF,
         )
         # NDHWC -> NCDHW
         out = ops.permute(out, [0, 4, 1, 2, 3])
@@ -186,9 +191,10 @@ class WanCausalConv3dCached(Module):
 
         dev_ref = device if device is not None else DeviceRef.CPU()
         dt = dtype or DType.float32
-        f, c = out_channels, in_channels
         d, h, w = kernel_size
-        self.filter = Weight("weight", dt, [f, c, d, h, w], dev_ref)
+        self.filter = Weight(
+            "weight", dt, [d, h, w, in_channels, out_channels], dev_ref
+        )
         self._has_bias = has_bias
         if has_bias:
             self.bias = Weight("bias", dt, [out_channels], dev_ref)
@@ -210,7 +216,7 @@ class WanCausalConv3dCached(Module):
             self.filter,
             stride=self._stride,
             padding=self._padding,
-            filter_layout=FilterLayout.FCQRS,
+            filter_layout=FilterLayout.QRSCF,
         )
         # NDHWC -> NCDHW
         out = ops.permute(out, [0, 4, 1, 2, 3])
@@ -479,17 +485,13 @@ class WanAttentionBlock(Module):
         pad_w = (ws - (w % ws)) % ws
         if pad_w:
             zw = ops.constant(
-                np.zeros([b * t, h, pad_w, 3 * c], dtype=np.float32),
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
+                0.0, dtype=qkv.dtype, device=qkv.device
+            ).broadcast_to([b * t, h, pad_w, 3 * c])
             qkv = ops.concat([qkv, zw], axis=2)
         if pad_h:
             zh = ops.constant(
-                np.zeros([b * t, pad_h, w + pad_w, 3 * c], dtype=np.float32),
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
+                0.0, dtype=qkv.dtype, device=qkv.device
+            ).broadcast_to([b * t, pad_h, w + pad_w, 3 * c])
             qkv = ops.concat([qkv, zh], axis=1)
 
         h_p = h + pad_h
@@ -1499,7 +1501,7 @@ class _CachedFramewiseDecoder:
             caches = list(outputs[1:])
             decoded_frames.append(Tensor.from_dlpack(decoded_buf).to(cpu))
 
-        return F.concat(decoded_frames, axis=2).to(gpu)
+        return concat(decoded_frames, axis=2).to(gpu)
 
 
 _VAEShapeKey = tuple[int, int, int, int, int]
@@ -1521,6 +1523,8 @@ class AutoencoderKLWanModel(ComponentModel):
         encoding: SupportedEncoding,
         devices: list[Device],
         weights: Weights,
+        session: InferenceSession | None = None,
+        eager_load: bool = True,
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = AutoencoderKLWanConfig.generate(config, encoding, devices)
@@ -1528,56 +1532,71 @@ class AutoencoderKLWanModel(ComponentModel):
         self._framewise_decoder_cache: dict[
             _VAEFramewiseKey, _CachedFramewiseDecoder
         ] = {}
-        self._session = InferenceSession(devices=devices)
-        self.load_model()
+        self._decoder_state_dict: dict[str, Any] | None = None
+        self._session = session or InferenceSession(devices=devices)
+        self._load_lock = threading.Lock()
+        self._compile_lock = threading.Lock()
+        if eager_load:
+            self.load_model()
 
     def load_model(self) -> Callable[[Tensor], Tensor]:
-        decoder_state_dict: dict[str, Any] = {}
-        target_dtype = self.config.dtype
+        with self._load_lock:
+            if self._decoder_state_dict is not None:
+                return self.decode_4d
 
-        assert self.weights is not None
-        weights_obj: Any = self.weights
+            decoder_state_dict: dict[str, Any] = {}
+            target_dtype = self.config.dtype
 
-        for key, value in weights_obj.items():
-            if not (
-                key.startswith("decoder.") or key.startswith("post_quant_conv.")
-            ):
-                continue
+            assert self.weights is not None
+            weights_obj: Any = self.weights
 
-            weight_data = value.data()
+            for key, value in weights_obj.items():
+                if not (
+                    key.startswith("decoder.")
+                    or key.startswith("post_quant_conv.")
+                ):
+                    continue
 
-            # Wan checkpoints store filters in PyTorch layout.
-            # Conv3d weights stay in FCQRS for cuDNN dispatch.
-            # Resample Conv2d (permute=True equivalent) stays in FCRS.
-            # Attention Conv2d (permute=False equivalent) needs RSCF [H,W,in,out].
-            if key.endswith(".weight") and len(weight_data.shape) == 4:
-                is_resample_conv = "resample" in key
-                if not is_resample_conv:
+                weight_data = value.data()
+
+                # Wan checkpoints store filters in PyTorch layout.
+                # Conv3d weights are converted to MAX QRSCF layout.
+                # Resample Conv2d (permute=True equivalent) stays in FCRS.
+                # Attention Conv2d (permute=False equivalent) needs RSCF [H,W,in,out].
+                if key.endswith(".weight") and len(weight_data.shape) == 5:
                     weight_data = np.ascontiguousarray(
-                        np.from_dlpack(weight_data).transpose(2, 3, 1, 0)
+                        np.from_dlpack(weight_data).transpose(
+                            2, 3, 4, 1, 0
+                        )
+                    )
+                if key.endswith(".weight") and len(weight_data.shape) == 4:
+                    is_resample_conv = "resample" in key
+                    if not is_resample_conv:
+                        weight_data = np.ascontiguousarray(
+                            np.from_dlpack(weight_data).transpose(2, 3, 1, 0)
+                        )
+
+                decoder_state_dict[key] = weight_data
+
+            # Cast all weights to target dtype using a compiled graph (cached
+            # per dtype pair, so the LLVM compilation only happens once).
+            if target_dtype != DType.float32:
+                cpu_device = CPU()
+                for key in decoder_state_dict:
+                    decoder_state_dict[key] = cast_dlpack_to(
+                        decoder_state_dict[key],
+                        DType.float32,
+                        target_dtype,
+                        cpu_device,
                     )
 
-            decoder_state_dict[key] = weight_data
+            # Defer compilation to first decode_5d() call so we have concrete
+            # dimensions. Keep a small shape cache for mixed-resolution serving.
+            self._decoder_state_dict = decoder_state_dict
+            # Free the raw Weights object now that we have the state dict.
+            self.weights = None  # type: ignore[assignment]
 
-        # Cast all weights to target dtype using a compiled graph (cached
-        # per dtype pair, so the LLVM compilation only happens once).
-        if target_dtype != DType.float32:
-            cpu_device = CPU()
-            for key in decoder_state_dict:
-                decoder_state_dict[key] = cast_dlpack_to(
-                    decoder_state_dict[key],
-                    DType.float32,
-                    target_dtype,
-                    cpu_device,
-                )
-
-        # Defer compilation to first decode_5d() call so we have concrete
-        # dimensions. Keep a small shape cache for mixed-resolution serving.
-        self._decoder_state_dict = decoder_state_dict
-        # Free the raw Weights object now that we have the state dict.
-        self.weights = None  # type: ignore[assignment]
-
-        return self.decode_4d
+            return self.decode_4d
 
     def _compile_decoder(
         self,
@@ -1615,21 +1634,22 @@ class AutoencoderKLWanModel(ComponentModel):
         return None
 
     def _get_shape_cached_decoder(self, shape: _VAEShapeKey) -> _FullDecoder:
-        cached = self._shape_decoder_cache.get(shape)
-        if cached is not None:
-            return cached
+        with self._compile_lock:
+            cached = self._shape_decoder_cache.get(shape)
+            if cached is not None:
+                return cached
 
-        decoder = self._compile_decoder(shape)
-        self._shape_decoder_cache[shape] = decoder
+            decoder = self._compile_decoder(shape)
+            self._shape_decoder_cache[shape] = decoder
 
-        if len(self._shape_decoder_cache) > self.MAX_CACHED_DECODERS:
-            oldest_key = next(iter(self._shape_decoder_cache))
-            if oldest_key != shape:
-                self._shape_decoder_cache.pop(oldest_key, None)
-            else:
-                # Shape itself is first only when cache size==1; keep it.
-                pass
-        return decoder
+            if len(self._shape_decoder_cache) > self.MAX_CACHED_DECODERS:
+                oldest_key = next(iter(self._shape_decoder_cache))
+                if oldest_key != shape:
+                    self._shape_decoder_cache.pop(oldest_key, None)
+                else:
+                    # Shape itself is first only when cache size==1; keep it.
+                    pass
+            return decoder
 
     def _compile_framewise_cached_decoder(
         self, shape: _VAEFramewiseKey
@@ -1705,17 +1725,36 @@ class AutoencoderKLWanModel(ComponentModel):
     def _get_framewise_cached_decoder(
         self, shape: _VAEFramewiseKey
     ) -> _CachedFramewiseDecoder:
-        cached = self._framewise_decoder_cache.get(shape)
-        if cached is not None:
-            return cached
+        with self._compile_lock:
+            cached = self._framewise_decoder_cache.get(shape)
+            if cached is not None:
+                return cached
 
-        decoder = self._compile_framewise_cached_decoder(shape)
-        self._framewise_decoder_cache[shape] = decoder
-        if len(self._framewise_decoder_cache) > self.MAX_CACHED_DECODERS:
-            oldest_key = next(iter(self._framewise_decoder_cache))
-            if oldest_key != shape:
-                self._framewise_decoder_cache.pop(oldest_key, None)
-        return decoder
+            decoder = self._compile_framewise_cached_decoder(shape)
+            self._framewise_decoder_cache[shape] = decoder
+            if len(self._framewise_decoder_cache) > self.MAX_CACHED_DECODERS:
+                oldest_key = next(iter(self._framewise_decoder_cache))
+                if oldest_key != shape:
+                    self._framewise_decoder_cache.pop(oldest_key, None)
+            return decoder
+
+    def prewarm_for_latent_shape(self, shape: _VAEShapeKey) -> None:
+        self.load_model()
+        batch_size, z_dim, _frames, latent_h, latent_w = shape
+        if self.CHUNK_T == 1:
+            self._get_framewise_cached_decoder(
+                (batch_size, z_dim, latent_h, latent_w)
+            )
+            return
+        self._get_shape_cached_decoder(
+            (
+                batch_size,
+                z_dim,
+                min(shape[2], self.CHUNK_T),
+                latent_h,
+                latent_w,
+            )
+        )
 
     @staticmethod
     def _is_cuda_oom(exc: Exception) -> bool:
@@ -1753,7 +1792,7 @@ class AutoencoderKLWanModel(ComponentModel):
             if int(chunk.shape[2]) < chunk_t:
                 pad_t = chunk_t - int(chunk.shape[2])
                 actual_t = int(chunk.shape[2])
-                chunk = F.pad(
+                chunk = pad(
                     chunk, [0, 0, 0, 0, 0, pad_t, 0, 0, 0, 0]
                 )
                 decoded = decoder(chunk)
@@ -1763,7 +1802,7 @@ class AutoencoderKLWanModel(ComponentModel):
 
             decoded_chunks.append(decoded.to(cpu))
 
-        return F.concat(decoded_chunks, axis=2).to(gpu)
+        return concat(decoded_chunks, axis=2).to(gpu)
 
     def decode_5d(self, latents_5d: Tensor) -> Tensor:
         """Decode 5D latents [B, C, T, H, W].
@@ -1805,7 +1844,7 @@ class AutoencoderKLWanModel(ComponentModel):
         raise RuntimeError("Wan VAE decode failed without an explicit error.")
 
     def decode_4d(self, latents_4d: Tensor) -> Tensor:
-        z5d = F.unsqueeze(latents_4d, axis=2)
+        z5d = latents_4d.unsqueeze(axis=2)
         decoded_5d = self.decode_5d(z5d)
         return decoded_5d[:, :, 0, :, :]
 

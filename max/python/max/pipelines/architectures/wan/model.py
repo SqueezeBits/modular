@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -250,141 +251,163 @@ class WanTransformerModel(ComponentModel):
         devices: list[Device],
         weights: Weights,
         session: InferenceSession | None = None,
+        eager_load: bool = True,
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = WanConfig.generate(config, encoding, devices)
-        self._state_dict = _remap_state_dict(
-            self.weights,
-            target_dtype=self.config.dtype,
-        )
-        # Free the raw Weights object (~56 GB fp32) now that we have the
-        # remapped state dict.
-        self.weights = None  # type: ignore[assignment]
+        self._state_dict: dict[str, object] | None = None
         self.model: _BlockLevelModel | None = None
         self._rope_cache: dict[tuple[int, int, int], tuple[Buffer, Buffer]] = {}
         self._max_rope_cache_entries = 8
         self.session = session or InferenceSession(devices=devices)
+        self._load_lock = threading.Lock()
+        if eager_load:
+            self.load_model()
 
     def load_model(self) -> Callable[..., Any]:
-        return lambda: None
-
-    def compile_model(self) -> None:
         """Compile the transformer as separate pre/block/post graphs.
 
         Uses symbolic dimensions so the compiled graphs work for any
         resolution / frame count without recompilation.
         """
-        if self.model is not None:
-            return
+        with self._load_lock:
+            if self.model is not None:
+                return self.__call__
 
-        dim = self.config.num_attention_heads * self.config.attention_head_dim
-        dtype = self.config.dtype
-        dev = self.config.device
-        dev_ref = DeviceRef.from_device(dev)
-
-        # --- Split state dict by component ---
-        pre_weights: dict[str, object] = {}
-        post_weights: dict[str, object] = {}
-        block_weights_list: list[dict[str, object]] = [
-            {} for _ in range(self.config.num_layers)
-        ]
-
-        for key, value in self._state_dict.items():
-            if key.startswith("patch_embedding.") or key.startswith(
-                "condition_embedder."
-            ):
-                pre_weights[key] = value
-            elif key.startswith("blocks."):
-                rest = key[len("blocks."):]
-                dot = rest.index(".")
-                block_idx = int(rest[:dot])
-                sub_key = rest[dot + 1:]
-                block_weights_list[block_idx][sub_key] = value
-            else:
-                post_weights[key] = value
-
-        # --- Compile pre-processing (symbolic spatial dims) ---
-        pre_input_types = [
-            TensorType(
-                dtype,
-                ["batch", self.config.in_channels, "frames", "height", "width"],
-                device=dev,
-            ),
-            TensorType(DType.float32, ["batch"], device=dev),
-            TensorType(
-                dtype, ["batch", "seq_text", self.config.text_dim], device=dev
-            ),
-        ]
-        pre_module = WanTransformerPreProcess(
-            self.config, dtype=dtype, device=dev_ref
-        )
-        pre_module.load_state_dict(pre_weights, weight_alignment=1, strict=True)
-        with Graph("wan_pre", input_types=pre_input_types) as pre_graph:
-            outs = pre_module(*(v.tensor for v in pre_graph.inputs))
-            pre_graph.output(*outs)
-        pre_model = self.session.load(
-            pre_graph, weights_registry=pre_module.state_dict()
-        )
-
-        # --- Compile each transformer block (symbolic seq_len) ---
-        block_input_types = [
-            TensorType(dtype, ["batch", "seq_len", dim], device=dev),
-            TensorType(dtype, ["batch", "seq_text", dim], device=dev),
-            TensorType(dtype, ["batch", 6, dim], device=dev),
-            TensorType(
-                DType.float32,
-                ["seq_len", self.config.attention_head_dim],
-                device=dev,
-            ),
-            TensorType(
-                DType.float32,
-                ["seq_len", self.config.attention_head_dim],
-                device=dev,
-            ),
-        ]
-
-        block_models: list[Model] = []
-        for i in range(self.config.num_layers):
-            block = WanTransformerBlock(
-                dim=dim,
-                ffn_dim=self.config.ffn_dim,
-                num_heads=self.config.num_attention_heads,
-                head_dim=self.config.attention_head_dim,
-                text_dim=dim,
-                cross_attn_norm=self.config.cross_attn_norm,
-                eps=self.config.eps,
-                dtype=dtype,
-                device=dev_ref,
-            )
-            block.load_state_dict(
-                block_weights_list[i], weight_alignment=1, strict=True
-            )
-            with Graph(f"wan_block_{i}", input_types=block_input_types) as block_graph:
-                block_out = block(*(v.tensor for v in block_graph.inputs))
-                block_graph.output(block_out)
-            block_models.append(
-                self.session.load(
-                    block_graph, weights_registry=block.state_dict()
+            if self._state_dict is None:
+                self._state_dict = _remap_state_dict(
+                    self.weights,
+                    target_dtype=self.config.dtype,
                 )
+                # Free the raw Weights object (~56 GB fp32) now that we have the
+                # remapped state dict.
+                self.weights = None  # type: ignore[assignment]
+
+            state_dict = self._state_dict
+
+            dim = self.config.num_attention_heads * self.config.attention_head_dim
+            dtype = self.config.dtype
+            dev = self.config.device
+            dev_ref = DeviceRef.from_device(dev)
+
+            # --- Split state dict by component ---
+            pre_weights: dict[str, object] = {}
+            post_weights: dict[str, object] = {}
+            block_weights_list: list[dict[str, object]] = [
+                {} for _ in range(self.config.num_layers)
+            ]
+
+            for key, value in state_dict.items():
+                if key.startswith("patch_embedding.") or key.startswith(
+                    "condition_embedder."
+                ):
+                    pre_weights[key] = value
+                elif key.startswith("blocks."):
+                    rest = key[len("blocks."):]
+                    dot = rest.index(".")
+                    block_idx = int(rest[:dot])
+                    sub_key = rest[dot + 1:]
+                    block_weights_list[block_idx][sub_key] = value
+                else:
+                    post_weights[key] = value
+
+            # --- Compile pre-processing (symbolic spatial dims) ---
+            pre_input_types = [
+                TensorType(
+                    dtype,
+                    [
+                        "batch",
+                        self.config.in_channels,
+                        "frames",
+                        "height",
+                        "width",
+                    ],
+                    device=dev,
+                ),
+                TensorType(DType.float32, ["batch"], device=dev),
+                TensorType(
+                    dtype,
+                    ["batch", "seq_text", self.config.text_dim],
+                    device=dev,
+                ),
+            ]
+            pre_module = WanTransformerPreProcess(
+                self.config, dtype=dtype, device=dev_ref
+            )
+            pre_module.load_state_dict(
+                pre_weights, weight_alignment=1, strict=True
+            )
+            with Graph("wan_pre", input_types=pre_input_types) as pre_graph:
+                outs = pre_module(*(v.tensor for v in pre_graph.inputs))
+                pre_graph.output(*outs)
+            pre_model = self.session.load(
+                pre_graph, weights_registry=pre_module.state_dict()
             )
 
-        # --- Compile post-processing (spatial shape tensor carries ppf/pph/ppw) ---
-        post_input_types = [
-            TensorType(dtype, ["batch", "seq_len", dim], device=dev),
-            TensorType(dtype, ["batch", dim], device=dev),  # temb
-            TensorType(DType.int8, ["ppf", "pph", "ppw"], device=dev),
-        ]
-        post_module = WanTransformerPostProcess(
-            self.config, dtype=dtype, device=dev_ref
-        )
-        post_module.load_state_dict(post_weights, weight_alignment=1, strict=True)
-        with Graph("wan_post", input_types=post_input_types) as post_graph:
-            post_out = post_module(*(v.tensor for v in post_graph.inputs))
-            post_graph.output(post_out)
-        post_model = self.session.load(
-            post_graph, weights_registry=post_module.state_dict()
-        )
-        self.model = _BlockLevelModel(pre_model, block_models, post_model)
+            # --- Compile each transformer block (symbolic seq_len) ---
+            block_input_types = [
+                TensorType(dtype, ["batch", "seq_len", dim], device=dev),
+                TensorType(dtype, ["batch", "seq_text", dim], device=dev),
+                TensorType(dtype, ["batch", 6, dim], device=dev),
+                TensorType(
+                    DType.float32,
+                    ["seq_len", self.config.attention_head_dim],
+                    device=dev,
+                ),
+                TensorType(
+                    DType.float32,
+                    ["seq_len", self.config.attention_head_dim],
+                    device=dev,
+                ),
+            ]
+
+            block_models: list[Model] = []
+            for i in range(self.config.num_layers):
+                block = WanTransformerBlock(
+                    dim=dim,
+                    ffn_dim=self.config.ffn_dim,
+                    num_heads=self.config.num_attention_heads,
+                    head_dim=self.config.attention_head_dim,
+                    text_dim=dim,
+                    cross_attn_norm=self.config.cross_attn_norm,
+                    eps=self.config.eps,
+                    dtype=dtype,
+                    device=dev_ref,
+                )
+                block.load_state_dict(
+                    block_weights_list[i], weight_alignment=1, strict=True
+                )
+                with Graph(
+                    f"wan_block_{i}", input_types=block_input_types
+                ) as block_graph:
+                    block_out = block(*(v.tensor for v in block_graph.inputs))
+                    block_graph.output(block_out)
+                block_models.append(
+                    self.session.load(
+                        block_graph, weights_registry=block.state_dict()
+                    )
+                )
+
+            # --- Compile post-processing (spatial shape tensor carries ppf/pph/ppw) ---
+            post_input_types = [
+                TensorType(dtype, ["batch", "seq_len", dim], device=dev),
+                TensorType(dtype, ["batch", dim], device=dev),  # temb
+                TensorType(DType.int8, ["ppf", "pph", "ppw"], device=dev),
+            ]
+            post_module = WanTransformerPostProcess(
+                self.config, dtype=dtype, device=dev_ref
+            )
+            post_module.load_state_dict(
+                post_weights, weight_alignment=1, strict=True
+            )
+            with Graph("wan_post", input_types=post_input_types) as post_graph:
+                post_out = post_module(*(v.tensor for v in post_graph.inputs))
+                post_graph.output(post_out)
+            post_model = self.session.load(
+                post_graph, weights_registry=post_module.state_dict()
+            )
+            self.model = _BlockLevelModel(pre_model, block_models, post_model)
+            return self.__call__
 
     def compute_rope(
         self,
@@ -410,3 +433,25 @@ class WanTransformerModel(ComponentModel):
         if len(self._rope_cache) > self._max_rope_cache_entries:
             self._rope_cache.pop(next(iter(self._rope_cache)))
         return rope
+
+    def __call__(
+        self,
+        hidden_states: Buffer,
+        timestep: Buffer,
+        encoder_hidden_states: Buffer,
+        rope_cos: Buffer,
+        rope_sin: Buffer,
+        spatial_shape: Buffer,
+    ) -> Buffer:
+        if self.model is None:
+            self.load_model()
+        if self.model is None:
+            raise RuntimeError("Wan transformer model failed to load.")
+        return self.model(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            rope_cos,
+            rope_sin,
+            spatial_shape,
+        )

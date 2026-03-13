@@ -14,14 +14,14 @@
 from __future__ import annotations
 
 import torch
-from max.pipelines.architectures.wan.model_config import WanDiTConfigBase
+from max.pipelines.architectures.wan.model_config import WanConfigBase
 from max.pipelines.architectures.wan.pipeline_wan import WanPipeline
 from max.experimental.tensor import Tensor
 from torch.utils.dlpack import from_dlpack
 
 
 def test_wan_dit_config_defaults_match_diffusers_signature() -> None:
-    config = WanDiTConfigBase()
+    config = WanConfigBase()
     assert config.patch_size == (1, 2, 2)
     assert config.num_attention_heads == 40
     assert config.attention_head_dim == 128

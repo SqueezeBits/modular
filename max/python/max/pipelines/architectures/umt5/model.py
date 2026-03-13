@@ -15,7 +15,7 @@ from typing import Any
 
 from max.experimental import functional as F
 from max.driver import Device
-from max.engine import Model
+from max.engine import InferenceSession, Model
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
@@ -32,8 +32,10 @@ class UMT5Model(ComponentModel):
         encoding: SupportedEncoding,
         devices: list[Device],
         weights: Weights,
+        session: InferenceSession | None = None,
     ) -> None:
         super().__init__(config, encoding, devices, weights)
+        self.session = session
         self.config: UMT5ConfigBase = UMT5Config.generate(
             config,
             encoding,

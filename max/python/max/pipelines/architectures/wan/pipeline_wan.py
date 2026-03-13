@@ -18,12 +18,15 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from concurrent.futures import Future
+from time import perf_counter
 
 import numpy as np
 import numpy.typing as npt
+from max._mlir_context import MLIRThreadPoolExecutor
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
-from max.experimental import functional as F
+from max.experimental.functional import concat, reshape, stack, tile
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
 from max.graph.weights import load_weights
@@ -109,38 +112,67 @@ class WanPipeline(DiffusionPipeline):
         components_cfg = diffusers_config.get("components", {})
         relative_paths = self._resolve_relative_component_paths()
 
+        def _load_component(
+            name: str,
+            component_cls: type[ComponentModel],
+            *,
+            session: object | None = None,
+            eager_load: bool = True,
+        ) -> ComponentModel:
+            start = perf_counter()
+            logger.info("Loading Wan component: %s", name)
+            config_dict = self._get_component_config_dict(components_cfg, name)
+            abs_paths = self._resolve_absolute_paths(
+                weight_paths, relative_paths[name]
+            )
+            component_cls_any = component_cls
+            component_kwargs = {
+                "config": config_dict,
+                "encoding": self.pipeline_config.model.quantization_encoding,
+                "devices": self.devices,
+                "weights": load_weights(abs_paths),
+            }
+            if session is not None:
+                component_kwargs["session"] = session
+            if component_cls is WanTransformerModel:
+                component_kwargs["eager_load"] = eager_load
+            if component_cls is AutoencoderKLWanModel:
+                component_kwargs["eager_load"] = eager_load
+            component = component_cls_any(
+                **component_kwargs,
+            )
+            logger.info(
+                "Loaded Wan component %s in %.2fs", name, perf_counter() - start
+            )
+            return component
+
         models: dict[str, ComponentModel] = {}
         for name, component_cls in tqdm(
             self.components.items(), desc="Loading sub models"
         ):
             if not issubclass(component_cls, ComponentModel):
                 continue
-            config_dict = self._get_component_config_dict(
-                components_cfg, name
-            )
-            abs_paths = self._resolve_absolute_paths(
-                weight_paths, relative_paths[name]
-            )
-            models[name] = component_cls(
-                config=config_dict,
-                encoding=self.pipeline_config.model.quantization_encoding,
-                devices=self.devices,
-                weights=load_weights(abs_paths),
+            component_session: object | None = None
+            component_eager_load = True
+            if component_cls is UMT5Model:
+                component_session = self.session
+            elif component_cls is WanTransformerModel:
+                component_session = self.session
+            elif component_cls is AutoencoderKLWanModel:
+                component_eager_load = False
+            models[name] = _load_component(
+                name,
+                component_cls,
+                session=component_session,
+                eager_load=component_eager_load,
             )
 
         # Optionally load transformer_2 (low-noise expert) for MoE models.
         if "transformer_2" in relative_paths:
-            config_dict = self._get_component_config_dict(
-                components_cfg, "transformer_2"
-            )
-            abs_paths = self._resolve_absolute_paths(
-                weight_paths, relative_paths["transformer_2"]
-            )
-            models["transformer_2"] = WanTransformerModel(
-                config=config_dict,
-                encoding=self.pipeline_config.model.quantization_encoding,
-                devices=self.devices,
-                weights=load_weights(abs_paths),
+            models["transformer_2"] = _load_component(
+                "transformer_2",
+                WanTransformerModel,
+                eager_load=False,
             )
         else:
             self.transformer_2 = None
@@ -189,13 +221,12 @@ class WanPipeline(DiffusionPipeline):
 
         self.build_guidance_model()
 
-        # Pre-compile transformers with symbolic dims (no recompilation needed).
-        self.transformer.compile_model()
-        if self.transformer_2 is not None:
-            self.transformer_2.compile_model()
         self.vae.prepare_for_serving()
         self._cached_spatial_shapes: dict[str, Buffer] = {}
         self._cached_batched_timesteps: dict[str, list[Buffer]] = {}
+        self._warmup_executor = MLIRThreadPoolExecutor(max_workers=2)
+        self._low_noise_future: Future[object] | None = None
+        self._vae_prewarm_future: Future[object] | None = None
 
     def build_guidance_model(self) -> None:
         """Compile classifier-free guidance: uncond + scale * (cond - uncond)."""
@@ -351,7 +382,10 @@ class WanPipeline(DiffusionPipeline):
             if has_moe:
                 assert boundary_timestep is not None
                 for idx in range(num_steps):
-                    if float(scheduler_timesteps[idx]) < boundary_timestep:
+                    if self.use_low_noise_transformer(
+                        float(scheduler_timesteps[idx]),
+                        boundary_timestep,
+                    ):
                         boundary_step_idx = idx
                         break
 
@@ -363,10 +397,13 @@ class WanPipeline(DiffusionPipeline):
         ppw = int(latents.shape[4]) // p_w
         spatial_shape = self._get_spatial_shape(ppf, pph, ppw, device)
 
-        high_noise_model = self.transformer.model
-        assert high_noise_model is not None
+        high_noise_model = self.transformer
 
         latents_np_cache: np.ndarray | None = None
+        self._start_background_warmups(
+            latents_shape=tuple(int(dim) for dim in latents.shape),
+            has_moe=has_moe,
+        )
         with Tracer("denoising_high_noise"):
             latents, latents_np_cache = self._run_denoising_phase(
                 latents=latents,
@@ -389,10 +426,9 @@ class WanPipeline(DiffusionPipeline):
             )
 
         if has_moe and boundary_step_idx < num_steps:
-            low_noise_model = (
-                self.transformer_2.model if self.transformer_2 else None
-            )
+            low_noise_model = self.transformer_2
             assert low_noise_model is not None
+            self._finish_low_noise_warmup()
 
             with Tracer("denoising_low_noise"):
                 latents, latents_np_cache = self._run_denoising_phase(
@@ -414,7 +450,7 @@ class WanPipeline(DiffusionPipeline):
                 )
 
         with Tracer("denormalize_latents"):
-            denorm_latents = latents * self._vae_std_t + self._vae_mean_t
+            denorm_latents = self._denormalize_vae_latents(latents)
             denorm_latents = denorm_latents.cast(transformer_dtype)
             raw_latents_dump = os.getenv("WAN_DUMP_RAW_LATENTS_NPY")
             denorm_latents_dump = os.getenv("WAN_DUMP_DENORM_LATENTS_NPY")
@@ -434,6 +470,9 @@ class WanPipeline(DiffusionPipeline):
                 )
 
         with Tracer("vae_decode"):
+            self._finish_vae_prewarm(
+                tuple(int(dim) for dim in denorm_latents.shape)
+            )
             decoded_video = self.vae.decode_5d(denorm_latents)
             decoded_num_frames = int(decoded_video.shape[2])
             target_num_frames = min(
@@ -630,7 +669,7 @@ class WanPipeline(DiffusionPipeline):
         hidden_dim = int(hidden_states.shape[2])
         rows: list[Tensor] = []
         for batch_idx in range(batch_size):
-            seq_len = int(F.sum(attention_mask[batch_idx], axis=0).item())
+            seq_len = int(attention_mask[batch_idx].sum(axis=0).item())
             seq_len = max(0, min(seq_len, int(hidden_states.shape[1])))
             row = hidden_states[batch_idx, :seq_len, :]
             if seq_len < max_sequence_length:
@@ -639,20 +678,20 @@ class WanPipeline(DiffusionPipeline):
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
-                row = F.concat([row, pad], axis=0)
+                row = concat([row, pad], axis=0)
             elif seq_len > max_sequence_length:
                 row = row[:max_sequence_length, :]
             rows.append(row)
 
-        prompt_embeds = F.stack(rows, axis=0)
+        prompt_embeds = stack(rows, axis=0)
 
         if num_videos_per_prompt <= 1:
             return prompt_embeds
 
         batch_size = int(prompt_embeds.shape[0])
         seq_len = int(prompt_embeds.shape[1])
-        prompt_embeds = F.tile(prompt_embeds, (1, num_videos_per_prompt, 1))
-        return F.reshape(
+        prompt_embeds = tile(prompt_embeds, (1, num_videos_per_prompt, 1))
+        return reshape(
             prompt_embeds,
             (
                 batch_size * num_videos_per_prompt,
@@ -660,6 +699,9 @@ class WanPipeline(DiffusionPipeline):
                 int(prompt_embeds.shape[2]),
             ),
         )
+
+    def _denormalize_vae_latents(self, latents: Tensor) -> Tensor:
+        return latents * self._vae_std_t + self._vae_mean_t
 
     def _normalize_num_frames_for_wan(
         self,
@@ -690,6 +732,68 @@ class WanPipeline(DiffusionPipeline):
         if boundary_ratio is None:
             return None
         return boundary_ratio * num_train_timesteps
+
+    @staticmethod
+    def use_low_noise_transformer(
+        scheduler_timestep: float,
+        boundary_timestep: float | None,
+    ) -> bool:
+        return (
+            boundary_timestep is not None
+            and scheduler_timestep < boundary_timestep
+        )
+
+    def _start_background_warmups(
+        self, latents_shape: tuple[int, int, int, int, int], has_moe: bool
+    ) -> None:
+        if has_moe and self.transformer_2 is not None and self._low_noise_future is None:
+            logger.info("Starting Wan low-noise expert background warmup")
+            self._low_noise_future = self._warmup_executor.submit(
+                self.transformer_2.load_model
+            )
+
+        if self._vae_prewarm_future is None:
+            logger.info(
+                "Starting Wan VAE background prewarm for latent shape %s",
+                latents_shape,
+            )
+            self._vae_prewarm_future = self._warmup_executor.submit(
+                self.vae.prewarm_for_latent_shape, latents_shape
+            )
+
+    def _finish_low_noise_warmup(self) -> None:
+        if self.transformer_2 is None:
+            return
+        if self._low_noise_future is not None:
+            logger.info("Waiting for Wan low-noise expert background warmup")
+            self._low_noise_future.result()
+            self._low_noise_future = None
+        self.transformer_2.load_model()
+
+    def _finish_vae_prewarm(
+        self, latents_shape: tuple[int, int, int, int, int]
+    ) -> None:
+        if self._vae_prewarm_future is not None:
+            logger.info("Waiting for Wan VAE background prewarm")
+            self._vae_prewarm_future.result()
+            self._vae_prewarm_future = None
+        self.vae.prewarm_for_latent_shape(latents_shape)
+
+    @staticmethod
+    def denormalize_vae_latents(
+        latents: Tensor,
+        latents_mean: list[float],
+        latents_std: list[float],
+        z_dim: int,
+    ) -> Tensor:
+        device = latents.device
+        latents_mean_t = Tensor.from_dlpack(
+            np.asarray(latents_mean, dtype=np.float32).reshape(1, z_dim, 1, 1, 1)
+        ).to(device)
+        latents_std_t = Tensor.from_dlpack(
+            np.asarray(latents_std, dtype=np.float32).reshape(1, z_dim, 1, 1, 1)
+        ).to(device)
+        return latents * latents_std_t + latents_mean_t
 
     @staticmethod
     def _to_numpy(image: Tensor) -> np.ndarray:

@@ -15,7 +15,10 @@ modular_py_library(
 
 modular_py_binary(
     name = "simple_offline_generation",
-    srcs = ["simple_offline_generation.py"],
+    srcs = [
+        "simple_offline_generation.py",
+        "simple_offline_video_generation.py",
+    ],
     tags = ["no-pydeps"],  # TODO: Fix and re-enable
     deps = [
         ":profiler",

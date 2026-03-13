@@ -354,11 +354,9 @@ async def generate_video(args: argparse.Namespace) -> None:
             model_path=args.model,
             device_specs=[DeviceSpec.accelerator()],
         ),
-        prefer_module_v3=True,
     )
     arch = PIPELINE_REGISTRY.retrieve_architecture(
         config.model.huggingface_weight_repo,
-        prefer_module_v3=config.prefer_module_v3,
         task=PipelineTask.PIXEL_GENERATION,
     )
     assert arch is not None, "No matching diffusion architecture found."

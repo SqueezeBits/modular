@@ -127,7 +127,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output",
         type=str,
         default="output.png",
-        help="Output filename for the generated image.",
+        help="Output filename for the generated result.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Optional number of frames for video generation.",
+    )
+    parser.add_argument(
+        "--guidance-scale-2",
+        type=float,
+        default=None,
+        help="Optional secondary guidance scale for MoE video models.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=16,
+        help="Frames per second when video output is requested.",
     )
     parser.add_argument(
         "--max-length",
@@ -177,14 +195,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "num-inference-steps must be a positive integer."
     )
     assert args.guidance_scale > 0.0, "guidance-scale must be positive."
-    assert not args.output.lower().endswith(
-        ".mp4"
-    ), (
-        "simple_offline_generation.py is image-only; "
-        "use simple_offline_video_generation.py for video output."
-    )
+    if args.num_frames is not None:
+        assert args.num_frames > 0, "num-frames must be a positive integer."
+    if args.guidance_scale_2 is not None:
+        assert (
+            args.guidance_scale_2 > 0.0
+        ), "guidance-scale-2 must be positive."
+    assert args.fps > 0, "fps must be a positive integer."
 
     return args
+
+
+def _should_use_video_entrypoint(args: argparse.Namespace) -> bool:
+    return (
+        args.output.lower().endswith(".mp4")
+        or args.num_frames is not None
+        or args.guidance_scale_2 is not None
+    )
 
 
 def save_image(image_data: str, output_path: str) -> None:
@@ -254,11 +281,9 @@ async def generate_image(args: argparse.Namespace) -> None:
             model_path=args.model,
             device_specs=[DeviceSpec.accelerator()],
         ),
-        prefer_module_v3=True,
     )
     arch = PIPELINE_REGISTRY.retrieve_architecture(
         config.model.huggingface_weight_repo,
-        prefer_module_v3=config.prefer_module_v3,
         task=PipelineTask.PIXEL_GENERATION,
     )
     assert arch is not None, (
@@ -492,6 +517,13 @@ def main(argv: list[str] | None = None) -> int:
         Process exit code. 0 indicates success.
     """
     args = parse_args(argv)
+
+    if _should_use_video_entrypoint(args):
+        from max.examples.diffusion import (
+            simple_offline_video_generation,
+        )
+
+        return simple_offline_video_generation.main(argv)
 
     try:
         asyncio.run(generate_image(args))
