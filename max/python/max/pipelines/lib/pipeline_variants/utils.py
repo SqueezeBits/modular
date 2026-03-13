@@ -217,12 +217,50 @@ def _maybe_adapt_flux2_klein_fp8_weight_paths(
 
     from max.pipelines.architectures.flux2.weight_adapters import (
         adapt_bflabs_flux2_transformer_weights,
+        materialize_bflabs_flux2_klein_static_repo,
+    )
+    from max.pipelines.lib.hf_utils import HuggingFaceRepo
+    from max.graph.weights import WeightsFormat
+
+    activation_scheme = model_config.fp8_activation_scheme or "static"
+    if activation_scheme != "static":
+        return [
+            adapt_bflabs_flux2_transformer_weights(
+                path, activation_scheme=activation_scheme
+            )
+            for path in weight_paths
+        ]
+
+    if len(weight_paths) != 1:
+        raise ValueError(
+            "Expected a single flat safetensors file for FLUX.2 Klein FP8 "
+            f"materialization, got {len(weight_paths)} paths."
+        )
+
+    diffusers_config = model_config.diffusers_config
+    if diffusers_config is None:
+        raise ValueError(
+            "diffusers_config is required to materialize the FLUX.2 Klein FP8 "
+            "static repo."
+        )
+
+    repo_root = materialize_bflabs_flux2_klein_static_repo(
+        weight_paths[0],
+        base_repo_id=model_config.model_path,
+        base_revision=model_config.huggingface_model_revision,
+        diffusers_config=diffusers_config,
+        force_download=model_config.force_download,
     )
 
-    activation_scheme = model_config.fp8_activation_scheme or "dynamic"
-    return [
-        adapt_bflabs_flux2_transformer_weights(
-            path, activation_scheme=activation_scheme
-        )
-        for path in weight_paths
+    repo = HuggingFaceRepo(repo_id=str(repo_root))
+    materialized_weight_paths = [
+        Path(rel_path)
+        for rel_path in repo.weight_files.get(WeightsFormat.safetensors, [])
     ]
+    model_config.model_path = str(repo_root)
+    model_config._weights_repo_id = str(repo_root)
+    model_config.weight_path = materialized_weight_paths
+    model_config.quantization_encoding = "bfloat16"
+    model_config._diffusers_config = None
+
+    return [repo_root / rel_path for rel_path in materialized_weight_paths]

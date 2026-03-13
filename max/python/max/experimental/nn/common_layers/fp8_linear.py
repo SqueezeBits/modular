@@ -54,7 +54,18 @@ class FP8Linear(Module[[Tensor], Tensor]):
         weight_dtype: DType | None = None,
         bias_dtype: DType | None = None,
     ):
-        self.weight = random.normal([out_dim, in_dim], dtype=weight_dtype)
+        # When float8_config is set, initialize the weight parameter as
+        # float8_e4m3fn so the checkpoint loader preserves the fp8 dtype
+        # from the adapted safetensors file.  Without this, a bfloat16
+        # parameter causes the loader to cast fp8 values → bf16 without
+        # applying the weight_scale, producing ~100× magnitude errors.
+        effective_weight_dtype = (
+            DType.float8_e4m3fn
+            if float8_config is not None
+            and (weight_dtype is None or not weight_dtype.is_float8())
+            else weight_dtype
+        )
+        self.weight = random.normal([out_dim, in_dim], dtype=effective_weight_dtype)
         self.bias = (
             random.normal([out_dim], dtype=bias_dtype or weight_dtype)
             if bias

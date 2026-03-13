@@ -30,3 +30,29 @@ modular_py_binary(
         requirement("torch"),  # for test
     ],
 )
+
+modular_py_binary(
+    name = "inspect_flux2_fp8_static_contract",
+    srcs = ["inspect_flux2_fp8_static_contract.py"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/experimental/nn",
+        "//max/python/max/pipelines/architectures",
+        requirement("safetensors"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "compare_flux2_fp8_layer_quality",
+    srcs = ["compare_flux2_fp8_layer_quality.py"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/experimental/nn",
+        "//max/python/max/pipelines/architectures",
+        requirement("safetensors"),
+        requirement("torch"),
+    ],
+)
