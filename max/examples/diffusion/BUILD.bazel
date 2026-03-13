@@ -49,3 +49,41 @@ modular_py_binary(
         requirement("torch"),
     ],
 )
+
+modular_py_binary(
+    name = "wan_compare_against_diffusers",
+    srcs = ["wan_compare_against_diffusers.py"],
+    tags = ["no-pydeps"],
+    testonly = True,
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("accelerate"),
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "wan_transformer_block_compare",
+    srcs = [
+        "wan_transformer_block_compare.py",
+        "wan_compare_against_diffusers.py",
+    ],
+    tags = ["no-pydeps"],
+    testonly = True,
+    deps = [
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("accelerate"),
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)

@@ -1,93 +1,193 @@
-# WAN Pipeline V2 Migration — Current Status
+# WAN Pipeline — Current Status (2026-03-13)
 
-## What Was Done
+## Branch / Commit
+- Branch: `add/wan-pipeline/full-pipeline`
+- Last pushed commit: `05c2f4f8ee`
+  - `[Pipelines] Fix Wan video generation and startup`
 
-**module_v3 → nn.layer API migration** for the WAN video generation pipeline.
+## What is already committed/pushed
+The pushed commit includes:
+- Wan video generation path working end-to-end
+- `simple_offline_generation` video-argument delegation to video entrypoint
+- Wan VAE dtype/runtime bug fix (`ops.constant` bf16 mismatch)
+- Wan startup cleanup / component-owned load-model structure
+- shared session wiring for Wan components
+- startup latency improvements:
+  - `transformer_2` moved off startup critical path
+  - VAE prewarm improvements
+- Wan tests updated and passing
 
-Migrated from the old API (`max.nn.module_v3`, `max.experimental.tensor.Tensor`, `max.experimental.functional`) to the new v2 API (`max.nn.layer.Module`, `max.graph.TensorValue`, `max.graph.ops`, `max.nn.linear.Linear`, `max.driver.Buffer`).
+## Current uncommitted worktree state
+These are **NOT committed yet**:
+- `max/examples/diffusion/BUILD.bazel` (adds comparison targets)
+- `max/examples/diffusion/wan_compare_against_diffusers.py` (diffusers vs MAX comparison script)
+- `max/examples/diffusion/wan_transformer_block_compare.py` (deeper block-level comparison script)
 
-### Files Modified (5 files, +920 -677 lines)
+Do **not** assume these scripts exist on another server unless copied/cherry-picked.
 
-1. **`max/python/max/pipelines/architectures/flux2/layers/embeddings.py`**
-   - WAN depends on `TimestepEmbedding`, `Timesteps`, `apply_rotary_emb` from here
-   - `F.*` → `ops.*`, `Tensor` → `TensorValue`, `Module[[...], ...]` → `Module`, `forward` → `__call__`
-   - `Linear(in, out, bias=True)` → `Linear(in_dim=, out_dim=, dtype=, device=, has_bias=)`
+## End-to-end runtime status
+### Successful runs
+- smoke run (video entrypoint): success
+- smoke run via image entrypoint delegation: success
+- full run: success
 
-2. **`max/python/max/pipelines/architectures/wan/wan_transformer.py`**
-   - 11 module classes migrated
-   - New `WanConv3d(Module)` class using `Weight` + `ops.conv3d` (NDHWC/QRSCF layout)
-   - `Tensor.ones/zeros` → `Weight("name", dtype, shape, device)`
-   - `flash_attention_gpu` called directly (no `F.functional()` wrapper)
-   - `ModuleList` → `LayerList`
+Generated artifacts in this workspace:
+- `smoke_t2v.mp4`
+- `smoke_t2v_refactored.mp4`
+- `smoke_t2v_via_image_entrypoint.mp4`
+- `smoke_t2v_overlap.mp4`
+- `smoke_t2v_startup_optimized.mp4`
+- `smoke_t2v_startup_optimized2.mp4`
+- `t2v_output.mp4`
 
-3. **`max/python/max/pipelines/architectures/wan/model.py`**
-   - `_BlockLevelModel`: `CompileWrapper` → `Model`, takes/returns `Buffer`
-   - `compile_model()`: `F.lazy()` + `CompileWrapper` → `Graph` + `module.load_state_dict()` + `session.load()`
-   - `_compute_wan_rope`: `Tensor.from_dlpack().to()` → `Buffer.from_numpy().to()`
-   - `_rope_cache`: `tuple[Tensor, Tensor]` → `tuple[Buffer, Buffer]`
+### Tests/builds that passed recently
+- `./bazelw test //max/tests/integration/architectures/wan:wan`
+- `./bazelw build //max/examples/diffusion:simple_offline_generation //max/examples/diffusion:simple_offline_video_generation`
 
-4. **`max/python/max/pipelines/architectures/wan/pipeline_wan.py`**
-   - Runtime tensor types at transformer boundary: `Tensor` → `Buffer`
-   - `prompt_embeds.driver_tensor` to extract `Buffer` from `Tensor` for transformer input
-   - `Tensor.from_dlpack(buffer)` to wrap Buffer back to Tensor for guidance model
-   - **Intentionally kept** `F` and `Tensor` imports for UMT5 text encoder and guidance model (still on module_v3)
+## Comparison work summary
+### Baseline reduced diffusers vs MAX comparison
+Artifacts:
+- `outputs/20260313_042629/`
+  - `comparison_report.json`
+  - `report_ko.md`
+  - paired `diffusers_*.npy` / `max_*.npy`
 
-5. **`max/python/max/pipelines/architectures/autoencoders/autoencoder_kl_wan.py`**
-   - 23+ classes migrated (1724 → 1823 lines)
-   - New conv wrappers: `WanCausalConv3d`, `WanCausalConv3dCached`, `WanConv2dPermuted`, `WanConv2d`
-   - `AutoencoderKLWanModel`: compilation uses `Graph` + `load_state_dict` + `session.load`
-   - **Intentionally kept** `F` and `Tensor` for runtime decode methods
+Reduced settings used for parity:
+- `height=160`
+- `width=256`
+- `num_frames=5`
+- `num_inference_steps=4`
+- `guidance_scale=4.0`
+- `guidance_scale_2=3.0`
 
-## What Needs Testing
+Main findings from baseline:
+- Scheduler matches exactly
+- Text encoder difference is small (~2–3% relative L2)
+- VAE on the same diffusers denorm latents is relatively close (~2.9% relative L2)
+- Main divergence is in DiT and accumulates into final latents/output
+- Example baseline numbers:
+  - `dit.step_0.guided` rel L2: `4.106695e-02`
+  - `dit.step_2.guided` rel L2: `7.781990e-02` (after one modulation/residual experiment)
+  - `pipeline.final_decoded_output` rel L2: `2.654759e-01` (best observed from that experiment)
 
-**NO TESTS HAVE BEEN RUN YET.** The migration is code-complete but unverified.
+### Deep block-level comparison
+Artifacts:
+- `outputs/20260313_053536/`
+  - `block_comparison_report.json`
+  - `block_report_ko.md`
 
-### Test Command (E2E Video Generation)
+Important conclusions from block-level analysis:
+- First noticeably divergent block in high-noise stage: block `15`
+- First noticeably divergent block in low-noise stage: block `12`
+- Pre-block inputs are still very close:
+  - `pre hidden` rel L2 ~ `7e-06`
+  - `timestep_proj` rel L2 ~ `0.003`
+  - `text_emb` rel L2 ~ `0.003`
+- Within the selected block, the first *visible* divergence was around `norm1_out` / `sa_input`
+- However, later analysis showed LayerNorm itself is probably **not** the root cause
 
-```bash
-./bazelw run //max/examples/diffusion:simple_offline_video_generation -- \
-  --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
-  --negative-prompt '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走' \
-  --height 720 --width 1280 --num-frames 81 \
-  --guidance-scale 4.0 --guidance-scale-2 3.0 \
-  --num-inference-steps 40 \
-  --output t2v_out.mp4 --fps 16
-```
+### Forward-hook / finer-grained block comparison
+Artifacts:
+- `outputs/20260313_070221/`
+  - copied from runfiles into repo outputs
+  - `block_comparison_report.json`
+  - `block_report_ko.md`
 
-### Unit Tests
+Important conclusions:
+- Using actual diffusers forward hooks reduced the chance of “wrong probe point” interpretation
+- `norm1_in` is already divergent by ~1.8–2.0% relative L2 in the first problematic block
+- `norm1_out` is similar magnitude to `norm1_in`
+- modulation tensors themselves are much smaller error (~0.3–0.4% relative L2)
+- Therefore:
+  - LayerNorm is **not creating** the large error from nothing
+  - the error is already entering the block from earlier blocks
+  - self-attn / cross-attn / FFN then amplify it
 
-```bash
-./bazelw test //max/tests/integration/architectures/wan/...
-```
+## Experiments already tried and their outcomes
+### 1) Modulation/residual float32 alignment experiment
+Result:
+- Improved numbers somewhat
+- Suggested modulation/residual numerics matter
+- But this was not kept as final committed state
 
-## Key Migration Patterns (Quick Reference)
+### 2) LayerNorm rewrite toward diffusers FP32LayerNorm
+Artifacts:
+- `outputs/20260313_055839/`
+  - `comparison_report.json`
+  - `report_ko.md`
 
-| Old (module_v3)                        | New (nn.layer)                                              |
-|----------------------------------------|-------------------------------------------------------------|
-| `from max.nn.module_v3 import Module`  | `from max.nn.layer import Module`                           |
-| `from max.nn.module_v3 import Linear`  | `from max.nn.linear import Linear`                          |
-| `from max.experimental.tensor import Tensor` | `from max.graph import TensorValue` / `from max.driver import Buffer` |
-| `from max.experimental import functional as F` | `from max.graph import ops`                          |
-| `Module[[In], Out]`                    | `Module`                                                    |
-| `def forward(self, ...)`              | `def __call__(self, ...)`                                   |
-| `Tensor.ones/zeros([dim])`            | `Weight("name", dtype, [dim], device)`                      |
-| `Linear(in, out, bias=True)`          | `Linear(in_dim=, out_dim=, dtype=, device=, has_bias=)`     |
-| `F.reshape/permute/concat`            | `ops.reshape/permute/concat`                                |
-| `CompileWrapper(module, types, weights)` | `Graph` + `load_state_dict` + `session.load()`            |
-| `Tensor.from_dlpack(arr).to(dev)`     | `Buffer.from_numpy(arr).to(dev)`                            |
+Result:
+- Made metrics worse, not better
+- Conclusion: `WanLayerNorm` formula itself is **not** the main culprit
+- This patch was reverted
 
-## Known Design Decisions
+### 3) Cross-attention split-K/V experiment
+Artifacts:
+- `outputs/20260313_062139/`
+  - `comparison_report.json`
+  - `report_ko.md`
 
-- **Buffer↔Tensor bridging**: UMT5 text encoder and guidance model still use module_v3 `Tensor`. At the transformer boundary, we convert using `tensor.driver_tensor` (Tensor→Buffer) and `Tensor.from_dlpack(buffer)` (Buffer→Tensor).
-- **Conv3d layout**: Weights stored in FCQRS (PyTorch) layout with manual NCDHW↔NDHWC permute for input/output.
-- **ops.pad format**: Uses `[d0_before, d0_after, d1_before, d1_after, ...]` (NOT PyTorch's reversed-pairs format).
-- **ops.range**: `ops.range(start, stop, step, dtype=, device=)` replaces `F.arange(0, n, dtype=, device=)`.
+Result:
+- Changing MAX from fused `attn2.to_kv` to split `to_k` / `to_v` gave effectively no improvement
+- Conclusion: cross-attention K/V fusion is **not** the primary root cause
+- This patch was reverted
 
-## Detailed Plan
+## Best current interpretation
+### Ruled out / lower priority
+- scheduler
+- text encoder
+- VAE same-input decode
+- LayerNorm formula itself
+- cross-attention fused K/V as primary culprit
 
-Full migration plan is at: `.claude/plans/vast-scribbling-balloon.md`
+### Still most suspicious
+1. **attention backend / attention numerics**
+   - MAX: `flash_attention_gpu`
+   - diffusers: `WanAttnProcessor` / `dispatch_attention_fn`
+2. **RoPE application differences**
+   - MAX rotary helper vs diffusers local rotary path
+3. **attention-adjacent numeric flow across earlier blocks**
+   - not block-local LayerNorm formula, but block-to-block accumulation through attention paths
 
-## Branch
+## Important caution
+There was concern that comparison probes might be misleading. The later block analysis used actual diffusers forward hooks and showed:
+- the selected block is receiving already-divergent input (`norm1_in`)
+- so “the first place we *see* it” is not necessarily the place it is *born*
 
-`add/wan-pipeline/full-pipeline`
+Translation:
+- the root cause may live in **earlier attention computation** and only become clearly visible later.
+
+## Recommended next steps on another server
+If continuing from scratch on another server, do this in order:
+
+1. Restore or copy the uncommitted comparison scripts if needed:
+   - `wan_compare_against_diffusers.py`
+   - `wan_transformer_block_compare.py`
+   - matching `BUILD.bazel` changes
+
+2. Reproduce reduced comparison baseline first
+   - same reduced settings (`160x256`, `5f`, `4 steps`)
+
+3. Focus next on **attention backend / rotary path**, not LayerNorm or K/V fusion
+   - compare self-attn and cross-attn outputs more directly
+   - ideally compare q/k/v or post-RoPE tensors if instrumentation is feasible
+
+4. Keep checking runtime impact
+   - any parity experiment should also track whether startup / total run time regresses
+
+## Useful artifact directories to inspect manually
+- `outputs/20260313_042629/`
+- `outputs/20260313_053536/`
+- `outputs/20260313_055839/`
+- `outputs/20260313_062139/`
+- `outputs/20260313_070221/`
+
+## Files most relevant for next debugging pass
+- `max/python/max/pipelines/architectures/wan/wan_transformer.py`
+- `max/python/max/pipelines/architectures/wan/model.py`
+- `max/examples/diffusion/wan_compare_against_diffusers.py` (uncommitted)
+- `max/examples/diffusion/wan_transformer_block_compare.py` (uncommitted)
+- diffusers reference:
+  - `diffusers/models/transformers/transformer_wan.py`
+  - `diffusers/models/normalization.py`
+  - `diffusers/models/attention.py`
