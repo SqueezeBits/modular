@@ -264,6 +264,117 @@ class WanTransformerModel(ComponentModel):
         if eager_load:
             self.load_model()
 
+    def _ensure_state_dict(self) -> dict[str, object]:
+        if self._state_dict is None:
+            self._state_dict = _remap_state_dict(
+                self.weights,
+                target_dtype=self.config.dtype,
+            )
+            self.weights = None  # type: ignore[assignment]
+        return self._state_dict
+
+    def prepare_state_dict(self) -> dict[str, object]:
+        """Materialize the remapped state dict without compiling graphs."""
+        with self._load_lock:
+            return self._ensure_state_dict()
+
+    def _split_state_dict(
+        self, state_dict: dict[str, object]
+    ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
+        pre_weights: dict[str, object] = {}
+        post_weights: dict[str, object] = {}
+        block_weights_list: list[dict[str, object]] = [
+            {} for _ in range(self.config.num_layers)
+        ]
+
+        for key, value in state_dict.items():
+            if key.startswith("patch_embedding.") or key.startswith(
+                "condition_embedder."
+            ):
+                pre_weights[key] = value
+            elif key.startswith("blocks."):
+                rest = key[len("blocks."):]
+                dot = rest.index(".")
+                block_idx = int(rest[:dot])
+                sub_key = rest[dot + 1 :]
+                block_weights_list[block_idx][sub_key] = value
+            else:
+                post_weights[key] = value
+
+        return pre_weights, block_weights_list, post_weights
+
+    def _build_weight_registries(
+        self, state_dict: dict[str, object]
+    ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
+        dim = self.config.num_attention_heads * self.config.attention_head_dim
+        dtype = self.config.dtype
+        dev_ref = DeviceRef.from_device(self.config.device)
+        pre_weights, block_weights_list, post_weights = self._split_state_dict(
+            state_dict
+        )
+
+        pre_module = WanTransformerPreProcess(
+            self.config, dtype=dtype, device=dev_ref
+        )
+        pre_module.load_state_dict(
+            pre_weights, weight_alignment=1, strict=True
+        )
+
+        # Reuse a single block module instance to build all weight registries
+        block_registries: list[dict[str, object]] = []
+        block_module = WanTransformerBlock(
+            dim=dim,
+            ffn_dim=self.config.ffn_dim,
+            num_heads=self.config.num_attention_heads,
+            head_dim=self.config.attention_head_dim,
+            text_dim=dim,
+            cross_attn_norm=self.config.cross_attn_norm,
+            eps=self.config.eps,
+            dtype=dtype,
+            device=dev_ref,
+        )
+        for block_weights in block_weights_list:
+            block_module.load_state_dict(
+                block_weights, weight_alignment=1, strict=True
+            )
+            block_registries.append(block_module.state_dict())
+
+        post_module = WanTransformerPostProcess(
+            self.config, dtype=dtype, device=dev_ref
+        )
+        post_module.load_state_dict(
+            post_weights, weight_alignment=1, strict=True
+        )
+
+        return pre_module.state_dict(), block_registries, post_module.state_dict()
+
+    def reload_model_weights(
+        self, state_dict: dict[str, object] | None = None
+    ) -> None:
+        """Reload weights into already-compiled models via private Model._load.
+
+        Uses Model._load (private API) to hot-swap weight buffers without
+        recompiling the graph.  This is needed for MoE weight switching
+        between high-noise and low-noise transformer experts.
+        """
+        with self._load_lock:
+            if self.model is None:
+                self.load_model()
+            if self.model is None:
+                raise RuntimeError("Wan transformer model failed to load.")
+
+            target_state_dict = state_dict or self._ensure_state_dict()
+            pre_registry, block_registries, post_registry = (
+                self._build_weight_registries(target_state_dict)
+            )
+
+            self.model.pre._load(pre_registry)
+            for compiled_block, block_registry in zip(
+                self.model.blocks, block_registries, strict=True
+            ):
+                compiled_block._load(block_registry)
+            self.model.post._load(post_registry)
+
     def load_model(self) -> Callable[..., Any]:
         """Compile the transformer as separate pre/block/post graphs.
 
@@ -274,42 +385,16 @@ class WanTransformerModel(ComponentModel):
             if self.model is not None:
                 return self.__call__
 
-            if self._state_dict is None:
-                self._state_dict = _remap_state_dict(
-                    self.weights,
-                    target_dtype=self.config.dtype,
-                )
-                # Free the raw Weights object (~56 GB fp32) now that we have the
-                # remapped state dict.
-                self.weights = None  # type: ignore[assignment]
-
-            state_dict = self._state_dict
+            state_dict = self._ensure_state_dict()
 
             dim = self.config.num_attention_heads * self.config.attention_head_dim
             dtype = self.config.dtype
             dev = self.config.device
             dev_ref = DeviceRef.from_device(dev)
 
-            # --- Split state dict by component ---
-            pre_weights: dict[str, object] = {}
-            post_weights: dict[str, object] = {}
-            block_weights_list: list[dict[str, object]] = [
-                {} for _ in range(self.config.num_layers)
-            ]
-
-            for key, value in state_dict.items():
-                if key.startswith("patch_embedding.") or key.startswith(
-                    "condition_embedder."
-                ):
-                    pre_weights[key] = value
-                elif key.startswith("blocks."):
-                    rest = key[len("blocks."):]
-                    dot = rest.index(".")
-                    block_idx = int(rest[:dot])
-                    sub_key = rest[dot + 1:]
-                    block_weights_list[block_idx][sub_key] = value
-                else:
-                    post_weights[key] = value
+            pre_weights, block_weights_list, post_weights = self._split_state_dict(
+                state_dict
+            )
 
             # --- Compile pre-processing (symbolic spatial dims) ---
             pre_input_types = [
@@ -344,7 +429,10 @@ class WanTransformerModel(ComponentModel):
                 pre_graph, weights_registry=pre_module.state_dict()
             )
 
-            # --- Compile each transformer block (symbolic seq_len) ---
+            # --- Compile transformer block graph ONCE, reuse for all layers ---
+            # All 40 blocks have identical structure (same dims, heads, FFN).
+            # Compile the graph once, then use Model._load() to swap weights
+            # for each subsequent block — avoids 39 redundant compilations.
             block_input_types = [
                 TensorType(dtype, ["batch", "seq_len", dim], device=dev),
                 TensorType(dtype, ["batch", "seq_text", dim], device=dev),
@@ -361,32 +449,45 @@ class WanTransformerModel(ComponentModel):
                 ),
             ]
 
-            block_models: list[Model] = []
-            for i in range(self.config.num_layers):
-                block = WanTransformerBlock(
-                    dim=dim,
-                    ffn_dim=self.config.ffn_dim,
-                    num_heads=self.config.num_attention_heads,
-                    head_dim=self.config.attention_head_dim,
-                    text_dim=dim,
-                    cross_attn_norm=self.config.cross_attn_norm,
-                    eps=self.config.eps,
-                    dtype=dtype,
-                    device=dev_ref,
+            # Build block module template (used for graph + all weight registries)
+            block_template = WanTransformerBlock(
+                dim=dim,
+                ffn_dim=self.config.ffn_dim,
+                num_heads=self.config.num_attention_heads,
+                head_dim=self.config.attention_head_dim,
+                text_dim=dim,
+                cross_attn_norm=self.config.cross_attn_norm,
+                eps=self.config.eps,
+                dtype=dtype,
+                device=dev_ref,
+            )
+
+            # Build and compile graph with block 0's weights
+            block_template.load_state_dict(
+                block_weights_list[0], weight_alignment=1, strict=True
+            )
+            with Graph(
+                "wan_block", input_types=block_input_types
+            ) as block_graph:
+                block_out = block_template(
+                    *(v.tensor for v in block_graph.inputs)
                 )
-                block.load_state_dict(
+                block_graph.output(block_out)
+            block_0_model = self.session.load(
+                block_graph, weights_registry=block_template.state_dict()
+            )
+            block_models: list[Model] = [block_0_model]
+
+            # Reuse compiled graph for blocks 1..N-1 via _load()
+            for i in range(1, self.config.num_layers):
+                block_template.load_state_dict(
                     block_weights_list[i], weight_alignment=1, strict=True
                 )
-                with Graph(
-                    f"wan_block_{i}", input_types=block_input_types
-                ) as block_graph:
-                    block_out = block(*(v.tensor for v in block_graph.inputs))
-                    block_graph.output(block_out)
-                block_models.append(
-                    self.session.load(
-                        block_graph, weights_registry=block.state_dict()
-                    )
+                block_i_model = self.session.load(
+                    block_graph,
+                    weights_registry=block_template.state_dict(),
                 )
+                block_models.append(block_i_model)
 
             # --- Compile post-processing (spatial shape tensor carries ppf/pph/ppw) ---
             post_input_types = [
@@ -408,6 +509,65 @@ class WanTransformerModel(ComponentModel):
             )
             self.model = _BlockLevelModel(pre_model, block_models, post_model)
             return self.__call__
+
+    def warmup(self) -> None:
+        """Run a tiny forward pass to force GPU kernel initialization.
+
+        Uses minimal dimensions (1 frame, 2x2 spatial) to trigger lazy kernel
+        compilation without wasting time on large tensors.
+        """
+        if self.model is None:
+            self.load_model()
+        assert self.model is not None
+
+        import logging
+        logger = logging.getLogger(__name__)
+        from time import perf_counter
+        t0 = perf_counter()
+
+        dev = self.devices[0]
+        dtype = self.config.dtype
+        p_t, p_h, p_w = self.config.patch_size
+        dim = self.config.num_attention_heads * self.config.attention_head_dim
+        # Minimal latent: 1 frame, patch_size spatial
+        warmup_frames, warmup_h, warmup_w = p_t, p_h * 2, p_w * 2
+        seq_len = (warmup_frames // p_t) * (warmup_h // p_h) * (warmup_w // p_w)
+
+        from max.pipelines.lib.bfloat16_utils import (
+            float32_to_bfloat16_as_uint16,
+        )
+
+        def _zeros_buf(shape: tuple[int, ...], dt: DType) -> Buffer:
+            arr = np.zeros(shape, dtype=np.float32)
+            if dt == DType.bfloat16:
+                u16 = float32_to_bfloat16_as_uint16(arr)
+                return Buffer.from_numpy(u16).to(dev).view(
+                    dtype=DType.bfloat16, shape=shape
+                )
+            return Buffer.from_numpy(arr).to(dev)
+
+        hs = _zeros_buf(
+            (1, self.config.in_channels, warmup_frames, warmup_h, warmup_w),
+            dtype,
+        )
+        ts = Buffer.from_numpy(np.zeros((1,), dtype=np.float32)).to(dev)
+        enc = _zeros_buf((1, 4, self.config.text_dim), dtype)
+        rope_cos, rope_sin = self.compute_rope(
+            warmup_frames, warmup_h, warmup_w
+        )
+        spatial = Buffer.from_numpy(
+            np.zeros(
+                (warmup_frames // p_t, warmup_h // p_h, warmup_w // p_w),
+                dtype=np.int8,
+            )
+        ).to(dev)
+
+        self.model(hs, ts, enc, rope_cos, rope_sin, spatial)
+        logger.info(
+            "Wan transformer warmup complete in %.2fs (seq_len=%d)",
+            perf_counter() - t0,
+            seq_len,
+        )
 
     def compute_rope(
         self,

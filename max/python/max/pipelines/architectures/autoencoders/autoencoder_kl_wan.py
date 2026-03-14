@@ -14,21 +14,22 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Callable
 from itertools import pairwise
+from time import perf_counter
 from typing import Any, Literal
 
 import numpy as np
-from max.driver import CPU, Accelerator, Buffer, Device
+from max.driver import CPU, Buffer, Device, accelerator_api
 from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, TensorType, TensorValue, Weight, ops
 from max.graph.buffer_utils import cast_dlpack_to
 from max.graph.type import ConvInputLayout, FilterLayout
 from max.graph.weights import Weights
-from max.experimental.functional import concat, pad
-from max.experimental.tensor import Tensor
+from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
 from max.nn.layer import LayerList, Module
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
@@ -39,6 +40,36 @@ logger = logging.getLogger(__name__)
 
 CACHE_T = 2
 WAN_DECODER_CACHE_SLOTS = 32
+
+
+def _use_nvidia_fcrs_conv3d(device: DeviceRef | None) -> bool:
+    return (
+        device is not None and device.is_gpu() and accelerator_api() == "cuda"
+    )
+
+
+def _buffer_to_numpy_f32(buf: Buffer, cpu: CPU | None = None) -> np.ndarray:
+    """Convert a Buffer (possibly bf16) to f32 numpy on CPU."""
+    cpu_buf = buf.to(cpu or CPU())
+    if cpu_buf.dtype == DType.bfloat16:
+        u16 = np.from_dlpack(
+            cpu_buf.view(dtype=DType.uint16, shape=cpu_buf.shape)
+        )
+        return (u16.astype(np.uint32) << 16).view(np.float32)
+    return np.from_dlpack(cpu_buf).astype(np.float32, copy=False)
+
+
+def _numpy_f32_to_buffer(
+    arr: np.ndarray, target_dtype: DType, device: object
+) -> Buffer:
+    """Convert f32 numpy to Buffer on device with target dtype."""
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    if target_dtype == DType.bfloat16:
+        u16 = float32_to_bfloat16_as_uint16(arr)
+        return Buffer.from_numpy(u16).to(device).view(
+            dtype=DType.bfloat16, shape=arr.shape
+        )
+    return Buffer.from_numpy(arr).to(device)
 
 
 def _zero_cache_for(x: TensorValue) -> TensorValue:
@@ -95,7 +126,8 @@ class WanCausalConv3d(Module):
     padding parameter supports directly.
 
     Input is permuted from NCDHW to NDHWC before conv, and back after.
-    Weights use MAX's native QRSCF layout [D, H, W, C, F].
+    On NVIDIA GPUs, weights stay in PyTorch FCQRS layout to use the cuDNN
+    3D conv dispatch path. Other backends use MAX's native QRSCF layout.
     """
 
     def __init__(
@@ -128,9 +160,13 @@ class WanCausalConv3d(Module):
         dev_ref = device if device is not None else DeviceRef.CPU()
         dt = dtype or DType.float32
         d, h, w = kernel_size
-        self.filter = Weight(
-            "weight", dt, [d, h, w, in_channels, out_channels], dev_ref
+        self._use_nvidia_fcrs = _use_nvidia_fcrs_conv3d(dev_ref)
+        filter_shape = (
+            [out_channels, in_channels, d, h, w]
+            if self._use_nvidia_fcrs
+            else [d, h, w, in_channels, out_channels]
         )
+        self.filter = Weight("weight", dt, filter_shape, dev_ref)
         self._has_bias = has_bias
         if has_bias:
             self.bias = Weight("bias", dt, [out_channels], dev_ref)
@@ -143,7 +179,11 @@ class WanCausalConv3d(Module):
             self.filter,
             stride=self._stride,
             padding=self._padding,
-            filter_layout=FilterLayout.QRSCF,
+            filter_layout=(
+                FilterLayout.FCRS
+                if self._use_nvidia_fcrs
+                else FilterLayout.QRSCF
+            ),
         )
         # NDHWC -> NCDHW
         out = ops.permute(out, [0, 4, 1, 2, 3])
@@ -192,9 +232,13 @@ class WanCausalConv3dCached(Module):
         dev_ref = device if device is not None else DeviceRef.CPU()
         dt = dtype or DType.float32
         d, h, w = kernel_size
-        self.filter = Weight(
-            "weight", dt, [d, h, w, in_channels, out_channels], dev_ref
+        self._use_nvidia_fcrs = _use_nvidia_fcrs_conv3d(dev_ref)
+        filter_shape = (
+            [out_channels, in_channels, d, h, w]
+            if self._use_nvidia_fcrs
+            else [d, h, w, in_channels, out_channels]
         )
+        self.filter = Weight("weight", dt, filter_shape, dev_ref)
         self._has_bias = has_bias
         if has_bias:
             self.bias = Weight("bias", dt, [out_channels], dev_ref)
@@ -216,7 +260,11 @@ class WanCausalConv3dCached(Module):
             self.filter,
             stride=self._stride,
             padding=self._padding,
-            filter_layout=FilterLayout.QRSCF,
+            filter_layout=(
+                FilterLayout.FCRS
+                if self._use_nvidia_fcrs
+                else FilterLayout.QRSCF
+            ),
         )
         # NDHWC -> NCDHW
         out = ops.permute(out, [0, 4, 1, 2, 3])
@@ -1444,9 +1492,9 @@ class _FullDecoder:
     def __init__(self, compiled_decoder: Model) -> None:
         self.compiled_decoder = compiled_decoder
 
-    def __call__(self, latents_5d: Tensor) -> Tensor:
-        buffers = self.compiled_decoder(latents_5d.driver_tensor)
-        return Tensor.from_dlpack(buffers[0])
+    def __call__(self, latents_5d: Buffer) -> Buffer:
+        buffers = self.compiled_decoder(latents_5d)
+        return buffers[0]
 
 
 class _CachedFramewiseDecoder:
@@ -1462,20 +1510,27 @@ class _CachedFramewiseDecoder:
         self.first_frame_decoder = first_frame_decoder
         self.rest_frame_decoder = rest_frame_decoder
 
-    def __call__(self, latents_5d: Tensor) -> Tensor:
+    def __call__(self, latents_5d: Buffer) -> Buffer:
         t_total = int(latents_5d.shape[2])
         if t_total <= 0:
             raise ValueError("Expected non-empty temporal dimension for decode")
 
         cpu = CPU()
-        gpu = latents_5d.device
-        decoded_frames: list[Tensor] = []
+        decoded_frames: list[np.ndarray] = []
         caches: list[Buffer] | None = None
 
-        for t_idx in range(t_total):
-            z_t = latents_5d[:, :, t_idx : t_idx + 1, :, :]
+        # Slice temporal frames via numpy (Buffer doesn't support fancy indexing)
+        latents_cpu_np = _buffer_to_numpy_f32(latents_5d, cpu)
 
-            pqc_outputs = self.post_quant_conv(z_t.driver_tensor)
+        for t_idx in range(t_total):
+            z_t_np = np.ascontiguousarray(
+                latents_cpu_np[:, :, t_idx : t_idx + 1, :, :]
+            )
+            z_t_buf = _numpy_f32_to_buffer(
+                z_t_np, latents_5d.dtype, latents_5d.device
+            )
+
+            pqc_outputs = self.post_quant_conv(z_t_buf)
             if len(pqc_outputs) != 1:
                 raise ValueError(
                     f"Expected 1 output from post_quant_conv, got {len(pqc_outputs)}"
@@ -1499,9 +1554,12 @@ class _CachedFramewiseDecoder:
 
             decoded_buf = outputs[0]
             caches = list(outputs[1:])
-            decoded_frames.append(Tensor.from_dlpack(decoded_buf).to(cpu))
+            decoded_frames.append(
+                _buffer_to_numpy_f32(decoded_buf, cpu)
+            )
 
-        return concat(decoded_frames, axis=2).to(gpu)
+        stitched = np.ascontiguousarray(np.concatenate(decoded_frames, axis=2))
+        return Buffer.from_numpy(stitched)
 
 
 _VAEShapeKey = tuple[int, int, int, int, int]
@@ -1511,9 +1569,8 @@ _VAEFramewiseKey = tuple[int, int, int, int]
 class AutoencoderKLWanModel(ComponentModel):
     """Wan VAE decoder model using MAX-native 3D modules."""
 
-    # Default to cached framewise decode.
-    # Larger temporal chunks can be faster, but 720p/81f repeatedly OOMs and
-    # falls back anyway, so starting at 1 avoids the retry penalty.
+    # Default to cached framewise decode. A larger chunk can be forced with
+    # WAN_VAE_CHUNK_T for profiling/tuning without changing code.
     CHUNK_T: int = 1
     MAX_CACHED_DECODERS: int = 4
 
@@ -1539,7 +1596,7 @@ class AutoencoderKLWanModel(ComponentModel):
         if eager_load:
             self.load_model()
 
-    def load_model(self) -> Callable[[Tensor], Tensor]:
+    def load_model(self) -> Callable[[Buffer], Buffer]:
         with self._load_lock:
             if self._decoder_state_dict is not None:
                 return self.decode_4d
@@ -1559,16 +1616,18 @@ class AutoencoderKLWanModel(ComponentModel):
 
                 weight_data = value.data()
 
-                # Wan checkpoints store filters in PyTorch layout.
-                # Conv3d weights are converted to MAX QRSCF layout.
+                # Wan checkpoints store conv filters in PyTorch layout.
+                # Keep 3D convs in FCQRS on NVIDIA GPUs to use the cuDNN path;
+                # fall back to MAX QRSCF elsewhere.
                 # Resample Conv2d (permute=True equivalent) stays in FCRS.
                 # Attention Conv2d (permute=False equivalent) needs RSCF [H,W,in,out].
                 if key.endswith(".weight") and len(weight_data.shape) == 5:
-                    weight_data = np.ascontiguousarray(
-                        np.from_dlpack(weight_data).transpose(
-                            2, 3, 4, 1, 0
+                    if not _use_nvidia_fcrs_conv3d(self.config.device):
+                        weight_data = np.ascontiguousarray(
+                            np.from_dlpack(weight_data).transpose(
+                                2, 3, 4, 1, 0
+                            )
                         )
-                    )
                 if key.endswith(".weight") and len(weight_data.shape) == 4:
                     is_resample_conv = "resample" in key
                     if not is_resample_conv:
@@ -1739,12 +1798,21 @@ class AutoencoderKLWanModel(ComponentModel):
             return decoder
 
     def prewarm_for_latent_shape(self, shape: _VAEShapeKey) -> None:
+        log_vae_timings = os.getenv("WAN_LOG_VAE_TIMINGS") == "1"
+        prewarm_start = perf_counter()
         self.load_model()
         batch_size, z_dim, _frames, latent_h, latent_w = shape
         if self.CHUNK_T == 1:
             self._get_framewise_cached_decoder(
                 (batch_size, z_dim, latent_h, latent_w)
             )
+            if log_vae_timings:
+                logger.info(
+                    "Wan VAE prewarm shape=%s chunk_t=%d mode=framewise elapsed=%.3fs",
+                    shape,
+                    self.CHUNK_T,
+                    perf_counter() - prewarm_start,
+                )
             return
         self._get_shape_cached_decoder(
             (
@@ -1755,6 +1823,13 @@ class AutoencoderKLWanModel(ComponentModel):
                 latent_w,
             )
         )
+        if log_vae_timings:
+            logger.info(
+                "Wan VAE prewarm shape=%s chunk_t=%d mode=chunked elapsed=%.3fs",
+                shape,
+                self.CHUNK_T,
+                perf_counter() - prewarm_start,
+            )
 
     @staticmethod
     def _is_cuda_oom(exc: Exception) -> bool:
@@ -1762,8 +1837,8 @@ class AutoencoderKLWanModel(ComponentModel):
         return ("out of memory" in msg) or ("cuda_error_out_of_memory" in msg)
 
     def _decode_with_chunk_t(
-        self, latents_5d: Tensor, chunk_t: int
-    ) -> Tensor:
+        self, latents_5d: Buffer, chunk_t: int
+    ) -> Buffer:
         T = int(latents_5d.shape[2])
         B = int(latents_5d.shape[0])
         C = int(latents_5d.shape[1])
@@ -1779,40 +1854,52 @@ class AutoencoderKLWanModel(ComponentModel):
         if T <= chunk_t:
             return decoder(latents_5d)
 
-        # Temporal chunking: decode in chunks of chunk_t latent frames.
-        # Each decoded chunk is moved to CPU to free GPU memory for the
-        # next chunk. Final concat happens on CPU, result moves to GPU.
+        # Temporal chunking: decode in chunks of chunk_t latent frames and keep
+        # the stitched result on CPU. This avoids an unnecessary full-video
+        # CPU->GPU->CPU roundtrip in the offline decode path.
         cpu = CPU()
-        gpu = latents_5d.device
-        decoded_chunks: list[Tensor] = []
+        latents_cpu_np = _buffer_to_numpy_f32(latents_5d, cpu)
+        decoded_chunks: list[np.ndarray] = []
         for start in range(0, T, chunk_t):
             end = min(start + chunk_t, T)
-            chunk = latents_5d[:, :, start:end, :, :]
+            chunk_np = latents_cpu_np[:, :, start:end, :, :]
+            actual_t = end - start
 
-            if int(chunk.shape[2]) < chunk_t:
-                pad_t = chunk_t - int(chunk.shape[2])
-                actual_t = int(chunk.shape[2])
-                chunk = pad(
-                    chunk, [0, 0, 0, 0, 0, pad_t, 0, 0, 0, 0]
+            if actual_t < chunk_t:
+                pad_t = chunk_t - actual_t
+                chunk_np = np.pad(
+                    chunk_np,
+                    [(0, 0), (0, 0), (0, pad_t), (0, 0), (0, 0)],
                 )
-                decoded = decoder(chunk)
-                decoded = decoded[:, :, : actual_t * 4, :, :]
-            else:
-                decoded = decoder(chunk)
 
-            decoded_chunks.append(decoded.to(cpu))
+            chunk_buf = _numpy_f32_to_buffer(
+                chunk_np, latents_5d.dtype, latents_5d.device
+            )
+            decoded = decoder(chunk_buf)
 
-        return concat(decoded_chunks, axis=2).to(gpu)
+            decoded_np = _buffer_to_numpy_f32(decoded, cpu)
+            if actual_t < chunk_t:
+                decoded_np = decoded_np[:, :, : actual_t * 4, :, :]
+            decoded_chunks.append(decoded_np)
 
-    def decode_5d(self, latents_5d: Tensor) -> Tensor:
+        stitched = np.ascontiguousarray(np.concatenate(decoded_chunks, axis=2))
+        return Buffer.from_numpy(stitched)
+
+    def decode_5d(self, latents_5d: Buffer) -> Buffer:
         """Decode 5D latents [B, C, T, H, W].
 
         When T exceeds CHUNK_T, temporal chunking is used to avoid OOM.
         """
         self.prepare_for_serving()
 
+        log_vae_timings = os.getenv("WAN_LOG_VAE_TIMINGS") == "1"
+        decode_start = perf_counter()
         T = int(latents_5d.shape[2])
-        max_chunk_t = min(T, self.CHUNK_T)
+        env_chunk_t = os.getenv("WAN_VAE_CHUNK_T")
+        requested_chunk_t = self.CHUNK_T
+        if env_chunk_t:
+            requested_chunk_t = max(1, int(env_chunk_t))
+        max_chunk_t = min(T, requested_chunk_t)
         chunk_candidates = []
         chunk_t = max_chunk_t
         while chunk_t >= 1:
@@ -1826,7 +1913,15 @@ class AutoencoderKLWanModel(ComponentModel):
         last_exc: Exception | None = None
         for chunk_t in chunk_candidates:
             try:
-                return self._decode_with_chunk_t(latents_5d, chunk_t)
+                decoded = self._decode_with_chunk_t(latents_5d, chunk_t)
+                if log_vae_timings:
+                    logger.info(
+                        "Wan VAE decode shape=%s chunk_t=%d elapsed=%.3fs",
+                        tuple(int(dim) for dim in latents_5d.shape),
+                        chunk_t,
+                        perf_counter() - decode_start,
+                    )
+                return decoded
             except Exception as exc:  # noqa: BLE001
                 if not self._is_cuda_oom(exc):
                     raise
@@ -1843,20 +1938,39 @@ class AutoencoderKLWanModel(ComponentModel):
             raise last_exc
         raise RuntimeError("Wan VAE decode failed without an explicit error.")
 
-    def decode_4d(self, latents_4d: Tensor) -> Tensor:
-        z5d = latents_4d.unsqueeze(axis=2)
+    def decode_4d(self, latents_4d: Buffer) -> Buffer:
+        # Add temporal dimension: [B, C, H, W] -> [B, C, 1, H, W]
+        shape_5d = (
+            int(latents_4d.shape[0]),
+            int(latents_4d.shape[1]),
+            1,
+            int(latents_4d.shape[2]),
+            int(latents_4d.shape[3]),
+        )
+        z5d = latents_4d.view(dtype=latents_4d.dtype, shape=shape_5d)
         decoded_5d = self.decode_5d(z5d)
-        return decoded_5d[:, :, 0, :, :]
+        # Remove temporal dimension from decoded output
+        out_shape_4d = (
+            int(decoded_5d.shape[0]),
+            int(decoded_5d.shape[1]),
+            int(decoded_5d.shape[3]),
+            int(decoded_5d.shape[4]),
+        )
+        cpu = CPU()
+        decoded_np = _buffer_to_numpy_f32(decoded_5d, cpu)
+        return Buffer.from_numpy(
+            np.ascontiguousarray(decoded_np[:, :, 0, :, :])
+        )
 
     def decode(
-        self, latents_4d: Tensor, return_dict: bool = False
-    ) -> tuple[Tensor]:
+        self, latents: Buffer, return_dict: bool = False
+    ) -> tuple[Buffer]:
         del return_dict
-        if latents_4d.rank == 5:
-            return (self.decode_5d(latents_4d),)
-        return (self.decode_4d(latents_4d),)
+        if latents.rank == 5:
+            return (self.decode_5d(latents),)
+        return (self.decode_4d(latents),)
 
-    def __call__(self, latents_4d: Tensor) -> Tensor:
-        if latents_4d.rank == 5:
-            return self.decode_5d(latents_4d)
-        return self.decode_4d(latents_4d)
+    def __call__(self, latents: Buffer) -> Buffer:
+        if latents.rank == 5:
+            return self.decode_5d(latents)
+        return self.decode_4d(latents)

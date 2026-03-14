@@ -17,6 +17,8 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanCausalConv3d as HFWanCausalConv3d,
 )
+import max.pipelines.architectures.autoencoders.autoencoder_kl_wan as wan_vae
+from max.driver import Buffer
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.pipelines.architectures.autoencoders.autoencoder_kl_wan import (
@@ -27,8 +29,6 @@ from max.pipelines.architectures.autoencoders.model_config import (
     AutoencoderKLWanConfigBase,
 )
 from max.pipelines.architectures.wan.pipeline_wan import WanPipeline
-from max.experimental.tensor import Tensor
-from torch.utils.dlpack import from_dlpack
 
 
 @torch.no_grad()
@@ -48,13 +48,13 @@ def test_denormalize_vae_latents_matches_diffusers_formula() -> None:
     latents_recip_std = 1.0 / latents_std_t
     expected = latents / latents_recip_std + latents_mean_t
 
-    actual = WanPipeline.denormalize_vae_latents(
-        latents=Tensor.from_dlpack(latents),
+    actual_np = WanPipeline.denormalize_vae_latents(
+        latents_np=latents.numpy(),
         latents_mean=latents_mean,
         latents_std=latents_std,
         z_dim=z_dim,
     )
-    actual_torch = from_dlpack(actual).to(torch.float32)
+    actual_torch = torch.from_numpy(actual_np)
 
     torch.testing.assert_close(expected, actual_torch, rtol=1e-5, atol=1e-6)
 
@@ -106,10 +106,29 @@ def test_wan_causal_conv3d_uses_qrscf_weight_layout() -> None:
 
     max_conv.load_state_dict(
         {
-            "weight": Tensor.from_dlpack(
+            "weight": Buffer.from_dlpack(
                 hf_conv.weight.detach().permute(2, 3, 4, 1, 0).contiguous()
             ),
-            "bias": Tensor.from_dlpack(hf_conv.bias.detach().contiguous()),
+            "bias": Buffer.from_dlpack(hf_conv.bias.detach().contiguous()),
         }
     )
     assert tuple(max_conv.filter.shape) == (3, 3, 3, 4, 6)
+
+
+@torch.no_grad()
+def test_wan_causal_conv3d_uses_fcrs_weight_layout_on_cuda_gpu(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(wan_vae, "accelerator_api", lambda: "cuda")
+
+    max_conv = WanCausalConv3d(
+        in_channels=4,
+        out_channels=6,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        dtype=DType.float32,
+        device=DeviceRef.GPU(),
+    )
+
+    assert tuple(max_conv.filter.shape) == (6, 4, 3, 3, 3)

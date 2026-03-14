@@ -24,11 +24,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import logging
 import os
 import subprocess
-from io import BytesIO
 from typing import cast
 
 import numpy as np
@@ -47,7 +45,6 @@ from max.interfaces.provider_options import (
 from max.interfaces.request import OpenResponsesRequest
 from max.interfaces.request.open_responses import (
     OpenResponsesRequestBody,
-    OutputImageContent,
 )
 from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
 from max.pipelines.core import PixelContext
@@ -56,7 +53,6 @@ from max.pipelines.lib.interfaces import DiffusionPipeline
 from max.pipelines.lib.pipeline_variants.pixel_generation import (
     PixelGenerationPipeline,
 )
-from PIL import Image
 
 logging.basicConfig(
     level=logging.INFO, format="%(name)s %(levelname)s %(message)s"
@@ -346,6 +342,19 @@ def save_video(frames: list[np.ndarray], output_path: str, fps: int) -> None:
         print(f"Video saved to: {output_path}")
 
 
+def _video_frames_from_raw_output(images: np.ndarray) -> list[np.ndarray]:
+    """Convert raw pipeline video output [B, C, T, H, W] to uint8 RGB frames."""
+    if images.ndim != 5:
+        raise ValueError(
+            f"Expected video output with rank 5 [B, C, T, H, W], got {images.shape}."
+        )
+
+    video = (images[0] * 0.5 + 0.5).clip(min=0.0, max=1.0)
+    video = np.transpose(video, (1, 2, 3, 0))
+    video = (video * 255.0).round().astype(np.uint8, copy=False)
+    return [video[t] for t in range(video.shape[0])]
+
+
 async def generate_video(args: argparse.Namespace) -> None:
     print(f"Loading model: {args.model}")
 
@@ -538,31 +547,37 @@ async def generate_video(args: argparse.Namespace) -> None:
                 outputs = pipeline.execute(inputs)
         print(f"Method timings:\n{prof.report(unit='ms')}")
         print(f"Module timings:\n{prof.report_modules(unit='ms')}")
+
+        output = outputs[context.request_id]
+        output = await tokenizer.postprocess(output)
+
+        if not output.is_done:
+            print(f"WARNING: Generation status: {output.final_status}")
+            return
+
+        print("Generation complete!")
+        if not output.output:
+            print("ERROR: No output generated")
+            return
+
+        frames = []
+        for image_content in output.output:
+            if not getattr(image_content, "image_data", None):
+                continue
+            print(
+                "ERROR: profile mode still returned encoded image payloads; "
+                "run without --profile-timings for the raw fast path."
+            )
+            return
     else:
-        outputs = pipeline.execute(inputs)
-
-    # Post-process
-    output = outputs[context.request_id]
-    output = await tokenizer.postprocess(output)
-
-    if not output.is_done:
-        print(f"WARNING: Generation status: {output.final_status}")
-        return
-
-    print("Generation complete!")
-    if not output.output:
-        print("ERROR: No output generated")
-        return
-
-    # Extract frames and save video
-    frames = []
-    for image_content in output.output:
-        if not isinstance(image_content, OutputImageContent):
-            continue
-        if image_content.image_data:
-            image_bytes = base64.b64decode(image_content.image_data)
-            frame = Image.open(BytesIO(image_bytes)).convert("RGB")
-            frames.append(np.array(frame))
+        model_inputs = pipeline._pipeline_model.prepare_inputs(context)
+        model_outputs = pipeline._pipeline_model.execute(model_inputs)
+        if not isinstance(model_outputs.images, np.ndarray):
+            raise TypeError(
+                "Expected raw numpy video output from the diffusion pipeline."
+            )
+        print("Generation complete!")
+        frames = _video_frames_from_raw_output(model_outputs.images)
 
     if not frames:
         print("ERROR: No frames generated")
