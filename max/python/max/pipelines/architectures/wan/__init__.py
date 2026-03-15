@@ -11,6 +11,8 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .autoencoder_kl import AutoencoderKLModel
-from .autoencoder_kl_flux2 import AutoencoderKLFlux2Model
-from .autoencoder_kl_wan import AutoencoderKLWanModel
+from .arch import wan_arch
+from .model import WanTransformerModel
+from .pipeline_wan import WanPipeline
+
+__all__ = ["WanPipeline", "WanTransformerModel", "wan_arch"]
