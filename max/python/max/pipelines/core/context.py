@@ -737,6 +737,16 @@ class PixelContext:
     """Input image as numpy array (H, W, C) in uint8 format for image-to-image generation."""
     image: npt.NDArray[np.uint8] | None = field(default=None)
     """Decoded output image (H, W, C) uint8 [0, 255]. Set after generation completes."""
+    num_frames: int | None = field(default=None)
+    """Number of frames for video generation."""
+    frames_per_second: int = field(default=16)
+    """Frame rate for video output."""
+    guidance_scale_2: float | None = field(default=None)
+    """Secondary guidance scale for low-noise expert (MoE models)."""
+    step_coefficients: npt.NDArray[np.float32] | None = field(default=None)
+    """Pre-computed scheduler step coefficients."""
+    boundary_timestep: float | None = field(default=None)
+    """Timestep threshold for switching between high/low noise experts."""
     status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
 
     @property
