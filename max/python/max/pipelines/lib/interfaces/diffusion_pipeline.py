@@ -415,6 +415,12 @@ class PixelModelInputs:
     Optional input image for image-to-image generation (PIL.Image.Image).
     """
 
+    step_coefficients: npt.NDArray[np.float32] | None = None
+    """Pre-computed scheduler step coefficients."""
+
+    boundary_timestep: float | None = None
+    """Timestep threshold for switching between high/low noise experts."""
+
     def __post_init__(self) -> None:
         """Basic invariant checks for core scalar fields.
 

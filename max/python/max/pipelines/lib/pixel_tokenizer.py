@@ -71,6 +71,7 @@ class PipelineClassName(str, Enum):
     FLUX2 = "Flux2Pipeline"
     FLUX2_KLEIN = "Flux2KleinPipeline"
     ZIMAGE = "ZImagePipeline"
+    WAN = "WanPipeline"
 
     @classmethod
     def from_diffusers_config(
@@ -206,7 +207,10 @@ class PixelGenerationTokenizer(
 
         # Store static model dimensions
         self._default_sample_size = 128
-        self._num_channels_latents = transformer_config["in_channels"] // 4
+        if self._pipeline_class_name == PipelineClassName.WAN:
+            self._num_channels_latents = transformer_config["in_channels"]
+        else:
+            self._num_channels_latents = transformer_config["in_channels"] // 4
 
         # Create scheduler
         scheduler_class_name = components.get("scheduler", {}).get(
@@ -942,6 +946,21 @@ class PixelGenerationTokenizer(
             request.body.seed,
         )
 
+        video_options = request.body.provider_options.video
+        if video_options and video_options.num_frames:
+            vae_scale_factor_temporal = 4
+            latent_frames = (
+                video_options.num_frames - 1
+            ) // vae_scale_factor_temporal + 1
+            shape_5d = (
+                image_options.num_images,
+                self._num_channels_latents,
+                latent_frames,
+                latent_height,
+                latent_width,
+            )
+            latents = self._randn_tensor(shape_5d, request.body.seed)
+
         # 5. Build the context
         context = PixelContext(
             request_id=request.request_id,
@@ -963,7 +982,14 @@ class PixelGenerationTokenizer(
             num_warmup_steps=num_warmup_steps,
             model_name=request.body.model,
             residual_threshold=image_options.residual_threshold,
-            input_image=preprocessed_image_array,  # Pass numpy array instead of PIL.Image
+            input_image=preprocessed_image_array,
+            num_frames=video_options.num_frames if video_options else None,
+            frames_per_second=(
+                video_options.frames_per_second or 16 if video_options else 16
+            ),
+            guidance_scale_2=(
+                video_options.guidance_scale_2 if video_options else None
+            ),
         )
 
         return context
