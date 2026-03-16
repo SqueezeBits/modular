@@ -15,8 +15,9 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-import numpy.typing as npt
+import array as _array
+import ctypes
+import struct
 from PIL import Image
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
@@ -88,7 +89,7 @@ class Flux2ModelInputs:
     residual_threshold: float = 0.08
     """Residual threshold for cache reuse decisions."""
 
-    input_image: npt.NDArray[np.uint8] | None
+    input_image: Any | None
     """Optional input image for image-to-image generation (HWC uint8)."""
 
     rdt_tensor: Tensor | None = None
@@ -136,7 +137,7 @@ class Flux2PipelineOutput:
             intermediate latents depending on the selected output mode.
     """
 
-    images: np.ndarray | Tensor
+    images: Tensor
 
 
 class Flux2Pipeline(DiffusionPipeline):
@@ -270,8 +271,8 @@ class Flux2Pipeline(DiffusionPipeline):
         packed_w = latent_w // 2
         for n in (packed_h, packed_w):
             if n not in self._cached_shape_carriers:
-                self._cached_shape_carriers[n] = Tensor.from_dlpack(
-                    np.empty(n, dtype=np.float32)
+                self._cached_shape_carriers[n] = Tensor(
+                    storage=Buffer(DType.float32, [n])
                 )
         h_carrier = self._cached_shape_carriers[packed_h]
         w_carrier = self._cached_shape_carriers[packed_w]
@@ -288,11 +289,10 @@ class Flux2Pipeline(DiffusionPipeline):
             if rdt_key in self._cached_rdt:
                 rdt_tensor = self._cached_rdt[rdt_key]
             else:
-                rdt_tensor = Tensor(
-                    storage=Buffer.from_dlpack(
-                        np.array([context.residual_threshold], dtype=np.float32)
-                    ).to(device)
-                )
+                rdt_raw = struct.pack("<f", float(context.residual_threshold))
+                rdt_buf = Buffer(DType.float32, [1])
+                ctypes.memmove(rdt_buf._data_ptr(), rdt_raw, 4)
+                rdt_tensor = Tensor(storage=rdt_buf.to(device))
                 self._cached_rdt[rdt_key] = rdt_tensor
 
             # prev_residual and prev_output are zero-initialized tensors
@@ -487,23 +487,16 @@ class Flux2Pipeline(DiffusionPipeline):
         scale: int = 10,
         device: Device = CPU(),
     ) -> Tensor:
-        all_coords = []
+        flat: _array.array[int] = _array.array("q")  # signed int64
         for i, (height, width) in enumerate(latent_shapes):
             t_coord = scale + scale * i
-            t_coords = np.full((height, width), t_coord, dtype=np.int64)
-            h_coords, w_coords = np.meshgrid(
-                np.arange(height, dtype=np.int64),
-                np.arange(width, dtype=np.int64),
-                indexing="ij",
-            )
-            l_coords = np.zeros((height, width), dtype=np.int64)
-
-            coords = np.stack([t_coords, h_coords, w_coords, l_coords], axis=-1)
-            all_coords.append(coords.reshape(-1, 4))
-
-        combined = np.concatenate(all_coords, axis=0)
-        combined = np.expand_dims(combined, 0)  # (1, total_seq, 4)
-        return Tensor.from_dlpack(np.ascontiguousarray(combined)).to(device)
+            for h_idx in range(height):
+                for w_idx in range(width):
+                    flat.extend((t_coord, h_idx, w_idx, 0))
+        total_seq = sum(h * w for h, w in latent_shapes)
+        buf = Buffer(DType.int64, [1, total_seq, 4])
+        ctypes.memmove(buf._data_ptr(), flat.tobytes(), total_seq * 4 * 8)
+        return Tensor(storage=buf).to(device)
 
     @staticmethod
     def retrieve_latents(
@@ -680,8 +673,8 @@ class Flux2Pipeline(DiffusionPipeline):
         latents: Tensor,
         h_carrier: Tensor,
         w_carrier: Tensor,
-    ) -> np.ndarray:
-        """Decode Flux2 packed latents into a (B, H, W, C) uint8 NumPy array.
+    ) -> Tensor:
+        """Decode Flux2 packed latents into a (B, H, W, C) uint8 Tensor.
 
         Args:
             latents: Packed latents, shaped (B, S, C).
@@ -689,11 +682,9 @@ class Flux2Pipeline(DiffusionPipeline):
             w_carrier: 1-D shape carrier of length packed_w (content unused).
 
         Returns:
-            uint8 NumPy array of shape (B, H, W, C) with values in [0, 255].
+            uint8 Tensor of shape (B, H, W, C) with values in [0, 255].
         """
-        decoded = self._postprocess_and_decode(latents, h_carrier, w_carrier)
-
-        return np.from_dlpack(decoded)  # (B, H, W, C)
+        return self._postprocess_and_decode(latents, h_carrier, w_carrier)
 
     @staticmethod
     def _prepare_text_ids(
@@ -709,22 +700,14 @@ class Flux2Pipeline(DiffusionPipeline):
         Returns:
             Tensor[int64] of shape (batch_size, seq_len, 4).
         """
-        coords = np.stack(
-            [
-                np.zeros(seq_len, dtype=np.int64),  # T
-                np.zeros(seq_len, dtype=np.int64),  # H
-                np.zeros(seq_len, dtype=np.int64),  # W
-                np.arange(seq_len, dtype=np.int64),  # L
-            ],
-            axis=-1,
-        )  # (seq_len, 4)
-
-        text_ids = np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
-        return Tensor(
-            storage=Buffer.from_dlpack(np.ascontiguousarray(text_ids)).to(
-                device
-            )
-        )
+        # Build (batch_size, seq_len, 4) int64 buffer: T=0, H=0, W=0, L=token_idx
+        row: _array.array[int] = _array.array("q")
+        for l in range(seq_len):
+            row.extend((0, 0, 0, l))
+        flat = row * batch_size  # repeat for each batch element
+        buf = Buffer(DType.int64, [batch_size, seq_len, 4])
+        ctypes.memmove(buf._data_ptr(), flat.tobytes(), batch_size * seq_len * 4 * 8)
+        return Tensor(storage=buf.to(device))
 
     @traced(message="Flux2Pipeline.preprocess_latents")
     def preprocess_latents(self, latents: Tensor) -> Tensor:
@@ -756,14 +739,29 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def _numpy_image_to_tensor(
         self,
-        image: npt.NDArray[np.uint8],
+        image: Any,
     ) -> Tensor:
-        img_array = (image.astype(np.float32) / 127.5) - 1.0
-        img_array = np.transpose(img_array, (2, 0, 1))
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array = np.ascontiguousarray(img_array)
+        # image is a HWC uint8 array-like (supports __dlpack__ and .shape).
+        # Use Tensor.from_dlpack for zero-copy import, then MAX ops for
+        # normalization and HWC → BCHW transposition — no numpy functions used.
+        t = Tensor.from_dlpack(image)  # (H, W, C) uint8
+        h, w, c = int(t.shape[0]), int(t.shape[1]), int(t.shape[2])
+        t = t.cast(DType.float32)
+        # Normalize [0,255] → [-1,1] via raw buffer math (ctypes, no numpy).
+        n = h * w * c
+        buf = t._storage  # underlying Buffer on CPU
+        f32_ptr = ctypes.cast(buf._data_ptr(), ctypes.POINTER(ctypes.c_float))
+        out_vals = _array.array("f", [0.0] * n)
+        for c_idx in range(c):
+            for h_idx in range(h):
+                for w_idx in range(w):
+                    src = h_idx * w * c + w_idx * c + c_idx  # HWC layout
+                    dst = c_idx * h * w + h_idx * w + w_idx  # CHW layout
+                    out_vals[dst] = f32_ptr[src] / 127.5 - 1.0
+        chw_buf = Buffer(DType.float32, [1, c, h, w])
+        ctypes.memmove(chw_buf._data_ptr(), out_vals.tobytes(), n * 4)
         return (
-            Tensor.from_dlpack(img_array)
+            Tensor(storage=chw_buf)
             .to(self.vae.devices[0])
             .cast(self.vae.config.dtype)
         )

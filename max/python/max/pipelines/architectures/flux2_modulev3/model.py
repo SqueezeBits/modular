@@ -11,11 +11,13 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+import ctypes
+import struct
 from collections.abc import Callable
 from typing import Any
 
-import numpy as np
-from max.driver import Device
+from max.driver import Buffer, Device
+from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.nn.common_layers.fp8_config_utils import (
     build_dynamic_block_fp8_config,
@@ -142,9 +144,18 @@ class Flux2TransformerModel(ComponentModel):
                         and param_name not in state_dict
                     ):
                         shape = tuple(int(d) for d in tensor.shape)
-                        state_dict[param_name] = WeightData.from_numpy(
-                            np.ones(shape if shape else (), dtype=np.float32),
-                            param_name,
+                        shape_list = list(shape) if shape else []
+                        n = 1
+                        for d in shape_list:
+                            n *= d
+                        raw = struct.pack(f"<{n}f", *([1.0] * n))
+                        buf = Buffer(DType.float32, shape_list)
+                        ctypes.memmove(buf._data_ptr(), raw, len(raw))
+                        state_dict[param_name] = WeightData(
+                            data=buf,
+                            name=param_name,
+                            dtype=DType.float32,
+                            shape=shape_list,
                         )
 
         self._state_dict = state_dict
