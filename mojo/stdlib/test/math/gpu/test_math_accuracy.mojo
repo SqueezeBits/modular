@@ -26,7 +26,7 @@ comptime length = 8192
 
 def run_elementwise[
     dtype: DType, math_fn: fn(x: SIMD) -> type_of(x)
-](ctx: DeviceContext, in_device: DeviceBuffer[dtype],):
+](ctx: DeviceContext, in_device: DeviceBuffer[dtype],) raises:
     comptime pack_size = simd_width_of[dtype, target=get_gpu_target()]()
 
     var out_device = ctx.enqueue_create_buffer[dtype](length)
@@ -41,7 +41,7 @@ def run_elementwise[
     @always_inline
     @__copy_capture(out_buffer, in_buffer)
     @parameter
-    fn func[
+    def func[
         simd_width: Int, rank: Int, alignment: Int = 1
     ](idx0: IndexList[rank]):
         var idx = rebind[IndexList[1]](idx0)

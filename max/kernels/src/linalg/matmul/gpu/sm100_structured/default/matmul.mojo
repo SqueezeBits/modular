@@ -20,9 +20,6 @@ All GPU code (kernel structs, runtime functions) is in matmul_kernels.mojo.
 """
 
 from std.math import align_up, ceildiv
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.sys import size_of
 
 from std.gpu.host import DeviceContext, FuncAttribute
@@ -33,13 +30,11 @@ from layout import (
     ComptimeInt,
     Coord,
     Idx,
+    RowMajorLayout,
     RuntimeInt,
+    TensorLayout,
     TileTensor,
     row_major,
-)
-from layout.tile_layout import (
-    RowMajorLayout,
-    TensorLayout,
     row_major as tt_row_major,
 )
 from structured_kernels.tile_types import create_tma_tile
@@ -67,7 +62,7 @@ from .matmul_kernels import (
 )
 
 
-fn _blackwell_matmul_tma_umma_warp_specialized[
+def _blackwell_matmul_tma_umma_warp_specialized[
     transpose_b: Bool,
     *,
     config: MatmulConfig[_, _, _, transpose_b],
@@ -128,14 +123,33 @@ fn _blackwell_matmul_tma_umma_warp_specialized[
             or MMA_M != 128
             or register_based_epilogue
             or elementwise_compute_lambda_fn is None
-        ) or (MMA_N % 32 == 0), (
+        ) or (MMA_N % 16 == 0), (
             "SM100 doesn't support shared memory based epilogue when MMA_M =="
-            " 128 and MMA_N is not a multiple of 32"
+            " 128 and MMA_N is not a multiple of 16"
         )
     else:
         comptime assert (
             MMA_M == 128 or MMA_M == 64
         ), "Only support MMA_M == 128 or 64 when cta_group == 1"
+
+    # requirements for float8_e4m3fn output dtype
+    comptime if c_type == DType.float8_e4m3fn:
+        comptime assert a_type == b_type == DType.bfloat16, (
+            "Only support bfloat16 input types is tested for float8_e4m3fn"
+            " output dtype"
+        )
+        comptime assert (
+            config.c_swizzle == TensorMapSwizzle.SWIZZLE_NONE
+        ), "c_swizzle must be for float8_e4m3fn output dtype"
+        comptime assert (
+            (config.cta_group == 1 or MMA_M == 256) and MMA_N % 16 == 0
+        ) or (
+            (config.cta_group == 2 or MMA_M == 128) and MMA_N % 32 == 0
+        ), "MMA_N must be a multiple of 16/32 for float8_e4m3fn output dtype"
+        comptime assert register_based_epilogue, (
+            "only register-based epilogue is supported for float8_e4m3fn output"
+            " dtype"
+        )
 
     comptime cluster_shape = config.cluster_shape
 
@@ -185,8 +199,8 @@ fn _blackwell_matmul_tma_umma_warp_specialized[
 
     comptime a_tma_tile_shape = Index(1, BM // cluster_shape[1], BK)
     a_tma_op = create_tma_tile[
-        KernelType.ATmaTile.tile_layout,
-        KernelType.ATmaTile.desc_layout,
+        KernelType.ATileLayout,
+        KernelType.ADescLayout,
         a_tma_tile_shape,
         swizzle_mode=config.a_swizzle,
     ](ctx, a_device)
@@ -198,8 +212,8 @@ fn _blackwell_matmul_tma_umma_warp_specialized[
         1, BK, BN // (cluster_shape[0] // config.cta_group)
     )
     b_tma_op = create_tma_tile[
-        KernelType.BTmaTile.tile_layout,
-        KernelType.BTmaTile.desc_layout,
+        KernelType.BTileLayout,
+        KernelType.BDescLayout,
         b_tma_tile_shape,
         swizzle_mode = config.b_swizzle,
     ](ctx, b_device)
@@ -213,14 +227,15 @@ fn _blackwell_matmul_tma_umma_warp_specialized[
         1, config.output_tile_shape[0], config.output_tile_shape[1]
     ) if (MMA_M == 256 or config.cta_group == 1) else c_tma_tile_shape_mma128
 
-    comptime assert (not config.AB_swapped) or config.c_swizzle.bytes() == 128, "Only support 128B swizzle mode when AB_swapped is True"
+    comptime assert (not config.AB_swapped) or config.c_swizzle.bytes() in (128, 16), "Only support 128B or None swizzle mode when AB_swapped is True"
     comptime c_tma_tile_shape_1 = config.c_swizzle.bytes() // size_of[c_type]()
     comptime c_tma_tile_shape_final = c_tma_tile_shape if not config.AB_swapped else Index(
         1, c_tma_tile_shape[1], c_tma_tile_shape_1
     )
+
     var c_tma_op = create_tma_tile[
-        KernelType.CTmaTile.tile_layout,
-        KernelType.CTmaTile.desc_layout,
+        KernelType.CTileLayout,
+        KernelType.CDescLayout,
         c_tma_tile_shape_final,
         swizzle_mode = config.c_swizzle,
     ](ctx, c_device)
@@ -256,9 +271,7 @@ fn _blackwell_matmul_tma_umma_warp_specialized[
             max_profiled_tiles
         ].get_workspace(ctx)
     else:
-        workspace = Span[UInt64, MutAnyOrigin](
-            ptr=UnsafePointer[UInt64, origin=MutAnyOrigin](), length=0
-        )
+        workspace = {}
 
     ctx.enqueue_function[kernel, kernel](
         a_tma_op,
@@ -286,7 +299,7 @@ fn _blackwell_matmul_tma_umma_warp_specialized[
         ].dump_workspace_as_csv(ctx, workspace, "profile")
 
 
-fn blackwell_matmul_tma_umma_warp_specialized[
+def blackwell_matmul_tma_umma_warp_specialized[
     transpose_b: Bool,
     *,
     config: MatmulConfig[_, _, _, transpose_b],
@@ -347,7 +360,7 @@ fn blackwell_matmul_tma_umma_warp_specialized[
         ](c_device, a_device, b_device, ctx)
 
 
-fn _blackwell_matmul_tma_umma_warp_specialized_split_k[
+def _blackwell_matmul_tma_umma_warp_specialized_split_k[
     transpose_b: Bool,
     *,
     config: MatmulConfig[_, _, _, transpose_b],
@@ -451,15 +464,15 @@ fn _blackwell_matmul_tma_umma_warp_specialized_split_k[
     comptime KernelType = type_of(matmul_kernel)
 
     a_tma_op = create_tma_tile[
-        KernelType.ATmaTile_splitk.tile_layout,
-        KernelType.ATmaTile_splitk.desc_layout,
+        KernelType.ATileLayout_splitk,
+        KernelType.ADescLayout_splitk,
         Index(BM // cluster_shape[1], BK),
         swizzle_mode=config.a_swizzle,
     ](ctx, a_device)
 
     b_tma_op = create_tma_tile[
-        KernelType.BTmaTile_splitk.tile_layout,
-        KernelType.BTmaTile_splitk.desc_layout,
+        KernelType.BTileLayout_splitk,
+        KernelType.BDescLayout_splitk,
         Index(
             BN // (cluster_shape[0] // config.cta_group), BK
         ) if transpose_b else Index(
@@ -482,8 +495,8 @@ fn _blackwell_matmul_tma_umma_warp_specialized_split_k[
     # on the contiguous dim.
     comptime c_tma_tile_shape_1 = config.c_swizzle.bytes() // size_of[c_type]()
     var c_tma_op = create_tma_tile[
-        KernelType.CTmaTile_splitk.tile_layout,
-        KernelType.CTmaTile_splitk.desc_layout,
+        KernelType.CTileLayout_splitk,
+        KernelType.CDescLayout_splitk,
         c_tma_tile_shape if not config.AB_swapped else Index(
             c_tma_tile_shape[0], c_tma_tile_shape_1
         ),
@@ -594,7 +607,7 @@ fn _blackwell_matmul_tma_umma_warp_specialized_split_k[
 # =============================================================================
 
 
-fn blackwell_batched_matmul_tma_umma_warp_specialized[
+def blackwell_batched_matmul_tma_umma_warp_specialized[
     transpose_b: Bool,
     *,
     config: MatmulConfig[_, _, _, transpose_b],
@@ -673,7 +686,7 @@ fn blackwell_batched_matmul_tma_umma_warp_specialized[
             ](c_device, a_device, b_device, ctx)
 
 
-fn matmul_sm100_fallback[
+def matmul_sm100_fallback[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -723,14 +736,14 @@ fn matmul_sm100_fallback[
 
     # Create TMA descriptors using kernel-derived layout types
     a_tma_op = create_tma_tile[
-        FallbackKernelType.ATmaTile.tile_layout,
-        FallbackKernelType.ATmaTile.desc_layout,
+        FallbackKernelType.ATileLayout,
+        FallbackKernelType.ADescLayout,
         Index(BM, BK),
         swizzle_mode=a_swizzle,
     ](ctx, a)
     b_tma_op = create_tma_tile[
-        FallbackKernelType.BTmaTile.tile_layout,
-        FallbackKernelType.BTmaTile.desc_layout,
+        FallbackKernelType.BTileLayout,
+        FallbackKernelType.BDescLayout,
         Index(BN, BK) if transpose_b else Index(BK, BN),
         swizzle_mode=b_swizzle,
     ](ctx, b)
@@ -743,7 +756,7 @@ fn matmul_sm100_fallback[
         a_tma_op,
         b_tma_op,
         c,
-        UInt(ceildiv(K, BK)),
+        ceildiv(K, BK),
         grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
         block_dim=(block_dim),
         shared_mem_bytes=smem_use,

@@ -14,23 +14,22 @@
 
 from std.random import seed
 
-from buffer import DimList, NDBuffer
 from std.gpu import *
 from std.gpu.host import DeviceContext
 from internal_utils import InitializationType, Timer, init_vector_launch
-from std.memory import LegacyUnsafePointer
 from std.utils.index import IndexList
 
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.testing import assert_equal
+
+from layout import TileTensor, Idx, row_major
 
 
 @no_inline
-fn test_vec_init[
+def test_vec_init[
     dtype: DType, block_dim: Int = 256
 ](length: Int, init_type: InitializationType, context: DeviceContext) raises:
     var timer = Timer()
-    var out_host = UnsafePointer[Scalar[dtype]].alloc(length)
+    var out_host = alloc[Scalar[dtype]](length)
     var out_device = context.enqueue_create_buffer[dtype](length)
     timer.measure("create-buffer")
 
@@ -47,18 +46,18 @@ fn test_vec_init[
         InitializationType.one,
         InitializationType.arange,
     ]:
-        var verification_ptr = UnsafePointer[Scalar[dtype]].alloc(length)
-        var verification_data = NDBuffer[dtype, 1](
-            verification_ptr, IndexList[1](length)
+        var verification_ptr = alloc[Scalar[dtype]](length)
+        var verification_data = TileTensor(
+            verification_ptr, row_major(Idx(length))
         )
         seed(0)
         if init_type == InitializationType.zero:
-            verification_data.zero()
+            _ = verification_data.fill(0)
         elif init_type == InitializationType.one:
-            verification_data.fill(1)
+            _ = verification_data.fill(1)
         elif init_type == InitializationType.arange:
             for i in range(length):
-                verification_data.data[i] = Scalar[dtype](i)
+                verification_data.ptr[i] = Scalar[dtype](i)
         for i in range(length):
             assert_equal(verification_ptr[i], out_host[i])
         verification_ptr.free()

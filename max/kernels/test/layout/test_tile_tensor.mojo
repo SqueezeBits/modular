@@ -12,17 +12,22 @@
 # ===----------------------------------------------------------------------=== #
 
 from buffer import NDBuffer, Dim, DimList
+from std.gpu.memory import AddressSpace
 from std.utils.index import IndexList
-from layout.tile_layout import Layout
 from layout import (
     ComptimeInt,
     Coord,
     Idx,
+    IntTuple,
+    RowMajorLayout,
     RuntimeInt,
     TileTensor,
     row_major,
+    stack_allocation,
+    Layout,
+    UNKNOWN_VALUE,
 )
-from layout.int_tuple import IntTuple
+from layout.tile_layout import Layout as TileLayout
 from layout.swizzle import Swizzle
 from std.math import ceildiv
 from std.testing import (
@@ -38,7 +43,7 @@ def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
 
 
-fn test_distribute() raises:
+def test_distribute() raises:
     comptime thread_layout = row_major((Idx[2](), Idx[2]()))
 
     var array = InlineArray[UInt32, 16](fill=-1)
@@ -48,7 +53,7 @@ fn test_distribute() raises:
     comptime data_layout_stride = Coord[ComptimeInt[4], ComptimeInt[1]]
     var layout_tensor = TileTensor(
         ptr=ptr,
-        layout=Layout(
+        layout=TileLayout(
             shape=data_layout_shape(Idx[4](), Idx[4]()),
             stride=data_layout_stride(Idx[4](), Idx[1]()),
         ),
@@ -69,7 +74,7 @@ fn test_distribute() raises:
         assert_equal(ptr[i], UInt32(expected[i]))
 
 
-fn test_distribute_with_swizzle() raises:
+def test_distribute_with_swizzle() raises:
     """Test distribute with swizzle parameter.
 
     This test verifies that the swizzle parameter correctly transforms
@@ -94,7 +99,7 @@ fn test_distribute_with_swizzle() raises:
     comptime data_layout_stride = Coord[ComptimeInt[4], ComptimeInt[1]]
     var layout_tensor = TileTensor[dtype=DType.uint32](
         ptr=ptr,
-        layout=Layout(
+        layout=TileLayout(
             shape=data_layout_shape(Idx[4](), Idx[4]()),
             stride=data_layout_stride(Idx[4](), Idx[1]()),
         ),
@@ -130,7 +135,7 @@ fn test_distribute_with_swizzle() raises:
     assert_equal(ptr[4], 3)
 
 
-fn test_distribute_swizzle_vs_no_swizzle() raises:
+def test_distribute_swizzle_vs_no_swizzle() raises:
     """Test that swizzle actually changes the memory access pattern.
 
     Compare the results of distribute with and without swizzle to verify
@@ -152,7 +157,7 @@ fn test_distribute_swizzle_vs_no_swizzle() raises:
 
     var tensor_no_swizzle = TileTensor[dtype=DType.uint32](
         ptr=ptr_no_swizzle,
-        layout=Layout(
+        layout=TileLayout(
             shape=data_layout_shape(Idx[4](), Idx[4]()),
             stride=data_layout_stride(Idx[4](), Idx[1]()),
         ),
@@ -160,7 +165,7 @@ fn test_distribute_swizzle_vs_no_swizzle() raises:
 
     var tensor_with_swizzle = TileTensor[dtype=DType.uint32](
         ptr=ptr_with_swizzle,
-        layout=Layout(
+        layout=TileLayout(
             shape=data_layout_shape(Idx[4](), Idx[4]()),
             stride=data_layout_stride(Idx[4](), Idx[1]()),
         ),
@@ -189,7 +194,7 @@ fn test_distribute_swizzle_vs_no_swizzle() raises:
     assert_true(differ, "Swizzle should produce different memory layout")
 
 
-fn test_tile() raises:
+def test_tile() raises:
     # Create a 4x4 tensor with row-major layout
     var data = InlineArray[UInt32, 16](fill=0)
 
@@ -243,7 +248,7 @@ def test_fill_large() raises:
             assert_equal(tensor[(Idx(i), Idx(j))], 1)
 
 
-fn test_slice() raises:
+def test_slice() raises:
     """Test tensor slicing functionality."""
     # Test 2D slice (most common case)
     var data_2d = InlineArray[Int32, 16](uninitialized=True)
@@ -293,7 +298,7 @@ fn test_slice() raises:
     assert_equal(first_row[0, 3], 3)
 
 
-fn test_slice_3d() raises:
+def test_slice_3d() raises:
     """Test 3D tensor slicing."""
     # Create a 4x4x4 tensor
     var data_3d = InlineArray[Int32, 64](uninitialized=True)
@@ -326,7 +331,7 @@ fn test_slice_3d() raises:
     assert_equal(tensor_3d[(Idx(1), Idx(1), Idx(1))], 999)
 
 
-# fn test_slice_runtime_shapes() raises:
+# def test_slice_runtime_shapes() raises:
 #     """Test slicing with runtime-shaped tensors."""
 #     var data = InlineArray[Float32, 12](uninitialized=True)
 #
@@ -361,7 +366,7 @@ fn test_slice_3d() raises:
 #     assert_equal(sliced[(Idx(1), Idx(1))], Float32(10))
 
 
-fn test_slice_dynamic() raises:
+def test_slice_dynamic() raises:
     """Test slice with runtime (start, end) tuples."""
     var data_2d = InlineArray[Int32, 16](uninitialized=True)
     for i in range(16):
@@ -402,7 +407,7 @@ fn test_slice_dynamic() raises:
     assert_equal(tensor_2d[(Idx(1), Idx(1))], 99)
 
 
-fn test_vectorize() raises:
+def test_vectorize() raises:
     """Test tensor vectorization functionality."""
     # Create a 16x16 tensor with row-major layout
     var data = InlineArray[Int32, 256](uninitialized=True)
@@ -443,7 +448,7 @@ fn test_vectorize() raises:
     assert_equal(vectorized[(Idx(3), Idx(3))][0], 204)
 
 
-fn test_vectorize_non_square() raises:
+def test_vectorize_non_square() raises:
     """Test vectorization with non-square vector shapes."""
     var data = InlineArray[Int32, 64](uninitialized=True)
 
@@ -475,7 +480,7 @@ fn test_vectorize_non_square() raises:
     )  # Block (3,1) at element 52
 
 
-fn test_vectorize_1d() raises:
+def test_vectorize_1d() raises:
     """Test vectorization of 1D tensor."""
     var data = InlineArray[Int32, 16](uninitialized=True)
 
@@ -511,13 +516,11 @@ def test_indexing() raises:
 def test_to_layout_tensor_square() raises:
     var stack: InlineArray[UInt8, 4] = [1, 2, 3, 4]
     var tensor = TileTensor(stack, row_major[2, 2]()).to_layout_tensor()
-    assert_equal(materialize[tensor.layout](), layout.Layout.row_major(2, 2))
+    assert_equal(materialize[tensor.layout](), Layout.row_major(2, 2))
     assert_equal(tensor.rank, 2)
     assert_equal(
-        rebind[std.utils.IndexList[2]](
-            tensor.runtime_layout.shape.value.canonicalize()
-        ),
-        std.utils.IndexList[2](2, 2),
+        rebind[IndexList[2]](tensor.runtime_layout.shape.value.canonicalize()),
+        IndexList[2](2, 2),
     )
 
 
@@ -525,13 +528,11 @@ def test_to_layout_tensor_3d() raises:
     var stack = InlineArray[UInt8, 64 * 8 * 4](fill=0)
     var tensor = TileTensor(stack, row_major[64, 8, 4]())
     var lt = tensor.to_layout_tensor()
-    assert_equal(materialize[lt.layout](), layout.Layout.row_major(64, 8, 4))
+    assert_equal(materialize[lt.layout](), Layout.row_major(64, 8, 4))
     assert_equal(lt.rank, 3)
     assert_equal(
-        rebind[std.utils.IndexList[3]](
-            lt.runtime_layout.shape.value.canonicalize()
-        ),
-        std.utils.IndexList[3](64, 8, 4),
+        rebind[IndexList[3]](lt.runtime_layout.shape.value.canonicalize()),
+        IndexList[3](64, 8, 4),
     )
 
 
@@ -543,18 +544,16 @@ def test_to_layout_tensor_3d_dynamic() raises:
     var lt = tensor.to_layout_tensor()
     assert_equal(
         materialize[lt.layout](),
-        layout.Layout.row_major(64, 8, layout.UNKNOWN_VALUE),
+        Layout.row_major(64, 8, UNKNOWN_VALUE),
     )
     assert_equal(lt.rank, 3)
     assert_equal(
-        rebind[std.utils.IndexList[3]](
-            lt.runtime_layout.shape.value.canonicalize()
-        ),
-        std.utils.IndexList[3](64, 8, 4),
+        rebind[IndexList[3]](lt.runtime_layout.shape.value.canonicalize()),
+        IndexList[3](64, 8, 4),
     )
 
 
-fn test_coalesce_2d() raises:
+def test_coalesce_2d() raises:
     """Test coalescing a 2D tensor to rank-1."""
     var data = InlineArray[Int32, 16](uninitialized=True)
 
@@ -579,7 +578,7 @@ fn test_coalesce_2d() raises:
         assert_equal(coalesced[(Idx(i),)], Int32(i))
 
 
-fn test_coalesce_3d() raises:
+def test_coalesce_3d() raises:
     """Test coalescing a 3D tensor to rank-1."""
     var data = InlineArray[Int32, 24](uninitialized=True)
 
@@ -603,7 +602,7 @@ fn test_coalesce_3d() raises:
         assert_equal(coalesced[(Idx(i),)], Int32(i))
 
 
-fn test_coalesce_1d() raises:
+def test_coalesce_1d() raises:
     """Test coalescing a 1D tensor (should be no-op effectively)."""
     var data = InlineArray[Int32, 8](uninitialized=True)
 
@@ -625,7 +624,7 @@ fn test_coalesce_1d() raises:
         assert_equal(coalesced[(Idx(i),)], Int32(i))
 
 
-fn test_coalesce_element_size() raises:
+def test_coalesce_element_size() raises:
     """Test that coalesce properly tracks element_size."""
     var data = InlineArray[Int32, 16](uninitialized=True)
 
@@ -653,7 +652,7 @@ fn test_coalesce_element_size() raises:
         assert_equal(coalesced[(Idx(i),)], Int32(i))
 
 
-fn test_to_nd_buffer_partially_dynamic() raises:
+def test_to_nd_buffer_partially_dynamic() raises:
     var stack = InlineArray[Int32, 16](fill=0)
     var tensor = TileTensor(stack, row_major((Idx(Int(4)), Idx[4]())))
     var buffer = tensor._to_ndbuffer()
@@ -663,7 +662,7 @@ fn test_to_nd_buffer_partially_dynamic() raises:
     assert_equal(buffer.dynamic_shape[1], 4)
 
 
-fn test_from_ndbuffer_row_major_strides() raises:
+def test_from_ndbuffer_row_major_strides() raises:
     """Verify TileTensor(NDBuffer) computes static row-major strides.
 
     When an NDBuffer has mixed static/dynamic shape dims (e.g. shape=(?, 128)),
@@ -675,8 +674,10 @@ fn test_from_ndbuffer_row_major_strides() raises:
     var ptr = stack.unsafe_ptr()
 
     # Mixed shape: dim 0 dynamic, dim 1 static (128).
-    comptime shape = DimList(Dim(), 128)
-    var ndbuf = NDBuffer[DType.float32, 2, _, shape](ptr, IndexList[2](2, 128))
+    comptime shape = DimList[Dim(), 128]()
+    var ndbuf = NDBuffer[rank=2, DType.float32, _, shape](
+        ptr, IndexList[2](2, 128)
+    )
     var tt = TileTensor(ndbuf)
 
     # Runtime values correct.
@@ -692,7 +693,7 @@ fn test_from_ndbuffer_row_major_strides() raises:
     assert_equal(tt.layout.static_shape[1], 128)
 
 
-fn test_to_nd_buffer_fully_dynamic() raises:
+def test_to_nd_buffer_fully_dynamic() raises:
     var stack = InlineArray[Int32, 16](fill=0)
     var tensor = TileTensor(stack, row_major((Idx(Int(8)), Idx(Int(2)))))
     var buffer = tensor._to_ndbuffer()
@@ -702,7 +703,7 @@ fn test_to_nd_buffer_fully_dynamic() raises:
     assert_equal(buffer.dynamic_shape[1], 2)
 
 
-fn test_to_nd_buffer_fully_static() raises:
+def test_to_nd_buffer_fully_static() raises:
     var stack = InlineArray[Int32, 16](fill=0)
     var tensor = TileTensor(stack, row_major((Idx[16](), Idx[1]())))
     var buffer = tensor._to_ndbuffer()
@@ -710,3 +711,243 @@ fn test_to_nd_buffer_fully_static() raises:
     assert_equal(buffer.shape.at[1](), Dim(1))
     assert_equal(buffer.dynamic_shape[0], 16)
     assert_equal(buffer.dynamic_shape[1], 1)
+
+
+def test_load_store_linear_row_major() raises:
+    # 3x4 row-major: strides are (4, 1)
+    var data = InlineArray[Int32, 12](fill=0)
+    for i in range(12):
+        data[i] = Int32(i * 10)
+
+    var tensor = TileTensor(data, row_major((Idx[3](), Idx[4]())))
+
+    # Verify load_linear at known positions.
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](0, 0))), 0)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](0, 3))), 30)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](1, 0))), 40)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](2, 3))), 110)
+
+    # Verify vectorized load (width=2).
+    var vec = tensor.load_linear[2](IndexList[2](1, 0))
+    assert_equal(Int(vec[0]), 40)
+    assert_equal(Int(vec[1]), 50)
+
+    # Verify store_linear.
+    tensor.store_linear(IndexList[2](0, 1), SIMD[DType.int32, 1](999))
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](0, 1))), 999)
+
+    # Verify vectorized store (width=2).
+    tensor.store_linear(IndexList[2](2, 0), SIMD[DType.int32, 2](77, 88))
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](2, 0))), 77)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](2, 1))), 88)
+
+
+def test_load_store_linear_non_trivial_stride() raises:
+    # 2x3 column-major: shape (2,3), strides (1,2) — non-contiguous access
+    var data = InlineArray[Int32, 6](fill=0)
+    for i in range(6):
+        data[i] = Int32(i)
+
+    # Column-major layout: stride[0]=1, stride[1]=2
+    comptime col_major_shape = Coord[ComptimeInt[2], ComptimeInt[3]]
+    comptime col_major_stride = Coord[ComptimeInt[1], ComptimeInt[2]]
+    var tensor = TileTensor(
+        ptr=data.unsafe_ptr(),
+        layout=TileLayout(
+            shape=col_major_shape(Idx[2](), Idx[3]()),
+            stride=col_major_stride(Idx[1](), Idx[2]()),
+        ),
+    )
+
+    # In column-major with strides (1,2), linear offset = row*1 + col*2
+    # data[0]=0, data[1]=1, data[2]=2, data[3]=3, data[4]=4, data[5]=5
+    # (0,0) -> offset 0 -> data[0] = 0
+    # (1,0) -> offset 1 -> data[1] = 1
+    # (0,1) -> offset 2 -> data[2] = 2
+    # (1,1) -> offset 3 -> data[3] = 3
+    # (0,2) -> offset 4 -> data[4] = 4
+    # (1,2) -> offset 5 -> data[5] = 5
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](0, 0))), 0)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](1, 0))), 1)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](0, 1))), 2)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](1, 1))), 3)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](0, 2))), 4)
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](1, 2))), 5)
+
+    # Store and verify.
+    tensor.store_linear(IndexList[2](1, 1), SIMD[DType.int32, 1](42))
+    assert_equal(Int(tensor.load_linear[1](IndexList[2](1, 1))), 42)
+    # Verify underlying data: offset 3 should be 42.
+    assert_equal(Int(data[3]), 42)
+
+
+def test_linear_idx_type_small_static_layout() raises:
+    """Small fully-static layouts use int32 for linear_idx_type."""
+    # Cosize = (4-1)*4 + (4-1)*1 + 1 = 16, fits in int32
+    comptime TensorType = TileTensor[
+        DType.float32,
+        RowMajorLayout[ComptimeInt[4], ComptimeInt[4]],
+        MutAnyOrigin,
+    ]
+    comptime assert TensorType.linear_idx_type == DType.int32
+
+
+def test_linear_idx_type_dynamic_layout_generic() raises:
+    """Dynamic layouts in GENERIC address space use int64."""
+    comptime TensorType = TileTensor[
+        DType.float32,
+        RowMajorLayout[RuntimeInt[DType.int], ComptimeInt[4]],
+        MutAnyOrigin,
+    ]
+    # Not all dims known -> falls through to address_space check -> GENERIC -> int64
+    comptime assert TensorType.linear_idx_type == DType.int64
+
+
+def test_linear_idx_type_shared_address_space() raises:
+    """Shared memory address space always uses int32."""
+    comptime TensorType = TileTensor[
+        DType.float32,
+        RowMajorLayout[ComptimeInt[4], ComptimeInt[4]],
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ]
+    comptime assert TensorType.linear_idx_type == DType.int32
+
+
+def test_linear_idx_type_recomputed_after_tile() raises:
+    """After tile(), linear_idx_type is recomputed from the new layout."""
+    var stack = InlineArray[Int32, 256](fill=0)
+    var tensor = TileTensor(stack, row_major[16, 16]())
+    # Original: cosize=256, int32
+    assert_equal(type_of(tensor).linear_idx_type, DType.int32)
+
+    # After tiling: new layout has smaller cosize, still int32
+    var tiled = tensor.tile[4, 4]((Idx(0), Idx(0)))
+    assert_equal(type_of(tiled).linear_idx_type, DType.int32)
+    _ = tiled
+
+
+def test_linear_idx_type_recomputed_after_distribute() raises:
+    """After distribute(), linear_idx_type is recomputed from the new layout."""
+    var stack = InlineArray[Int32, 16](fill=0)
+    var tensor = TileTensor(stack, row_major[4, 4]())
+    assert_equal(type_of(tensor).linear_idx_type, DType.int32)
+
+    comptime thread_layout = row_major((Idx[2](), Idx[2]()))
+    var frag = tensor.distribute[thread_layout=thread_layout](0)
+    # Distributed fragment: shape [2,2], strides [8,2] -> cosize = (2-1)*8 + (2-1)*2 + 1 = 11
+    assert_equal(type_of(frag).linear_idx_type, DType.int32)
+    _ = frag
+
+
+def test_linear_idx_type_recomputed_after_vectorize() raises:
+    """After vectorize(), linear_idx_type is recomputed from the new layout."""
+    var stack = InlineArray[Int32, 256](fill=0)
+    var tensor = TileTensor(stack, row_major[16, 16]())
+    assert_equal(type_of(tensor).linear_idx_type, DType.int32)
+
+    var vectorized = tensor.vectorize[4, 4]()
+    # Vectorized: shape [4,4], strides [64,4] -> cosize = (4-1)*64 + (4-1)*4 + 1 = 205
+    assert_equal(type_of(vectorized).linear_idx_type, DType.int32)
+    _ = vectorized
+
+
+def test_transpose_2d() raises:
+    """Test transpose on a 2D tensor swaps rows and columns."""
+    var data = InlineArray[Int32, 12](uninitialized=True)
+    for i in range(12):
+        data[i] = Int32(i)
+
+    # 3x4 row-major:
+    # [0  1  2  3]
+    # [4  5  6  7]
+    # [8  9  10 11]
+    var tensor = TileTensor(data, row_major[3, 4]())
+    var trans = tensor.transpose()
+
+    # Transposed shape should be (4, 3)
+    assert_equal(trans.dim[0](), 4)
+    assert_equal(trans.dim[1](), 3)
+
+    # Transposed strides: original (4, 1) -> reversed (1, 4)
+    assert_equal(trans.layout.stride[0]().value(), 1)
+    assert_equal(trans.layout.stride[1]().value(), 4)
+
+    # Verify element access: trans[col, row] == tensor[row, col]
+    assert_equal(trans[0, 0], 0)
+    assert_equal(trans[1, 0], 1)
+    assert_equal(trans[2, 0], 2)
+    assert_equal(trans[3, 0], 3)
+    assert_equal(trans[0, 1], 4)
+    assert_equal(trans[0, 2], 8)
+    assert_equal(trans[3, 2], 11)
+
+
+def test_transpose_is_view() raises:
+    """Test that transpose creates a view sharing memory with the original."""
+    var data = InlineArray[Int32, 6](uninitialized=True)
+    var tensor = TileTensor(data, row_major[2, 3]()).fill(0)
+
+    var trans = tensor.transpose()
+
+    # Modify through transposed view: trans[1, 0] -> tensor[0, 1]
+    trans[(Idx(1), Idx(0))] = 42
+    assert_equal(tensor[(Idx(0), Idx(1))], 42)
+
+    # Modify through original: tensor[1, 2] -> trans[2, 1]
+    tensor[(Idx(1), Idx(2))] = 99
+    assert_equal(trans[(Idx(2), Idx(1))], 99)
+
+
+def test_transpose_square() raises:
+    """Test transpose on a square tensor."""
+    var data = InlineArray[Int32, 9](uninitialized=True)
+    for i in range(9):
+        data[i] = Int32(i)
+
+    # 3x3 row-major:
+    # [0 1 2]
+    # [3 4 5]
+    # [6 7 8]
+    var tensor = TileTensor(data, row_major[3, 3]())
+    var trans = tensor.transpose()
+
+    assert_equal(trans.dim[0](), 3)
+    assert_equal(trans.dim[1](), 3)
+
+    # Diagonal unchanged
+    assert_equal(trans[0, 0], 0)
+    assert_equal(trans[1, 1], 4)
+    assert_equal(trans[2, 2], 8)
+
+    # Off-diagonal swapped
+    assert_equal(trans[0, 1], 3)  # was tensor[1, 0]
+    assert_equal(trans[1, 0], 1)  # was tensor[0, 1]
+    assert_equal(trans[0, 2], 6)  # was tensor[2, 0]
+    assert_equal(trans[2, 0], 2)  # was tensor[0, 2]
+
+
+def test_transpose_1d() raises:
+    """Test transpose on a 1D tensor (identity operation)."""
+    var data = InlineArray[Int32, 4](uninitialized=True)
+    for i in range(4):
+        data[i] = Int32(i * 10)
+
+    var tensor = TileTensor(data, row_major[4]())
+    var trans = tensor.transpose()
+
+    assert_equal(trans.dim[0](), 4)
+    assert_equal(trans.layout.stride[0]().value(), 1)
+
+    for i in range(4):
+        assert_equal(trans[(Idx(i),)], Int32(i * 10))
+
+
+def test_transpose_preserves_element_count() raises:
+    """Test that transpose preserves the total number of elements."""
+    var data = InlineArray[Int32, 20](uninitialized=True)
+    var tensor = TileTensor(data, row_major[4, 5]()).fill(1)
+    var trans = tensor.transpose()
+
+    assert_equal(trans.num_elements(), tensor.num_elements())
+    assert_equal(trans.num_elements(), 20)

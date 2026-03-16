@@ -27,6 +27,7 @@ Architecture:
 """
 
 from std.math import ceildiv
+from std.math.uutils import ufloordiv
 from std.sys import size_of
 
 from std.gpu import WARP_SIZE, thread_idx
@@ -38,10 +39,9 @@ from std.gpu.primitives.cluster import (
     elect_one_sync_with_mask,
 )
 from std.gpu.sync import named_barrier, syncwarp
-from layout.tile_layout import TensorLayout
-from layout import TileTensor
+from layout import TensorLayout, TileTensor
 from structured_kernels.tile_types import (
-    TMATile,
+    TmaOpType,
     static_row_major,
 )
 
@@ -290,14 +290,11 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     comptime AScalesLayout = static_row_major[1, Self.BM]
 
     # TMA operation types (derived from new Layout types)
-    comptime ATmaTile = TMATile[Self.a_type, Self.ATileLayout, Self.ADescLayout]
-    comptime ATmaOp = Self.ATmaTile.InnerType
-    comptime BTmaTile = TMATile[Self.b_type, Self.BTileLayout, Self.BDescLayout]
-    comptime BTmaOp = Self.BTmaTile.InnerType
-    comptime AScalesTmaTile = TMATile[
+    comptime ATmaOp = TmaOpType[Self.a_type, Self.ATileLayout, Self.ADescLayout]
+    comptime BTmaOp = TmaOpType[Self.b_type, Self.BTileLayout, Self.BDescLayout]
+    comptime AScalesTmaOp = TmaOpType[
         Self.a_scales_type, Self.AScalesLayout, Self.AScalesLayout
     ]
-    comptime AScalesTmaOp = Self.AScalesTmaTile.InnerType
 
     # TMA load size constants (from desc layout dimensions)
     comptime a_tma_load_size = Self.a_tile_dim0 * Self.a_swizzle_elems
@@ -355,7 +352,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     # ========== Validation ==========
 
     @staticmethod
-    fn validate_config():
+    def validate_config():
         """Compile-time validation of kernel configuration."""
         comptime assert Self.transpose_b, "Only support transposed B"
         comptime assert (
@@ -383,7 +380,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn init_barriers(
+    def init_barriers(
         elect_one_warp: Bool,
         elect_one_thread: Bool,
         a_tma_op: Self.ATmaOp,
@@ -432,7 +429,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(a_scales_tma_op, `nvvm.grid_constant`)
-    fn run(
+    def run(
         # Grid-constant TMA descriptors
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
@@ -504,7 +501,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
         var mma_complete_mask = UInt16((1 << Self.cta_group) - 1)
 
         # K iteration count
-        var num_k_iters = Int(ceildiv(Int(K), Self.BK))
+        var num_k_iters = ceildiv(Int(K), Self.BK)
 
         # ===== Barrier Initialization =====
         Self.init_barriers(
@@ -634,7 +631,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
                     )
 
                     # Convert absolute N to tile index for b_scales lookup
-                    var n_tile = UInt(ctx.n()) // UInt(Self.MMA_N)
+                    var n_tile = ufloordiv(Int(ctx.n()), Self.MMA_N)
 
                     for k_iter in range(num_k_iters):
                         with epi_ctx.per_k_stage(input_pipeline) as epi_stage:
@@ -643,10 +640,10 @@ struct BlockwiseFP8_1D2DMatmulKernel[
                                 a_scales_tiles,
                                 epi_stage,
                                 work_tile_coord=(
-                                    UInt(ctx.m()),
+                                    Int(ctx.m()),
                                     n_tile,
                                 ),
-                                k_iter=UInt(k_iter),
+                                k_iter=k_iter,
                                 problem_shape=StaticTuple[Int32, 3](
                                     Int32(0),
                                     Int32(Self.static_N),
@@ -674,7 +671,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn load_input_tiles[
+    def load_input_tiles[
         tiles_origin: MutOrigin,
         //,
     ](
@@ -760,7 +757,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn mma[
+    def mma[
         tiles_origin: MutOrigin,
         //,
     ](

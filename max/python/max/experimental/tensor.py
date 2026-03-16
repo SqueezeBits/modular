@@ -106,22 +106,10 @@ from dataclasses import dataclass
 from typing import Any, Protocol, TypeAlias, cast
 
 from max import driver, graph
-from max.driver import (
-    CPU,
-    Accelerator,
-    Device,
-    DLPackArray,
-    accelerator_count,
-)
+from max.driver import CPU, Accelerator, Device, DLPackArray, accelerator_count
 from max.dtype import DType
 from max.experimental.support import contextvar_context, driver_tensor_type
-from max.graph import (
-    DimLike,
-    ShapeLike,
-    TensorType,
-    TensorValueLike,
-    ops,
-)
+from max.graph import DimLike, ShapeLike, TensorType, TensorValueLike, ops
 from max.graph.ops.constant import NestedArray, Number
 from max.graph.value import HasTensorValue
 from rich.pretty import pretty_repr
@@ -524,7 +512,7 @@ class Tensor(DLPackArray, HasTensorValue):
         ``storage`` or ``state`` for internal construction.
 
         For DLPack-compatible arrays (NumPy, PyTorch, etc.) the array's own
-        ``dtype`` is preserved by default — no silent precision conversion
+        ``dtype`` is preserved by default; no silent precision conversion
         happens.  For Python scalars and nested lists, ``dtype`` defaults to
         :obj:`DType.float32` on CPU and :obj:`DType.bfloat16` on accelerators.
 
@@ -550,7 +538,7 @@ class Tensor(DLPackArray, HasTensorValue):
                 must be supplied.
             dtype: The data type for the tensor elements.  For DLPack arrays
                 this defaults to the array's own dtype; passing a conflicting
-                value raises :obj:`ValueError`.  For Python scalars/lists this
+                value raises :exc:`ValueError`.  For Python scalars/lists this
                 defaults to :obj:`DType.float32` on CPU and
                 :obj:`DType.bfloat16` on accelerators.
             device: The device where the tensor will be allocated. If not
@@ -1263,9 +1251,15 @@ class Tensor(DLPackArray, HasTensorValue):
     def to(self, device: Device) -> Tensor:
         """Transfers the tensor to a different device.
 
-        Creates a new tensor with the same data on the specified device. This
-        allows moving tensors between CPU and accelerators or between different
-        accelerator devices.
+        For realized tensors (those with concrete data in memory), this
+        performs a direct driver-level transfer via
+        :meth:`~max.driver.Buffer.to`, bypassing graph compilation entirely.
+        If the tensor is already on the target device, ``self`` is returned
+        unchanged (matching PyTorch semantics).
+
+        For unrealized tensors (symbolic graph values), this falls through to
+        :func:`~max.graph.ops.transfer_to` which inserts a transfer op into
+        the computation graph.
 
         .. code-block:: python
 
@@ -1280,12 +1274,21 @@ class Tensor(DLPackArray, HasTensorValue):
             y = x.to(Accelerator())
             print(y.device)  # Accelerator(0)
 
+            # Same-device transfer is a no-op
+            z = y.to(y.device)
+            assert z is y
+
         Args:
             device: The target device for the tensor.
 
         Returns:
-            Tensor: A new tensor with the same data on the specified device.
+            Tensor: A new tensor on the specified device, or ``self`` if the
+            tensor is already on that device.
         """
+        if self.real:
+            if self.device == device:
+                return self
+            return Tensor(storage=self.driver_tensor.to(device))
         return F.transfer_to(self, device)
 
     def argmax(self, axis: int | None = -1) -> Tensor:
@@ -1725,8 +1728,11 @@ class Tensor(DLPackArray, HasTensorValue):
             dtype: The target data type for the tensor.
 
         Returns:
-            Tensor: A new tensor with the specified data type.
+            Tensor: A new tensor with the specified data type, or ``self``
+            if the tensor already has the target dtype.
         """
+        if self.real and self.dtype == dtype:
+            return self
         return F.cast(self, dtype)
 
     def permute(self, dims: list[int]) -> Tensor:
@@ -1800,7 +1806,7 @@ class Tensor(DLPackArray, HasTensorValue):
     def T(self) -> Tensor:
         """Returns a tensor with the last two dimensions transposed.
 
-        This is equivalent to calling :obj:`transpose(-1, -2)`, which swaps
+        This is equivalent to calling ``transpose(-1, -2)``, which swaps
         the last two dimensions of the tensor. For a 2D matrix, this produces
         the standard matrix transpose.
 

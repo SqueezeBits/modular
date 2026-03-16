@@ -60,7 +60,7 @@ comptime _target_address_space = (
 )
 
 
-fn _mode_name[direction: Int]() -> String:
+def _mode_name[direction: Int]() -> String:
     comptime if direction == 0:
         return "unidir-push"
     elif direction == 1:
@@ -74,7 +74,7 @@ fn _mode_name[direction: Int]() -> String:
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK_SIZE))
 )
-fn p2p_copy_kernel[
+def p2p_copy_kernel[
     dtype: DType,
     width: Int,
 ](
@@ -98,7 +98,7 @@ fn p2p_copy_kernel[
         ](elem_idx, data)
 
 
-fn bench_p2p[
+def bench_p2p[
     dtype: DType,
     simd_width: Int,
     direction: Int,
@@ -108,10 +108,9 @@ fn bench_p2p[
     comptime is_bidir = (direction == 2 or direction == 3)
 
     var num_elements = num_bytes // size_of[dtype]()
-    debug_assert(
-        num_bytes % (size_of[dtype]() * simd_width) == 0,
-        "Ragged sizes unsupported by bench_p2p.",
-    )
+    assert (
+        num_bytes % (size_of[dtype]() * simd_width) == 0
+    ), "Ragged sizes unsupported by bench_p2p."
     var grid_size = ceildiv(num_elements // simd_width, BLOCK_SIZE)
 
     # Create contexts and buffers on both GPUs.
@@ -155,12 +154,12 @@ fn bench_p2p[
 
     @parameter
     @always_inline
-    fn bench_iter(
+    def bench_iter(
         mut bencher: Bencher, ctx: DeviceContext, ctx_idx: Int
     ) raises:
         @parameter
         @always_inline
-        fn call_fn(ctx_inner: DeviceContext, cache_iter: Int) raises:
+        def call_fn(ctx_inner: DeviceContext, cache_iter: Int) raises:
             # In unidir mode only GPU 0 does work; GPU 1 is idle.
             comptime if not is_bidir:
                 if ctx_idx != 0:
@@ -318,7 +317,7 @@ fn bench_p2p[
     _ = ctxs^
 
 
-fn _verify[
+def _verify[
     dtype: DType
 ](
     host: UnsafePointer[Scalar[dtype], MutExternalOrigin],
@@ -343,7 +342,7 @@ fn _verify[
     print("Verification passed for GPU", gpu)
 
 
-fn main() raises:
+def main() raises:
     var num_bytes = arg_parse("num_bytes", 64 * 1024 * 1024)
     comptime dtype = get_defined_dtype["dtype", DType.bfloat16]()
     comptime simd_width = (

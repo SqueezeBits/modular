@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.math import ceildiv
 
 from std.gpu.host import DeviceContext
@@ -28,13 +25,15 @@ from nn.mha_tile_scheduler import (
 )
 
 
-fn test_kernel[schedule: MHASchedule]():
+def test_kernel[schedule: MHASchedule]():
     comptime scheduler_t = TileScheduler[32, 3, num_ctas=8, schedule=schedule]
     scheduler = scheduler_t()
     valid_length = NullPointer[DType.uint32]()
     tile_summary = MHATileSummary(1, ceildiv(100, 32), valid_length, 0)
     state = scheduler.initial_state(
-        UnsafePointer[UInt32, address_space=AddressSpace.SHARED](),
+        UnsafePointer[
+            UInt32, MutAnyOrigin, address_space=AddressSpace.SHARED
+        ](),
         tile_summary,
     )
     work_info = scheduler.get_current_work_info(tile_summary, state)

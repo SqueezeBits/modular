@@ -772,11 +772,21 @@ class MAXModelConfig(MAXModelConfigBase):
                 "config_dict": component_configs.get(component_name, {}),
             }
 
+        # Collect top-level metadata (non-private, non-component keys).
+        metadata: dict[str, Any] = {}
+        for key, value in model_index.items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, list) and len(value) == 2:
+                continue
+            metadata[key] = value
+
         # Build the final config structure
         return {
             "_class_name": class_name,
             "_diffusers_version": diffusers_version,
             "components": components,
+            **metadata,
         }
 
     @computed_field  # type: ignore[prop-decorator]
@@ -957,14 +967,22 @@ class MAXModelConfig(MAXModelConfigBase):
 
         if self.weight_path:
             # Get the encoding of the first weight path file.
-            if os.path.exists(self.weight_path[0]):
-                file_encoding = parse_supported_encoding_from_file_name(
-                    str(self.weight_path[0])
-                )
-            else:
-                file_encoding = self.huggingface_weight_repo.encoding_for_file(
-                    self.weight_path[0]
-                )
+            # Try filename-based detection first — it works for both
+            # local and remote paths and avoids ambiguity when a repo
+            # has multiple dtypes (e.g. NVFP4 repos with F32 norms).
+            file_encoding = parse_supported_encoding_from_file_name(
+                str(self.weight_path[0])
+            )
+            if file_encoding is None:
+                if os.path.exists(self.weight_path[0]):
+                    # Local file with no encoding hint in the name.
+                    file_encoding = None
+                else:
+                    file_encoding = (
+                        self.huggingface_weight_repo.encoding_for_file(
+                            self.weight_path[0]
+                        )
+                    )
 
             if file_encoding:
                 if self.allow_safetensors_weights_fp32_bf6_bidirectional_cast:
@@ -1304,6 +1322,7 @@ class MAXModelConfig(MAXModelConfigBase):
         self.kv_cache = KVCacheConfig(**kv_cache_kwargs)
         # Note: the quantization_encoding is possibly not set yet here, so we first check for an explicit override.
         if cache_dtype := self._get_cache_override():
+            # Handled by `create_kv_cache_config` but we set it again here to ensure it takes precedence over quantization encoding.
             self.kv_cache._cache_dtype = cache_dtype
 
     def set_cache_dtype_given_quantization_encoding(
@@ -1318,8 +1337,9 @@ class MAXModelConfig(MAXModelConfigBase):
         3. Falls back to ``float32`` if no encoding is specified.
         """
         # First check for an explicit override.
-        if self.kv_cache.kv_cache_format is not None:
-            return  # No default needed, override is set.
+        if cache_dtype := self._get_cache_override():
+            self.kv_cache._cache_dtype = cache_dtype
+            return
 
         # If there's no quantization encoding return a default value.
         if not self.quantization_encoding:

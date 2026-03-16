@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.sys import prefetch
 from std.sys.info import align_of
 from std.sys.intrinsics import PrefetchOptions
@@ -32,7 +29,7 @@ from .impl import InnerMatmulKernel
 @fieldwise_init
 struct Inner_matmul_default(InnerMatmulKernel, Movable):
     @always_inline
-    fn _accumulate[
+    def _accumulate[
         simd_size: Int, kernel_rows: Int, kernel_cols: Int
     ](
         self,
@@ -99,7 +96,7 @@ struct Inner_matmul_default(InnerMatmulKernel, Movable):
                 c_local.fma(idx0, idx1, a_val, b_val)
 
     @always_inline
-    fn __inner_matmul__[
+    def __inner_matmul__[
         kernel_rows: Int,
         kernel_cols: Int,
         simd_size: Int,
@@ -137,7 +134,7 @@ struct Inner_matmul_default(InnerMatmulKernel, Movable):
                 acc.init(0)
             else:
                 acc.load(
-                    rebind[UnsafePointer[Scalar[c.dtype]]](c_ptr),
+                    rebind[UnsafePointer[Scalar[c.dtype], MutAnyOrigin]](c_ptr),
                     c_stride,
                     idx_n,
                     c_bound,
@@ -156,7 +153,7 @@ struct Inner_matmul_default(InnerMatmulKernel, Movable):
                     Index(idx_n, idx_k),
                 )
             acc.store(
-                rebind[UnsafePointer[Scalar[c.dtype]]](c_ptr),
+                rebind[UnsafePointer[Scalar[c.dtype], MutAnyOrigin]](c_ptr),
                 c_stride,
                 idx_n,
                 c_bound,

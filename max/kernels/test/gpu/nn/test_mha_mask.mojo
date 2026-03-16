@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.sys import has_amd_gpu_accelerator, has_nvidia_gpu_accelerator
 from std.sys.info import CompilationTarget
 
@@ -82,7 +79,9 @@ def test_causal_mask_asm() raises:
 
     print("== test_causal_mask_asm")
 
-    fn kernel(q_idx: UInt32, k_idx: UInt32, x: UnsafePointer[Float32]):
+    def kernel(
+        q_idx: UInt32, k_idx: UInt32, x: UnsafePointer[Float32, MutAnyOrigin]
+    ):
         var mask = CausalMask()
         var vec = mask.mask(
             IndexList[4, element_type=DType.uint32](
@@ -111,7 +110,7 @@ def test_causal_mask_asm() raises:
         assert_true("s_cselect_b64" in asm)
         assert_true("v_cndmask_b32_e64" in asm)
     else:
-        return CompilationTarget.unsupported_target_error[
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name(),
         ]()
 
@@ -144,7 +143,7 @@ def test_and_mask() raises:
     assert_true(
         mask2.status(Index(64, 384), Index(64, 128))
         == TileMaskStatus.FULL_MASK,
-        msg=(
+        msg=String(
             t"lhs = {mask2.status(Index(0, 0), Index(0, 0))} rhs ="
             t" {TileMaskStatus.FULL_MASK}"
         ),
@@ -166,7 +165,7 @@ def test_sliding_window_causal_mask() raises:
         assert_equal(
             status,
             expected,
-            msg=t"  {offset}, {size} > {status} (expected: {expected})",
+            msg=String(t"  {offset}, {size} > {status} (expected: {expected})"),
         )
 
         # K > 0 1 2 3 4 5 6 7 8
@@ -198,7 +197,9 @@ def test_sliding_window_causal_mask_asm() raises:
 
     print("== test_sliding_window_causal_mask_asm")
 
-    fn kernel(q_idx: UInt32, k_idx: UInt32, x: UnsafePointer[Float32]):
+    def kernel(
+        q_idx: UInt32, k_idx: UInt32, x: UnsafePointer[Float32, MutAnyOrigin]
+    ):
         var mask = SlidingWindowCausalMask[8]()
         var vec = mask.mask(
             IndexList[4, element_type=DType.uint32](
@@ -228,7 +229,7 @@ def test_sliding_window_causal_mask_asm() raises:
         assert_true("s_cselect_b64" in asm)
         assert_true("v_cndmask_b32_e64" in asm)
     else:
-        return CompilationTarget.unsupported_target_error[
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name(),
         ]()
 

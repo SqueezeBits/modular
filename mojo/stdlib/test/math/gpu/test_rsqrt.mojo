@@ -27,7 +27,7 @@ def run_elementwise[
     kernel_fn: fn[dtype: DType, width: Int](SIMD[dtype, width]) raises -> SIMD[
         dtype, width
     ],
-](ctx: DeviceContext) where dtype.is_floating_point():
+](ctx: DeviceContext) raises where dtype.is_floating_point():
     comptime length = 256
 
     comptime pack_size = simd_width_of[dtype, target=get_gpu_target()]()
@@ -51,7 +51,7 @@ def run_elementwise[
     @always_inline
     @__copy_capture(out_buffer, in_buffer)
     @parameter
-    fn func[
+    def func[
         simd_width: Int, rank: Int, alignment: Int = 1
     ](idx0: IndexList[rank]):
         var idx = rebind[IndexList[1]](idx0)

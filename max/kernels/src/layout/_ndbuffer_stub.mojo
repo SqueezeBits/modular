@@ -15,13 +15,12 @@ from std.sys import align_of, size_of
 
 from buffer import NDBuffer
 from buffer.dimlist import Dim, DimList
-from std.gpu import thread_idx, CacheEviction, async_copy
+from std.gpu import thread_idx_int as thread_idx, CacheEviction, async_copy
 from layout import Layout, LayoutTensor
 from layout.int_tuple import depth
 from layout.layout import make_layout
 
 from std.utils import IndexList, StaticTuple
-from std.builtin.variadics import _ReduceVariadicValueAndIdxToVariadic
 
 comptime _swizzle_signature = fn[dtype: DType](Scalar[dtype]) -> Scalar[dtype]
 
@@ -39,7 +38,7 @@ struct TileMask[
     var max_dim: IndexList[Self.rank]
     var offset: IndexList[Self.rank]
 
-    fn __init__(
+    def __init__(
         out self,
         max_dim: IndexList[Self.rank],
         offset: IndexList[Self.rank] = IndexList[Self.rank](0),
@@ -51,7 +50,7 @@ struct TileMask[
     # accessed at the given `point` at this axis.
     #
     @always_inline
-    fn access_mask(
+    def access_mask(
         self, point: IndexList[Self.rank]
     ) -> StaticTuple[Bool, Self.rank]:
         var mask = StaticTuple[Bool, Self.rank]()
@@ -75,7 +74,7 @@ struct TileMask[
     # Returns the element size can be accessed.
     #
     @always_inline
-    fn access_size(
+    def access_size(
         self,
         point: IndexList[Self.rank],
         dim_mask: StaticTuple[Bool, Self.rank],
@@ -98,7 +97,7 @@ struct TileMask[
 # Computes the mask resulting tiling buffer with the `tile sizes`.
 #
 @always_inline("nodebug")
-fn _tile_mask[
+def _tile_mask[
     *tile_sizes: Dim,
     rank: Int,
     __sizes: IndexList[rank] = IndexList[rank](1),
@@ -119,7 +118,7 @@ fn _tile_mask[
 # Computes the mask resulting vectorizing buffer with the `sizes`.
 #
 @always_inline("nodebug")
-fn _vectorize_mask[
+def _vectorize_mask[
     rank: Int,
     sizes: IndexList[rank],
     element_stride: IndexList[rank],
@@ -127,14 +126,13 @@ fn _vectorize_mask[
 ](mask: TileMask[rank, mask_sizes, element_stride]) -> TileMask[
     rank, sizes, element_stride
 ]:
-    var res = TileMask[rank, sizes, element_stride](mask.max_dim, mask.offset)
-    return res
+    return TileMask[rank, sizes, element_stride](mask.max_dim, mask.offset)
 
 
 # Returns the shaep of the `thread_layout` as tuple.
 #
 @always_inline("nodebug")
-fn _get_shape_as_tuple[
+def _get_shape_as_tuple[
     rank: Int,
 ](thread_layout: Layout) -> IndexList[rank]:
     var res = IndexList[rank]()
@@ -148,7 +146,7 @@ fn _get_shape_as_tuple[
 # Computes the mask resulting distributing to `thread_layout`.
 #
 @always_inline("nodebug")
-fn _distribute_mask[
+def _distribute_mask[
     thread_layout: Layout,
     rank: Int,
     element_size: IndexList[rank],
@@ -173,71 +171,32 @@ fn _distribute_mask[
     return res
 
 
-comptime _ValueIdxToValueGeneratorType[
-    From: AnyType, To: AnyType
-] = __mlir_type[
-    `!lit.generator<<"From": `,
-    +From,
-    `, "Idx":`,
-    Int,
-    `>`,
-    +To,
-    `>`,
-]
-"""This specifies a generator to generate a generator type for the reducer of
-values. The result generator type is [From, idx: Int] -> To,
-"""
-
-comptime _ValueToValueMapper[
-    FromType: AnyType,
-    ToType: AnyType,
-    //,
-    Mapper: _ValueIdxToValueGeneratorType[FromType, ToType],
-    Prev: Variadic.ValuesOfType[ToType],
-    From: Variadic.ValuesOfType[FromType],
-    idx: Int,
-] = Variadic.concat_values[
-    Prev,
-    Variadic.values[Mapper[From[idx], idx]],
-]
-comptime _ValueToValueVariadicMapper[
-    FromType: AnyType,
-    ToType: AnyType,
-    //,
-    Mapper: _ValueIdxToValueGeneratorType[FromType, ToType],
-    From: Variadic.ValuesOfType[FromType],
-] = _ReduceVariadicValueAndIdxToVariadic[
-    BaseVal=Variadic.empty_of_type[ToType],
-    VariadicType=From,
-    Reducer=_ValueToValueMapper[Mapper, ...],
-]
-"""Given a mapping function for an element+index and a variadic list of that
-element, this applies the function to each entry in the list and returns a new
-list of results."""
-
-
 # Returns the shape of distribute `thread_layout` into `shape`.
 #
-@always_inline("nodebug")
-fn _distribute_shape[thread_layout: Layout, shape: DimList]() -> DimList:
-    comptime transform[dim: Dim, idx: Int]: Dim = dim // Int(
-        thread_layout.shape[idx]
-    )
-    return DimList(_ValueToValueVariadicMapper[transform, shape.value.value])
+comptime _distribute_shape_transform[
+    thread_layout: Layout, shape: DimList, idx: Int
+]: Dim = shape.values[idx] // Int(thread_layout.shape[idx])
+
+comptime _distribute_shape[thread_layout: Layout, shape: DimList]: DimList[
+    *Variadic.tabulate[
+        Variadic.size(shape.values),
+        _distribute_shape_transform[thread_layout, shape, ...],
+    ]
+] = {}
 
 
 # Distribute thread_layout and returns the fragments of `thread_id`.
 #
 @always_inline("nodebug")
-fn distribute[
+def distribute[
     dtype: DType,
     rank: Int,
     shape: DimList,
     thread_layout: Layout,
     swizzle: Optional[_swizzle_signature] = None,
     element_size: Int = 1,
-](buff: NDBuffer[dtype, rank, _, shape], thread_id: Int) -> NDBuffer[
-    dtype, rank, buff.origin, _distribute_shape[thread_layout, shape]()
+](buff: NDBuffer[rank=rank, dtype, _, shape], thread_id: Int) -> NDBuffer[
+    rank=rank, dtype, buff.origin, _distribute_shape[thread_layout, shape]
 ]:
     comptime assert (
         depth(thread_layout.shape) == 1
@@ -272,14 +231,20 @@ fn distribute[
     }
 
 
-@always_inline("nodebug")
-fn _vectorize_shape[*sizes: Int, shape: DimList]() -> DimList:
-    comptime transform[dim: Dim, idx: Int]: Dim = dim // sizes[idx]
-    return DimList(_ValueToValueVariadicMapper[transform, shape.value.value])
+comptime _vectorize_shape_transform[
+    idx: Int, shape: DimList, *sizes: Int
+]: Dim = shape.values[idx] // sizes[idx]
+
+comptime _vectorize_shape[*sizes: Int, shape: DimList]: DimList[
+    *Variadic.tabulate[
+        Variadic.size(shape.values),
+        _vectorize_shape_transform[_, shape, *sizes],
+    ]
+] = {}
 
 
 @always_inline("nodebug")
-fn _to_static_tuple[*sizes: Int, rank: Int]() -> IndexList[rank]:
+def _to_static_tuple[*sizes: Int, rank: Int]() -> IndexList[rank]:
     var vals = IndexList[rank]()
 
     comptime for i in range(rank):
@@ -295,30 +260,26 @@ struct ElementLayout[rank: Int, shape: IndexList[rank]](
 ):
     var stride: IndexList[Self.rank]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.stride = IndexList[Self.rank]()
 
     @no_inline
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    fn __str__(self) -> String:
-        return String.write(self)
-
-    @no_inline
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write(Self.shape, ":", self.stride)
 
 
 # Returns the linear index of an element, this is equivalent to concat
 # the element layout and the buffer layout
 @always_inline("nodebug")
-fn _get_element_idx[
+def _get_element_idx[
     rank: Int,
     dtype: DType,
     shape: DimList,
     element_shape: IndexList[rank],
+    //,
 ](
     linear_coord: Int,
-    buff: NDBuffer[dtype, rank, _, shape],
+    buff: NDBuffer[rank=rank, dtype, _, shape],
     element_layout: ElementLayout[rank, element_shape],
 ) -> Int:
     var result = 0
@@ -340,11 +301,12 @@ fn _get_element_idx[
 
 
 @always_inline("nodebug")
-fn _get_element_idx[
+def _get_element_idx[
     rank: Int,
     dtype: DType,
     shape: DimList,
-](linear_coord: Int, buff: NDBuffer[dtype, rank, _, shape]) -> Int:
+    //,
+](linear_coord: Int, buff: NDBuffer[rank=rank, dtype, _, shape]) -> Int:
     var result = 0
     var curr_linear_crd = linear_coord
 
@@ -355,9 +317,10 @@ fn _get_element_idx[
 
 
 @always_inline("nodebug")
-fn _get_element_idx[
+def _get_element_idx[
     rank: Int,
     element_shape: IndexList[rank],
+    //,
 ](
     linear_coord: Int,
     element_layout: ElementLayout[rank, element_shape],
@@ -379,18 +342,19 @@ fn _get_element_idx[
 # Vectorizes buffer and returns the vecrtorized buffer and its dynamic layout.
 #
 @always_inline("nodebug")
-fn vectorize[
-    *sizes: Int,
+def vectorize[
     dtype: DType,
     rank: Int,
     shape: DimList,
     origin: MutOrigin,
-](buff: NDBuffer[dtype, rank, origin, shape, _]) -> Tuple[
+    //,
+    *sizes: Int,
+](buff: NDBuffer[rank=rank, dtype, origin, shape]) -> Tuple[
     NDBuffer[
+        rank=rank,
         dtype,
-        rank,
         origin,
-        shape=_vectorize_shape[*sizes, shape=shape](),
+        shape=_vectorize_shape[*sizes, shape=shape],
         strides=DimList.create_unknown[rank](),
         address_space=buff.address_space,
     ],
@@ -415,7 +379,7 @@ fn vectorize[
 
 
 @always_inline("nodebug")
-fn _copy_nd_buffer_to_layout_tensor[
+def _copy_nd_buffer_to_layout_tensor[
     src_rank: Int,
     dtype: DType,
     layout: Layout,
@@ -432,7 +396,7 @@ fn _copy_nd_buffer_to_layout_tensor[
         layout,
         ...,
     ],
-    src: NDBuffer[dtype, src_rank, _, shape],
+    src: NDBuffer[rank=src_rank, dtype, _, shape],
     buff_element_layout: ElementLayout[src_rank, buff_element_layout_shape],
 ):
     comptime num_elements = dst.layout.size()
@@ -537,7 +501,7 @@ fn _copy_nd_buffer_to_layout_tensor[
 
 
 @always_inline("nodebug")
-fn _copy_nd_buffer_to_layout_tensor_masked[
+def _copy_nd_buffer_to_layout_tensor_masked[
     src_rank: Int,
     dtype: DType,
     layout: Layout,
@@ -557,7 +521,7 @@ fn _copy_nd_buffer_to_layout_tensor_masked[
         layout,
         ...,
     ],
-    src: NDBuffer[dtype, src_rank, _, shape],
+    src: NDBuffer[rank=src_rank, dtype, _, shape],
     buff_element_layout: ElementLayout[src_rank, buff_element_layout_shape],
     tile_mask: TileMask[mask_rank, mask_element_size, mask_element_stride],
 ):
@@ -665,8 +629,7 @@ fn _copy_nd_buffer_to_layout_tensor_masked[
 
             # Evaluate the mask, skip OOB element copies
             comptime dim_0_shape = Int(dst.layout.shape[0])
-            var dim_0 = i % dim_0_shape
-            var dim_1 = i // dim_0_shape
+            var dim_1, dim_0 = divmod(i, dim_0_shape)
             var mask_val = tile_mask.access_mask((dim_0, dim_1))
             var can_access = mask_val[0] and mask_val[1]
             if not can_access:
@@ -683,14 +646,14 @@ fn _copy_nd_buffer_to_layout_tensor_masked[
 
 
 @always_inline("nodebug")
-fn _copy_layout_tensor_to_nd_buffer[
+def _copy_layout_tensor_to_nd_buffer[
     dst_rank: Int,
     dtype: DType,
     layout: Layout,
     shape: DimList,
     buff_element_layout_shape: IndexList[dst_rank],
 ](
-    dst: NDBuffer[mut=True, dtype, dst_rank, _, shape],
+    dst: NDBuffer[mut=True, rank=dst_rank, dtype, _, shape],
     buff_element_layout: ElementLayout[dst_rank, buff_element_layout_shape],
     src: LayoutTensor[
         dtype,
@@ -770,7 +733,7 @@ fn _copy_layout_tensor_to_nd_buffer[
 
 
 @always_inline
-fn _copy_layout_tensor_to_nd_buffer_masked[
+def _copy_layout_tensor_to_nd_buffer_masked[
     dst_rank: Int,
     mask_rank: Int,
     dtype: DType,
@@ -780,7 +743,7 @@ fn _copy_layout_tensor_to_nd_buffer_masked[
     mask_element_size: IndexList[mask_rank],
     mask_element_stride: IndexList[mask_rank],
 ](
-    dst: NDBuffer[mut=True, dtype, dst_rank, _, shape],
+    dst: NDBuffer[mut=True, rank=dst_rank, dtype, _, shape],
     buff_element_layout: ElementLayout[dst_rank, buff_element_layout_shape],
     src: LayoutTensor[
         dtype,
@@ -869,8 +832,7 @@ fn _copy_layout_tensor_to_nd_buffer_masked[
         comptime for i in range(num_elements * src.element_size):
             # Evaluate the mask, skip OOB element copies
             comptime dim_0_shape = Int(src.layout.shape[0])
-            var dim_0 = i % dim_0_shape
-            var dim_1 = i // dim_0_shape
+            var dim_1, dim_0 = divmod(i, dim_0_shape)
             var mask_val = tile_mask.access_mask((dim_0, dim_1))
             var can_access = mask_val[0] and mask_val[1]
             if not can_access:
@@ -885,7 +847,7 @@ fn _copy_layout_tensor_to_nd_buffer_masked[
 # where each element of the fragment is originally distributed by `thread_layout`.
 #
 @always_inline("nodebug")
-fn copy_from_nd_buffer[
+def copy_from_nd_buffer[
     dtype: DType,
     dst_data_layout: Layout,
     //,
@@ -899,7 +861,7 @@ fn copy_from_nd_buffer[
         dst_data_layout,
         ...,
     ],
-    src: NDBuffer[mut=True, dtype, _, _, _, _],
+    src: NDBuffer[mut=True, rank=_, dtype, _, _, _],
     thread_id: Int,
 ):
     comptime dst_rank = dst_data_layout.rank()
@@ -953,7 +915,7 @@ fn copy_from_nd_buffer[
 # where each element of the fragment is originally distributed by `thread_layout`.
 #
 @always_inline("nodebug")
-fn copy_from_nd_buffer_masked[
+def copy_from_nd_buffer_masked[
     src_rank: Int,
     dtype: DType,
     dst_data_layout: Layout,
@@ -968,7 +930,7 @@ fn copy_from_nd_buffer_masked[
         dst_data_layout,
         ...,
     ],
-    src: NDBuffer[mut=True, dtype, src_rank, _, src_buff_shape],
+    src: NDBuffer[mut=True, rank=src_rank, dtype, _, src_buff_shape],
     tile_mask: TileMask,
     thread_id: Int,
 ):
@@ -1049,14 +1011,14 @@ fn copy_from_nd_buffer_masked[
 # of the fragment is distributed by `thread_layout`.
 #
 @always_inline("nodebug")
-fn copy_to_nd_buffer[
+def copy_to_nd_buffer[
     dst_rank: Int,
     dtype: DType,
     dst_buff_shape: DimList,
     src_data_layout: Layout,
     thread_layout: Layout,
 ](
-    dst: NDBuffer[mut=True, dtype, dst_rank, _, dst_buff_shape],
+    dst: NDBuffer[mut=True, rank=dst_rank, dtype, _, dst_buff_shape],
     src_thread_local: LayoutTensor[
         dtype,
         src_data_layout,
@@ -1107,14 +1069,14 @@ fn copy_to_nd_buffer[
 
 
 @always_inline("nodebug")
-fn copy_to_nd_buffer_masked[
+def copy_to_nd_buffer_masked[
     dst_rank: Int,
     dtype: DType,
     dst_buff_shape: DimList,
     src_data_layout: Layout,
     thread_layout: Layout,
 ](
-    dst: NDBuffer[mut=True, dtype, dst_rank, _, dst_buff_shape],
+    dst: NDBuffer[mut=True, rank=dst_rank, dtype, _, dst_buff_shape],
     src_thread_local: LayoutTensor[
         dtype,
         src_data_layout,
@@ -1192,7 +1154,7 @@ fn copy_to_nd_buffer_masked[
 # Copies `src_buffer` to `dst_tensor` asynchronously, the work is distributed
 # to `thread_layout` of threads.
 #
-fn copy_from_nd_buffer_async[
+def copy_from_nd_buffer_async[
     src_rank: Int,
     dtype: DType,
     dst_data_layout: Layout,
@@ -1207,16 +1169,16 @@ fn copy_from_nd_buffer_async[
         dst_data_layout,
         ...,
     ],
-    src_buffer: NDBuffer[mut=True, dtype, src_rank, _, src_buff_shape],
+    src_buffer: NDBuffer[mut=True, rank=src_rank, dtype, _, src_buff_shape],
 ):
     copy_from_nd_buffer[thread_layout=thread_layout, is_async=True](
         dst_tensor.distribute[thread_layout](thread_idx.x),
         src_buffer,
-        Int(thread_idx.x),
+        thread_idx.x,
     )
 
 
-fn from_ndbuffer_row_major(
+def from_ndbuffer_row_major(
     buffer: NDBuffer,
     out result: LayoutTensor[
         buffer.type,

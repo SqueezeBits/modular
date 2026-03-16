@@ -16,7 +16,14 @@ from kv_cache.types import (
     PagedKVCache,
     PagedKVCacheCollection,
 )
-from layout import IntTuple, Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
+from layout import (
+    IntTuple,
+    Layout,
+    LayoutTensor,
+    RuntimeLayout,
+    UNKNOWN_VALUE,
+    coord,
+)
 from std.memory import alloc
 from std.testing import assert_true
 
@@ -125,7 +132,7 @@ def do_test[
     lookup_table_ptr.free()
 
 
-fn test_paged_kv_cache_stride_is_unknown() raises:
+def test_paged_kv_cache_stride_is_unknown() raises:
     """Test that PagedKVCache has UNKNOWN stride[0] for view tensor correctness.
 
     PagedKVCache is a 4D view of a 6D parent tensor. The outer stride depends
@@ -178,7 +185,7 @@ fn test_paged_kv_cache_stride_is_unknown() raises:
     )
 
 
-fn test_paged_kv_cache_offset_correctness() raises:
+def test_paged_kv_cache_offset_correctness() raises:
     """Test that PagedKVCache offset calculations use correct runtime strides.
 
     This test verifies that when accessing elements through a PagedKVCache view,
@@ -298,8 +305,9 @@ fn test_paged_kv_cache_offset_correctness() raises:
     # If the bug existed (using compile-time stride[0] = page_size * num_heads * head_size),
     # we'd compute wrong offset: 1*16 + 0*8 + 1*4 + 2 = 22 (wrong!)
 
-    # Access via the blocks LayoutTensor using IndexList - this tests _offset(IndexList)
-    var value = key_cache.blocks.load[1](Index(1, 0, 1, 2))
+    # Access via the blocks TileTensor - this tests the layout offset computation
+    var idx = coord[DType.int64](Tuple(1, 0, 1, 2))
+    var value = key_cache.blocks.ptr.load[width=1](key_cache.blocks.layout(idx))
     var expected_value = Float32(expected_6d_offset)
 
     assert_true(
@@ -319,7 +327,7 @@ fn test_paged_kv_cache_offset_correctness() raises:
     lookup_table_ptr.free()
 
 
-fn test_paged_kv_cache_quantization() raises:
+def test_paged_kv_cache_quantization() raises:
     comptime CacheType = PagedKVCache[
         DType.float32, kv_params, 16, DType.float8_e4m3fn, 256
     ]

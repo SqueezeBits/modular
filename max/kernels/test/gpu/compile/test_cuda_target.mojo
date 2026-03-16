@@ -30,9 +30,7 @@ from std.gpu import (
 )
 from std.gpu.host import DeviceContext, get_gpu_target
 from std.gpu.host.compile import _compile_code
-from std.memory import LegacyUnsafePointer, memset_zero, stack_allocation
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from std.memory import memset_zero, stack_allocation
 from std.testing import *
 
 from std.utils.index import IndexList
@@ -47,7 +45,7 @@ from std.utils.index import IndexList
 # COM: one that does not would return -1.
 
 
-fn parameterized_on_cuda() -> Int:
+def parameterized_on_cuda() -> Int:
     comptime if is_nvidia_gpu():
         return 42
     else:
@@ -55,7 +53,7 @@ fn parameterized_on_cuda() -> Int:
 
 
 @always_inline
-fn _verify_parameterized_on_cuda(asm: StringSlice) raises -> None:
+def _verify_parameterized_on_cuda(asm: StringSlice) raises -> None:
     assert_true("test_cuda_target_parameterized" in asm)
 
     # Now make sure that we have something like this:
@@ -64,7 +62,7 @@ fn _verify_parameterized_on_cuda(asm: StringSlice) raises -> None:
     assert_true(instruction_start_loc >= 0)  # Assert it's present
     instruction_end_loc = asm.find(";", instruction_start_loc)
     assert_true(instruction_end_loc >= 0)
-    instruction_str = asm[instruction_start_loc:instruction_end_loc]
+    instruction_str = asm[byte=instruction_start_loc:instruction_end_loc]
     # Make sure 42 appears somewhere in the instruction
     assert_true("42" in instruction_str)
 
@@ -88,12 +86,12 @@ def test_parameterized_on_cuda_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn hello_mojo():
+def hello_mojo():
     _printf["Hello"]()
 
 
 @always_inline
-fn _verify_hello(asm: StringSlice) raises -> None:
+def _verify_hello(asm: StringSlice) raises -> None:
     assert_true("test_cuda_target_hello_mojo" in asm)
     assert_true("vprintf" in asm)
 
@@ -113,8 +111,8 @@ def test_hello_mojo_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn erf_elementwise(
-    buf: UnsafePointer[Float32], len: Int, ctx: DeviceContext
+def erf_elementwise(
+    buf: UnsafePointer[Float32, MutAnyOrigin], len: Int, ctx: DeviceContext
 ) raises:
     # Each thread will process 4 * simd_width elements.
     comptime granularity = 4 * simd_width_of[DType.float32]()
@@ -123,7 +121,7 @@ fn erf_elementwise(
     @always_inline
     @__copy_capture(tid)
     @parameter
-    fn func[
+    def func[
         simd_width: Int, rank: Int, alignment: Int = 1
     ](idx: IndexList[rank]):
         var offset = tid + idx[0]
@@ -162,7 +160,7 @@ def test_erf_elementwise_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn erf_kernel(buf: UnsafePointer[Float32], len: Int):
+def erf_kernel(buf: UnsafePointer[Float32, MutAnyOrigin], len: Int):
     var tid = thread_idx.x + block_dim.y * block_idx.y
 
     if tid >= UInt(len):
@@ -172,7 +170,7 @@ fn erf_kernel(buf: UnsafePointer[Float32], len: Int):
 
 
 @always_inline
-fn _verify_erf_kernel(asm: StringSlice) raises -> None:
+def _verify_erf_kernel(asm: StringSlice) raises -> None:
     assert_true("erf_kernel" in asm)
     assert_true("tid.x" in asm)
     assert_true("ntid.y" in asm)
@@ -194,8 +192,8 @@ def test_erf_kernel_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn test_shared_stack_allocation() -> (
-    UnsafePointer[Int8, address_space=AddressSpace.SHARED]
+def test_shared_stack_allocation() -> (
+    UnsafePointer[Int8, MutAnyOrigin, address_space=AddressSpace.SHARED]
 ):
     return stack_allocation[
         999, DType.int8, 8, address_space=AddressSpace.SHARED
@@ -203,7 +201,7 @@ fn test_shared_stack_allocation() -> (
 
 
 @always_inline
-fn _verify_shared_stack_allocation(asm: StringSlice) raises -> None:
+def _verify_shared_stack_allocation(asm: StringSlice) raises -> None:
     assert_true("test_cuda_target_test_shared_" in asm)
     assert_true(".shared .align 8 .b8" in asm)
 
@@ -227,12 +225,12 @@ def test_shared_stack_allocation_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn test_barrier():
+def test_barrier():
     barrier()
 
 
 @always_inline
-fn _verify_barrier(asm: StringSlice) raises -> None:
+def _verify_barrier(asm: StringSlice) raises -> None:
     assert_true("barrier" in asm)
     assert_true("bar.sync 	0" in asm)
 
@@ -256,10 +254,10 @@ def test_barrier_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn gemm(
-    c: UnsafePointer[Float32],
-    a: UnsafePointer[Float32],
-    b: UnsafePointer[Float32],
+def gemm(
+    c: UnsafePointer[Float32, MutAnyOrigin],
+    a: UnsafePointer[Float32, ImmutAnyOrigin],
+    b: UnsafePointer[Float32, ImmutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -280,17 +278,17 @@ fn gemm(
     # Utilities for accessing flattened matrices.
     @always_inline
     @parameter
-    fn get_a(row: Int, col: Int) -> Float32:
+    def get_a(row: Int, col: Int) -> Float32:
         return a.load(row + m * col)
 
     @always_inline
     @parameter
-    fn get_b(row: Int, col: Int) -> Float32:
+    def get_b(row: Int, col: Int) -> Float32:
         return b.load(row * n + col)
 
     @always_inline
     @parameter
-    fn set_c(row: Int, col: Int, val: Float32):
+    def set_c(row: Int, col: Int, val: Float32):
         c[row + col * m] = val
 
     # Allocate B array into shared memory for tiling.
@@ -311,8 +309,7 @@ fn gemm(
 
     # Loop over each input tile.
     for tile_idx in range((k - 1) // TILE_SZ_RATIO + 1):
-        var i = thread_idx.x // TILE_SZ_B
-        var j = thread_idx.x % TILE_SZ_B
+        var i, j = divmod(thread_idx.x, TILE_SZ_B)
 
         # Load the B matrix into shared memory.
         var b_val: Float32
@@ -369,7 +366,7 @@ def test_gemm_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn test_warp_shuffle_up(val: Float32) -> Float32:
+def test_warp_shuffle_up(val: Float32) -> Float32:
     var res = val
 
     comptime limit = log2_floor(WARP_SIZE)
@@ -380,7 +377,7 @@ fn test_warp_shuffle_up(val: Float32) -> Float32:
 
 
 @always_inline
-fn _verify_warp_shuffle_up(asm: StringSlice) raises -> None:
+def _verify_warp_shuffle_up(asm: StringSlice) raises -> None:
     assert_true("test_warp_shuf" in asm)
     assert_true("shfl.sync.up.b32" in asm)
 
@@ -399,7 +396,7 @@ def test_warp_shuffle_up_sm90() raises:
     _verify_warp_shuffle_up(asm)
 
 
-fn test_warp_shuffle_down(val: Int32) -> Int32:
+def test_warp_shuffle_down(val: Int32) -> Int32:
     var res = val
 
     comptime limit = log2_floor(WARP_SIZE)
@@ -410,7 +407,7 @@ fn test_warp_shuffle_down(val: Int32) -> Int32:
 
 
 @always_inline
-fn _verify_warp_shuffle_down(asm: StringSlice) raises -> None:
+def _verify_warp_shuffle_down(asm: StringSlice) raises -> None:
     assert_true("test_warp_shuf" in asm)
     assert_true("shfl.sync.down.b32" in asm)
 
@@ -434,7 +431,7 @@ def test_warp_shuffle_down_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-fn warp_sum_reduce(val: Float32) -> Float32:
+def warp_sum_reduce(val: Float32) -> Float32:
     var res = val
 
     comptime limit = log2_floor(WARP_SIZE)
@@ -445,7 +442,7 @@ fn warp_sum_reduce(val: Float32) -> Float32:
 
 
 @always_inline
-fn _verify_warp_sum_reduce(asm: StringSlice) raises -> None:
+def _verify_warp_sum_reduce(asm: StringSlice) raises -> None:
     assert_true("warp_sum_" in asm)
     assert_true("shfl.sync.bfly.b32" in asm)
 
@@ -464,7 +461,7 @@ def test_warp_sum_reduce_sm90() raises:
     _verify_warp_sum_reduce(asm)
 
 
-fn block_reduce(val: Float32) -> Float32:
+def block_reduce(val: Float32) -> Float32:
     var shared = stack_allocation[
         WARP_SIZE, DType.float32, address_space=AddressSpace.SHARED
     ]()
@@ -488,7 +485,7 @@ fn block_reduce(val: Float32) -> Float32:
 
 
 @always_inline
-fn _verify_block_reduce(asm: StringSlice) raises -> None:
+def _verify_block_reduce(asm: StringSlice) raises -> None:
     assert_true("block_reduce" in asm)
     assert_true("mov.u32" in asm)
 

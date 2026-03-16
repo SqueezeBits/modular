@@ -18,7 +18,7 @@ from max.experimental import functional as F
 from max.experimental.nn import Linear, Module
 from max.experimental.tensor import Tensor
 
-from ...flux2.layers.embeddings import get_1d_rotary_pos_embed
+from ...flux2_modulev3.layers.embeddings import get_1d_rotary_pos_embed
 
 
 class TimestepEmbedder(Module[[Tensor], Tensor]):

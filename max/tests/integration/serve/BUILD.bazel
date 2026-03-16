@@ -210,12 +210,18 @@ modular_py_test(
 
 modular_py_test(
     name = "test_max_serve_e2e",
+    size = "large",
     srcs = [
         "test_max_serve_e2e.py",
     ],
     tags = [
         "requires-network",
     ],
+    # TODO(GEX-3155): Investigate and enable on macOS
+    target_compatible_with = select({
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         "//max/python/max/driver",
         "//max/python/max/entrypoints",

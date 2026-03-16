@@ -37,7 +37,7 @@ import std.gpu.primitives.warp as warp
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     barrier,
-    block_idx,
+    block_idx_int as block_idx,
     thread_idx,
     warp_id,
 )
@@ -61,11 +61,9 @@ from std.gpu.primitives.warp import _vote_nvidia_helper
 from layout.tma_async import (
     SharedMemBarrier,
 )
-from layout import row_major
-from layout.layout import Layout
+from layout import ComptimeInt, Layout, RowMajorLayout, TileTensor
 from layout.swizzle import make_ldmatrix_swizzle
 from std.memory import bitcast
-from layout.layout_tensor import LayoutTensor
 from nn.mha_fa3_utils import (
     OptionalPointer,
     KVTMATile,
@@ -200,7 +198,7 @@ struct MLA_SM100_Decode_QKV_FP8[
             Int32(Self.config.num_threads)
         )
     )
-    fn kernel(
+    def kernel(
         # Q TMA is FP8 with SWIZZLE_64B (same as KV)
         q_tma: QOTMATile[
             dtype=Self.kv_type,
@@ -228,8 +226,8 @@ struct MLA_SM100_Decode_QKV_FP8[
             SplitAccumType=Self.SplitAccumType,
         ],
         scales_ptr: UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin],
-        scalar_args: LayoutTensor[
-            DType.int64, Layout.row_major(4), MutAnyOrigin
+        scalar_args: TileTensor[
+            DType.int64, RowMajorLayout[ComptimeInt[3]], MutAnyOrigin
         ],
     ):
         # Extract scalar launch args from the stable device buffer.
@@ -275,7 +273,7 @@ struct MLA_SM100_Decode_QKV_FP8[
 
         # Early exit for ragged: skip blocks beyond actual sequence length
         comptime if Self.ragged:
-            if Int(block_idx.y) >= offset_position.seq_len:
+            if block_idx.y >= offset_position.seq_len:
                 comptime if Self.config.decoding_warp_split_k:
                     Self.Common_MLA_Op.pdl_early_exit(
                         offset_position.split_idx,
@@ -486,7 +484,7 @@ struct MLA_SM100_Decode_QKV_FP8[
     # --------------------------------------------------------------------------
     @staticmethod
     @always_inline
-    fn load(
+    def load(
         q_tma: QOTMATile[
             dtype=Self.kv_type,
             BM=Self.config.BM,
@@ -607,7 +605,7 @@ struct MLA_SM100_Decode_QKV_FP8[
     # --------------------------------------------------------------------------
     @staticmethod
     @always_inline
-    fn mmaQK(
+    def mmaQK(
         tmem_addr: UInt32,
         q_smem: SharedMemPointer[Scalar[Self.fp8_type]],
         kv_smem: SharedMemPointer[Scalar[Self.fp8_type]],
@@ -685,7 +683,7 @@ struct MLA_SM100_Decode_QKV_FP8[
     # --------------------------------------------------------------------------
     @staticmethod
     @always_inline
-    fn mmaPV(
+    def mmaPV(
         tmem_addr: UInt32,
         kv_smem: SharedMemPointer[Scalar[Self.fp8_type]],
         p_smem: SharedMemPointer[Scalar[Self.fp8_type]],

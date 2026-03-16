@@ -28,9 +28,6 @@ Key differences from standard/block-scaled kernels:
 - BlockwiseFP8TileWriter for final register → SMEM → GMEM flow
 """
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.sys import size_of
 
 from std.gpu import WARP_SIZE, thread_idx
@@ -50,8 +47,7 @@ from std.gpu.sync import (
     syncwarp,
 )
 from std.gpu.compute.arch.tcgen05 import *
-from layout.tile_layout import TensorLayout
-from layout import TileTensor
+from layout import TensorLayout, TileTensor
 from layout.tensor_core_async import (
     tile_layout_k_major,
     tile_layout_mn_major,
@@ -83,7 +79,7 @@ from ..structured_kernels.tile_pipeline import (
     InputConsumerStage,
 )
 from structured_kernels.tile_types import (
-    TMATile,
+    TmaOpType,
     static_row_major,
 )
 from ..structured_kernels.tile_pipeline import BlockwiseFP8TilePayload
@@ -296,8 +292,7 @@ struct BlackwellBlockwiseFP8MatmulKernel[
     comptime b_tma_rows = Self.b_tile_dim0
 
     # TMA operation types (derived from new Layout types)
-    comptime CTmaTile = TMATile[Self.c_type, Self.CTileLayout, Self.CDescLayout]
-    comptime CTmaOp = Self.CTmaTile.InnerType
+    comptime CTmaOp = TmaOpType[Self.c_type, Self.CTileLayout, Self.CDescLayout]
 
     # B-scales TileTensor type
     comptime BScalesTile = TileTensor[
@@ -338,9 +333,6 @@ struct BlackwellBlockwiseFP8MatmulKernel[
         Self.CLUSTER_N,
     ]
 
-    # TMEM allocation size
-    comptime max_tmem_cols: UInt = 512
-
     # ========== Tile Scheduler Type ==========
     comptime Scheduler = StructuredTileScheduler[
         num_stages=Self.num_clc_pipeline_stages,
@@ -375,14 +367,11 @@ struct BlackwellBlockwiseFP8MatmulKernel[
     ]
 
     # ========== TMA Operation Types (for run() params) ==========
-    comptime ATmaTile = TMATile[Self.a_type, Self.ATileLayout, Self.ADescLayout]
-    comptime ATmaOp = Self.ATmaTile.InnerType
-    comptime BTmaTile = TMATile[Self.b_type, Self.BTileLayout, Self.BDescLayout]
-    comptime BTmaOp = Self.BTmaTile.InnerType
-    comptime AScalesTmaTile = TMATile[
+    comptime ATmaOp = TmaOpType[Self.a_type, Self.ATileLayout, Self.ADescLayout]
+    comptime BTmaOp = TmaOpType[Self.b_type, Self.BTileLayout, Self.BDescLayout]
+    comptime AScalesTmaOp = TmaOpType[
         Self.a_scales_type, Self.AScalesLayout, Self.AScalesLayout
     ]
-    comptime AScalesTmaOp = Self.AScalesTmaTile.InnerType
 
     # ========== TMEM Types ==========
     comptime Tmem = TmemAllocation[Self.opc.cta_group]
@@ -466,7 +455,7 @@ struct BlackwellBlockwiseFP8MatmulKernel[
 
     @staticmethod
     @always_inline
-    fn load_input_tiles[
+    def load_input_tiles[
         a_tma_origin: ImmutOrigin,
         b_tma_origin: ImmutOrigin,
         a_scales_tma_origin: ImmutOrigin,
@@ -500,8 +489,8 @@ struct BlackwellBlockwiseFP8MatmulKernel[
             Self.config.k_group_size,
         ],
         peer_cta_coord: Tuple[UInt, UInt, UInt],
-        work_tile_coord: Tuple[UInt, UInt],
-        iter_idx: UInt,
+        work_tile_coord: Tuple[Int, Int],
+        iter_idx: Int,
         elect_one_cta: Bool,
     ):
         """Load A, B, and A-scales tiles using TMA.
@@ -516,17 +505,17 @@ struct BlackwellBlockwiseFP8MatmulKernel[
             iter_idx: K iteration index.
             elect_one_cta: Whether this is the elected CTA in the cluster.
         """
-        var peer_rank_n = peer_cta_coord[0]
-        var peer_rank_m = peer_cta_coord[1]
-        var peer_m_rank = peer_cta_coord[2]
+        var peer_rank_n = Int(peer_cta_coord[0])
+        var peer_rank_m = Int(peer_cta_coord[1])
+        var peer_m_rank = Int(peer_cta_coord[2])
 
-        var a_gmem_m_coord = peer_m_rank * UInt(
-            Self.a_tma_rows
-        ) + work_tile_coord[0] * UInt(Self.BM)
+        var a_gmem_m_coord = (
+            peer_m_rank * Self.a_tma_rows + work_tile_coord[0] * Self.BM
+        )
         var b_gmem_n_coord = (
-            peer_rank_m * UInt(Self.b_tma_rows)
-            + peer_rank_n * UInt(Self.BN)
-            + work_tile_coord[1] * UInt(Self.MMA_N)
+            peer_rank_m * Self.b_tma_rows
+            + peer_rank_n * Self.BN
+            + work_tile_coord[1] * Self.MMA_N
         )
 
         if elect_one_sync():
@@ -543,11 +532,11 @@ struct BlackwellBlockwiseFP8MatmulKernel[
 
             # Peer CTA slicing using TileTensor pattern (ptr + layout)
             var a_peer_tile = type_of(a_tile)(
-                a_tile.ptr + peer_m_rank * UInt(Self.a_tma_load_size),
+                a_tile.ptr + peer_m_rank * Self.a_tma_load_size,
                 a_tile.layout,
             )
             var b_peer_tile = type_of(b_tile)(
-                b_tile.ptr + peer_rank_m * UInt(Self.b_tma_load_size),
+                b_tile.ptr + peer_rank_m * Self.b_tma_load_size,
                 b_tile.layout,
             )
 
@@ -555,27 +544,27 @@ struct BlackwellBlockwiseFP8MatmulKernel[
             a_loader.load(
                 a_peer_tile,
                 barrier[0],
-                iter_idx * UInt(Self.BK),
+                iter_idx * Self.BK,
                 a_gmem_m_coord,
             )
             b_loader.load(
                 b_peer_tile,
                 barrier[0],
-                iter_idx * UInt(Self.BK),
+                iter_idx * Self.BK,
                 b_gmem_n_coord,
             )
             a_scales_loader.load(
                 a_scales_tile,
                 barrier[0],
-                Int(work_tile_coord[0]) * Self.BM,
-                Int(iter_idx),
+                work_tile_coord[0] * Self.BM,
+                iter_idx,
             )
 
     # ========== MMA Operation ==========
 
     @staticmethod
     @always_inline
-    fn mma[
+    def mma[
         tiles_origin: MutOrigin,
         //,
     ](
@@ -621,7 +610,7 @@ struct BlackwellBlockwiseFP8MatmulKernel[
     # ========== Compile-Time Validation ==========
 
     @staticmethod
-    fn validate_config():
+    def validate_config():
         """Validate configuration constraints at compile time."""
         comptime assert Self.transpose_b, "Only support transposed B"
         comptime assert (
@@ -637,7 +626,7 @@ struct BlackwellBlockwiseFP8MatmulKernel[
 
     @staticmethod
     @always_inline
-    fn init_barriers(
+    def init_barriers(
         ctx: Self.Context,
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
@@ -704,14 +693,14 @@ struct BlackwellBlockwiseFP8MatmulKernel[
     @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(c_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(a_scales_tma_op, `nvvm.grid_constant`)
-    fn run(
+    def run(
         # TMA descriptors -- types derived from loader's legacy layout computation
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
         c_tma_op: Self.CTmaOp,
         a_scales_tma_op: Self.AScalesTmaOp,
         cluster_dim: StaticTuple[Int32, 3],
-        num_iters: UInt,
+        num_iters: Int,
         b_scales: Self.BScalesTile,
         problem_shape: StaticTuple[Int32, 3],
     ):

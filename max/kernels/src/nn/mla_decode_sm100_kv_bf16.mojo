@@ -17,7 +17,7 @@ import std.gpu.primitives.warp as warp
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     barrier,
-    block_idx,
+    block_idx_int as block_idx,
     thread_idx,
     warp_id,
 )
@@ -36,8 +36,7 @@ from layout.tma_async import (
     SharedMemBarrier,
 )
 from std.memory import bitcast
-from layout.layout import Layout
-from layout.layout_tensor import LayoutTensor
+from layout import ComptimeInt, RowMajorLayout, TileTensor
 from nn.mha_fa3_utils import (
     OptionalPointer,
 )
@@ -181,7 +180,7 @@ struct MLA_SM100_Decode_KV_BF16[
         )
     )
     @__llvm_metadata(`nvvm.minctasm`=Int(1))
-    fn kernel(
+    def kernel(
         q_tma: QOTMATile[
             dtype=Self.q_type,
             BM=Self.config.BM,  # tile_m =64
@@ -208,8 +207,8 @@ struct MLA_SM100_Decode_KV_BF16[
             SplitAccumType=Self.SplitAccumType,
         ],
         scales_ptr: UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin],
-        scalar_args: LayoutTensor[
-            DType.int64, Layout.row_major(4), MutAnyOrigin
+        scalar_args: TileTensor[
+            DType.int64, RowMajorLayout[ComptimeInt[3]], MutAnyOrigin
         ],
     ):
         comptime num_reg_softmax = 192
@@ -218,7 +217,6 @@ struct MLA_SM100_Decode_KV_BF16[
         var batch_size = Int(scalar_args.ptr[0])
         var q_max_seq_len = Int(scalar_args.ptr[1])
         var num_partitions = Int(scalar_args.ptr[2])
-        var max_cache_valid_length = Int(scalar_args.ptr[3])
         mask = mla_decode_pack.mask
         valid_length = mla_decode_pack.valid_length
         var lse_accum_split_ptr = mla_decode_pack.lse_accum_split_ptr
@@ -264,7 +262,7 @@ struct MLA_SM100_Decode_KV_BF16[
         comptime if Self.ragged:
             # In ragged mode, block_idx.y is the query token index (0 to q_max_seq_len-1)
             # But this batch might have fewer tokens than q_max_seq_len
-            if Int(block_idx.y) >= offset_position.seq_len:
+            if block_idx.y >= offset_position.seq_len:
                 comptime if Self.config.decoding_warp_split_k:
                     Self.Common_MLA_Op.pdl_early_exit(
                         offset_position.split_idx,
@@ -488,7 +486,7 @@ struct MLA_SM100_Decode_KV_BF16[
     # --------------------------------------------------------------------------
     @staticmethod
     @always_inline
-    fn load(
+    def load(
         q_tma: QOTMATile[
             dtype=Self.q_type,
             BM=Self.config.BM,  # tile_m =64
@@ -649,7 +647,7 @@ struct MLA_SM100_Decode_KV_BF16[
 
     @staticmethod
     @always_inline
-    fn mmaQK(
+    def mmaQK(
         tmem_addr: UInt32,
         q_smem: SharedMemPointer[Scalar[Self.q_type]],
         kv_smem: SharedMemPointer[Scalar[Self.q_type]],
@@ -721,7 +719,7 @@ struct MLA_SM100_Decode_KV_BF16[
 
     @staticmethod
     @always_inline
-    fn mmaPV(
+    def mmaPV(
         tmem_addr: UInt32,
         kv_smem: SharedMemPointer[Scalar[Self.q_type]],
         p_bars: DecodeSM100MiscMBars[

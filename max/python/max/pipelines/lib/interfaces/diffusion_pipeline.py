@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import MISSING, dataclass, field, fields
@@ -32,7 +33,9 @@ from max.graph import Graph, TensorType
 from max.graph.weights import load_weights
 from max.interfaces import PixelGenerationContext
 from max.interfaces.tokens import TokenBuffer
+from max.pipelines.lib.config.config_enums import parse_supported_encoding_from_file_name
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from max.profiler import Tracer
 from PIL import Image
 from tqdm import tqdm
 from typing_extensions import Self
@@ -41,6 +44,8 @@ if TYPE_CHECKING:
     from max.engine import InferenceSession
 
     from ..config import PipelineConfig
+
+logger = logging.getLogger("max.pipelines")
 
 CompileTarget: TypeAlias = Callable[..., Any] | Module[..., Any]
 CompileDecorator: TypeAlias = Callable[[CompileTarget], "CompileWrapper"]
@@ -53,6 +58,18 @@ class DiffusionPipeline(ABC):
     """
 
     components: dict[str, type[ComponentModel]] | None = None
+
+    unprefixed_weight_component: str | None = None
+    """When set, weight files without a ``<component>/`` prefix are assigned to
+    this component.  This supports multi-repo layouts where quantized weights
+    for one component (e.g. the transformer) are shipped as flat files in a
+    separate repo while the remaining components use the base model repo."""
+
+    default_num_inference_steps: int = 50
+    """Default number of denoising steps when the user does not specify one.
+
+    Subclasses may override this to provide a model-appropriate default.
+    """
 
     def __init__(
         self,
@@ -120,6 +137,7 @@ class DiffusionPipeline(ABC):
 
         relative_paths = self._resolve_relative_component_paths()
         loaded_sub_models: dict[str, ComponentModel] = {}
+        pipeline_encoding = self.pipeline_config.model.quantization_encoding
 
         for name, component_cls in tqdm(
             self.components.items(), desc="Loading sub models"
@@ -130,28 +148,40 @@ class DiffusionPipeline(ABC):
             config_dict = self._get_component_config_dict(
                 components_config, name
             )
-            abs_paths = self._resolve_absolute_paths(
-                weight_paths, relative_paths[name]
-            )
-            component_encoding = (
-                self.pipeline_config.model.quantization_encoding
-            )
-            # Allow hybrid diffusion repos where only some components are FP8.
-            # If component config explicitly declares FP8 quantization metadata,
-            # prefer FP8 encoding for that component only.
-            quant_cfg = config_dict.get("quantization_config")
-            if not quant_cfg and isinstance(config_dict.get("text_config"), dict):
-                quant_cfg = config_dict["text_config"].get("quantization_config")
-            if (
-                isinstance(quant_cfg, dict)
-                and quant_cfg.get("quant_method") == "fp8"
-            ):
-                component_encoding = "float8_e4m3fn"
-            # Keep VAE in BF16 even when model-level encoding is FP8.
-            if (
-                name == "vae"
-                and component_encoding == "float8_e4m3fn"
-            ):
+
+            if name in relative_paths:
+                abs_paths = self._resolve_absolute_paths(
+                    weight_paths, relative_paths[name]
+                )
+                component_encoding = pipeline_encoding
+                # Allow hybrid diffusion repos where only some components are FP8.
+                # If component config explicitly declares FP8 quantization metadata,
+                # prefer FP8 encoding for that component only.
+                quant_cfg = config_dict.get("quantization_config")
+                if not quant_cfg and isinstance(config_dict.get("text_config"), dict):
+                    quant_cfg = config_dict["text_config"].get("quantization_config")
+                if (
+                    isinstance(quant_cfg, dict)
+                    and quant_cfg.get("quant_method") == "fp8"
+                    and any(
+                        parse_supported_encoding_from_file_name(path.name)
+                        == "float8_e4m3fn"
+                        for path in abs_paths
+                    )
+                ):
+                    component_encoding = "float8_e4m3fn"
+                # Keep VAE in BF16 even when model-level encoding is FP8.
+                if (
+                    name == "vae"
+                    and component_encoding == "float8_e4m3fn"
+                ):
+                    component_encoding = "bfloat16"
+            else:
+                # Component weights not provided — download from base model
+                # repo.  These components (e.g. VAE, text encoder) always use
+                # bfloat16 regardless of the quantization applied to the
+                # primary component.
+                abs_paths = self._download_component_weights(name)
                 component_encoding = "bfloat16"
 
             loaded_sub_models[name] = component_cls(
@@ -178,7 +208,11 @@ class DiffusionPipeline(ABC):
         return config_dict
 
     def _resolve_relative_component_paths(self) -> dict[str, list[str]]:
-        """Group weight paths by component name (first path segment)."""
+        """Group weight paths by component name (first path segment).
+
+        Files without a ``/`` separator (i.e. flat filenames) are assigned to
+        :attr:`unprefixed_weight_component` when it is set.
+        """
         result: dict[str, list[str]] = {}
 
         for path in self.pipeline_config.model.weight_path:
@@ -187,12 +221,46 @@ class DiffusionPipeline(ABC):
             if len(parts) >= 2:
                 component = parts[0]
                 result.setdefault(component, []).append(path_str)
+            elif self.unprefixed_weight_component:
+                result.setdefault(self.unprefixed_weight_component, []).append(
+                    path_str
+                )
 
         if not result:
             raise ValueError(
-                "No component weights found. Expected format: <component>/<file>"
+                "No component weights found. Expected format:"
+                " <component>/<file>"
             )
         return result
+
+    def _download_component_weights(self, component_name: str) -> list[Path]:
+        """Download weight files for a component from the base model repo."""
+        from max.graph.weights import WeightsFormat
+
+        from ..hf_utils import download_weight_files
+
+        model_repo = self.pipeline_config.model.huggingface_model_repo
+        all_safetensors = model_repo.weight_files.get(
+            WeightsFormat.safetensors, []
+        )
+        component_files = [
+            f for f in all_safetensors if f.startswith(f"{component_name}/")
+        ]
+        if not component_files:
+            raise ValueError(
+                f"No weight files found for component '{component_name}' "
+                f"in base model repo '{model_repo.repo_id}'."
+            )
+        if model_repo.repo_type == "online":
+            return download_weight_files(
+                huggingface_model_id=model_repo.repo_id,
+                filenames=component_files,
+                revision=self.pipeline_config.model.huggingface_model_revision,
+                force_download=self.pipeline_config.model.force_download,
+            )
+        else:
+            local_path = Path(model_repo.repo_id)
+            return [local_path / f for f in component_files]
 
     def _resolve_absolute_paths(
         self, weight_paths: list[Path], relative_paths: list[str]
@@ -499,6 +567,8 @@ class PixelModelInputs:
 
 
 class CompileWrapper:
+    """Wraps a compile target with optional input type annotations."""
+
     def __init__(
         self,
         compile_target: CompileTarget,
@@ -526,28 +596,34 @@ class CompileWrapper:
         input_types_tuple = tuple(input_types)
         self._compiled_module: Callable[..., Any] | None = None
         self._compiled_model: Model | None = None
+        self._target_name = target_name
 
-        if isinstance(compile_target, Module):
-            self._compiled_module = compile_target.compile(*input_types_tuple)
-            return
+        with Tracer(f"compile_{target_name}"):
+            if isinstance(compile_target, Module):
+                self._compiled_module = compile_target.compile(
+                    *input_types_tuple
+                )
+                return
 
-        with Graph(
-            compile_target.__name__, input_types=input_types_tuple
-        ) as graph:
-            output = compile_target(*graph.inputs)
-            if isinstance(output, Iterable):
-                graph.output(*output)
+            with Graph(
+                compile_target.__name__, input_types=input_types_tuple
+            ) as graph:
+                output = compile_target(*graph.inputs)
+                if isinstance(output, Iterable):
+                    graph.output(*output)
+                else:
+                    graph.output(output)
+                compiled_graph = graph
+
+            device: CPU | Accelerator
+            if any(
+                input_type.device.is_gpu() for input_type in input_types_tuple
+            ):
+                device = Accelerator()
             else:
-                graph.output(output)
-            compiled_graph = graph
-
-        device: CPU | Accelerator
-        if any(input_type.device.is_gpu() for input_type in input_types_tuple):
-            device = Accelerator()
-        else:
-            device = CPU()
-        session = InferenceSession([device])
-        self._compiled_model = session.load(compiled_graph)
+                device = CPU()
+            session = InferenceSession([device])
+            self._compiled_model = session.load(compiled_graph)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Execute the compiled session with the given arguments.
@@ -559,19 +635,22 @@ class CompileWrapper:
         Returns:
             The result of the session execution.
         """
-        if self._compiled_module is not None:
-            return self._compiled_module(*args, **kwargs)
+        with Tracer(f"exec_{self._target_name}"):
+            if self._compiled_module is not None:
+                return self._compiled_module(*args, **kwargs)
 
-        if self._compiled_model is None:
-            raise RuntimeError("CompileWrapper has no compiled target.")
+            if self._compiled_model is None:
+                raise RuntimeError("CompileWrapper has no compiled target.")
 
-        normalized_args = tuple(self._unwrap_tensor(arg) for arg in args)
-        normalized_kwargs = {
-            key: self._unwrap_tensor(val) for key, val in kwargs.items()
-        }
-        buffers = self._compiled_model(*normalized_args, **normalized_kwargs)
-        outputs = [Tensor.from_dlpack(buffer) for buffer in buffers]
-        return outputs[0] if len(outputs) == 1 else outputs
+            normalized_args = tuple(self._unwrap_tensor(arg) for arg in args)
+            normalized_kwargs = {
+                key: self._unwrap_tensor(val) for key, val in kwargs.items()
+            }
+            buffers = self._compiled_model(
+                *normalized_args, **normalized_kwargs
+            )
+            outputs = [Tensor.from_dlpack(buffer) for buffer in buffers]
+            return outputs[0] if len(outputs) == 1 else outputs
 
     @staticmethod
     def _unwrap_tensor(value: Any) -> Any:

@@ -47,7 +47,6 @@ ignore = [
   "B008", # Do not perform function call in argument defaults
   "B017", # Do not assert blind exception: `Exception`
   "B028", # No explicit `stacklevel` keyword argument found
-  "D101", # TODO: Enable missing docstrings in public classes
   "D105", # undocumented-magic-method
   "D107", # Missing docstring in __init__ (constructor args go in class docstring)
   "E402", # TODO: import top of file
@@ -90,7 +89,8 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"] # Ignore unused imports being re-exported
 # Enforce pydocstyle only for MAX API:
-"!max/python/max/**/*.py" = ["D"]
+# NOTE: Ruff skips all "missing docstring" (D10X) rules for *.pyi files
+"!max/python/max/**/{*.py,*.pyi}" = ["D"]
 # With exceptions for these packages:
 "max/python/max/benchmark/**/*" = ["D"]
 "max/python/max/config/**/*" = ["D"]
@@ -102,12 +102,17 @@ convention = "google"
 "max/python/max/pipelines/pipelines.py" = ["D"]
 "max/python/max/serve/**/*" = ["D"]
 "max/python/max/support/**/*" = ["D"]
-# And any private packages and modules:
-"max/python/max/_*/**" = ["D"]
+# Exclude private packages and modules (NOTE: this allows max/_core/*.pyi files):
+"max/python/max/_core_mojo/**/*" = ["D"]
+"max/python/max/_core_types/**/*" = ["D"]
+"max/python/max/_interpreter_ops/**/*" = ["D"]
+"max/python/max/_mlir/**/*" = ["D"]
+"max/python/max/_core/dialects/**/*" = ["D"]
+"max/python/max/_core/internal/**/*" = ["D"]
 "max/python/max/**/_*.py" = ["D"]
 # Ignore ANN001 (function argument missing type annotation) for auto-generated
 # stubfiles
-"*.pyi" = ["ANN001", "ANN201", "ANN202", "ANN205", "ANN206"]
+"*.pyi" = ["ANN001", "ANN201", "ANN202", "ANN205", "ANN206", "D200", "D212", "D418"]
 # Ignore type annotations for the llm-book tutorial files
 "oss/llm-book/**/*.py" = ["ANN001", "ANN201", "ANN202"]
 # Disable lints which complain about weird unicode characters in files that include
@@ -122,6 +127,7 @@ python_version = "3.10"
 
 check_untyped_defs = true
 warn_unused_ignores = true
+disallow_any_generics = true
 
 follow_imports = "silent"
 follow_imports_for_stubs = true
@@ -143,14 +149,6 @@ follow_imports = "skip"
 [[tool.mypy.overrides]]
 module = "lmcache.*"
 follow_imports = "skip"
-
-[[tool.mypy.overrides]]
-module = "max.*"
-disallow_any_generics = true
-
-[[tool.mypy.overrides]]
-module = "utils.benchmarking.results_publication.*"
-disallow_any_generics = true
 
 [tool.pydantic-mypy]
 init_forbid_extra = true

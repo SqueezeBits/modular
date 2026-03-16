@@ -27,29 +27,27 @@ from std.gpu import WARP_SIZE, barrier, block_dim, block_idx, thread_idx
 from std.gpu import warp_id as get_warp_id
 from std.gpu.host import DeviceBuffer, DeviceContext
 from std.gpu.memory import async_copy_wait_all
-from layout.layout_tensor import Layout, LayoutTensor, copy_dram_to_sram_async
+from layout import Layout, LayoutTensor
+from layout.layout_tensor import copy_dram_to_sram_async
 from layout.math import outer_product_acc
 from layout.tensor_core import TensorCore
 from std.utils import IndexList
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.utils.index import Index
 
 comptime NWARMUP = 1
 comptime NRUN = 1
 
 
-fn time_kernel[
+def time_kernel[
     func: fn(DeviceContext) raises capturing -> None
 ](mut m: Bench, ctx: DeviceContext, size: Int, kernel_name: String) raises:
     @parameter
     @always_inline
-    fn bench_func(mut m: Bencher):
+    def bench_func(mut m: Bencher):
         @parameter
         @always_inline
-        fn kernel_launch(ctx: DeviceContext, iteration: Int) raises:
+        def kernel_launch(ctx: DeviceContext, iteration: Int) raises:
             func(ctx)
 
         m.iter_custom[kernel_launch](ctx)
@@ -60,7 +58,7 @@ fn time_kernel[
     )
 
 
-fn run_cublas[
+def run_cublas[
     dtype: DType, enable_tc: Bool = False
 ](
     mut m: Bench,
@@ -68,21 +66,21 @@ fn run_cublas[
     M: Int,
     N: Int,
     K: Int,
-    a: UnsafePointer[Scalar[dtype]],
-    b: UnsafePointer[Scalar[dtype]],
-    c: UnsafePointer[Scalar[dtype]],
+    a: UnsafePointer[mut=False, Scalar[dtype], _],
+    b: UnsafePointer[mut=False, Scalar[dtype], _],
+    c: UnsafePointer[mut=True, Scalar[dtype], _],
 ) raises:
-    var a_device = NDBuffer[dtype, 2](a, IndexList[2](M, K))
-    var b_device = NDBuffer[dtype, 2](b, IndexList[2](K, N))
-    var c_device_ref = NDBuffer[dtype, 2](c, IndexList[2](M, N))
+    var a_device = NDBuffer[rank=2, dtype](a, IndexList[2](M, K))
+    var b_device = NDBuffer[rank=2, dtype](b, IndexList[2](K, N))
+    var c_device_ref = NDBuffer[rank=2, dtype](c, IndexList[2](M, N))
 
     with vendor_blas.Handle() as handle:
 
         @parameter
-        fn bench_func(mut m: Bencher):
+        def bench_func(mut m: Bencher):
             @parameter
             @always_inline
-            fn kernel_launch(ctx: DeviceContext) raises:
+            def kernel_launch(ctx: DeviceContext) raises:
                 vendor_blas.matmul[use_tf32=enable_tc](
                     ctx,
                     handle,
@@ -96,7 +94,7 @@ fn run_cublas[
             m.iter_custom[kernel_launch](ctx)
 
         @parameter
-        fn get_bench_id() -> String:
+        def get_bench_id() -> String:
             comptime if enable_tc:
                 return "cublas_tensorcore"
             else:
@@ -119,7 +117,7 @@ fn run_cublas[
         )
 
 
-fn gemm_kernel_1[
+def gemm_kernel_1[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -127,8 +125,8 @@ fn gemm_kernel_1[
     BM: Int,
     BN: Int,
 ](
-    a: LayoutTensor[dtype, a_layout, MutAnyOrigin],
-    b: LayoutTensor[dtype, b_layout, MutAnyOrigin],
+    a: LayoutTensor[dtype, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[dtype, b_layout, ImmutAnyOrigin],
     c: LayoutTensor[dtype, c_layout, MutAnyOrigin],
 ):
     """
@@ -182,7 +180,7 @@ fn gemm_kernel_1[
     dst[row, col] += dst_reg
 
 
-fn run_gemm_kernel_1[
+def run_gemm_kernel_1[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -204,7 +202,7 @@ fn run_gemm_kernel_1[
 
     @always_inline
     @parameter
-    fn run_func(ctx: DeviceContext) raises:
+    def run_func(ctx: DeviceContext) raises:
         ctx.enqueue_function_experimental[func](
             a,
             b,
@@ -219,7 +217,7 @@ fn run_gemm_kernel_1[
     ctx.enqueue_memset(
         DeviceBuffer[dtype](
             ctx,
-            rebind[UnsafePointer[Scalar[dtype]]](c.ptr),
+            rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](c.ptr),
             M * N,
             owning=False,
         ),
@@ -234,7 +232,7 @@ fn run_gemm_kernel_1[
     )
 
 
-fn gemm_kernel_2[
+def gemm_kernel_2[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -242,8 +240,8 @@ fn gemm_kernel_2[
     BM: Int,
     BN: Int,
 ](
-    a: LayoutTensor[dtype, a_layout, MutAnyOrigin],
-    b: LayoutTensor[dtype, b_layout, MutAnyOrigin],
+    a: LayoutTensor[dtype, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[dtype, b_layout, ImmutAnyOrigin],
     c: LayoutTensor[dtype, c_layout, MutAnyOrigin],
 ):
     """
@@ -297,7 +295,7 @@ fn gemm_kernel_2[
     dst[row, col] += dst_reg
 
 
-fn run_gemm_kernel_2[
+def run_gemm_kernel_2[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -319,7 +317,7 @@ fn run_gemm_kernel_2[
 
     @always_inline
     @parameter
-    fn run_func(ctx: DeviceContext) raises:
+    def run_func(ctx: DeviceContext) raises:
         ctx.enqueue_function_experimental[kernel](
             a,
             b,
@@ -334,7 +332,7 @@ fn run_gemm_kernel_2[
     ctx.enqueue_memset(
         DeviceBuffer[dtype](
             ctx,
-            rebind[UnsafePointer[Scalar[dtype]]](c.ptr),
+            rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](c.ptr),
             M * N,
             owning=False,
         ),
@@ -349,7 +347,7 @@ fn run_gemm_kernel_2[
     )
 
 
-fn gemm_kernel_3[
+def gemm_kernel_3[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -359,8 +357,8 @@ fn gemm_kernel_3[
     BK: Int,
     NUM_THREADS: Int,
 ](
-    a: LayoutTensor[dtype, a_layout, MutAnyOrigin],
-    b: LayoutTensor[dtype, b_layout, MutAnyOrigin],
+    a: LayoutTensor[dtype, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[dtype, b_layout, ImmutAnyOrigin],
     c: LayoutTensor[dtype, c_layout, MutAnyOrigin],
 ):
     """
@@ -446,7 +444,7 @@ fn gemm_kernel_3[
     dst[row, col] += dst_reg
 
 
-fn run_gemm_kernel_3[
+def run_gemm_kernel_3[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -471,7 +469,7 @@ fn run_gemm_kernel_3[
 
     @always_inline
     @parameter
-    fn run_func(ctx: DeviceContext) raises:
+    def run_func(ctx: DeviceContext) raises:
         ctx.enqueue_function_experimental[kernel](
             a,
             b,
@@ -486,7 +484,7 @@ fn run_gemm_kernel_3[
     ctx.enqueue_memset(
         DeviceBuffer[dtype](
             ctx,
-            rebind[UnsafePointer[Scalar[dtype]]](c.ptr),
+            rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](c.ptr),
             M * N,
             owning=False,
         ),
@@ -501,7 +499,7 @@ fn run_gemm_kernel_3[
     )
 
 
-fn gemm_kernel_4[
+def gemm_kernel_4[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -512,8 +510,8 @@ fn gemm_kernel_4[
     TM: Int,
     NUM_THREADS: Int,
 ](
-    a: LayoutTensor[dtype, a_layout, MutAnyOrigin],
-    b: LayoutTensor[dtype, b_layout, MutAnyOrigin],
+    a: LayoutTensor[dtype, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[dtype, b_layout, ImmutAnyOrigin],
     c: LayoutTensor[dtype, c_layout, MutAnyOrigin],
 ):
     """
@@ -615,7 +613,7 @@ fn gemm_kernel_4[
     dst.copy_from(dst_reg)
 
 
-fn run_gemm_kernel_4[
+def run_gemm_kernel_4[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -642,7 +640,7 @@ fn run_gemm_kernel_4[
 
     @always_inline
     @parameter
-    fn run_func(ctx: DeviceContext) raises:
+    def run_func(ctx: DeviceContext) raises:
         ctx.enqueue_function_experimental[kernel](
             a,
             b,
@@ -657,7 +655,7 @@ fn run_gemm_kernel_4[
     ctx.enqueue_memset(
         DeviceBuffer[dtype](
             ctx,
-            rebind[UnsafePointer[Scalar[dtype]]](c.ptr),
+            rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](c.ptr),
             M * N,
             owning=False,
         ),
@@ -672,7 +670,7 @@ fn run_gemm_kernel_4[
     )
 
 
-fn gemm_kernel_5[
+def gemm_kernel_5[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -684,8 +682,8 @@ fn gemm_kernel_5[
     TN: Int,
     NUM_THREADS: Int,
 ](
-    a: LayoutTensor[dtype, a_layout, MutAnyOrigin],
-    b: LayoutTensor[dtype, b_layout, MutAnyOrigin],
+    a: LayoutTensor[dtype, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[dtype, b_layout, ImmutAnyOrigin],
     c: LayoutTensor[dtype, c_layout, MutAnyOrigin],
 ):
     """
@@ -781,7 +779,7 @@ fn gemm_kernel_5[
     dst.copy_from(dst_reg)
 
 
-fn run_gemm_kernel_5[
+def run_gemm_kernel_5[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -810,7 +808,7 @@ fn run_gemm_kernel_5[
 
     @always_inline
     @parameter
-    fn run_func(ctx: DeviceContext) raises:
+    def run_func(ctx: DeviceContext) raises:
         ctx.enqueue_function_experimental[kernel](
             a,
             b,
@@ -824,7 +822,7 @@ fn run_gemm_kernel_5[
     ctx.enqueue_memset(
         DeviceBuffer[dtype](
             ctx,
-            rebind[UnsafePointer[Scalar[dtype]]](c.ptr),
+            rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](c.ptr),
             M * N,
             owning=False,
         ),
@@ -839,7 +837,7 @@ fn run_gemm_kernel_5[
     )
 
 
-fn gemm_kernel_6[
+def gemm_kernel_6[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -851,8 +849,8 @@ fn gemm_kernel_6[
     TN: Int,
     NUM_THREADS: Int,
 ](
-    a: LayoutTensor[dtype, a_layout, MutAnyOrigin],
-    b: LayoutTensor[dtype, b_layout, MutAnyOrigin],
+    a: LayoutTensor[dtype, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[dtype, b_layout, ImmutAnyOrigin],
     c: LayoutTensor[dtype, c_layout, MutAnyOrigin],
 ):
     """
@@ -974,7 +972,7 @@ fn gemm_kernel_6[
     dst_vec.copy_from(dst_reg_vec)
 
 
-fn run_gemm_kernel_6[
+def run_gemm_kernel_6[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -1002,7 +1000,7 @@ fn run_gemm_kernel_6[
 
     @always_inline
     @parameter
-    fn run_func(ctx: DeviceContext) raises:
+    def run_func(ctx: DeviceContext) raises:
         ctx.enqueue_function_experimental[kernel](
             a,
             b,
@@ -1016,7 +1014,7 @@ fn run_gemm_kernel_6[
     ctx.enqueue_memset(
         DeviceBuffer[dtype](
             ctx,
-            rebind[UnsafePointer[Scalar[dtype]]](c.ptr),
+            rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](c.ptr),
             M * N,
             owning=False,
         ),
@@ -1031,7 +1029,7 @@ fn run_gemm_kernel_6[
     )
 
 
-fn matmul_kernel_tc[
+def matmul_kernel_tc[
     dtype: DType,
     layout_a: Layout,
     layout_b: Layout,
@@ -1045,8 +1043,8 @@ fn matmul_kernel_tc[
     MMA_N: Int,
     MMA_K: Int,
 ](
-    A: LayoutTensor[dtype, layout_a, MutAnyOrigin],
-    B: LayoutTensor[dtype, layout_b, MutAnyOrigin],
+    A: LayoutTensor[dtype, layout_a, ImmutAnyOrigin],
+    B: LayoutTensor[dtype, layout_b, ImmutAnyOrigin],
     C: LayoutTensor[dtype, layout_c, MutAnyOrigin],
 ):
     """
@@ -1089,8 +1087,7 @@ fn matmul_kernel_tc[
     var warp_id = get_warp_id()  # Warp ID within the block
 
     # Calculate warp tile coordinates within the block
-    warp_y = warp_id // UInt(BN // WN)
-    warp_x = warp_id % UInt(BN // WN)
+    warp_y, warp_x = divmod(warp_id, UInt(BN // WN))
 
     # Get the warp tile of the output matrix C
     C_warp_tile = C.tile[BM, BN](Int(block_idx.y), Int(block_idx.x)).tile[
@@ -1187,7 +1184,7 @@ fn matmul_kernel_tc[
             mma_op.store_d(C_mma_tile, c_reg_m_n)
 
 
-fn run_gemm_kernel_tc[
+def run_gemm_kernel_tc[
     dtype: DType,
     a_layout: Layout,
     b_layout: Layout,
@@ -1229,7 +1226,7 @@ fn run_gemm_kernel_tc[
 
     @always_inline
     @parameter
-    fn run_func(ctx: DeviceContext) raises:
+    def run_func(ctx: DeviceContext) raises:
         ctx.enqueue_function_experimental[kernel](
             a,
             b,
@@ -1243,7 +1240,7 @@ fn run_gemm_kernel_tc[
     ctx.enqueue_memset(
         DeviceBuffer[dtype](
             ctx,
-            rebind[UnsafePointer[Scalar[dtype]]](c.ptr),
+            rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](c.ptr),
             M * N,
             owning=False,
         ),

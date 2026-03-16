@@ -40,22 +40,19 @@ from std.gpu.primitives.grid_controls import (
     pdl_launch_attributes,
 )
 from internal_utils._utils import ValOrDim, dynamic, static
+from layout import TileTensor
 from linalg.matmul.gpu import _matmul_gpu
 from std.math import ceildiv
-from std.memory import LegacyUnsafePointer
 from std.sys import get_defined_int, size_of
 
 from std.utils import IndexList
 
-# Use LegacyUnsafePointer for alloc support
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 
-
-fn consumer_kernel[
+def consumer_kernel[
     dtype: DType,
 ](
-    input: UnsafePointer[Scalar[dtype]],
-    output: UnsafePointer[Scalar[dtype]],
+    input: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     length: Int,
 ):
     """Consumer kernel that reads matmul output after PDL wait.
@@ -75,7 +72,7 @@ fn consumer_kernel[
         output[i] = input[i]
 
 
-fn run_pdl_race_test[
+def run_pdl_race_test[
     dtype: DType,
     M: Int,
     N: Int,
@@ -97,9 +94,9 @@ fn run_pdl_race_test[
     )
 
     # Allocate host buffers
-    var a_host = UnsafePointer[Scalar[dtype]].alloc(M * K)
-    var b_host = UnsafePointer[Scalar[dtype]].alloc(K * N)
-    var result_host = UnsafePointer[Scalar[dtype]].alloc(M * N)
+    var a_host = alloc[Scalar[dtype]](M * K)
+    var b_host = alloc[Scalar[dtype]](K * N)
+    var result_host = alloc[Scalar[dtype]](M * N)
 
     # Initialize A with 1.0, B with 1.0
     # Result should be K (sum of K products of 1.0 * 1.0)
@@ -122,17 +119,17 @@ fn run_pdl_race_test[
     ctx.enqueue_copy(b_device, b_host)
 
     # Create NDBuffers for matmul
-    comptime a_static_shape = DimList(Dim(), Dim(K))
-    comptime b_static_shape = DimList(Dim(N), Dim(K))
-    comptime c_static_shape = DimList(Dim(), Dim(N))
+    comptime a_static_shape = DimList[Dim(), Dim(K)]()
+    comptime b_static_shape = DimList[Dim(N), Dim(K)]()
+    comptime c_static_shape = DimList[Dim(), Dim(N)]()
 
-    var a_buf = NDBuffer[dtype, 2, MutAnyOrigin, a_static_shape](
+    var a_buf = NDBuffer[rank=2, dtype, MutAnyOrigin, a_static_shape](
         a_device.unsafe_ptr(), IndexList[2](M, K)
     )
-    var b_buf = NDBuffer[dtype, 2, MutAnyOrigin, b_static_shape](
+    var b_buf = NDBuffer[rank=2, dtype, MutAnyOrigin, b_static_shape](
         b_device.unsafe_ptr(), IndexList[2](N, K)
     )
-    var c_buf = NDBuffer[dtype, 2, MutAnyOrigin, c_static_shape](
+    var c_buf = NDBuffer[rank=2, dtype, MutAnyOrigin, c_static_shape](
         c_device.unsafe_ptr(), IndexList[2](M, N)
     )
 
@@ -147,7 +144,7 @@ fn run_pdl_race_test[
             use_tensor_core=True,
             transpose_b=True,
             pdl_level=PDLLevel.OVERLAP_AT_END,
-        ](c_buf, a_buf, b_buf, ctx)
+        ](TileTensor(c_buf), TileTensor(a_buf), TileTensor(b_buf), ctx)
         #
         # Launch consumer kernel - waits for matmul via PDL
         var num_threads = 256

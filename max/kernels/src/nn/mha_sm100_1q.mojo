@@ -55,14 +55,8 @@ from std.gpu.compute.arch.tcgen05 import (
     tcgen05_st,
     tcgen05_store_wait,
 )
-from layout.int_tuple import IntTuple, UNKNOWN_VALUE
-from layout.layout import Layout
-from layout.layout_tensor import (
-    LayoutTensor,
-    LayoutTensorIter,
-    copy_local_to_shared,
-    copy_sram_to_dram,
-)
+from layout import IntTuple, Layout, LayoutTensor, UNKNOWN_VALUE
+from layout.layout_tensor import copy_local_to_shared, copy_sram_to_dram
 from layout.swizzle import make_swizzle
 from layout.tensor_core_async import (
     tile_layout_k_major,
@@ -126,7 +120,7 @@ struct RegisterAccumulatorDescription:
     var frag_size: Int
 
     @always_inline
-    fn __init__(out self, num_mmas: Int, frag_size: Int):
+    def __init__(out self, num_mmas: Int, frag_size: Int):
         self.num_mmas = num_mmas
         self.frag_size = frag_size
 
@@ -169,7 +163,7 @@ struct RegisterAccumulatorLayout[
 
     @staticmethod
     @always_inline
-    fn description() -> RegisterAccumulatorDescription:
+    def description() -> RegisterAccumulatorDescription:
         comptime assert Self.vec_output_layout.size() > 0, "layout: " + String(
             Self.vec_output_layout
         )
@@ -207,7 +201,7 @@ struct MMAOperandOffsetFn[
     comptime canonical_layout_size = Self.canonical_layout.size()
 
     @always_inline
-    fn __init__(out self):
+    def __init__(out self):
         pass
 
 
@@ -216,17 +210,17 @@ trait DescriptorPair(TrivialRegisterPassable):
     comptime b_t: MMAOperandDescriptor
 
     @always_inline
-    fn get_a(self) -> Self.a_t:
+    def get_a(self) -> Self.a_t:
         ...
 
     @always_inline
-    fn get_b(self) -> Self.b_t:
+    def get_b(self) -> Self.b_t:
         ...
 
 
 trait WriteableMMAOperandDescriptor(TrivialRegisterPassable):
     @always_inline
-    fn copy_from[
+    def copy_from[
         src_type: DType, src_layout: Layout, src_element_layout: Layout, //
     ](
         self,
@@ -246,15 +240,15 @@ trait DescriptorPairTS(TrivialRegisterPassable):
     comptime b_t: MMAOperandDescriptor
 
     @always_inline
-    fn get_a(self) -> Self.a_t:
+    def get_a(self) -> Self.a_t:
         ...
 
     @always_inline
-    fn get_b(self) -> Self.b_t:
+    def get_b(self) -> Self.b_t:
         ...
 
 
-fn local_tensor_type[
+def local_tensor_type[
     dtype: DType, layout: Layout, element_layout: Layout
 ](
     out dummy_arg: LayoutTensor[
@@ -280,7 +274,7 @@ trait AccumulatorTile(TrivialRegisterPassable):
 
     @staticmethod
     @always_inline
-    fn _empty_tensor() -> (
+    def _empty_tensor() -> (
         type_of(
             local_tensor_type[
                 Self.dtype, Self.vec_output_layout, Self.element_layout
@@ -291,7 +285,7 @@ trait AccumulatorTile(TrivialRegisterPassable):
 
     @staticmethod
     @always_inline
-    fn rows_of_frags(
+    def rows_of_frags(
         src: type_of(Self._empty_tensor()),
         out res: LayoutTensor[
             Self.dtype,
@@ -304,20 +298,20 @@ trait AccumulatorTile(TrivialRegisterPassable):
 
     @staticmethod
     @always_inline
-    fn allocate_register_tile(
+    def allocate_register_tile(
         out res: type_of(Self._empty_tensor()),
     ):
         ...
 
     @always_inline
-    fn copy_from(
+    def copy_from(
         self,
         src: type_of(Self._empty_tensor()),
     ):
         ...
 
     @always_inline
-    fn copy_to(
+    def copy_to(
         self,
         dst: type_of(Self._empty_tensor()),
     ):
@@ -335,28 +329,28 @@ struct UMMADescriptorSS[operand_type: DType](
     var b: Self.b_t
 
     @always_inline
-    fn __init__(out self, a: Self.a_t, b: Self.b_t):
+    def __init__(out self, a: Self.a_t, b: Self.b_t):
         self.a = a
         self.b = b
 
     @always_inline
-    fn get_a(self) -> Self.a_t:
+    def get_a(self) -> Self.a_t:
         return self.a
 
     @always_inline
-    fn get_b(self) -> Self.b_t:
+    def get_b(self) -> Self.b_t:
         return self.b
 
 
 @always_inline
-fn _tmem_offset(dtype_size: Int, *, MMA_N: Int, m_mma: Int, n_mma: Int) -> Int:
+def _tmem_offset(dtype_size: Int, *, MMA_N: Int, m_mma: Int, n_mma: Int) -> Int:
     row = 16 * m_mma
     col = (MMA_N * n_mma * dtype_size) // 4
     return (row << 16) + col
 
 
 @always_inline
-fn _tmem_offset[dtype: DType, *, MMA_N: Int, m_mma: Int, n_mma: Int]() -> Int:
+def _tmem_offset[dtype: DType, *, MMA_N: Int, m_mma: Int, n_mma: Int]() -> Int:
     comptime linear = _tmem_offset(
         size_of[dtype](), MMA_N=MMA_N, m_mma=m_mma, n_mma=n_mma
     )
@@ -387,13 +381,13 @@ struct TMemAccumulator[
     var tmem_addr: UInt32
 
     @always_inline
-    fn __init__(out self, tmem_addr: UInt32):
+    def __init__(out self, tmem_addr: UInt32):
         Self.check_constraints()
         self.tmem_addr = tmem_addr
 
     @staticmethod
     @always_inline
-    fn _empty_tensor() -> (
+    def _empty_tensor() -> (
         type_of(
             local_tensor_type[
                 Self.dtype, Self.vec_output_layout, Self.layout_t.element_layout
@@ -406,12 +400,12 @@ struct TMemAccumulator[
         ]()
 
     @always_inline
-    fn __getitem__(self, i: UInt32) -> Self:
+    def __getitem__(self, i: UInt32) -> Self:
         return {self.tmem_addr + i * UInt32(Self.MMA_N)}
 
     @always_inline
     @staticmethod
-    fn check_constraints():
+    def check_constraints():
         comptime assert Self.vec_output_layout[0].size() > 0, (
             "layout: "
             + String(Self.vec_output_layout)
@@ -467,7 +461,7 @@ struct TMemAccumulator[
         )
 
     @always_inline
-    fn offset[m_mma: Int, n_mma: Int](self) -> UInt32:
+    def offset[m_mma: Int, n_mma: Int](self) -> UInt32:
         Self.check_constraints()
 
         comptime if m_mma == 0 and n_mma == 0:
@@ -481,7 +475,7 @@ struct TMemAccumulator[
 
     @staticmethod
     @always_inline
-    fn rows_of_frags(
+    def rows_of_frags(
         src: type_of(Self._empty_tensor()),
         out res: LayoutTensor[
             Self.dtype,
@@ -495,13 +489,13 @@ struct TMemAccumulator[
 
     @staticmethod
     @always_inline
-    fn allocate_register_tile(
+    def allocate_register_tile(
         out res: type_of(Self._empty_tensor()),
     ):
         res = type_of(res).stack_allocation()
 
     @always_inline
-    fn copy_from(
+    def copy_from(
         self,
         src: type_of(Self._empty_tensor()),
     ):
@@ -526,17 +520,23 @@ struct TMemAccumulator[
                 tmem = self.tmem_addr + UInt32(tmem_offset)
                 frag = bitcast[DType.uint32, frag_size_b32](frags[mma_id, 0])
                 # 16 x 256b results in repeated 8x4 matrix of <1,2> vector pattern
+                var frag_st = InlineArray[Scalar[DType.uint32], frag_size_b32](
+                    uninitialized=True
+                )
+
+                comptime for _i in range(frag_size_b32):
+                    frag_st[_i] = frag[_i]
                 tcgen05_st[
                     datapaths=16,  # first dimension of the shape
                     bits=256,  # second dimension of the shape
                     repeat=repeat,
                     pack=False,
-                ](tmem, frag)
+                ](tmem, frag_st)
         tcgen05_store_wait()
         named_barrier[Int32(Self.num_softmax_threads)]()
 
     @always_inline
-    fn copy_to(
+    def copy_to(
         self,
         dst: type_of(Self._empty_tensor()),
     ):
@@ -562,18 +562,21 @@ struct TMemAccumulator[
                     n_mma=n_mma,
                 )
                 tmem = self.tmem_addr + UInt32(tmem_offset)
+                var _ld_result = tcgen05_ld[
+                    datapaths=16,  # first dimension of the shape
+                    bits=256,  # second dimension of the shape
+                    repeat=repeat,
+                    dtype=DType.uint32,
+                    pack=False,
+                    width=frag_size_b32,
+                ](tmem)
+                var _ld_simd = SIMD[DType.uint32, frag_size_b32]()
+
+                comptime for _i in range(frag_size_b32):
+                    _ld_simd[_i] = _ld_result[_i]
                 frags[mma_id, 0] = bitcast[
                     Self.dtype, frags.element_layout.size()
-                ](
-                    tcgen05_ld[
-                        datapaths=16,  # first dimension of the shape
-                        bits=256,  # second dimension of the shape
-                        repeat=repeat,
-                        dtype=DType.uint32,
-                        pack=False,
-                        width=frag_size_b32,
-                    ](tmem)
-                )
+                ](_ld_simd)
 
         tcgen05_load_wait()
 
@@ -605,11 +608,11 @@ struct TMemOperand[
     )
 
     @always_inline
-    fn __init__(out self, tmem_addr: UInt32):
+    def __init__(out self, tmem_addr: UInt32):
         self.tmem_addr = tmem_addr
 
     @always_inline
-    fn offset[m_mma: Int, k_mma: Int](self) -> UInt32:
+    def offset[m_mma: Int, k_mma: Int](self) -> UInt32:
         comptime assert Self.MMA_M > 0, "MMA_M = " + String(Self.MMA_M) + "\n"
         comptime assert Self.MMA_K > 0, "MMA_K = " + String(Self.MMA_K) + "\n"
 
@@ -622,7 +625,7 @@ struct TMemOperand[
             return self.tmem_addr + UInt32(linear)
 
     @always_inline
-    fn copy_from[
+    def copy_from[
         src_type: DType,
         src_layout: Layout,
         src_element_layout: Layout,
@@ -689,17 +692,23 @@ struct TMemOperand[
             )
             # 16 x 256b results in repeated 8x4<1x64b> pattern
             # 256b means 256 // 4 = 64b per thread
+            var frag_st2 = InlineArray[Scalar[DType.uint32], frag_size_b32](
+                uninitialized=True
+            )
+
+            comptime for _i in range(frag_size_b32):
+                frag_st2[_i] = frag[_i]
             tcgen05_st[
                 datapaths=16,  # first dimension of the shape
                 bits=bits,  # second dimension of the shape
                 repeat=repeat,
                 pack=False,
-            ](tmem, frag)
+            ](tmem, frag_st2)
         tcgen05_store_wait()
         named_barrier[Int32(Self.num_softmax_threads)]()
 
     @always_inline
-    fn copy_to[
+    def copy_to[
         dst_type: DType,
         dst_layout: Layout,
         dst_element_layout: Layout,
@@ -745,20 +754,21 @@ struct TMemOperand[
         comptime for m_mma in range(Self.num_m_mmas):
             tmem = self.offset[m_mma, 0]()
             # 16 x 256b results in repeated 8x4<1x2> pattern
+            var _ld_result2 = tcgen05_ld[
+                datapaths=16,  # first dimension of the shape
+                bits=bits,  # second dimension of the shape
+                repeat=repeat,
+                dtype=DType.uint32,
+                pack=False,
+                width=frag_size_b32,
+            ](tmem)
+            var _ld_simd2 = SIMD[DType.uint32, frag_size_b32]()
+
+            comptime for _i in range(frag_size_b32):
+                _ld_simd2[_i] = _ld_result2[_i]
             frags[m_mma, 0] = rebind[
                 SIMD[dst_type, type_of(frags).element_size]
-            ](
-                bitcast[Self.dtype, Self.frag_size](
-                    tcgen05_ld[
-                        datapaths=16,  # first dimension of the shape
-                        bits=bits,  # second dimension of the shape
-                        repeat=repeat,
-                        dtype=DType.uint32,
-                        pack=False,
-                        width=frag_size_b32,
-                    ](tmem)
-                ).cast[dst_type]()
-            )
+            ](bitcast[Self.dtype, Self.frag_size](_ld_simd2).cast[dst_type]())
         tcgen05_load_wait()
 
 
@@ -788,16 +798,16 @@ struct UMMADescriptorTS[
     var b: Self.b_t
 
     @always_inline
-    fn __init__(out self, a: Self.a_t, b: Self.b_t):
+    def __init__(out self, a: Self.a_t, b: Self.b_t):
         self.a = a
         self.b = b
 
     @always_inline
-    fn get_a(self) -> Self.a_t:
+    def get_a(self) -> Self.a_t:
         return self.a
 
     @always_inline
-    fn get_b(self) -> Self.b_t:
+    def get_b(self) -> Self.b_t:
         return self.b
 
 
@@ -881,7 +891,7 @@ struct SM100TensorAccumulatorSS[
 
     @always_inline
     @staticmethod
-    fn check_constraints():
+    def check_constraints():
         comptime assert (Self.BM % Self.MMA_M) == 0, (
             "BM, MMA_M = " + String(Self.BM) + ", " + String(Self.MMA_M)
         )
@@ -898,7 +908,7 @@ struct SM100TensorAccumulatorSS[
         )
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         smem: UnsafePointer[
             SharedMemBarrier, MutAnyOrigin, address_space=AddressSpace.SHARED
@@ -909,7 +919,7 @@ struct SM100TensorAccumulatorSS[
         self.pipeline = {}
 
     @always_inline
-    fn init(self):
+    def init(self):
         comptime for i in range(Self.pipeline_stages):
             self.mbar[i].init()
             self.mbar[i + Self.pipeline_stages].init(
@@ -918,7 +928,7 @@ struct SM100TensorAccumulatorSS[
 
     @staticmethod
     @always_inline
-    fn mma_descriptors[
+    def mma_descriptors[
         dtype_a: DType, dtype_b: DType
     ](
         p_a: UnsafePointer[
@@ -954,7 +964,7 @@ struct SM100TensorAccumulatorSS[
         return Self.ab_t(adesc_base, bdesc_base)
 
     @always_inline
-    fn mma(
+    def mma(
         mut self,
         a: Self.a_t,
         b: Self.b_t,
@@ -1009,7 +1019,7 @@ struct SM100TensorAccumulatorSS[
     #   use accumulator
     #   tmem_arrive()    # self.mbar[Stages + index()].arrive(), step()
     @always_inline
-    fn wait_for_tmem(self):
+    def wait_for_tmem(self):
         """
         Wait for the accumulator tmem to finish being read.
         """
@@ -1018,7 +1028,7 @@ struct SM100TensorAccumulatorSS[
         )
 
     @always_inline
-    fn wait_for_mma(self, c_base: Self.c_t) -> Self.c_t:
+    def wait_for_mma(self, c_base: Self.c_t) -> Self.c_t:
         """
         Wait for the accumulator tmem to finish being read.
         """
@@ -1027,12 +1037,12 @@ struct SM100TensorAccumulatorSS[
         return c_base[idx]
 
     @always_inline
-    fn tmem_arrive_init(self):
+    def tmem_arrive_init(self):
         comptime for i in range(Self.pipeline_stages):
             _ = self.mbar[Self.pipeline_stages + i].arrive()
 
     @always_inline
-    fn tmem_arrive(mut self):
+    def tmem_arrive(mut self):
         """
         Indicate that the accumulator is ready to be updated.
         """
@@ -1116,7 +1126,7 @@ struct SM100TensorAccumulatorTS[
 
     @staticmethod
     @always_inline
-    fn check_constraints():
+    def check_constraints():
         comptime assert (Self.BM % Self.MMA_M) == 0, (
             "BM, MMA_M = " + String(Self.BM) + ", " + String(Self.MMA_M)
         )
@@ -1128,7 +1138,7 @@ struct SM100TensorAccumulatorTS[
         ), ("BK, MMA_K = " + String(Self.BK) + ", " + String(Self.MMA_K))
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         smem: UnsafePointer[
             SharedMemBarrier, MutAnyOrigin, address_space=AddressSpace.SHARED
@@ -1139,19 +1149,19 @@ struct SM100TensorAccumulatorTS[
         self.phase = 0
 
     @always_inline
-    fn init(self):
+    def init(self):
         self.mbar[0].init()
         self.mbar[1].init(Int32(Self.num_softmax_threads))
 
     @staticmethod
     @always_inline
-    fn a_mma_descriptor(a_tmem: UInt32) -> Self.ab_t.a_t:
+    def a_mma_descriptor(a_tmem: UInt32) -> Self.ab_t.a_t:
         Self.check_constraints()
         return Self.ab_t.a_t(a_tmem)
 
     @staticmethod
     @always_inline
-    fn b_mma_descriptor[
+    def b_mma_descriptor[
         dtype_b: DType
     ](
         p_b: UnsafePointer[
@@ -1173,7 +1183,7 @@ struct SM100TensorAccumulatorTS[
         return MMASmemDescriptor.create[bSBO, bLBO, Self.swizzle_b](p_b)
 
     @always_inline
-    fn mma(
+    def mma(
         self,
         a: Self.a_t,
         b: Self.b_t,
@@ -1218,28 +1228,28 @@ struct SM100TensorAccumulatorTS[
     #   scale output, write P
     #   tmem_arrive()     # self.mbar[1].arrive()
     @always_inline
-    fn wait(mut self, idx: UInt32):
+    def wait(mut self, idx: UInt32):
         # update the phase before waiting
         var old_phase: UInt32 = self.phase
         self.phase = old_phase ^ 1
         self.mbar[idx].wait(old_phase)
 
     @always_inline
-    fn wait_for_mma(mut self):
+    def wait_for_mma(mut self):
         """
         Wait for the mma to be complete.
         """
         self.wait(0)
 
     @always_inline
-    fn wait_for_tmem(mut self):
+    def wait_for_tmem(mut self):
         """
         Wait for the `output` and `A` tmem to be ready.
         """
         self.wait(1)
 
     @always_inline
-    fn tmem_arrive(self):
+    def tmem_arrive(self):
         """
         Indicate that the accumulator and the tensor memory arguments
         are ready for the MMA to begin.
@@ -1248,7 +1258,7 @@ struct SM100TensorAccumulatorTS[
 
 
 @always_inline
-fn mha_sm100_dispatch[
+def mha_sm100_dispatch[
     q_type: DType,
     KVType: MHAOperand,
     MaskType: MHAMask,
@@ -1362,7 +1372,10 @@ fn mha_sm100_dispatch[
     ](ctx)
 
     comptime SchedulerType = TransientScheduler[
-        UInt32(scheduler_tile_shape), UInt32(num_scheduler_heads)
+        UInt32(scheduler_tile_shape),
+        UInt32(num_scheduler_heads),
+        flip_prompt_idx=not decoding
+        and MaskType.get_type_name() == "CausalMask",
     ]
     var scheduler: SchedulerType = SchedulerType()
 
@@ -1441,7 +1454,7 @@ fn mha_sm100_dispatch[
 
 
 @always_inline
-fn _mha_sm100_kv_input_row_offset_dispatch[
+def _mha_sm100_kv_input_row_offset_dispatch[
     KVLUTType: MHAOperand,
     output_type: DType,
     MaskType: MHAMask,
@@ -1568,7 +1581,7 @@ fn _mha_sm100_kv_input_row_offset_dispatch[
 
 
 @always_inline
-fn _mha_sm100_valid_length_dispatch[
+def _mha_sm100_valid_length_dispatch[
     KVLUTType: MHAOperand,
     output_type: DType,
     MaskType: MHAMask,
@@ -1690,7 +1703,7 @@ fn _mha_sm100_valid_length_dispatch[
 
 
 @always_inline
-fn _mha_sm100_enqueue[
+def _mha_sm100_enqueue[
     KVLUTType: MHAOperand,
     output_type: DType,
     MaskType: MHAMask,
@@ -1835,7 +1848,7 @@ fn _mha_sm100_enqueue[
     )
 )
 @__llvm_metadata(`nvvm.minctasm`=Int(1))
-fn _mha_sm100[
+def _mha_sm100[
     KVLUTType: MHAOperand,
     output_type: DType,
     MaskType: MHAMask,
@@ -2208,7 +2221,7 @@ fn _mha_sm100[
 
     @parameter
     @always_inline
-    fn get_position(seq_info: SeqInfo) -> PositionType:
+    def get_position(seq_info: SeqInfo) -> PositionType:
         return _get_position[
             BM,
             BN,
@@ -2304,7 +2317,7 @@ fn _mha_sm100[
 
             @parameter
             @always_inline
-            fn q_mul_k(read_idx: UInt32, read_phase: UInt32):
+            def q_mul_k(read_idx: UInt32, read_phase: UInt32):
                 q = q_desc
                 k = k_desc + Int(
                     UInt32(BN * Int(config.padded_depth) * size_of[kv_type]())
@@ -2381,7 +2394,7 @@ fn _mha_sm100[
 
                 @parameter
                 @always_inline("nodebug")
-                fn p_mul_v(
+                def p_mul_v(
                     read_idx: UInt32,
                     read_phase: UInt32,
                     scale_c: UInt32,
@@ -2514,21 +2527,21 @@ fn _mha_sm100[
 
         @parameter
         @always_inline
-        fn vectorize_p_reg_tile(
+        def vectorize_p_reg_tile(
             out result: VecPType,
         ):
             result = {p_reg_tile.ptr}
 
         @parameter
         @always_inline
-        fn vectorize_o_reg_tile(
+        def vectorize_o_reg_tile(
             out result: VecOType,
         ):
             result = {output_reg_tile.ptr}
 
         @parameter
         @always_inline
-        fn apply_mask(
+        def apply_mask(
             position: PositionType,
             mask_status: TileMaskStatus,
             kv_tile_start_row: UInt32,
@@ -2550,7 +2563,7 @@ fn _mha_sm100[
 
         @parameter
         @always_inline
-        fn scale(correction: type_of(rowmax), vout: VecOType):
+        def scale(correction: type_of(rowmax), vout: VecOType):
             # Correct output
             # We could avoid this on the first iter
             # if we specialize and unswitch on `first_iter`
@@ -2564,7 +2577,7 @@ fn _mha_sm100[
                     vout[row, col] = vout[row, col] * c
 
         @always_inline
-        fn elementwise_reciprocal(
+        def elementwise_reciprocal(
             old_rowsum: type_of(rowsum), new_rowsum: type_of(rowsum)
         ):
             # new_rowsum, old_rowsum = 1/old_rowsum, new_rowsum
@@ -2576,7 +2589,7 @@ fn _mha_sm100[
 
         @parameter
         @always_inline
-        fn write_output(
+        def write_output(
             position: PositionType,
             rowsum_inv: type_of(rowsum),
             vout: VecOType,
@@ -2685,7 +2698,7 @@ fn _mha_sm100[
 
         @parameter
         @always_inline
-        fn wait_for_q_mul_k(read_idx: UInt32):
+        def wait_for_q_mul_k(read_idx: UInt32):
             p_acc = umma_0.wait_for_mma(p_accumulator)  # P is available
             _ = consumed_mbar_kv[read_idx].arrive()
             p_acc.copy_to(p_reg_tile)
@@ -2693,7 +2706,7 @@ fn _mha_sm100[
 
         @parameter
         @always_inline
-        fn wait_for_p_mul_v(read_idx: UInt32):
+        def wait_for_p_mul_v(read_idx: UInt32):
             umma_1.wait_for_mma()  # output is available
             _ = consumed_mbar_kv[read_idx].arrive()
             output_accumulator.copy_to(output_reg_tile)

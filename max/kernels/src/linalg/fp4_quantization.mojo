@@ -22,7 +22,15 @@ from std.gpu import (
     lane_id,
 )
 from std.gpu.host import DeviceContext, FuncAttribute, get_gpu_target
-from layout import Layout, LayoutTensor
+from layout import (
+    IntTuple,
+    Layout,
+    LayoutTensor,
+    RuntimeLayout,
+    RuntimeTuple,
+    TileTensor,
+    coord_to_index_list,
+)
 from std.logger import Logger
 from std.gpu.primitives.warp import shuffle_xor
 from std.math import recip
@@ -50,7 +58,7 @@ from linalg.utils import (
 from std.utils.index import Index, IndexList
 from linalg.matmul.vendor.blas import matmul
 from buffer import Dim, NDBuffer
-from layout._ndbuffer_stub import from_ndbuffer_row_major
+from buffer.dimlist import DimList
 from std.memory import bitcast
 from std.gpu.sync import named_barrier
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
@@ -65,14 +73,13 @@ from layout.layout_tensor import LayoutTensorIter
 from std.gpu.memory import external_memory, fence_async_view_proxy
 from std.gpu import barrier
 from std.sys import size_of, align_of, simd_width_of
-from layout import IntTuple, Layout, LayoutTensor, RuntimeLayout, RuntimeTuple
-from std.memory import LegacyUnsafePointer
 from layout.swizzle import make_swizzle
 from std.algorithm import elementwise
 from std.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
 from std.sys import get_defined_bool
 from linalg.matmul.gpu.sm100.block_scaled_dispatch import (
     heuristic_and_outliers_dispatch,
+    small_bn_dispatch,
 )
 from std.gpu.primitives.grid_controls import PDLLevel
 from linalg.matmul.gpu.sm100_structured.default.dispatch import (
@@ -88,12 +95,11 @@ from std.collections import OptionalReg
 # Dynamic scaled NVFP4 quantization
 ########################################################
 
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 comptime logger = Logger()
 
 
 @always_inline
-fn quantize_dynamic_scaled_fp4fp8[
+def quantize_dynamic_scaled_fp4fp8[
     out_dtype: DType,
     scales_dtype: DType,
     in_dtype: DType,
@@ -188,7 +194,7 @@ fn quantize_dynamic_scaled_fp4fp8[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_max_threads))
 )
-fn quantize_dynamic_scaled_fp4fp8_kernel[
+def quantize_dynamic_scaled_fp4fp8_kernel[
     out_dtype: DType,
     scales_dtype: DType,
     in_dtype: DType,
@@ -344,7 +350,7 @@ fn quantize_dynamic_scaled_fp4fp8_kernel[
 
 
 @always_inline
-fn block_scales_interleave_fp4[
+def block_scales_interleave_fp4[
     scales_dtype: DType,
     input_scales_layout: Layout,
     output_scales_layout: Layout,
@@ -401,7 +407,7 @@ fn block_scales_interleave_fp4[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_max_threads))
 )
-fn block_scales_interleave_fp4_kernel[
+def block_scales_interleave_fp4_kernel[
     scales_dtype: DType,
     input_scales_layout: Layout,
     output_scales_layout: Layout,
@@ -437,7 +443,7 @@ fn block_scales_interleave_fp4_kernel[
             )
 
 
-fn naive_block_scaled_matmul[
+def naive_block_scaled_matmul[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -576,7 +582,7 @@ fn naive_block_scaled_matmul[
     )
 
 
-fn naive_block_scaled_matmul_kernel[
+def naive_block_scaled_matmul_kernel[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -673,7 +679,7 @@ fn naive_block_scaled_matmul_kernel[
         c[row_idx, col_idx] = accum.cast[c_type]()
 
 
-fn quantize_dynamic_block_scaled[
+def quantize_dynamic_block_scaled[
     out_dtype: DType,
     scales_dtype: DType,
     in_dtype: DType,
@@ -682,9 +688,9 @@ fn quantize_dynamic_block_scaled[
     SF_VECTOR_SIZE: Int,
     target: StaticString = "cpu",
 ](
-    output_device: NDBuffer[mut=True, out_dtype, 2, MutAnyOrigin, _],
-    scales_device: NDBuffer[mut=True, scales_dtype, 5, MutAnyOrigin, _],
-    input_device: NDBuffer[in_dtype, 2, ImmutAnyOrigin, _],
+    output_device: NDBuffer[mut=True, rank=2, out_dtype, MutAnyOrigin, _],
+    scales_device: NDBuffer[mut=True, rank=5, scales_dtype, MutAnyOrigin, _],
+    input_device: NDBuffer[rank=2, in_dtype, ImmutAnyOrigin, _],
     tensor_sf: Float32,  # tensor-wise scale factor
     ctx: DeviceContext,
 ) raises:
@@ -713,9 +719,9 @@ fn quantize_dynamic_block_scaled[
         " MXFP8_SF_VECTOR_SIZE (32 for MXFP8)"
     )
 
-    var input_tensor = from_ndbuffer_row_major(input_device)
-    var output_tensor = from_ndbuffer_row_major(output_device)
-    var scales_tensor = from_ndbuffer_row_major(scales_device)
+    var input_tensor = TileTensor(input_device).to_layout_tensor()
+    var output_tensor = TileTensor(output_device).to_layout_tensor()
+    var scales_tensor = TileTensor(scales_device).to_layout_tensor()
 
     var num_rows = input_tensor.dim(0)
     var num_cols = input_tensor.dim(1)
@@ -765,15 +771,17 @@ fn quantize_dynamic_block_scaled[
         )
 
 
-fn block_scales_interleave[
+def block_scales_interleave[
     scales_dtype: DType,
     //,
     *,
     SF_VECTOR_SIZE: Int,
     target: StaticString = "cpu",
 ](
-    output_scales_device: NDBuffer[mut=True, scales_dtype, 5, MutAnyOrigin, _],
-    input_scales_device: NDBuffer[scales_dtype, 2, ImmutAnyOrigin, _],
+    output_scales_device: NDBuffer[
+        mut=True, rank=5, scales_dtype, MutAnyOrigin, _
+    ],
+    input_scales_device: NDBuffer[rank=2, scales_dtype, ImmutAnyOrigin, _],
     ctx: DeviceContext,
 ) raises:
     comptime assert (
@@ -783,8 +791,8 @@ fn block_scales_interleave[
         NVFP4_SF_DTYPE,
     ), "scales dtype should be NVFP4_SF_DTYPE (float8_e4m3fn) for now."
 
-    var output = from_ndbuffer_row_major(output_scales_device)
-    var input = from_ndbuffer_row_major(input_scales_device)
+    var output = TileTensor(output_scales_device).to_layout_tensor()
+    var input = TileTensor(input_scales_device).to_layout_tensor()
 
     block_scales_interleave_fp4[SF_VECTOR_SIZE=SF_VECTOR_SIZE,](
         ctx, input, output
@@ -794,7 +802,7 @@ fn block_scales_interleave[
 @__llvm_arg_metadata(input_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(output_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(scales_tma_op, `nvvm.grid_constant`)
-fn quantize_dynamic_scaled_async_fp4_kernel[
+def quantize_dynamic_scaled_async_fp4_kernel[
     input_dtype: DType,
     input_tile_rank: Int,
     input_tile_shape: IndexList[input_tile_rank],
@@ -825,7 +833,11 @@ fn quantize_dynamic_scaled_async_fp4_kernel[
     tensor_sf: Float32,  # tensor-wise scale factor
 ):
     var smem_storage = rebind[
-        UnsafePointer[Scalar[input_dtype], address_space=AddressSpace.SHARED]
+        UnsafePointer[
+            Scalar[input_dtype],
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+        ]
     ](
         external_memory[
             Scalar[input_dtype],
@@ -1060,7 +1072,7 @@ fn quantize_dynamic_scaled_async_fp4_kernel[
             output_tma_op.wait_group[0]()
 
 
-fn quantize_dynamic_scaled_fp4_async[
+def quantize_dynamic_scaled_fp4_async[
     input_dtype: DType,
     output_dtype: DType,
     scales_dtype: DType,
@@ -1214,7 +1226,7 @@ fn quantize_dynamic_scaled_fp4_async[
 ########################################################
 
 
-fn block_scaled_matmul[
+def block_scaled_matmul[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -1229,11 +1241,11 @@ fn block_scaled_matmul[
     _trace_description: StaticString = "",
     target: StaticString = "cpu",
 ](
-    c_device: NDBuffer[mut=True, c_type, 2, MutAnyOrigin, _],
-    a_device: NDBuffer[a_type, 2, ImmutAnyOrigin, _],
-    b_device: NDBuffer[b_type, 2, ImmutAnyOrigin, _],
-    a_scales_device: NDBuffer[scales_dtype, 5, ImmutAnyOrigin, _],
-    b_scales_device: NDBuffer[scales_dtype, 5, ImmutAnyOrigin, _],
+    c_device: NDBuffer[mut=True, rank=2, c_type, MutAnyOrigin, _],
+    a_device: NDBuffer[rank=2, a_type, ImmutAnyOrigin, _],
+    b_device: NDBuffer[rank=2, b_type, ImmutAnyOrigin, _],
+    a_scales_device: NDBuffer[rank=5, scales_dtype, ImmutAnyOrigin, _],
+    b_scales_device: NDBuffer[rank=5, scales_dtype, ImmutAnyOrigin, _],
     tensor_sf: Float32,
     ctx: DeviceContext,
 ) raises:
@@ -1251,11 +1263,15 @@ fn block_scaled_matmul[
         SF_VECTOR_SIZE == NVFP4_SF_VECTOR_SIZE
     ), "SF_VECTOR_SIZE must be equal to NVFP4_SF_VECTOR_SIZE (16 for NVFP4)"
 
-    var c = from_ndbuffer_row_major(c_device).as_any_origin()
-    var a = from_ndbuffer_row_major(a_device).as_any_origin()
-    var b = from_ndbuffer_row_major(b_device).as_any_origin()
-    var a_scales = from_ndbuffer_row_major(a_scales_device).as_any_origin()
-    var b_scales = from_ndbuffer_row_major(b_scales_device).as_any_origin()
+    var c = TileTensor(c_device).to_layout_tensor().as_any_origin()
+    var a = TileTensor(a_device).to_layout_tensor().as_any_origin()
+    var b = TileTensor(b_device).to_layout_tensor().as_any_origin()
+    var a_scales = (
+        TileTensor(a_scales_device).to_layout_tensor().as_any_origin()
+    )
+    var b_scales = (
+        TileTensor(b_scales_device).to_layout_tensor().as_any_origin()
+    )
 
     comptime sfa_layout = a_scales.layout
     comptime sfb_layout = b_scales.layout
@@ -1303,9 +1319,31 @@ fn block_scaled_matmul[
         "]",
     )
 
-    comptime static_N = c.layout.shape[1].value()
-    comptime static_K = a.layout.shape[1].value()
+    comptime static_N = c_device.shape.get[1]()
+    comptime static_K = a_device.shape.get[1]() * (
+        2 if a_type == DType.uint8 else 1
+    )
     comptime static_NK = Index(static_N, static_K)
+
+    var c_tt = TileTensor(c_device)
+    var a_tt = TileTensor(a_device)
+    var b_tt = TileTensor(b_device)
+
+    comptime if get_defined_bool[
+        "ENABLE_EXPERIMENTAL_SM100_SMALL_N_BLOCK_SCALED_MATMUL", False
+    ]():
+        var status = small_bn_dispatch[
+            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+            transpose_b=transpose_b,
+            elementwise_lambda_fn=elementwise_lambda_fn,
+            pdl_level=pdl_level,
+        ](c_tt, a_tt, b_tt, a_scales, b_scales, tensor_sf, ctx)
+
+        if status == DISPATCH_HIT:
+            logger.info("Executing SM100 small-BN Block Scaled matmul kernel")
+            return
+        else:
+            raise Error("Small-BN dispatch failed")
 
     comptime if get_defined_bool[
         "ENABLE_EXPERIMENTAL_SM100_BLOCK_SCALED_MATMUL", False
@@ -1315,7 +1353,7 @@ fn block_scaled_matmul[
             transpose_b=transpose_b,
             elementwise_lambda_fn=elementwise_lambda_fn,
             pdl_level=pdl_level,
-        ](c, a, b, a_scales, b_scales, tensor_sf, ctx)
+        ](c_tt, a_tt, b_tt, a_scales, b_scales, tensor_sf, ctx)
 
         if status == DISPATCH_HIT:
             logger.info("Executing SM100 Block Scaled matmul kernel")
@@ -1329,9 +1367,21 @@ fn block_scaled_matmul[
         # Index(7168, 2048),
     ]
 
+    comptime Llama_NK_256 = [
+        Index(16384, 2048),
+    ]
+
+    comptime Llama_NK_1 = [
+        Index(2304, 16384),
+        Index(16384, 2048),
+        Index(6656, 16384),
+        Index(13312, 16384),
+        # Index(16384, 6656),
+    ]
+
     @always_inline
     @parameter
-    fn description_fn() -> String:
+    def description_fn() -> String:
         # fmt: off
         return String(
             "(",
@@ -1343,7 +1393,6 @@ fn block_scaled_matmul[
             ";B_scales=", b_scales_device.dynamic_shape,
             ";transpose_a=", True,
             ";transpose_b=", transpose_b,
-            ";has_epilogue=", Bool(elementwise_lambda_fn),
             ";tensor_sf=", tensor_sf,
             ")"
         )
@@ -1363,20 +1412,47 @@ fn block_scaled_matmul[
     ):
         comptime if static_NK in DeepSeek_NK:
             if m == 1:
+                var status = small_bn_dispatch[
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                    pdl_level=pdl_level,
+                ](c_tt, a_tt, b_tt, a_scales, b_scales, tensor_sf, ctx)
+
+                if status == DISPATCH_HIT:
+                    return
+
+        comptime if static_NK in Llama_NK_256:
+            if m > 1 and m <= 256:
                 var status = heuristic_and_outliers_dispatch[
                     SF_VECTOR_SIZE=SF_VECTOR_SIZE,
                     transpose_b=transpose_b,
                     elementwise_lambda_fn=elementwise_lambda_fn,
                     pdl_level=pdl_level,
-                ](c, a, b, a_scales, b_scales, tensor_sf, ctx)
+                ](
+                    c_tt,
+                    a_tt,
+                    b_tt,
+                    a_scales,
+                    b_scales,
+                    tensor_sf,
+                    ctx,
+                )
 
                 if status == DISPATCH_HIT:
-                    logger.info(
-                        "Executing Mojo SM100 Block Scaled matmul kernel"
-                    )
                     return
 
-        logger.info("Executing Block Scaled matmul kernel")
+        comptime if static_NK in Llama_NK_1:
+            if m == 1:
+                var status = small_bn_dispatch[
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                    pdl_level=pdl_level,
+                ](c_tt, a_tt, b_tt, a_scales, b_scales, tensor_sf, ctx)
+
+                if status == DISPATCH_HIT:
+                    return
 
         block_scaled_matmul_with_epilogue[
             SF_VECTOR_SIZE=SF_VECTOR_SIZE,
@@ -1397,7 +1473,7 @@ fn block_scaled_matmul[
 ########################################################
 
 
-fn block_scaled_matmul_with_epilogue[
+def block_scaled_matmul_with_epilogue[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -1466,7 +1542,7 @@ fn block_scaled_matmul_with_epilogue[
 
     @always_inline
     @parameter
-    fn description_fn() -> String:
+    def description_fn() -> String:
         # fmt: off
         return String(
             "(gpu",
@@ -1476,7 +1552,6 @@ fn block_scaled_matmul_with_epilogue[
             ";A_scales=[", a_scales.dim(0), ",", a_scales.dim(1), "]",
             ";B_scales=[", b_scales.dim(0), ",", b_scales.dim(1), "]",
             ";transpose_b=", transpose_b,
-            ";has_epilogue=", Bool(elementwise_lambda_fn),
             ";tensor_sf=", tensor_sf,
             ")"
         )
@@ -1516,7 +1591,7 @@ fn block_scaled_matmul_with_epilogue[
 
             @parameter
             @__copy_capture(c)
-            fn epilogue_wrapper[
+            def epilogue_wrapper[
                 simd_width: Int, rank: Int, alignment: Int = 1
             ](idx: IndexList[rank]):
                 var c_coord = Index(idx[0], idx[1])
@@ -1567,3 +1642,247 @@ fn block_scaled_matmul_with_epilogue[
             )
 
             _ = tmp_device_buffer^
+
+
+# ===----------------------------------------------------------------------=== #
+# TileTensor overloads
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def block_scaled_matmul[
+    c_type: DType,
+    a_type: DType,
+    b_type: DType,
+    scales_dtype: DType,
+    //,
+    *,
+    SF_VECTOR_SIZE: Int,
+    transpose_b: Bool = True,
+    transpose_a: Bool = False,
+    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
+    pdl_level: PDLLevel = PDLLevel(),
+    _trace_description: StaticString = "",
+    target: StaticString = "cpu",
+](
+    c_device: TileTensor[
+        mut=True, c_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    a_device: TileTensor[
+        mut=False, a_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    b_device: TileTensor[
+        mut=False, b_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    a_scales_device: TileTensor[
+        mut=False, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    b_scales_device: TileTensor[
+        mut=False, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    tensor_sf: Float32,
+    ctx: DeviceContext,
+) raises:
+    """TileTensor overload of `block_scaled_matmul`. Converts to NDBuffer and
+    delegates."""
+    comptime assert c_device.rank == 2 and c_device.flat_rank == 2
+    comptime assert a_device.rank == 2 and a_device.flat_rank == 2
+    comptime assert b_device.rank == 2 and b_device.flat_rank == 2
+    comptime assert a_scales_device.rank == 5 and a_scales_device.flat_rank == 5
+    comptime assert b_scales_device.rank == 5 and b_scales_device.flat_rank == 5
+
+    comptime dim[i: Int] = Dim(i) if i > -1 else Dim()
+    comptime c_shape = DimList[
+        dim[c_device.static_shape[0]], dim[c_device.static_shape[1]]
+    ]()
+    comptime a_shape = DimList[
+        dim[a_device.static_shape[0]], dim[a_device.static_shape[1]]
+    ]()
+    comptime b_shape = DimList[
+        dim[b_device.static_shape[0]], dim[b_device.static_shape[1]]
+    ]()
+    comptime a_scales_shape = DimList[
+        dim[a_scales_device.static_shape[0]],
+        dim[a_scales_device.static_shape[1]],
+        dim[a_scales_device.static_shape[2]],
+        dim[a_scales_device.static_shape[3]],
+        dim[a_scales_device.static_shape[4]],
+    ]()
+    comptime b_scales_shape = DimList[
+        dim[b_scales_device.static_shape[0]],
+        dim[b_scales_device.static_shape[1]],
+        dim[b_scales_device.static_shape[2]],
+        dim[b_scales_device.static_shape[3]],
+        dim[b_scales_device.static_shape[4]],
+    ]()
+
+    var c_buf = NDBuffer[rank=2, c_type, MutAnyOrigin, c_shape](
+        c_device.ptr,
+        rebind[IndexList[2]](
+            coord_to_index_list(c_device.layout.shape_coord())
+        ),
+    )
+    var a_buf = NDBuffer[rank=2, a_type, ImmutAnyOrigin, a_shape](
+        a_device.ptr,
+        rebind[IndexList[2]](
+            coord_to_index_list(a_device.layout.shape_coord())
+        ),
+    )
+    var b_buf = NDBuffer[rank=2, b_type, ImmutAnyOrigin, b_shape](
+        b_device.ptr,
+        rebind[IndexList[2]](
+            coord_to_index_list(b_device.layout.shape_coord())
+        ),
+    )
+    var a_scales_buf = NDBuffer[
+        rank=5, scales_dtype, ImmutAnyOrigin, a_scales_shape
+    ](
+        a_scales_device.ptr,
+        rebind[IndexList[5]](
+            coord_to_index_list(a_scales_device.layout.shape_coord())
+        ),
+    )
+    var b_scales_buf = NDBuffer[
+        rank=5, scales_dtype, ImmutAnyOrigin, b_scales_shape
+    ](
+        b_scales_device.ptr,
+        rebind[IndexList[5]](
+            coord_to_index_list(b_scales_device.layout.shape_coord())
+        ),
+    )
+
+    block_scaled_matmul[
+        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+        transpose_b=transpose_b,
+        transpose_a=transpose_a,
+        elementwise_lambda_fn=elementwise_lambda_fn,
+        pdl_level=pdl_level,
+        _trace_description=_trace_description,
+        target=target,
+    ](c_buf, a_buf, b_buf, a_scales_buf, b_scales_buf, tensor_sf, ctx)
+
+
+@always_inline
+def quantize_dynamic_block_scaled[
+    out_dtype: DType,
+    scales_dtype: DType,
+    in_dtype: DType,
+    //,
+    *,
+    SF_VECTOR_SIZE: Int,
+    target: StaticString = "cpu",
+](
+    output_device: TileTensor[
+        mut=True, out_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    scales_device: TileTensor[
+        mut=True, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    input_device: TileTensor[
+        mut=False, in_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    tensor_sf: Float32,
+    ctx: DeviceContext,
+) raises:
+    """TileTensor overload of `quantize_dynamic_block_scaled`. Converts to
+    NDBuffer and delegates."""
+    comptime assert output_device.rank == 2 and output_device.flat_rank == 2
+    comptime assert scales_device.rank == 5 and scales_device.flat_rank == 5
+    comptime assert input_device.rank == 2 and input_device.flat_rank == 2
+
+    comptime dim[i: Int] = Dim(i) if i > -1 else Dim()
+    comptime out_shape = DimList[
+        dim[output_device.static_shape[0]], dim[output_device.static_shape[1]]
+    ]()
+    comptime scales_shape = DimList[
+        dim[scales_device.static_shape[0]],
+        dim[scales_device.static_shape[1]],
+        dim[scales_device.static_shape[2]],
+        dim[scales_device.static_shape[3]],
+        dim[scales_device.static_shape[4]],
+    ]()
+    comptime in_shape = DimList[
+        dim[input_device.static_shape[0]], dim[input_device.static_shape[1]]
+    ]()
+
+    var out_buf = NDBuffer[rank=2, out_dtype, MutAnyOrigin, out_shape](
+        output_device.ptr,
+        rebind[IndexList[2]](
+            coord_to_index_list(output_device.layout.shape_coord())
+        ),
+    )
+    var scales_buf = NDBuffer[rank=5, scales_dtype, MutAnyOrigin, scales_shape](
+        scales_device.ptr,
+        rebind[IndexList[5]](
+            coord_to_index_list(scales_device.layout.shape_coord())
+        ),
+    )
+    var in_buf = NDBuffer[rank=2, in_dtype, ImmutAnyOrigin, in_shape](
+        input_device.ptr,
+        rebind[IndexList[2]](
+            coord_to_index_list(input_device.layout.shape_coord())
+        ),
+    )
+
+    quantize_dynamic_block_scaled[
+        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+        target=target,
+    ](out_buf, scales_buf, in_buf, tensor_sf, ctx)
+
+
+@always_inline
+def block_scales_interleave[
+    scales_dtype: DType,
+    //,
+    *,
+    SF_VECTOR_SIZE: Int,
+    target: StaticString = "cpu",
+](
+    output_scales_device: TileTensor[
+        mut=True, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    input_scales_device: TileTensor[
+        mut=False, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    ctx: DeviceContext,
+) raises:
+    """TileTensor overload of `block_scales_interleave`. Converts to NDBuffer
+    and delegates."""
+    comptime assert (
+        output_scales_device.rank == 5 and output_scales_device.flat_rank == 5
+    )
+    comptime assert (
+        input_scales_device.rank == 2 and input_scales_device.flat_rank == 2
+    )
+
+    comptime dim[i: Int] = Dim(i) if i > -1 else Dim()
+    comptime out_shape = DimList[
+        dim[output_scales_device.static_shape[0]],
+        dim[output_scales_device.static_shape[1]],
+        dim[output_scales_device.static_shape[2]],
+        dim[output_scales_device.static_shape[3]],
+        dim[output_scales_device.static_shape[4]],
+    ]()
+    comptime in_shape = DimList[
+        dim[input_scales_device.static_shape[0]],
+        dim[input_scales_device.static_shape[1]],
+    ]()
+
+    var out_buf = NDBuffer[rank=5, scales_dtype, MutAnyOrigin, out_shape](
+        output_scales_device.ptr,
+        rebind[IndexList[5]](
+            coord_to_index_list(output_scales_device.layout.shape_coord())
+        ),
+    )
+    var in_buf = NDBuffer[rank=2, scales_dtype, ImmutAnyOrigin, in_shape](
+        input_scales_device.ptr,
+        rebind[IndexList[2]](
+            coord_to_index_list(input_scales_device.layout.shape_coord())
+        ),
+    )
+
+    block_scales_interleave[SF_VECTOR_SIZE=SF_VECTOR_SIZE, target=target](
+        out_buf,
+        in_buf,
+        ctx,
+    )

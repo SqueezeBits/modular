@@ -18,22 +18,12 @@ type mismatch that caused the DeepSeek-R1-NVFP4 pipeline failure.
 """
 
 from std.math import ceildiv
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-
 from buffer.buffer import NDBuffer
 from buffer.dimlist import DimList, Dim
 from std.gpu.host import DeviceContext
 from std.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
-from internal_utils._utils import InitializationType, init_vector_launch
-from layout import (
-    Coord,
-    Idx,
-    RuntimeInt,
-    TileTensor,
-    row_major,
-)
+from std.random import rand
+from layout import Coord, Idx, RuntimeInt, TileTensor, row_major
 from std.utils.index import Index, IndexList
 
 from linalg.matmul.gpu.sm100_structured.grouped_block_scaled_1d1d import (
@@ -51,12 +41,14 @@ from linalg.fp4_utils import (
 )
 
 
-fn test_grouped_1d1d_nvfp4[
+def test_grouped_1d1d_nvfp4[
     num_experts: Int,
     N: Int,
     K: Int,
     cluster_shape: IndexList[3] = Index(1, 1, 1),
     cta_group: Int = 1,
+    mma_n: Int = 128 * cta_group,
+    AB_swapped: Bool = (cta_group == 2),
 ](ctx: DeviceContext, num_active_experts: Int, tokens_per_expert: Int) raises:
     comptime a_type = DType.uint8
     comptime b_type = DType.uint8
@@ -74,20 +66,16 @@ fn test_grouped_1d1d_nvfp4[
         N,
         " K=",
         K,
+        " mma_n=",
+        mma_n,
     )
 
     var total_tokens = num_active_experts * tokens_per_expert
 
     # Offsets and expert IDs
-    var a_offsets_host = UnsafePointer[Scalar[DType.uint32]].alloc(
-        num_active_experts + 1
-    )
-    var a_scale_offsets_host = UnsafePointer[Scalar[DType.uint32]].alloc(
-        num_active_experts
-    )
-    var expert_ids_host = UnsafePointer[Scalar[DType.int32]].alloc(
-        num_active_experts
-    )
+    var a_offsets_host = alloc[Scalar[DType.uint32]](num_active_experts + 1)
+    var a_scale_offsets_host = alloc[Scalar[DType.uint32]](num_active_experts)
+    var expert_ids_host = alloc[Scalar[DType.int32]](num_active_experts)
 
     var a_scale_dim0 = 0
     a_offsets_host[0] = 0
@@ -99,32 +87,11 @@ fn test_grouped_1d1d_nvfp4[
         a_scale_dim0 += ceildiv(tokens_per_expert, SF_MN_GROUP_SIZE)
         expert_ids_host[i] = Int32(i)
 
-    # Device buffers
-    var a_buf = ctx.enqueue_create_buffer[a_type](total_tokens * packed_K)
-    var b_buf = ctx.enqueue_create_buffer[b_type](num_experts * N * packed_K)
-    var c_buf = ctx.enqueue_create_buffer[c_type](total_tokens * N)
-    var a_off_buf = ctx.enqueue_create_buffer[DType.uint32](
-        num_active_experts + 1
-    )
-    var a_soff_buf = ctx.enqueue_create_buffer[DType.uint32](num_active_experts)
-    var eid_buf = ctx.enqueue_create_buffer[DType.int32](num_active_experts)
-
-    # Init data
-    init_vector_launch[a_type](
-        a_buf,
-        total_tokens * packed_K,
-        InitializationType.uniform_distribution,
-        ctx,
-    )
-    init_vector_launch[b_type](
-        b_buf,
-        num_experts * N * packed_K,
-        InitializationType.uniform_distribution,
-        ctx,
-    )
-    ctx.enqueue_copy(a_off_buf, a_offsets_host)
-    ctx.enqueue_copy(a_soff_buf, a_scale_offsets_host)
-    ctx.enqueue_copy(eid_buf, expert_ids_host)
+    # Host-side data init (rand for uint8 produces proper [0, 255] values)
+    var a_host = alloc[Scalar[a_type]](total_tokens * packed_K)
+    var b_host = alloc[Scalar[b_type]](num_experts * N * packed_K)
+    rand(a_host, total_tokens * packed_K, min=0, max=255)
+    rand(b_host, num_experts * N * packed_K, min=0, max=255)
 
     # Scale factors
     comptime k_groups = ceildiv(K, NVFP4_SF_VECTOR_SIZE * SF_ATOM_K)
@@ -140,46 +107,59 @@ fn test_grouped_1d1d_nvfp4[
         * SF_ATOM_M[1]
         * SF_ATOM_K
     )
+    var a_sf_host = alloc[Scalar[NVFP4_SF_DTYPE]](a_sf_size)
+    var b_sf_host = alloc[Scalar[NVFP4_SF_DTYPE]](b_sf_size)
+    rand(a_sf_host, a_sf_size)
+    rand(b_sf_host, b_sf_size)
+
+    # Device buffers
+    var a_buf = ctx.enqueue_create_buffer[a_type](total_tokens * packed_K)
+    var b_buf = ctx.enqueue_create_buffer[b_type](num_experts * N * packed_K)
+    var c_buf = ctx.enqueue_create_buffer[c_type](total_tokens * N)
+    var a_off_buf = ctx.enqueue_create_buffer[DType.uint32](
+        num_active_experts + 1
+    )
+    var a_soff_buf = ctx.enqueue_create_buffer[DType.uint32](num_active_experts)
+    var eid_buf = ctx.enqueue_create_buffer[DType.int32](num_active_experts)
     var a_sf_buf = ctx.enqueue_create_buffer[NVFP4_SF_DTYPE](a_sf_size)
     var b_sf_buf = ctx.enqueue_create_buffer[NVFP4_SF_DTYPE](b_sf_size)
 
-    init_vector_launch[NVFP4_SF_DTYPE](
-        a_sf_buf, a_sf_size, InitializationType.uniform_distribution, ctx
-    )
-    init_vector_launch[NVFP4_SF_DTYPE](
-        b_sf_buf, b_sf_size, InitializationType.uniform_distribution, ctx
-    )
+    # Copy to device
+    ctx.enqueue_copy(a_buf, a_host)
+    ctx.enqueue_copy(b_buf, b_host)
+    ctx.enqueue_copy(a_off_buf, a_offsets_host)
+    ctx.enqueue_copy(a_soff_buf, a_scale_offsets_host)
+    ctx.enqueue_copy(eid_buf, expert_ids_host)
+    ctx.enqueue_copy(a_sf_buf, a_sf_host)
+    ctx.enqueue_copy(b_sf_buf, b_sf_host)
 
     # Expert scales
     var es_buf = ctx.enqueue_create_buffer[DType.float32](num_experts)
-    var es_host = UnsafePointer[Scalar[DType.float32]].alloc(num_experts)
+    var es_host = alloc[Scalar[DType.float32]](num_experts)
     for i in range(num_experts):
         es_host[i] = 1.0
     ctx.enqueue_copy(es_buf, es_host)
 
-    # Construct TileTensors via TileTensor(NDBuffer) to exercise the same
-    # _DimsToCoordLike type derivation path that MOGG's to_tile_tensor uses.
-    # This catches enqueue_function type identity mismatches that wouldn't
-    # appear if we hand-constructed TileTensors with GMEMLayout1D.
-    var a_nd = NDBuffer[a_type, 2, _, DimList(Dim(), packed_K)](
+    # Construct TileTensors via TileTensor(NDBuffer)
+    var a_nd = NDBuffer[rank=2, a_type, _, DimList[Dim(), packed_K]()](
         a_buf.unsafe_ptr(), IndexList[2](total_tokens, packed_K)
     )
-    var b_nd = NDBuffer[b_type, 3, _, DimList(num_experts, N, packed_K)](
+    var b_nd = NDBuffer[rank=3, b_type, _, DimList[num_experts, N, packed_K]()](
         b_buf.unsafe_ptr(), IndexList[3](num_experts, N, packed_K)
     )
-    var c_nd = NDBuffer[c_type, 2, _, DimList(Dim(), N)](
+    var c_nd = NDBuffer[rank=2, c_type, _, DimList[Dim(), N]()](
         c_buf.unsafe_ptr(), IndexList[2](total_tokens, N)
     )
-    var a_off_nd = NDBuffer[DType.uint32, 1](
+    var a_off_nd = NDBuffer[rank=1, DType.uint32](
         a_off_buf.unsafe_ptr(), IndexList[1](num_active_experts + 1)
     )
-    var a_soff_nd = NDBuffer[DType.uint32, 1](
+    var a_soff_nd = NDBuffer[rank=1, DType.uint32](
         a_soff_buf.unsafe_ptr(), IndexList[1](num_active_experts)
     )
-    var eid_nd = NDBuffer[DType.int32, 1](
+    var eid_nd = NDBuffer[rank=1, DType.int32](
         eid_buf.unsafe_ptr(), IndexList[1](num_active_experts)
     )
-    var es_nd = NDBuffer[DType.float32, 1](
+    var es_nd = NDBuffer[rank=1, DType.float32](
         es_buf.unsafe_ptr(), IndexList[1](num_experts)
     )
 
@@ -191,8 +171,7 @@ fn test_grouped_1d1d_nvfp4[
     var expert_ids_tt = TileTensor(eid_nd)
     var expert_scales_tt = TileTensor(es_nd)
 
-    # Scale factor TileTensors (5D and 6D) -- constructed from pointers
-    # with as_any_origin() to avoid verbose MutAnyOrigin pointer casts.
+    # Scale factor TileTensors (5D and 6D)
     var a_scales_tt = TileTensor(
         a_sf_buf.unsafe_ptr().bitcast[Scalar[NVFP4_SF_DTYPE]](),
         row_major(
@@ -220,7 +199,7 @@ fn test_grouped_1d1d_nvfp4[
     ).as_any_origin()
 
     # Launch kernel
-    comptime mma_shape = Index(128 * cta_group, 128 * cta_group, 32)
+    comptime mma_shape = Index(128 * cta_group, mma_n, 32)
     comptime config = BlockScaledMatmulConfig[
         a_type, b_type, c_type, NVFP4_SF_DTYPE, NVFP4_SF_DTYPE, True
     ](
@@ -229,7 +208,7 @@ fn test_grouped_1d1d_nvfp4[
         mma_shape=mma_shape,
         block_swizzle_size=0,
         cta_group=cta_group,
-        AB_swapped=(cta_group == 2),
+        AB_swapped=AB_swapped,
         k_group_size=1,
         num_accum_pipeline_stages=1 if mma_shape[1] == 256 else 2,
         is_gmm=True,
@@ -249,8 +228,13 @@ fn test_grouped_1d1d_nvfp4[
         ctx,
     )
     ctx.synchronize()
+
     print("    PASSED")
 
+    a_host.free()
+    b_host.free()
+    a_sf_host.free()
+    b_sf_host.free()
     a_offsets_host.free()
     a_scale_offsets_host.free()
     expert_ids_host.free()
@@ -273,9 +257,35 @@ def main() raises:
     test_grouped_1d1d_nvfp4[8, 128, 256](ctx, 4, 64)
     test_grouped_1d1d_nvfp4[4, 1024, 1024](ctx, 2, 128)
 
+    print("\n=== Grouped 1D1D NVFP4 MMA_N=64 1SM Smoke Tests (TileTensor) ===")
+    test_grouped_1d1d_nvfp4[4, 128, 256, mma_n=64](ctx, 4, 64)
+    test_grouped_1d1d_nvfp4[4, 1024, 1024, mma_n=64](ctx, 2, 128)
+
+    print(
+        "\n=== Grouped 1D1D NVFP4 MMA_N=64 AB_swapped 1SM Smoke Tests"
+        " (TileTensor) ==="
+    )
+    test_grouped_1d1d_nvfp4[4, 128, 256, mma_n=64, AB_swapped=True](ctx, 4, 64)
+    test_grouped_1d1d_nvfp4[4, 1024, 1024, mma_n=64, AB_swapped=True](
+        ctx, 2, 128
+    )
+
+    print(
+        "\n=== Grouped 1D1D NVFP4 MMA_N=64 AB_swapped 2SM Smoke Tests"
+        " (TileTensor) ==="
+    )
+    # 2SM with mma_n=64: UMMA shape (256, 128, 32), BM=128, BN=64
+    test_grouped_1d1d_nvfp4[4, 2048, 1024, Index(2, 1, 1), 2, 64](ctx, 4, 64)
+    test_grouped_1d1d_nvfp4[4, 2048, 1024, Index(2, 1, 1), 2, 64](ctx, 2, 256)
+
     print("\n=== Grouped 1D1D NVFP4 2SM Smoke Tests (TileTensor) ===")
     test_grouped_1d1d_nvfp4[4, 2048, 1024, Index(2, 1, 1), 2](ctx, 4, 64)
     test_grouped_1d1d_nvfp4[4, 2048, 1024, Index(2, 1, 1), 2](ctx, 2, 256)
+
+    print("\n=== Grouped 1D1D NVFP4 MMA_N=8 Smoke Tests (TileTensor) ===")
+    test_grouped_1d1d_nvfp4[6, 2048, 1024, mma_n=8](ctx, 1, 512)
+    test_grouped_1d1d_nvfp4[6, 2048, 1024, mma_n=8](ctx, 1, 129)
+    test_grouped_1d1d_nvfp4[1, 128, 256, mma_n=8](ctx, 1, 128)
 
     print("=== ALL TESTS PASSED ===")
     _ = ctx^

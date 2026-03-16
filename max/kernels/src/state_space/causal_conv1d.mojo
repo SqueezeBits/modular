@@ -62,7 +62,11 @@ from std.sys.info import simd_width_of
 
 from std.algorithm import sync_parallelize
 from std.gpu.host import DeviceContext
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import (
+    block_dim,
+    block_idx_int as block_idx,
+    thread_idx_int as thread_idx,
+)
 from layout import Layout, LayoutTensor
 from std.memory import UnsafePointer
 from std.utils.index import Index, IndexList
@@ -74,7 +78,7 @@ from std.utils.numerics import get_accum_type
 # ===----------------------------------------------------------------------=== #
 
 
-fn silu[
+def silu[
     dtype: DType, width: Int
 ](x: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
     """Sigmoid Linear Unit (SiLU) activation function.
@@ -100,7 +104,7 @@ fn silu[
 # ===----------------------------------------------------------------------=== #
 
 
-fn causal_conv1d_channel_first_fwd_cpu[
+def causal_conv1d_channel_first_fwd_cpu[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -166,7 +170,7 @@ fn causal_conv1d_channel_first_fwd_cpu[
 
     # Parallelize across batch*channel combinations
     @parameter
-    fn process_bc(bc_idx: Int):
+    def process_bc(bc_idx: Int):
         var b = bc_idx // dim
         var c = bc_idx % dim
 
@@ -175,12 +179,8 @@ fn causal_conv1d_channel_first_fwd_cpu[
             return
 
         # Validate bias tensor has valid dimensions (use debug_assert since we can't raise in @parameter fn)
-        debug_assert(
-            bias.dim(0) > 0, "Bias tensor must have at least one element"
-        )
-        debug_assert(
-            c < bias.dim(0), "Channel index out of bounds for bias tensor"
-        )
+        assert bias.dim(0) > 0, "Bias tensor must have at least one element"
+        assert c < bias.dim(0), "Channel index out of bounds for bias tensor"
 
         var weight_c_base_offset = UInt32(c * Int(weight_c_stride))
         var bias_offset = UInt32(c * Int(bias_stride))
@@ -250,7 +250,7 @@ fn causal_conv1d_channel_first_fwd_cpu[
     sync_parallelize[process_bc](total_bc)
 
 
-fn causal_conv1d_channel_first_fwd_cpu_no_bias[
+def causal_conv1d_channel_first_fwd_cpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -308,7 +308,7 @@ fn causal_conv1d_channel_first_fwd_cpu_no_bias[
 
     # Parallelize across batch*channel combinations
     @parameter
-    fn process_bc(bc_idx: Int):
+    def process_bc(bc_idx: Int):
         var b = bc_idx // dim
         var c = bc_idx % dim
 
@@ -376,7 +376,7 @@ fn causal_conv1d_channel_first_fwd_cpu_no_bias[
     sync_parallelize[process_bc](total_bc)
 
 
-fn causal_conv1d_channel_last_fwd_cpu[
+def causal_conv1d_channel_last_fwd_cpu[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -461,7 +461,7 @@ fn causal_conv1d_channel_last_fwd_cpu[
                 output.ptr[out_offset] = out_val
 
 
-fn causal_conv1d_channel_last_fwd_cpu_no_bias[
+def causal_conv1d_channel_last_fwd_cpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -539,7 +539,7 @@ fn causal_conv1d_channel_last_fwd_cpu_no_bias[
                 output.ptr[out_offset] = out_val
 
 
-fn causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
+def causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -644,7 +644,7 @@ fn causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
                 output.ptr[out_offset] = out_val
 
 
-fn causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
+def causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -749,7 +749,7 @@ fn causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
 # ===----------------------------------------------------------------------=== #
 
 
-fn causal_conv1d_channel_first_fwd_gpu[
+def causal_conv1d_channel_first_fwd_gpu[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -820,10 +820,10 @@ fn causal_conv1d_channel_first_fwd_gpu[
         silu_activation: Whether to apply SiLU activation (Int8: 0 or 1).
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = Int(x.dim(0))
@@ -1037,7 +1037,7 @@ fn causal_conv1d_channel_first_fwd_gpu[
 
 
 # Optimized GPU version without bias
-fn causal_conv1d_channel_first_fwd_gpu_no_bias[
+def causal_conv1d_channel_first_fwd_gpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -1080,10 +1080,10 @@ fn causal_conv1d_channel_first_fwd_gpu_no_bias[
     5. Better thread utilization and memory bandwidth usage
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = Int(x.dim(0))
@@ -1273,7 +1273,7 @@ fn causal_conv1d_channel_first_fwd_gpu_no_bias[
         output.ptr[out_offset] = Scalar[output_dtype](out_vals[i])
 
 
-fn causal_conv1d_channel_last_fwd_gpu[
+def causal_conv1d_channel_last_fwd_gpu[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -1325,10 +1325,10 @@ fn causal_conv1d_channel_last_fwd_gpu[
     operations along channels, and process multiple sequence positions per thread.
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_chunk_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_chunk_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = batch
@@ -1495,7 +1495,7 @@ fn causal_conv1d_channel_last_fwd_gpu[
 
 
 # Optimized GPU version without bias for channel last
-fn causal_conv1d_channel_last_fwd_gpu_no_bias[
+def causal_conv1d_channel_last_fwd_gpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -1538,10 +1538,10 @@ fn causal_conv1d_channel_last_fwd_gpu_no_bias[
     5. Better thread utilization and memory bandwidth usage
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_chunk_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_chunk_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = batch
@@ -1692,7 +1692,7 @@ fn causal_conv1d_channel_last_fwd_gpu_no_bias[
 
 
 # Optimized GPU implementation for channel-last with bias and seq_idx as LayoutTensor
-fn causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
+def causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -1749,10 +1749,10 @@ fn causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
     7. seq_idx support for conditional processing
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_chunk_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_chunk_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = batch
@@ -2059,7 +2059,7 @@ fn causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
 
 
 # Optimized GPU implementation for channel-last without bias but with seq_idx as LayoutTensor
-fn causal_conv1d_channel_last_fwd_gpu_no_bias_with_seq_idx[
+def causal_conv1d_channel_last_fwd_gpu_no_bias_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -2110,10 +2110,10 @@ fn causal_conv1d_channel_last_fwd_gpu_no_bias_with_seq_idx[
     6. seq_idx support for conditional processing
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_chunk_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_chunk_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = batch
@@ -2398,7 +2398,7 @@ fn causal_conv1d_channel_last_fwd_gpu_no_bias_with_seq_idx[
 
 
 # Optimized GPU implementation for channel-first with bias and seq_idx as LayoutTensor
-fn causal_conv1d_channel_first_fwd_gpu_with_seq_idx[
+def causal_conv1d_channel_first_fwd_gpu_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -2449,10 +2449,10 @@ fn causal_conv1d_channel_first_fwd_gpu_with_seq_idx[
     Offset = batch * x_batch_stride + channel * x_c_stride + seq * x_l_stride
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_chunk_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_chunk_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = batch
@@ -2754,7 +2754,7 @@ fn causal_conv1d_channel_first_fwd_gpu_with_seq_idx[
 
 
 # Optimized GPU implementation for channel-first without bias but with seq_idx as LayoutTensor
-fn causal_conv1d_channel_first_fwd_gpu_no_bias_with_seq_idx[
+def causal_conv1d_channel_first_fwd_gpu_no_bias_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -2800,10 +2800,10 @@ fn causal_conv1d_channel_first_fwd_gpu_no_bias_with_seq_idx[
     Offset = batch * x_batch_stride + channel * x_c_stride + seq * x_l_stride
     """
 
-    var tidx: Int = Int(thread_idx.x)
-    var batch_id: Int = Int(block_idx.z)
-    var channel_chunk_id: Int = Int(block_idx.y)
-    var chunk_id: Int = Int(block_idx.x)
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.z
+    var channel_chunk_id: Int = block_idx.y
+    var chunk_id: Int = block_idx.x
     var kChunkSize: Int = Int(block_dim.x)
 
     var nBatches: Int = batch
@@ -3088,7 +3088,7 @@ fn causal_conv1d_channel_first_fwd_gpu_no_bias_with_seq_idx[
 # maintaining a conv_state buffer that gets updated with each step.
 
 
-fn causal_conv1d_update_cpu[
+def causal_conv1d_update_cpu[
     x_dtype: DType,
     x_layout: Layout,
     conv_state_dtype: DType,
@@ -3285,7 +3285,7 @@ fn causal_conv1d_update_cpu[
                     ](x_val)
 
 
-fn causal_conv1d_update_cpu_no_bias[
+def causal_conv1d_update_cpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     conv_state_dtype: DType,
@@ -3425,7 +3425,7 @@ fn causal_conv1d_update_cpu_no_bias[
                     ](x_val)
 
 
-fn causal_conv1d_update_gpu[
+def causal_conv1d_update_gpu[
     x_dtype: DType,
     x_layout: Layout,
     conv_state_dtype: DType,
@@ -3494,9 +3494,9 @@ fn causal_conv1d_update_gpu[
         out_l_stride: Stride for the sequence length dimension of the output tensor.
         silu_activation: Whether to apply SiLU activation (Int8: 0 or 1).
     """
-    var b = Int(block_idx.x)
-    var c_base = Int(block_idx.y) * kNThreads
-    var c = c_base + Int(thread_idx.x)
+    var b = block_idx.x
+    var c_base = block_idx.y * kNThreads
+    var c = c_base + thread_idx.x
 
     if b >= batch or c >= dim:
         return
@@ -3596,7 +3596,7 @@ fn causal_conv1d_update_gpu[
             conv_state.ptr[conv_state_offset] = Scalar[conv_state_dtype](x_val)
 
 
-fn causal_conv1d_update_gpu_no_bias[
+def causal_conv1d_update_gpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     conv_state_dtype: DType,
@@ -3661,9 +3661,9 @@ fn causal_conv1d_update_gpu_no_bias[
         out_l_stride: Stride for the sequence length dimension of the output tensor.
         silu_activation: Whether to apply SiLU activation (Int8: 0 or 1).
     """
-    var b = Int(block_idx.x)
-    var c_base = Int(block_idx.y) * kNThreads
-    var c = c_base + Int(thread_idx.x)
+    var b = block_idx.x
+    var c_base = block_idx.y * kNThreads
+    var c = c_base + thread_idx.x
 
     if b >= batch or c >= dim:
         return

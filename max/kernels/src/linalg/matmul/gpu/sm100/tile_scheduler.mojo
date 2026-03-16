@@ -12,9 +12,6 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import ceildiv
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.sys import _RegisterPackType, size_of
 from std.sys._assembly import inlined_assembly
 
@@ -47,16 +44,11 @@ struct WorkInfo(TrivialRegisterPassable, Writable):
     var is_valid_tile: Bool
 
     @always_inline
-    fn is_valid(self) -> Bool:
+    def is_valid(self) -> Bool:
         return self.is_valid_tile
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
     @no_inline
-    fn __str__(self) -> String:
-        return String.write(self)
-
-    @no_inline
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write(
             "(",
             self.m,
@@ -90,26 +82,34 @@ struct TileScheduler[
     var log_cluster_dim_n: FastDiv[DType.uint32]
     var log_cluster_dim_k: FastDiv[DType.uint32]
 
-    var clc_response: UnsafePointer[UInt128, address_space=AddressSpace.SHARED]
+    var clc_response: UnsafePointer[
+        UInt128,
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ]
     var full_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        SharedMemBarrier,
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
     ]
     var empty_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        SharedMemBarrier,
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
     ]
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         cluster_dim: StaticTuple[Int32, 3],
         clc_response_ptr: UnsafePointer[
-            UInt128, address_space=AddressSpace.SHARED
+            mut=True, UInt128, _, address_space=AddressSpace.SHARED
         ],
         full_mbar_ptr: UnsafePointer[
-            SharedMemBarrier, address_space=AddressSpace.SHARED
+            mut=True, SharedMemBarrier, _, address_space=AddressSpace.SHARED
         ],
         empty_mbar_ptr: UnsafePointer[
-            SharedMemBarrier, address_space=AddressSpace.SHARED
+            mut=True, SharedMemBarrier, _, address_space=AddressSpace.SHARED
         ],
     ):
         comptime assert Self.block_swizzle_size in [
@@ -130,8 +130,10 @@ struct TileScheduler[
 
     @always_inline
     @staticmethod
-    fn work_info_from_clc_response(
-        result: UnsafePointer[UInt128, address_space=AddressSpace.SHARED],
+    def work_info_from_clc_response(
+        result: UnsafePointer[
+            mut=True, UInt128, _, address_space=AddressSpace.SHARED
+        ],
     ) -> WorkInfo:
         comptime asm = """{
             .reg .pred p1;
@@ -159,7 +161,7 @@ struct TileScheduler[
 
     @always_inline
     @staticmethod
-    fn work_info_from_cluster(
+    def work_info_from_cluster(
         work_info: WorkInfo,
         cluster_dim: StaticTuple[Int32, 3],
         log_cluster_dim_m: FastDiv[DType.uint32],
@@ -232,7 +234,7 @@ struct TileScheduler[
         )
 
     @always_inline
-    fn initial_work_info(self) -> WorkInfo:
+    def initial_work_info(self) -> WorkInfo:
         return self.work_info_from_cluster(
             WorkInfo(
                 UInt32(block_idx.x),
@@ -246,7 +248,7 @@ struct TileScheduler[
         )
 
     @always_inline
-    fn fetch_next_work(
+    def fetch_next_work(
         self,
         work_info: WorkInfo,
         consumer_state: PipelineState[Self.num_stages],
@@ -270,7 +272,7 @@ struct TileScheduler[
         )
 
     @always_inline
-    fn advance_to_next_work(
+    def advance_to_next_work(
         self,
         mut clc_state: PipelineState[Self.num_stages],
     ) -> PipelineState[Self.num_stages]:

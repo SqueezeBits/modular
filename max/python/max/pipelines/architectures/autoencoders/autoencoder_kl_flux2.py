@@ -23,6 +23,7 @@ from max.experimental.tensor import Tensor
 from max.graph import DeviceRef, TensorType
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
+from max.profiler import traced
 
 from .model import BaseAutoencoderModel
 from .model_config import AutoencoderKLFlux2Config
@@ -148,11 +149,18 @@ class PostprocessAndDecode(Module[..., Tensor]):
         latents = F.reshape(latents, (batch, c // 4, h * 2, w * 2))
 
         decoded = self.decoder(latents, None)
-        decoded = F.cast(decoded, DType.float32)
         decoded = F.permute(
             decoded, (0, 2, 3, 1)
         )  # (B, C, H, W) -> (B, H, W, C)
-        return decoded
+        # Denormalize [-1, 1] -> [0, 1], scale to [0, 255], cast to uint8.
+        # Keeping in the decoder's native dtype (bfloat16/float16): all values
+        # in [0, 255] are exactly representable, and avoiding the float32 upcast
+        # reduces GPU compute and memory bandwidth for the post-processing ops.
+        decoded = decoded * 0.5 + 0.5
+        decoded = F.max(decoded, 0.0)
+        decoded = F.min(decoded, 1.0)
+        decoded = decoded * 255.0
+        return F.transfer_to(F.cast(decoded, DType.uint8), DeviceRef.CPU())
 
     def input_types(self) -> tuple[TensorType, ...]:
         return (
@@ -207,26 +215,35 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             autoencoder_class=AutoencoderKLFlux2,
         )
 
-    def load_model(self) -> Any:
-        """Load and compile the decoder and encoder models with BatchNorm statistics.
+    @traced(message="AutoencoderKLFlux2Model.load_model")
+    def load_model(self) -> Callable[..., Any]:
+        """Load encoder and BatchNorm statistics (skip standalone decoder).
 
-        Extracts BatchNorm statistics (bn.*) which are specific to Flux2, then
-        delegates to base class for weight loading and model compilation.
+        The standalone decoder compiled by the base class is never used in
+        the Flux2 pipeline — decoding goes through the fused
+        ``PostprocessAndDecode`` graph built by ``build_fused_decode()``.
+        This override avoids that redundant compilation, cutting startup
+        time and GPU memory usage.
 
         Returns:
-            Compiled decoder model callable.
+            Compiled encoder model callable.
         """
-        bn_stats = {}
+        bn_stats: dict[str, Any] = {}
+        encoder_state_dict: dict[str, Any] = {}
+        target_dtype = self.config.dtype
 
         for key, value in self.weights.items():
+            weight_data = value.data()
+            if weight_data.dtype != target_dtype:
+                if weight_data.dtype.is_float() and target_dtype.is_float():
+                    weight_data = weight_data.astype(target_dtype)
+
             if key in ("bn.running_mean", "bn.running_var"):
-                weight_data = value.data()
-                target_dtype = self.config.dtype
-                if weight_data.dtype != target_dtype:
-                    if weight_data.dtype.is_float() and target_dtype.is_float():
-                        weight_data = weight_data.astype(target_dtype)
-                    # Non-float left as-is; running_mean/var are typically float.
                 bn_stats[key] = weight_data.data
+            elif key.startswith("encoder."):
+                encoder_state_dict[key.removeprefix("encoder.")] = weight_data
+            elif key.startswith("quant_conv."):
+                encoder_state_dict[key] = weight_data
 
         bn_mean_data = bn_stats.get("bn.running_mean")
         bn_var_data = bn_stats.get("bn.running_var")
@@ -237,8 +254,6 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
                 "Make sure the model weights contain 'bn.running_mean' and 'bn.running_var'."
             )
 
-        super().load_model()
-
         self.bn_running_mean = Tensor.from_dlpack(bn_mean_data).to(
             self.devices[0]
         )
@@ -246,8 +261,24 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
             self.devices[0]
         )
 
-        return self.model
+        # Compile only the encoder; the decoder is compiled later via
+        # build_fused_decode() which wraps it in PostprocessAndDecode.
+        if encoder_state_dict:
+            with F.lazy():
+                autoencoder = AutoencoderKLFlux2(self.config)
+                autoencoder.encoder.to(self.devices[0])
+                self.encoder_model = autoencoder.encoder.compile(
+                    *autoencoder.encoder.input_types(),
+                    weights=encoder_state_dict,
+                )
 
+        if self.encoder_model is None:
+            raise RuntimeError(
+                "Encoder model was not compiled — no encoder weights found."
+            )
+        return self.encoder_model
+
+    @traced(message="AutoencoderKLFlux2Model.build_fused_decode")
     def build_fused_decode(
         self, device: Device, num_channels: int
     ) -> Callable[..., Any]:

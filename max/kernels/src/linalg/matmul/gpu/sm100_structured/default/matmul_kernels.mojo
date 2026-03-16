@@ -30,9 +30,6 @@ The kernel implements a warp-specialized architecture:
 """
 
 from std.math import ceildiv
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.sys import align_of, size_of
 
 from std.gpu import WARP_SIZE, barrier, warp_id
@@ -42,7 +39,11 @@ from std.gpu.primitives.cluster import (
     elect_one_sync,
 )
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu import block_idx, lane_id, thread_idx
+from std.gpu import (
+    block_idx_int as block_idx,
+    lane_id_int as lane_id,
+    thread_idx_int as thread_idx,
+)
 from std.gpu import warp_id as get_warp_id
 from std.gpu.memory import (
     AddressSpace,
@@ -57,21 +58,27 @@ from std.gpu.primitives.grid_controls import (
 )
 from std.gpu.sync import syncwarp
 from std.gpu.compute.arch.tcgen05 import *
-from layout import Layout as LegacyLayout, LayoutTensor, TileTensor, row_major
-from layout.tile_layout import (
-    Layout as _NewLayout,
-    TensorLayout,
+from layout import (
     ComptimeInt,
+    Coord,
     CoordLike,
+    Idx,
+    LayoutTensor,
+    Layout as LegacyLayout,
+    RowMajorLayout,
+    TensorLayout,
+    TileTensor,
+    coord,
+    row_major,
 )
+from layout.tile_layout import Layout as _NewLayout
 from std.builtin.variadics import Variadic
-from layout.coord import Coord, Idx, coord
 from structured_kernels.tile_types import (
-    TMATile,
+    TmaOpType,
     static_row_major,
     tma_desc_layout_3d,
 )
-from layout.tile_layout import RowMajorLayout, _IntToComptimeInt
+from layout.tile_layout import _IntToComptimeInt
 from layout.swizzle import Swizzle
 from layout.tensor_core_async import (
     tile_layout_k_major,
@@ -232,15 +239,15 @@ struct B200MatmulSmem[
 
     # ========== Tile Accessors (Delegated) ==========
     @always_inline
-    fn a_tiles(ref[AddressSpace.SHARED] self) -> Self.ATileArray:
+    def a_tiles(ref[AddressSpace.SHARED] self) -> Self.ATileArray:
         return self.input_tiles.a_tiles()
 
     @always_inline
-    fn b_tiles(ref[AddressSpace.SHARED] self) -> Self.BTileArray:
+    def b_tiles(ref[AddressSpace.SHARED] self) -> Self.BTileArray:
         return self.input_tiles.b_tiles()
 
     @always_inline
-    fn c_tiles(ref[AddressSpace.SHARED] self) -> Self.CTileArray:
+    def c_tiles(ref[AddressSpace.SHARED] self) -> Self.CTileArray:
         return self.output_tiles.c_tiles()
 
     # ========== Pipeline Storage (Composed Bundle) ==========
@@ -262,19 +269,19 @@ struct B200MatmulSmem[
 
     @staticmethod
     @always_inline
-    fn ab_pipeline_size() -> Int:
+    def ab_pipeline_size() -> Int:
         """Total size of A+B tiles for all pipeline stages (in elements)."""
         return Self.ATileArray.num_elements + Self.BTileArray.num_elements
 
     @staticmethod
     @always_inline
-    fn c_output_size() -> Int:
+    def c_output_size() -> Int:
         """Size of C tiles for all output stages (in elements)."""
         return Self.CTileArray.num_elements
 
     @staticmethod
     @always_inline
-    fn total_tile_size() -> Int:
+    def total_tile_size() -> Int:
         """Total tile storage size (A+B+C) in elements."""
         return Self.ab_pipeline_size() + Self.c_output_size()
 
@@ -546,27 +553,21 @@ struct BlackwellMatmulSM100Kernel[
         Self.c_tile_dim0, Self.c_swizzle_elems
     ]
 
-    # 3D TMATile types (primary, used by run())
-    comptime ATmaTile = TMATile[Self.a_type, Self.ATileLayout, Self.ADescLayout]
-    comptime BTmaTile = TMATile[Self.b_type, Self.BTileLayout, Self.BDescLayout]
-    comptime CTmaTile = TMATile[Self.c_type, Self.CTileLayout, Self.CDescLayout]
-    comptime ATmaOp = Self.ATmaTile.InnerType
-    comptime BTmaOp = Self.BTmaTile.InnerType
-    comptime CTmaOp = Self.CTmaTile.InnerType
+    # 3D TMA operation types (primary, used by run())
+    comptime ATmaOp = TmaOpType[Self.a_type, Self.ATileLayout, Self.ADescLayout]
+    comptime BTmaOp = TmaOpType[Self.b_type, Self.BTileLayout, Self.BDescLayout]
+    comptime CTmaOp = TmaOpType[Self.c_type, Self.CTileLayout, Self.CDescLayout]
 
-    # 2D TMATile types (only for run_splitk)
-    comptime ATmaTile_splitk = TMATile[
+    # 2D TMA operation types (only for run_splitk)
+    comptime ATmaOp_splitk = TmaOpType[
         Self.a_type, Self.ATileLayout_splitk, Self.ADescLayout_splitk
     ]
-    comptime BTmaTile_splitk = TMATile[
+    comptime BTmaOp_splitk = TmaOpType[
         Self.b_type, Self.BTileLayout_splitk, Self.BDescLayout_splitk
     ]
-    comptime CTmaTile_splitk = TMATile[
+    comptime CTmaOp_splitk = TmaOpType[
         Self.c_type, Self.CTileLayout_splitk, Self.CDescLayout_splitk
     ]
-    comptime ATmaOp_splitk = Self.ATmaTile_splitk.InnerType
-    comptime BTmaOp_splitk = Self.BTmaTile_splitk.InnerType
-    comptime CTmaOp_splitk = Self.CTmaTile_splitk.InnerType
 
     # TMA load size constants (from desc layout dimensions)
     comptime a_tma_load_size = Self.a_tile_dim0 * Self.a_swizzle_elems
@@ -667,9 +668,12 @@ struct BlackwellMatmulSM100Kernel[
 
     @staticmethod
     @always_inline
-    fn validate_constraints():
+    def validate_constraints():
         """Validate parameter constraints at compile time."""
-        comptime assert Self.c_type != DType.float32, "c_type cannot be float32"
+        comptime assert Self.c_type in (
+            DType.bfloat16,
+            DType.float8_e4m3fn,
+        ), "c_type cannot be float32 or float8_e4m3fn"
         comptime assert Self.transpose_b, "Only support transposed B (K-major)"
         comptime assert Self.cta_group in (
             1,
@@ -691,7 +695,7 @@ struct BlackwellMatmulSM100Kernel[
 
     @staticmethod
     @always_inline
-    fn init_barriers(
+    def init_barriers(
         ctx: Self.Context,
         input_barriers: Self.SmemType.Pipelines.InputBarriers,
         accum_barriers: Self.SmemType.Pipelines.AccumBarriers,
@@ -739,7 +743,7 @@ struct BlackwellMatmulSM100Kernel[
 
     @staticmethod
     @always_inline
-    fn mma[
+    def mma[
         tiles_origin: MutOrigin,
         //,
     ](
@@ -792,7 +796,7 @@ struct BlackwellMatmulSM100Kernel[
 
     @staticmethod
     @always_inline
-    fn load_input_tiles[
+    def load_input_tiles[
         tiles_origin: MutOrigin,
         //,
     ](
@@ -866,7 +870,7 @@ struct BlackwellMatmulSM100Kernel[
                     b_tile.layout,
                 )
 
-                var k_coord = Int(iter_idx + UInt32(j)) * Int(Self.BK)
+                var k_coord = Int(iter_idx + UInt32(j)) * Self.BK
 
                 # 3D TMA loads with batch coordinate
                 a_tma_op.async_multicast_load_3d[Self.cta_group](
@@ -884,7 +888,7 @@ struct BlackwellMatmulSM100Kernel[
 
     @staticmethod
     @always_inline
-    fn load_input_tiles_splitk[
+    def load_input_tiles_splitk[
         a_tma_origin: ImmutOrigin,
         b_tma_origin: ImmutOrigin,
         tiles_origin: MutOrigin,
@@ -911,8 +915,8 @@ struct BlackwellMatmulSM100Kernel[
             Self.config.k_group_size,
         ],
         iter_idx: UInt32,
-        work_m_coord: UInt,
-        work_n_coord: UInt,
+        work_m_coord: Int,
+        work_n_coord: Int,
         peer_cta_coord: Tuple[UInt, UInt, UInt],
         elect_one_cta: Bool,
     ):
@@ -933,18 +937,18 @@ struct BlackwellMatmulSM100Kernel[
             peer_cta_coord: Peer CTA coordinates (rank_n, rank_m, peer_m_rank).
             elect_one_cta: True if this CTA should call expect_bytes.
         """
-        var peer_rank_n = peer_cta_coord[0]
-        var peer_rank_m = peer_cta_coord[1]
-        var peer_m_rank = peer_cta_coord[2]
+        var peer_rank_n = Int(peer_cta_coord[0])
+        var peer_rank_m = Int(peer_cta_coord[1])
+        var peer_m_rank = Int(peer_cta_coord[2])
 
         # Global memory coordinates for A (M) and B (N)
-        var a_gmem_m_coord = peer_m_rank * UInt(
-            Self.a_tma_rows
-        ) + work_m_coord * UInt(Self.BM)
+        var a_gmem_m_coord = (
+            peer_m_rank * Self.a_tma_rows + work_m_coord * Self.BM
+        )
         var b_gmem_n_coord = (
-            peer_rank_m * UInt(Self.b_tma_rows)
-            + peer_rank_n * UInt(Self.BN)
-            + work_n_coord * UInt(Self.MMA_N)
+            peer_rank_m * Self.b_tma_rows
+            + peer_rank_n * Self.BN
+            + work_n_coord * Self.MMA_N
         )
 
         if elect_one_sync():
@@ -966,15 +970,15 @@ struct BlackwellMatmulSM100Kernel[
                 # TMA descriptor layout. Pointer arithmetic with a_tma_load_size
                 # preserves the original working behavior.
                 var a_peer_tile = type_of(a_tile)(
-                    a_tile.ptr + peer_m_rank * UInt(Self.a_tma_load_size),
+                    a_tile.ptr + peer_m_rank * Self.a_tma_load_size,
                     a_tile.layout,
                 )
                 var b_peer_tile = type_of(b_tile)(
-                    b_tile.ptr + peer_rank_m * UInt(Self.b_tma_load_size),
+                    b_tile.ptr + peer_rank_m * Self.b_tma_load_size,
                     b_tile.layout,
                 )
 
-                var k_coord = UInt(iter_idx + UInt32(j)) * UInt(Self.BK)
+                var k_coord = Int(iter_idx + UInt32(j)) * Self.BK
 
                 # TileTensor directly to loader (uses TileTensor TMA overload)
                 a_loader.load(
@@ -996,7 +1000,7 @@ struct BlackwellMatmulSM100Kernel[
     @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(c_tma_op, `nvvm.grid_constant`)
-    fn run(
+    def run(
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
         c_tma_op: Self.CTmaOp,
@@ -1199,7 +1203,7 @@ struct BlackwellMatmulSM100Kernel[
     @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(c_tma_op, `nvvm.grid_constant`)
-    fn run_splitk[
+    def run_splitk[
         reduction_layout: TensorLayout,
     ](
         a_tma_op: Self.ATmaOp_splitk,
@@ -1208,7 +1212,7 @@ struct BlackwellMatmulSM100Kernel[
         reduction_tensor: TileTensor[
             Self.config.accum_type, reduction_layout, MutAnyOrigin
         ],
-        lock_ptr: UnsafePointer[UInt8],
+        lock_ptr: UnsafePointer[UInt8, AnyOrigin[mut=True]],
         cluster_dim: StaticTuple[Int32, 3],
         mnk: StaticTuple[UInt32, 3],
         workspace: Span[UInt64, MutAnyOrigin],
@@ -1341,8 +1345,8 @@ struct BlackwellMatmulSM100Kernel[
                                         b_loader,
                                         tiles,
                                         UInt32(i),
-                                        UInt(current.m),
-                                        UInt(current.n),
+                                        Int(current.m),
+                                        Int(current.n),
                                         ctx.peer_cta_coord,
                                         ctx.elect_one_cta,
                                     )
@@ -1487,10 +1491,8 @@ struct BlackwellMatmulSM100FallbackKernel[
     comptime BTileLayout = static_row_major[Self.BN, Self.BK]
     comptime BDescLayout = static_row_major[Self.BN, Self.b_swizzle_elems]
 
-    comptime ATmaTile = TMATile[Self.a_type, Self.ATileLayout, Self.ADescLayout]
-    comptime BTmaTile = TMATile[Self.b_type, Self.BTileLayout, Self.BDescLayout]
-    comptime ATmaOp = Self.ATmaTile.InnerType
-    comptime BTmaOp = Self.BTmaTile.InnerType
+    comptime ATmaOp = TmaOpType[Self.a_type, Self.ATileLayout, Self.ADescLayout]
+    comptime BTmaOp = TmaOpType[Self.b_type, Self.BTileLayout, Self.BDescLayout]
 
     # Static N dimension (columns) from C layout stride -- used for output tiling
     comptime static_N = Self.c_layout.static_stride[0]
@@ -1534,7 +1536,7 @@ struct BlackwellMatmulSM100FallbackKernel[
     # ========== Validation ==========
     @staticmethod
     @always_inline
-    fn validate_constraints():
+    def validate_constraints():
         """Validate compile-time constraints for this kernel configuration."""
         comptime assert Self.num_threads == 128 or Self.num_threads == 256
         comptime assert (
@@ -1550,11 +1552,11 @@ struct BlackwellMatmulSM100FallbackKernel[
     @__llvm_metadata(`nvvm.cluster_dim`=Self.cluster_shape)
     @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
-    fn run(
+    def run(
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
         c: TileTensor[Self.c_type, Self.c_layout, MutAnyOrigin],
-        num_iters: UInt,
+        num_iters: Int,
     ):
         """Run the fallback matmul kernel.
 
@@ -1584,7 +1586,7 @@ struct BlackwellMatmulSM100FallbackKernel[
         # Shared memory pointer to hold tensor memory address
         var ptr_tmem_addr = (b_smem + Self.b_size).bitcast[UInt32]()
 
-        var c_frag = SIMD[Self.accum_type, Self.c_frag_size]()
+        var c_frag: InlineArray[Scalar[Self.accum_type], Self.c_frag_size]
 
         comptime a_expected_bytes = Self.a_size * size_of[Self.a_type]()
         comptime b_expected_bytes = Self.b_size * size_of[Self.b_type]()
@@ -1636,17 +1638,17 @@ struct BlackwellMatmulSM100FallbackKernel[
                 a_tma_op.async_copy(
                     a_smem_tile,
                     tma_mbar[0],
-                    (Int(i) * Self.BK, Int(block_idx.y) * Self.BM),
+                    (i * Self.BK, block_idx.y * Self.BM),
                 )
                 b_tma_op.async_copy(
                     b_smem_tile,
                     tma_mbar[0],
                     (
-                        Int(i) * Self.BK,
-                        Int(block_idx.x) * Self.BN,
+                        i * Self.BK,
+                        block_idx.x * Self.BN,
                     ) if Self.transpose_b else (
-                        Int(block_idx.x) * Self.BN,
-                        Int(i) * Self.BK,
+                        block_idx.x * Self.BN,
+                        i * Self.BK,
                     ),
                 )
 
@@ -1689,7 +1691,7 @@ struct BlackwellMatmulSM100FallbackKernel[
 
         var ctile, ctile_coords, _ = c.tile_with_offset[
             Self.BM, Self.BN, stride_layout=Self.CGmemStrideLayout
-        ](Coord(Idx(Int(block_idx.y)), Idx(Int(block_idx.x))))
+        ](Coord(Idx(block_idx.y), Idx(block_idx.x)))
 
         var M = c.dim[0]()
 
@@ -1711,7 +1713,7 @@ struct BlackwellMatmulSM100FallbackKernel[
                 var vectorized = warp_tile.vectorize[1, 2]()
                 var dist_result = vectorized.distribute_with_offset[
                     row_major[8, 4]()
-                ](Int(lane_id()))
+                ](lane_id())
                 var frag = dist_result[0]
                 var frag_coords = dist_result[1]
                 var frag_m = warp_m + frag_coords[0]
@@ -1724,8 +1726,7 @@ struct BlackwellMatmulSM100FallbackKernel[
                     comptime for m_vec in range(num_vecs_m):
                         comptime i_vec = n_vec * num_vecs_m + m_vec
                         var dst_idx = Int(frag.layout(coord[m_vec, n_vec]()))
-                        var dst_m_offset = dst_idx // N
-                        var dst_n_offset = dst_idx % N
+                        var dst_m_offset, dst_n_offset = divmod(dst_idx, N)
                         var m = UInt32(frag_m + dst_m_offset)
                         var n = UInt32(frag_n + dst_n_offset)
 

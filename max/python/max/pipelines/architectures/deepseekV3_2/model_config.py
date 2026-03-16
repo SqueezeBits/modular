@@ -27,6 +27,7 @@ from max.nn.kv_cache.cache_params import (
 from max.pipelines.architectures.deepseekV3.model_config import DeepseekV3Config
 from max.pipelines.lib import KVCacheConfig, PipelineConfig
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
+from max.pipelines.lib.pipeline_variants.utils import get_rope_theta
 from transformers import AutoConfig
 from typing_extensions import Self, override
 
@@ -58,8 +59,9 @@ class DeepseekV3_2Config(DeepseekV3Config):
 
         # Always store the indexer's K cache in float8_e4m3fn.
         indexer_cache_dtype = DType.float8_e4m3fn
+        # TODO: Set valid scale_dtype when kv_scales are needed (SERVOPT-1094: [EPIC] SnapMLA Implementation).
         indexer_kvcache_quant_config = KVCacheQuantizationConfig(
-            scale_dtype=DType.float32, quantization_granularity=32
+            scale_dtype=DType.int8, quantization_granularity=32
         )
         assert isinstance(mla_kv_params, KVCacheParams)
         indexer_kv_params = kv_cache_config.to_params(
@@ -85,7 +87,7 @@ class DeepseekV3_2Config(DeepseekV3Config):
 
         This method creates a config instance with all fields that can be determined
         from the pipeline configuration, without needing the state_dict.
-        Fields that depend on the state_dict (like norm_dtype, float8_config, etc.)
+        Fields that depend on the state_dict (like norm_dtype, quant_config, etc.)
         should be set directly after calling this method.
 
         Args:
@@ -152,7 +154,7 @@ class DeepseekV3_2Config(DeepseekV3Config):
             max_position_embeddings=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=config.tie_word_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=get_rope_theta(config),
             rope_scaling=config.rope_scaling,
             rope_interleave=getattr(config, "rope_interleave", True),
             scoring_func=config.scoring_func,

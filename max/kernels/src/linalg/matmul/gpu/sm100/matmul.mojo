@@ -36,20 +36,26 @@ from std.gpu.sync import (
 )
 from std.gpu.compute.arch.tcgen05 import *
 from layout import (
-    UNKNOWN_VALUE,
+    IntTuple,
     Layout,
+    LayoutTensor,
     RuntimeTuple,
+    TileTensor,
+    UNKNOWN_VALUE,
 )
-from layout.int_tuple import IntTuple
 from layout.layout import coalesce
-from layout.layout_tensor import LayoutTensorIter
 from layout.runtime_tuple import idx2crd
 from layout.swizzle import Swizzle, make_swizzle
 from layout.tensor_core_async import st_matrix_n_layout
+from layout.tile_layout import TensorLayout
 from layout.tma_async import TMATensorTile
+from structured_kernels.tile_types import (
+    SMemTileArray2D,
+    swizzle_mode_to_bytes,
+)
 
 from std.utils.fast_div import FastDiv
-from std.utils.index import IndexList
+from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
 from ....arch.sm100 import MmaOpSM100_SS
@@ -67,51 +73,57 @@ struct WarpRole[has_scheduler: Bool = True](TrivialRegisterPassable):
     comptime Epilogue = Self(3)
 
     @always_inline
-    fn __eq__(self, other: UInt) -> Bool:
+    def __eq__(self, other: UInt) -> Bool:
         return self._role == Int32(other)
 
     @always_inline
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         return self._role == other._role
 
     @always_inline
-    fn __ne__(self, other: Self) -> Bool:
+    def __ne__(self, other: Self) -> Bool:
         return self._role != other._role
 
     @always_inline
-    fn __ge__(self, other: UInt) -> Bool:
+    def __ge__(self, other: UInt) -> Bool:
         return self._role >= Int32(other)
 
     @staticmethod
     @always_inline
-    fn is_main_load() -> Bool:
+    def is_main_load() -> Bool:
         return Self.MainLoad == warp_id()
 
     @staticmethod
     @always_inline
-    fn is_mma() -> Bool:
+    def is_mma() -> Bool:
         return Self.Mma == warp_id()
 
     @staticmethod
     @always_inline
-    fn is_epilogue() -> Bool:
+    def is_epilogue() -> Bool:
         return Self.Epilogue >= warp_id()
 
     @staticmethod
     @always_inline
-    fn is_scheduler() -> Bool:
+    def is_scheduler() -> Bool:
         comptime assert Self.has_scheduler, "Scheduler warp is not enabled"
         return Self.Scheduler == warp_id()
 
 
 @always_inline
-fn consumer_main_loop[
+def consumer_main_loop[
     accum_type: DType,
     c_type: DType,
     a_type: DType,
     b_type: DType,
-    a_smem_layout: Layout,
-    b_smem_layout: Layout,
+    a_dim0: Int,
+    a_dim1: Int,
+    a_num_tiles: Int,
+    a_swizzle_bytes: Int,
+    b_dim0: Int,
+    b_dim1: Int,
+    b_num_tiles: Int,
+    b_swizzle_bytes: Int,
     a_swizzle: TensorMapSwizzle,
     b_swizzle: TensorMapSwizzle,
     transpose_b: Bool,
@@ -125,19 +137,11 @@ fn consumer_main_loop[
     k_group_size: Int = 1,
 ](
     tmem_addr: UInt32,
-    a_smem_iter: LayoutTensorIter[
-        a_type,
-        a_smem_layout,
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-        alignment=128,
+    a_smem_tiles: SMemTileArray2D[
+        a_type, a_dim0, a_dim1, a_num_tiles, a_swizzle_bytes
     ],
-    b_smem_iter: LayoutTensorIter[
-        b_type,
-        b_smem_layout,
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-        alignment=128,
+    b_smem_tiles: SMemTileArray2D[
+        b_type, b_dim0, b_dim1, b_num_tiles, b_swizzle_bytes
     ],
     load_mma_pipeline: ProducerConsumerPipeline[pipeline_stages],
     mma_op: MmaOpSM100_SS[
@@ -157,6 +161,13 @@ fn consumer_main_loop[
     iter_idx: UInt32,
     k_start: UInt32,
 ):
+    """TileTensor overload of `consumer_main_loop`.
+
+    Accepts `SMemTileArray2D` instead of `LayoutTensorIter`, indexing directly
+    into the tile arrays to get TileTensor tiles for MMA. The tile dimension
+    and swizzle parameters (a_dim0, a_dim1, etc.) are explicit because Mojo
+    requires them for overload resolution with parametric struct arguments.
+    """
     var stage = load_mma_pipeline.consumer_stage()
 
     load_mma_pipeline.wait_producer()
@@ -165,8 +176,8 @@ fn consumer_main_loop[
     if elect_one_sync():
         for j in range(UInt32(k_group_size)):
             var offset = stage * UInt32(k_group_size) + j
-            var a_smem_tile = a_smem_iter.next(offset)[]
-            var b_smem_tile = b_smem_iter.next(offset)[]
+            var a_smem_tile = a_smem_tiles[offset]
+            var b_smem_tile = b_smem_tiles[offset]
             mma_op.mma(
                 a_smem_tile,
                 b_smem_tile,
@@ -184,47 +195,65 @@ comptime RLayout32Bits[layout: Layout] = RuntimeLayout[
 
 
 @always_inline
-fn f32_frag_to_smem[
+def f32_frag_to_smem[
     swizzle_mode: TensorMapSwizzle,
-    stageN: UInt,
+    vec_dtype: DType,
+    vec_size: Int,
+    DstLayout: TensorLayout,
 ](
-    vec: SIMD[_, _],
-    dst: LayoutTensor[mut=True, _, _, address_space=AddressSpace.SHARED, ...],
+    vec: InlineArray[Scalar[vec_dtype], vec_size],
+    dst: TileTensor[
+        _, DstLayout, MutAnyOrigin, address_space=AddressSpace.SHARED
+    ],
 ):
-    # TODO: apply swizzle. Somehow swizzle+distribute results in wrong values.
-    # alias swizzle = make_swizzle[DType.float64, swizzle_mode]() # hack
-    # var dst_frag = dst.vectorize[1, 2]().distribute[Layout.row_major(8, 4), swizzle=swizzle](lane_id())
-    var dst_frag = dst.vectorize[1, 2]().distribute[Layout.row_major(8, 4)](
-        lane_id()
-    )
-    comptime assert (
-        2 * dst_frag.layout.size() == vec.size
-    ), "2*dst_frag.layout.size() must be equal to vec.size"
+    # Manual implementation of dst.vectorize[1, 2]().distribute[row_major(8, 4)]
+    # because the compiler can't prove `all_dims_known` through layout types
+    # produced by `lt_to_tt()`. See MSTDL-2422.
+    comptime stride0 = dst.static_stride[0]
+    comptime shape0 = dst.static_shape[0]
+    comptime shape1 = dst.static_shape[1]
 
-    comptime for i in range(dst_frag.layout.shape[0].value()):
-        comptime for j in range(dst_frag.layout.shape[1].value()):
-            comptime i_vec = i + j * dst_frag.layout.shape[0].value()
-            val = SIMD[dst.dtype, 2](
+    comptime frag_rows = shape0 // 8
+    comptime frag_cols = shape1 // 8
+    comptime assert (
+        2 * frag_rows * frag_cols == vec_size
+    ), "2*frag_rows*frag_cols must be equal to vec_size"
+
+    var lane = lane_id()
+    var thread_row = Int((lane >> 2) & 7)
+    var thread_col = Int(lane & 3)
+    var base_offset = thread_row * Int(stride0) + thread_col * 2
+
+    comptime for i in range(frag_rows):
+        comptime for j in range(frag_cols):
+            comptime i_vec = i + j * frag_rows
+            var val = SIMD[dst.dtype, 2](
                 rebind[Scalar[dst.dtype]](vec[2 * i_vec]),
                 rebind[Scalar[dst.dtype]](vec[2 * i_vec + 1]),
             )
-            dst_frag[i, j] = rebind[dst_frag.element_type](val)
+            var offset = base_offset + i * 8 * Int(stride0) + j * 8
+            (dst.ptr + offset).store(val)
 
 
 @always_inline
-fn stsm_helper[
+def stsm_helper[
     swizzle: Swizzle,
-    stageN: UInt,
+    stageN: Int,
+    vec_dtype: DType,
+    vec_size: Int,
+    DstLayout: TensorLayout,
     transpose_c: Bool = False,
     swizzle_mode: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
 ](
-    vec: SIMD[_, _],
-    dst: LayoutTensor[mut=True, _, _, address_space=AddressSpace.SHARED, ...],
+    vec: InlineArray[Scalar[vec_dtype], vec_size],
+    dst: TileTensor[
+        _, DstLayout, MutAnyOrigin, address_space=AddressSpace.SHARED
+    ],
     warp_offset: UInt32 = 0,
 ):
     comptime if size_of[dst.dtype]() == 4:
         comptime assert not transpose_c, "transpose_c must be False"
-        return f32_frag_to_smem[swizzle_mode, stageN](vec, dst)
+        return f32_frag_to_smem[swizzle_mode](vec, dst)
     # Number of elements in one row is 32B and 16B per stsmx4 and stmtx2 tile, respectively.
     comptime stsmx_row_size = 32 // size_of[
         dst.dtype
@@ -235,17 +264,20 @@ fn stsm_helper[
     # E.g. dst layout can be (16, 16) : (32, 1), which is tiled from
     # row-major(16, 32). The map should use tile's stride to calculate
     # the dst row offset.
-    comptime stride0 = dst.layout.stride[0].value()
-    comptime stride1 = dst.layout.stride[1].value()
+    comptime stride0 = dst.static_stride[0]
+    comptime stride1 = dst.static_stride[1]
     comptime assert stride1 == 1, (
         "stride1 must be 1. Got: "
         + String(stride1)
-        + " for layout: "
-        + String(dst.layout)
+        + " for strides ("
+        + String(stride0)
+        + ", "
+        + String(stride1)
+        + ")"
     )
-    comptime shape0 = dst.layout.shape[
+    comptime shape0 = dst.static_shape[
         1
-    ].value() if not transpose_c else dst.layout.shape[0].value()
+    ] if not transpose_c else dst.static_shape[0]
     # the layout looks like
     # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-16256b
     # but transposed and coalesced by 8 elements.
@@ -261,16 +293,6 @@ fn stsm_helper[
         (lane & 15) * UInt(stride0) + (lane >> 4) * 8
     ) if not transpose_c else RLayout32Bits[trans_st_matrix_layout]()(Int(lane))
 
-    # Helper function to slice a range of SIMD vector.
-    # LLVM extract intrinsic generates bad code on GPU.
-    @always_inline
-    fn slice[offset: Int, size: Int](v: SIMD) -> SIMD[v.dtype, size]:
-        var tmp = SIMD[v.dtype, size]()
-
-        comptime for i in range(size):
-            tmp[i] = v[i + offset]
-        return tmp
-
     # Assume the dst tile has 16 rows and only use stsm in N dim.
     comptime for i in range(shape0 // stsmx_row_size):
         comptime n_offset = i * stsmx_tile_offset
@@ -284,16 +306,24 @@ fn stsm_helper[
         else:
             offset = swizzle(stsm_lane_offset + UInt32(n_offset))
         comptime stmtx_simd_width = 4 if stageN % 16 == 0 else 2
-        var v = slice[i * stsmx_lane_size, 2 * stmtx_simd_width](vec).cast[
-            dst.dtype
-        ]()
+        comptime cast_width = 4 // size_of[Scalar[dst.dtype]]()
+        var v = SIMD[dst.dtype, stmtx_simd_width * cast_width]()
+        comptime for k in range(stmtx_simd_width):
+            var src = SIMD[vec_dtype, cast_width]()
+            comptime for _j in range(cast_width):
+                src[_j] = rebind[Scalar[vec_dtype]](
+                    vec[i * stsmx_lane_size + k * cast_width + _j]
+                )
+            var casted = src.cast[dst.dtype]()
+            comptime for _j in range(cast_width):
+                v[k * cast_width + _j] = casted[_j]
         st_matrix[simd_width=stmtx_simd_width, transpose=transpose_c](
             dst.ptr + offset, bitcast[DType.float32, stmtx_simd_width](v)
         )
 
 
 @always_inline
-fn shared_memory_epilogue_transpose[
+def shared_memory_epilogue_transpose[
     stage: UInt,
     stageN: UInt,
     c_type: DType,
@@ -473,7 +503,72 @@ fn shared_memory_epilogue_transpose[
 
 
 @always_inline
-fn shared_memory_epilogue[
+def shared_memory_epilogue_transpose[
+    stage: UInt,
+    stageN: UInt,
+    c_type: DType,
+    c_smem_layout: Layout,
+    swizzle: Swizzle,
+    compute_lambda_fn: elementwise_compute_lambda_type,
+    num_output_warps: Int,
+    warp_dim: Int,
+    MMA_M: Int,
+    BN: Int,
+    cta_group: Int,
+    DstLayout: TensorLayout,
+](
+    M: UInt32,
+    N: UInt32,
+    c_col: UInt,
+    c_row: UInt,
+    c_smem: TileTensor[
+        _, DstLayout, MutAnyOrigin, address_space=AddressSpace.SHARED
+    ],
+    warp_i: UInt,
+    warp_j: UInt,
+):
+    """TileTensor overload. Delegates to the LayoutTensor overload since the
+    function body only uses `c_smem.ptr` — all layout algebra operates on the
+    `c_smem_layout` compile-time parameter directly."""
+    shared_memory_epilogue_transpose[
+        stage,
+        stageN,
+        c_type,
+        c_smem_layout,
+        swizzle,
+        compute_lambda_fn,
+        num_output_warps,
+        warp_dim,
+        MMA_M,
+        BN,
+        cta_group,
+    ](
+        M,
+        N,
+        c_col,
+        c_row,
+        LayoutTensor[
+            c_type,
+            c_smem_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+        ](
+            rebind[
+                UnsafePointer[
+                    Scalar[c_type],
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                ]
+            ](c_smem.ptr),
+            RuntimeLayout[c_smem_layout](),
+        ),
+        warp_i,
+        warp_j,
+    )
+
+
+@always_inline
+def shared_memory_epilogue[
     MMA_M: UInt,
     data_paths: UInt,
     num_stages: UInt,
@@ -525,11 +620,11 @@ fn shared_memory_epilogue[
     )
     var c_smem_upper_frag = c_smem_warp_tile_upper.vectorize[
         1, Int(simd_size)
-    ]().distribute[distribute_layout, swizzle=swizzle](lane_id())
+    ]().distribute[distribute_layout, swizzle=swizzle](Int(lane_id()))
 
     var c_smem_lower_frag = c_smem_warp_tile_lower.vectorize[
         1, Int(simd_size)
-    ]().distribute[distribute_layout, swizzle=swizzle](lane_id())
+    ]().distribute[distribute_layout, swizzle=swizzle](Int(lane_id()))
 
     comptime fragment_size = c_smem_upper_frag.layout.size()
 
@@ -663,7 +758,90 @@ fn shared_memory_epilogue[
 
 
 @always_inline
-fn _compute_register_lambda_fn[
+def shared_memory_epilogue[
+    MMA_M: UInt,
+    data_paths: UInt,
+    num_stages: UInt,
+    stage: UInt,
+    stageN: UInt,
+    c_type: DType,
+    shared_n: UInt,
+    simd_size: UInt,
+    c_smem_upper_layout: Layout,
+    c_smem_lower_layout: Layout,
+    swizzle: Swizzle,
+    compute_lambda_fn: elementwise_compute_lambda_type,
+    num_output_warps: Int,
+    UpperLayout: TensorLayout,
+    LowerLayout: TensorLayout,
+](
+    M: UInt32,
+    N: UInt32,
+    c_col: UInt,
+    c_row: UInt,
+    c_smem_warp_tile_upper: TileTensor[
+        _, UpperLayout, MutAnyOrigin, address_space=AddressSpace.SHARED
+    ],
+    c_smem_warp_tile_lower: TileTensor[
+        _, LowerLayout, MutAnyOrigin, address_space=AddressSpace.SHARED
+    ],
+):
+    """TileTensor overload. Delegates to the LayoutTensor overload since the
+    function body uses `.vectorize().distribute()` on LayoutTensor."""
+    shared_memory_epilogue[
+        MMA_M,
+        data_paths,
+        num_stages,
+        stage,
+        stageN,
+        c_type,
+        shared_n,
+        simd_size,
+        c_smem_upper_layout,
+        c_smem_lower_layout,
+        swizzle,
+        compute_lambda_fn,
+        num_output_warps,
+    ](
+        M,
+        N,
+        c_col,
+        c_row,
+        LayoutTensor[
+            c_type,
+            c_smem_upper_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+        ](
+            rebind[
+                UnsafePointer[
+                    Scalar[c_type],
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                ]
+            ](c_smem_warp_tile_upper.ptr),
+            RuntimeLayout[c_smem_upper_layout](),
+        ),
+        LayoutTensor[
+            c_type,
+            c_smem_lower_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+        ](
+            rebind[
+                UnsafePointer[
+                    Scalar[c_type],
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                ]
+            ](c_smem_warp_tile_lower.ptr),
+            RuntimeLayout[c_smem_lower_layout](),
+        ),
+    )
+
+
+@always_inline
+def _compute_register_lambda_fn[
     epilogue_dtype: DType,
     frag_size: Int,
     inc: Int,
@@ -673,7 +851,7 @@ fn _compute_register_lambda_fn[
 ](
     top_coord: StaticTuple[UInt32, 2],
     bottom_coord: StaticTuple[UInt32, 2],
-    mut frag: SIMD[epilogue_dtype, frag_size],
+    mut frag: InlineArray[Scalar[epilogue_dtype], frag_size],
     staged_c_row: UInt32,
     staged_c_col: UInt32,
 ):
@@ -687,56 +865,44 @@ fn _compute_register_lambda_fn[
         staged_c_col + bottom_coord[1] + UInt32(inc),
     )
 
-    # slice the fragment to get the current repeat top and bottom fragments
-    var simd_top = frag.slice[2, offset=offset]()
-    var simd_bottom = frag.slice[2, offset=offset + 2]()
-
-    # In normal case, simd_top and simd_bottom are elements on the M dimension
+    # In normal case, top and bottom are elements on the M dimension
     # when transpose_c is true, they are on the N dimension. We change the index order
-    # when we do the transpose and pass the SIMD sector one-by-one to the lambda function.
-    comptime for i in range(simd_top.size):
+    # when we do the transpose and pass the elements one-by-one to the lambda function.
+    comptime for i in range(2):
         comptime if not transpose_c:
-            simd_top[i] = compute_lambda_fn(
+            frag[offset + i] = compute_lambda_fn(
                 IndexList[2](
                     Int(top_frag_upper_coord[0]),
                     Int(top_frag_upper_coord[1] + UInt32(i)),
                 ),
-                simd_top[i],
+                frag[offset + i],
             )
-
-            simd_bottom[i] = compute_lambda_fn(
+            frag[offset + 2 + i] = compute_lambda_fn(
                 IndexList[2](
                     Int(bottom_frag_upper_coord[0]),
                     Int(bottom_frag_upper_coord[1] + UInt32(i)),
                 ),
-                simd_bottom[i],
+                frag[offset + 2 + i],
             )
         else:
-            simd_top[i] = compute_lambda_fn(
+            frag[offset + i] = compute_lambda_fn(
                 IndexList[2](
                     Int(top_frag_upper_coord[1] + UInt32(i)),
                     Int(top_frag_upper_coord[0]),
                 ),
-                simd_top[i],
+                frag[offset + i],
             )
-
-            simd_bottom[i] = compute_lambda_fn(
+            frag[offset + 2 + i] = compute_lambda_fn(
                 IndexList[2](
                     Int(bottom_frag_upper_coord[1] + UInt32(i)),
                     Int(bottom_frag_upper_coord[0]),
                 ),
-                simd_bottom[i],
+                frag[offset + 2 + i],
             )
-
-    # store the results back into the fragment
-    frag[offset] = simd_top[0]
-    frag[offset + 1] = simd_top[1]
-    frag[offset + 2] = simd_bottom[0]
-    frag[offset + 3] = simd_bottom[1]
 
 
 @always_inline
-fn register_epilogue[
+def register_epilogue[
     MMA_M: Int,
     data_paths: Int,
     num_stages: Int,
@@ -752,8 +918,8 @@ fn register_epilogue[
     cta_group: Int,
     is_lower_frag_required: Bool,
 ](
-    mut upper_frag_casted: SIMD[epilogue_dtype, frag_size],
-    mut lower_frag_casted: SIMD[epilogue_dtype, frag_size],
+    mut upper_frag_casted: InlineArray[Scalar[epilogue_dtype], frag_size],
+    mut lower_frag_casted: InlineArray[Scalar[epilogue_dtype], frag_size],
     c_row: UInt32,
     c_col: UInt32,
     N: UInt32,
@@ -844,7 +1010,7 @@ fn register_epilogue[
 
 
 @always_inline
-fn accum_arrive[
+def accum_arrive[
     cta_group: Int
 ](mma_output_pipeline: ProducerConsumerPipeline, mma_output_stage: UInt32):
     comptime if cta_group == 1:

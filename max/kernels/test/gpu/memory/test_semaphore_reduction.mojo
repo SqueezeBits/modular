@@ -16,20 +16,18 @@ from std.random import rand
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceContext
 from std.gpu.sync.semaphore import Semaphore
-from std.memory import LegacyUnsafePointer, memset_zero
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from std.memory import memset_zero
 from std.testing import assert_equal
 
 
-fn semaphore_vector_reduce[
+def semaphore_vector_reduce[
     dtype: DType,
     N: Int,
     num_parts: Int,
 ](
-    c_ptr: UnsafePointer[Scalar[dtype]],
-    a_ptr: UnsafePointer[Scalar[dtype]],
-    locks: UnsafePointer[Int32],
+    c_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    a_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    locks: UnsafePointer[Int32, MutAnyOrigin],
 ):
     var tid = thread_idx.x
     var block_idx = block_idx.x
@@ -49,7 +47,7 @@ fn semaphore_vector_reduce[
     sema.release(Int32(lx))
 
 
-fn run_vector_reduction[
+def run_vector_reduction[
     dtype: DType,
     N: Int,
     num_parts: Int,
@@ -62,9 +60,9 @@ fn run_vector_reduction[
     )
 
     comptime PN = N * num_parts
-    var a_host = UnsafePointer[Scalar[dtype]].alloc(PN)
-    var c_host = UnsafePointer[Scalar[dtype]].alloc(N)
-    var c_host_ref = UnsafePointer[Scalar[dtype]].alloc(N)
+    var a_host = alloc[Scalar[dtype]](PN)
+    var c_host = alloc[Scalar[dtype]](N)
+    var c_host_ref = alloc[Scalar[dtype]](N)
 
     rand[dtype](a_host, PN)
     memset_zero(c_host, N)
@@ -106,12 +104,12 @@ fn run_vector_reduction[
     c_host_ref.free()
 
 
-fn semaphore_matrix_reduce[
+def semaphore_matrix_reduce[
     dtype: DType, M: Int, N: Int, num_parts: Int
 ](
-    c_ptr: UnsafePointer[Scalar[dtype]],
-    a_ptr: UnsafePointer[Scalar[dtype]],
-    locks: UnsafePointer[Int32],
+    c_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    a_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    locks: UnsafePointer[Int32, MutAnyOrigin],
 ):
     var tid = thread_idx.x
     var block_idx = block_idx.x
@@ -135,7 +133,7 @@ fn semaphore_matrix_reduce[
     sema.release(Int32(lx))
 
 
-fn run_matrix_reduction[
+def run_matrix_reduction[
     dtype: DType,
     M: Int,
     N: Int,
@@ -150,9 +148,9 @@ fn run_matrix_reduction[
     )
 
     comptime PX = M * N * num_parts
-    var a_host = UnsafePointer[Scalar[dtype]].alloc(PX)
-    var c_host = UnsafePointer[Scalar[dtype]].alloc(M * N)
-    var c_host_ref = UnsafePointer[Scalar[dtype]].alloc(M * N)
+    var a_host = alloc[Scalar[dtype]](PX)
+    var c_host = alloc[Scalar[dtype]](M * N)
+    var c_host_ref = alloc[Scalar[dtype]](M * N)
 
     rand[dtype](a_host, PX)
     memset_zero(c_host, M * N)

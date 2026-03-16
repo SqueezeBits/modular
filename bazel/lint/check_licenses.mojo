@@ -38,12 +38,8 @@ comptime LICENSE_TO_ADD = """# ===----------------------------------------------
 """
 
 
-fn is_ignored_file(filename: StringSlice) -> Bool:
-    if not (
-        filename.endswith(".py")
-        or filename.endswith(".mojo")
-        or filename.endswith(".🔥")
-    ):
+def is_ignored_file(filename: StringSlice) -> Bool:
+    if not (filename.endswith(".py") or filename.endswith(".mojo")):
         return True
 
     # Generated files
@@ -56,13 +52,13 @@ fn is_ignored_file(filename: StringSlice) -> Bool:
     return False
 
 
-fn get_git_files() raises -> Set[String]:
+def get_git_files() raises -> Set[String]:
     # Need to get tracked, untracked, and deleted files separately
     tracked = run("git ls-files")
     untracked = run("git ls-files --exclude-standard --others")
     deleted = run("git ls-files --deleted")
 
-    fn _get_files(stdout: String) -> Set[String]:
+    def _get_files(stdout: String) -> Set[String]:
         result = Set[String]()
         for file in stdout.split("\n"):
             # Manually replace escaped 🔥 with a literal 🔥
@@ -75,7 +71,7 @@ fn get_git_files() raises -> Set[String]:
     return (_get_files(tracked) | _get_files(untracked)) - _get_files(deleted)
 
 
-fn check_path(path: Path, mut files_without_license: List[Path]) raises:
+def check_path(path: Path, mut files_without_license: List[Path]) raises:
     file_text = path.read_text()
 
     # Ignore #! in scripts
@@ -91,7 +87,7 @@ fn check_path(path: Path, mut files_without_license: List[Path]) raises:
 
 
 def main() raises:
-    target_paths = sys.argv()
+    target_paths = std.sys.argv()
 
     fix = False
     for arg in target_paths:
@@ -130,4 +126,4 @@ def main() raises:
                 print(file)
             print("Please add the license to each file before committing.")
             print("You can run `./bazelw run format` to do this automatically.")
-            sys.exit(1)
+            std.sys.exit(1)

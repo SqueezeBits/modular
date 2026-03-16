@@ -40,9 +40,13 @@ from .tile_layout import (
     ColMajorLayout,
     row_major,
     col_major,
-    blocked_product,
-    zipped_divide,
 )
 from .runtime_layout import RuntimeLayout
 from .runtime_tuple import RuntimeTuple
-from .tile_tensor import TileTensor, flatten_leading, stack_allocation
+from .tile_tensor import (
+    TileTensor,
+    flatten_leading,
+    stack_allocation,
+    lt_to_tt,
+    LTToTTLayout,
+)

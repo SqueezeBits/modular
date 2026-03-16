@@ -42,16 +42,19 @@ from std.gpu.compute.arch.tcgen05 import (
     tcgen05_st,
     tcgen05_store_wait,
 )
-from layout.int_tuple import IntTuple
-from layout.layout import Layout
-from layout.layout_tensor import LayoutTensor
+from layout import (
+    IntTuple,
+    Layout,
+    LayoutTensor,
+    TileTensor,
+    row_major,
+    stack_allocation as tt_stack_allocation,
+)
 from layout.tensor_core_async import (
     tile_layout_k_major,
     tile_layout_mn_major,
 )
 from layout.tile_layout import Layout as InternalLayout
-from layout import TileTensor, row_major
-from layout import stack_allocation as tt_stack_allocation
 from layout.tma_async import PipelineState, SharedMemBarrier
 from std.memory import bitcast
 from nn.fa4_config import FA4Config
@@ -109,7 +112,7 @@ comptime SharedMemPointer[type: AnyType] = UnsafePointer[
 comptime MBarType = SharedMemPointer[SharedMemBarrier]
 
 
-fn extract_power_of_two(N: Int, i: Int) -> Int:
+def extract_power_of_two(N: Int, i: Int) -> Int:
     pt = prev_power_of_two(N)
     rem = N
     for _ in range(i):
@@ -118,7 +121,7 @@ fn extract_power_of_two(N: Int, i: Int) -> Int:
     return pt
 
 
-fn cumulative_power_of_two(N: Int, i: Int) -> Int:
+def cumulative_power_of_two(N: Int, i: Int) -> Int:
     acc = 0
     rem = N
     for _ in range(i):
@@ -131,7 +134,7 @@ fn cumulative_power_of_two(N: Int, i: Int) -> Int:
 # Final call is with `pow_two == 0` (which isn't a power of 2)
 # to enable use of this function with pipelining.
 @always_inline("nodebug")
-fn break_into_powers_of_two[
+def break_into_powers_of_two[
     origins: OriginSet,
     //,
     func: fn[pow_two: Int, offset: Int]() capturing[origins] -> None,
@@ -223,7 +226,7 @@ struct STMatrixLayout[
     comptime bits = Self.bits_per_byte * Self.frag_simdwidth * Self.thread_cols * Self.accum_type_size
 
     @always_inline
-    fn __init__(out self):
+    def __init__(out self):
         pass
 
 
@@ -254,19 +257,19 @@ struct STMatrixOffsets[
     )
 
     @always_inline
-    fn __init__(out self):
+    def __init__(out self):
         pass
 
 
 @always_inline
-fn _tmem_offset(dtype_size: Int, *, MMA_N: Int, m_mma: Int, n_mma: Int) -> Int:
+def _tmem_offset(dtype_size: Int, *, MMA_N: Int, m_mma: Int, n_mma: Int) -> Int:
     row = 16 * m_mma
     col = (MMA_N * n_mma * dtype_size) // 4
     return (row << 16) + col
 
 
 @always_inline
-fn _tmem_offset[dtype: DType, *, MMA_N: Int, m_mma: Int, n_mma: Int]() -> Int:
+def _tmem_offset[dtype: DType, *, MMA_N: Int, m_mma: Int, n_mma: Int]() -> Int:
     comptime linear = _tmem_offset(
         size_of[dtype](), MMA_N=MMA_N, m_mma=m_mma, n_mma=n_mma
     )
@@ -285,15 +288,15 @@ struct TMemTile[
     var tmem_addr: UInt32
 
     @always_inline
-    fn __init__(out self, tmem_addr: UInt32):
+    def __init__(out self, tmem_addr: UInt32):
         self.tmem_addr = tmem_addr
 
     @always_inline
-    fn __getitem__(self, i: UInt32) -> Self:
+    def __getitem__(self, i: UInt32) -> Self:
         return {self.tmem_addr + i * UInt32(Self.BN)}
 
     @always_inline
-    fn offset[m_mma: Int, n_mma: Int](self) -> UInt32:
+    def offset[m_mma: Int, n_mma: Int](self) -> UInt32:
         comptime if m_mma == 0 and n_mma == 0:
             return self.tmem_addr
         else:
@@ -305,7 +308,7 @@ struct TMemTile[
 
     @staticmethod
     @always_inline
-    fn allocate_register_tile[
+    def allocate_register_tile[
         *, num_threads: Int
     ](
         out res: STMatrixLayout[
@@ -318,7 +321,7 @@ struct TMemTile[
         res = type_of(res).stack_allocation()
 
     @always_inline
-    fn store_async[
+    def store_async[
         *, num_threads: Int
     ](
         self,
@@ -341,7 +344,7 @@ struct TMemTile[
 
         @parameter
         @always_inline
-        fn store_fn[pow_two: Int, offset: Int]():
+        def store_fn[pow_two: Int, offset: Int]():
             # pow_two is current repeat, offset total so far
             comptime if pow_two > 0:
                 comptime for m_mma in range(st_mat_layout.num_m_tiles):
@@ -355,9 +358,12 @@ struct TMemTile[
                         m_mma=m_mma,
                     ]()
                     tmem = self.tmem_addr + UInt32(offsets.tmem_offset)
-                    frag = ptr.load[width=offsets.local_frag_size_b32](
-                        offsets.ptr_offset
-                    )
+                    var frag = InlineArray[
+                        Scalar[DType.uint32], offsets.local_frag_size_b32
+                    ](uninitialized=True)
+
+                    comptime for _i in range(offsets.local_frag_size_b32):
+                        frag[_i] = ptr.load(offsets.ptr_offset + _i)
                     # 16 x 256b results in repeated 8x4 matrix of <1,2> vector pattern
                     tcgen05_st[
                         datapaths=16,  # first dimension of the shape
@@ -372,7 +378,7 @@ struct TMemTile[
         ]()
 
     @always_inline
-    fn load_async_with_st_matrix_layout[
+    def load_async_with_st_matrix_layout[
         *, num_threads: Int
     ](
         self,
@@ -408,7 +414,7 @@ struct TMemTile[
         ](dst)
 
     @always_inline
-    fn load_st_matrix_chunk[
+    def load_st_matrix_chunk[
         *, num_threads: Int, start_repeat: Int, num_repeats: Int
     ](
         self,
@@ -447,7 +453,7 @@ struct TMemTile[
 
         @parameter
         @always_inline
-        fn load_fn[pow_two: Int, local_offset: Int]():
+        def load_fn[pow_two: Int, local_offset: Int]():
             comptime assert pow_two + local_offset <= num_repeats
             comptime if pow_two > 0:
                 comptime for m_mma in range(st_mat_layout.num_m_tiles):
@@ -469,7 +475,9 @@ struct TMemTile[
                         pack=False,
                         width=offsets.local_frag_size_b32,
                     ](tmem)
-                    ptr.store(offsets.ptr_offset, frag)
+
+                    comptime for _i in range(offsets.local_frag_size_b32):
+                        ptr.store(offsets.ptr_offset + _i, frag[_i])
 
         comptime max_value = 64 if st_mat_layout.bits == 128 else 32
         break_into_powers_of_two[
@@ -477,19 +485,23 @@ struct TMemTile[
         ]()
 
     @always_inline
-    fn load_async(
+    def load_async(
         self,
-        out dst: LocalTensor[Self.dtype, row_major[Self.BN]()],
+        out dst: InlineArray[Scalar[Self.dtype], Self.BN],
     ):
-        dst = tt_stack_allocation[
-            dtype=Self.dtype, address_space=AddressSpace.LOCAL
-        ](row_major[Self.BN]())
+        dst = InlineArray[Scalar[Self.dtype], Self.BN](uninitialized=True)
+        # The uint32 bitcast path below assumes dtype_size == 4.
+        # Sub-32-bit types (bf16, f16) pack multiple elements per uint32
+        # and would need unpacking logic not yet implemented.
+        comptime assert (
+            Self.dtype_size == 4
+        ), "load_async only supports 32-bit dtypes"
         comptime repeat = Self.dtype_size * Self.BN // 4
         comptime dtype = Self.dtype if Self.dtype_size == 4 else DType.uint32
 
         @parameter
         @always_inline
-        fn load_fn[pow_two: Int, offset: Int]():
+        def load_fn[pow_two: Int, offset: Int]():
             comptime if pow_two > 0:
                 comptime if dtype == Self.dtype:
                     frag0 = tcgen05_ld[
@@ -500,7 +512,9 @@ struct TMemTile[
                         pack=False,
                         width=pow_two,
                     ](self.tmem_addr + UInt32(offset))
-                    dst.ptr.store(offset, frag0)
+
+                    comptime for _i in range(pow_two):
+                        dst[offset + _i] = frag0[_i]
                 else:
                     frag1 = tcgen05_ld[
                         datapaths=32,  # first dimension of the shape
@@ -510,39 +524,125 @@ struct TMemTile[
                         pack=False,
                         width=pow_two,
                     ](self.tmem_addr + UInt32(offset))
-                    dst.ptr.bitcast[UInt32]().store[width=pow_two](
-                        offset, frag1
-                    )
+
+                    comptime for _i in range(pow_two):
+                        dst[offset + _i] = bitcast[Self.dtype](frag1[_i])
 
         break_into_powers_of_two[func=load_fn, N=repeat, max_value=128]()
 
     @always_inline
-    fn store_async[
+    def store_async[
         src_type: DType
     ](self, src: LocalTensor[src_type, row_major[Self.BN]()]):
         @parameter
         @always_inline
-        fn store_fn[pow_two: Int, offset: Int]():
+        def store_fn[pow_two: Int, offset: Int]():
             comptime if pow_two > 0:
-                var frag: SIMD[DType.uint32, pow_two * Self.dtype_size // 4]
+                comptime frag_width = pow_two * Self.dtype_size // 4
+                var frag = InlineArray[Scalar[DType.uint32], frag_width](
+                    uninitialized=True
+                )
 
                 comptime if src_type == Self.dtype:
-                    frag = src.ptr.bitcast[UInt32]().load[
-                        width=pow_two * Self.dtype_size // 4
-                    ](offset)
-                else:
-                    comptime src_offset = offset
-                    comptime src_frag = pow_two
-                    frag = bitcast[
-                        DType.uint32, pow_two * Self.dtype_size // 4
-                    ](
-                        src.ptr.load[width=src_frag](src_offset).cast[
-                            Self.dtype
-                        ]()
+                    comptime for _i in range(frag_width):
+                        frag[_i] = src.ptr.bitcast[UInt32]().load(offset + _i)
+                elif pow_two > 1:
+                    comptime size_ratio = size_of[src_type]() // Self.dtype_size
+                    comptime cast_width = min(
+                        4 if size_ratio
+                        >= 4 else (2 if size_ratio >= 2 else pow_two),
+                        pow_two,
                     )
+                    comptime u32_per_cast = cast_width * Self.dtype_size // 4
+                    comptime num_casts = pow_two // cast_width
+
+                    comptime if u32_per_cast >= 1:
+                        comptime for _i in range(num_casts):
+                            var src_vec = src.ptr.load[width=cast_width](
+                                offset + _i * cast_width
+                            )
+                            var dst_vec = src_vec.cast[Self.dtype]()
+                            var packed_chunk = bitcast[
+                                DType.uint32, u32_per_cast
+                            ](dst_vec)
+                            comptime for _j in range(u32_per_cast):
+                                frag[_i * u32_per_cast + _j] = packed_chunk[_j]
+                    else:
+                        var packed = bitcast[DType.uint32, frag_width](
+                            src.ptr.load[width=pow_two](offset).cast[
+                                Self.dtype
+                            ]()
+                        )
+                        comptime for _i in range(frag_width):
+                            frag[_i] = packed[_i]
+                else:
+                    frag[0] = bitcast[DType.uint32](src[0].cast[Self.dtype]())
+
                 tcgen05_st[
                     datapaths=32,  # first dimension of the shape
                     bits=32,  # second dimension of the shape
+                    repeat=pow_two * Self.dtype_size // 4,
+                    pack=False,
+                ](self.tmem_addr + UInt32(offset * Self.dtype_size // 4), frag)
+
+        break_into_powers_of_two[func=store_fn, N=Self.BN, max_value=128]()
+
+    @always_inline
+    def store_async[
+        src_type: DType,
+        src_len: Int,
+        src_offset: Int = 0,
+    ](self, src: InlineArray[Scalar[src_type], src_len]):
+        @parameter
+        @always_inline
+        def store_fn[pow_two: Int, offset: Int]():
+            comptime if pow_two > 0:
+                comptime frag_width = pow_two * Self.dtype_size // 4
+                var frag = InlineArray[Scalar[DType.uint32], frag_width](
+                    uninitialized=True
+                )
+
+                comptime if src_type == Self.dtype:
+                    comptime for _i in range(frag_width):
+                        frag[_i] = bitcast[DType.uint32](
+                            src[src_offset + offset + _i]
+                        )
+                else:
+                    comptime sub_elements = 4 // Self.dtype_size
+                    comptime size_ratio = size_of[src_type]() // Self.dtype_size
+                    comptime cast_width = 4 if size_ratio >= 4 else (
+                        2 if size_ratio >= 2 else 1
+                    )
+
+                    comptime for _i in range(frag_width):
+                        var x: SIMD[Self.dtype, sub_elements] = {}
+                        comptime if cast_width >= 2:
+                            comptime for _j in range(
+                                0, sub_elements, cast_width
+                            ):
+                                var src_vec: SIMD[src_type, cast_width] = {}
+                                comptime for _k in range(cast_width):
+                                    comptime idx = (
+                                        src_offset
+                                        + offset
+                                        + _i * sub_elements
+                                        + _j
+                                        + _k
+                                    )
+                                    src_vec[_k] = src[idx]
+                                var dst_vec = src_vec.cast[Self.dtype]()
+                                comptime for _k in range(cast_width):
+                                    x[_j + _k] = dst_vec[_k]
+                        else:
+                            comptime for _j in range(sub_elements):
+                                comptime idx = (
+                                    src_offset + offset + _i * sub_elements + _j
+                                )
+                                x[_j] = src[idx].cast[Self.dtype]()
+                        frag[_i] = bitcast[DType.uint32, 1](x)
+                tcgen05_st[
+                    datapaths=32,
+                    bits=32,
                     repeat=pow_two * Self.dtype_size // 4,
                     pack=False,
                 ](self.tmem_addr + UInt32(offset * Self.dtype_size // 4), frag)
@@ -606,7 +706,7 @@ struct SM100TensorAccumulatorSS[
 
     @staticmethod
     @always_inline("nodebug")
-    fn mma[
+    def mma[
         *, stage_idx: Int = 0
     ](
         a: Self.AType,
@@ -710,12 +810,12 @@ struct SM100TensorAccumulatorTS[
 
     @staticmethod
     @always_inline
-    fn descriptor_a(a_tmem: UInt32) -> Self.AType:
+    def descriptor_a(a_tmem: UInt32) -> Self.AType:
         return {a_tmem}
 
     @staticmethod
     @always_inline("nodebug")
-    fn mma[
+    def mma[
         *, stage_idx: Int = 0
     ](a: UInt32, b: Self.BType, c: UInt32, *, c_scale: UInt32, elect: Int32):
         comptime if Self.num_stages == 1:
@@ -763,7 +863,7 @@ struct SM100TensorAccumulatorTS[
             )
 
 
-fn build_mma_ss(
+def build_mma_ss(
     kind: String,
     layout_a: Layout,
     layout_b: Layout,
@@ -809,7 +909,7 @@ setp.eq.s32 %pj, $6, 0;
     return mma + "}"
 
 
-fn build_mma_ts(
+def build_mma_ts(
     kind: String,
     layout_b: Layout,
     *,
@@ -856,7 +956,7 @@ setp.eq.s32 %pj, $6, 0;
 
 
 @always_inline("nodebug")
-fn bulk_mma[
+def bulk_mma[
     kind: UMMAKind,
     //,
     layout_a: Layout,
@@ -888,7 +988,7 @@ fn bulk_mma[
 
 
 @always_inline("nodebug")
-fn bulk_mma[
+def bulk_mma[
     kind: UMMAKind,
     //,
     layout_b: Layout,
@@ -984,7 +1084,7 @@ fn bulk_mma[
 
 
 @always_inline
-fn elect() -> Int32:
+def elect() -> Int32:
     return inlined_assembly[
         """{
             .reg .b32 %re;
@@ -999,12 +1099,12 @@ fn elect() -> Int32:
 
 
 @always_inline
-fn llvm_opaque_tid() -> UInt32:
+def llvm_opaque_tid() -> UInt32:
     return inlined_assembly["mov.u32 $0, %tid.x;", UInt32, constraints="=r"]()
 
 
 @always_inline
-fn intrin_ftz[intrin: String](a: Float32, b: Float32) -> Float32:
+def intrin_ftz[intrin: String](a: Float32, b: Float32) -> Float32:
     return inlined_assembly[
         String(intrin, ".ftz.f32 $0, $1, $2;"),
         Float32,
@@ -1014,7 +1114,7 @@ fn intrin_ftz[intrin: String](a: Float32, b: Float32) -> Float32:
 
 
 @always_inline
-fn intrin[intrin: String](a: Float32, b: Float32, c: Float32) -> Float32:
+def intrin[intrin: String](a: Float32, b: Float32, c: Float32) -> Float32:
     return inlined_assembly[
         String(intrin, ".f32 $0, $1, $2, $3;"),
         Float32,
@@ -1024,7 +1124,7 @@ fn intrin[intrin: String](a: Float32, b: Float32, c: Float32) -> Float32:
 
 
 @always_inline
-fn intrin_ftz_x2[
+def intrin_ftz_x2[
     intrin: String
 ](a: SIMD[DType.float32, 2], b: SIMD[DType.float32, 2]) -> SIMD[
     DType.float32, 2
@@ -1038,60 +1138,60 @@ fn intrin_ftz_x2[
 
 
 @always_inline
-fn add_ftz(a: Float32, b: Float32) -> Float32:
+def add_ftz(a: Float32, b: Float32) -> Float32:
     return intrin_ftz["add"](a, b)
 
 
 @always_inline
-fn sub_ftz(a: Float32, b: Float32) -> Float32:
+def sub_ftz(a: Float32, b: Float32) -> Float32:
     return intrin_ftz["sub"](a, b)
 
 
 @always_inline
-fn mul_ftz(a: Float32, b: Float32) -> Float32:
+def mul_ftz(a: Float32, b: Float32) -> Float32:
     return intrin_ftz["mul"](a, b)
 
 
 @always_inline
-fn max_ftz(a: Float32, b: Float32) -> Float32:
+def max_ftz(a: Float32, b: Float32) -> Float32:
     return intrin_ftz["max"](a, b)
 
 
 @always_inline
-fn max_ftz(a: Float32, b: Float32, c: Float32) -> Float32:
+def max_ftz(a: Float32, b: Float32, c: Float32) -> Float32:
     return intrin["max.ftz"](a, b, c)
 
 
 @always_inline
-fn add_ftz(
+def add_ftz(
     a: SIMD[DType.float32, 2], b: SIMD[DType.float32, 2]
 ) -> SIMD[DType.float32, 2]:
     return intrin_ftz_x2["add"](a, b)
 
 
 @always_inline
-fn sub_ftz(
+def sub_ftz(
     a: SIMD[DType.float32, 2], b: SIMD[DType.float32, 2]
 ) -> SIMD[DType.float32, 2]:
     return intrin_ftz_x2["sub"](a, b)
 
 
 @always_inline
-fn mul_ftz(
+def mul_ftz(
     a: SIMD[DType.float32, 2], b: SIMD[DType.float32, 2]
 ) -> SIMD[DType.float32, 2]:
     return intrin_ftz_x2["mul"](a, b)
 
 
 @always_inline
-fn add_ftz_rm(
+def add_ftz_rm(
     a: SIMD[DType.float32, 2], b: SIMD[DType.float32, 2]
 ) -> SIMD[DType.float32, 2]:
     return intrin_ftz_x2["add.rm"](a, b)
 
 
 @always_inline
-fn fma_ftz(
+def fma_ftz(
     a: SIMD[DType.float32, 2],
     b: SIMD[DType.float32, 2],
     c: SIMD[DType.float32, 2],
@@ -1105,7 +1205,7 @@ fn fma_ftz(
 
 
 @always_inline
-fn exp2_emulation[
+def exp2_emulation[
     use_exp2_emulation: Bool = True
 ](x: SIMD[DType.float32, 2]) -> SIMD[DType.float32, 2]:
     comptime if use_exp2_emulation:
@@ -1140,7 +1240,7 @@ fn exp2_emulation[
 
 
 @always_inline
-fn elect_mma_arrive[
+def elect_mma_arrive[
     cta_group: Int = 1
 ](
     mbar_ptr: UnsafePointer[address_space=AddressSpace.SHARED, ...],
@@ -1179,19 +1279,19 @@ fn elect_mma_arrive[
 
 
 @always_inline
-fn maximum[
+def maximum[
     BN: Int, //, *, width: Int = 4
 ](
-    x: LocalTensor[DType.float32, row_major[BN]()],
+    x: InlineArray[Scalar[DType.float32], BN],
     out res: StaticTuple[Float32, width],
 ):
     res = {}
 
     comptime for w in range(width):
         res[w] = max_ftz(
-            rebind[Float32](x[3 * w]),
-            rebind[Float32](x[3 * w + 1]),
-            rebind[Float32](x[3 * w + 2]),
+            x[3 * w],
+            x[3 * w + 1],
+            x[3 * w + 2],
         )
 
     # max idx = 3 * (width-1) + 2 = 3*width - 1
@@ -1204,8 +1304,8 @@ fn maximum[
         comptime for w in range(width):
             res[w] = max_ftz(
                 res[w],
-                rebind[Float32](x[col + 2 * w]),
-                rebind[Float32](x[col + 2 * w + 1]),
+                x[col + 2 * w],
+                x[col + 2 * w + 1],
             )
 
     comptime remainder_base = 3 * width + 2 * width * num_iters
@@ -1214,19 +1314,19 @@ fn maximum[
     comptime for w in range(end_iters):
         res[w] = max_ftz(
             res[w],
-            rebind[Float32](x[remainder_base + 2 * w]),
-            rebind[Float32](x[remainder_base + 2 * w + 1]),
+            x[remainder_base + 2 * w],
+            x[remainder_base + 2 * w + 1],
         )
 
     comptime if (BN - remainder_base) % 2 == 1:
-        res[end_iters] = max_ftz(res[end_iters], rebind[Float32](x[BN - 1]))
+        res[end_iters] = max_ftz(res[end_iters], x[BN - 1])
 
 
 @always_inline
-fn maximum[
+def maximum[
     BN: Int, //, *, width: Int = 4
 ](
-    x: LocalTensor[DType.float32, row_major[BN]()],
+    x: InlineArray[Scalar[DType.float32], BN],
     init: StaticTuple[Float32, width],
     out res: StaticTuple[Float32, width],
 ):
@@ -1238,9 +1338,7 @@ fn maximum[
     comptime for i in range(num_iters):
         comptime for w in range(width):
             comptime j = i * 2 * width + 2 * w
-            res[w] = max_ftz(
-                res[w], rebind[Float32](x[j]), rebind[Float32](x[j + 1])
-            )
+            res[w] = max_ftz(res[w], x[j], x[j + 1])
 
     comptime remainder_base = 2 * width * num_iters
     comptime end_iters = (BN - remainder_base) // 2
@@ -1248,26 +1346,26 @@ fn maximum[
     comptime for w in range(end_iters):
         res[w] = max_ftz(
             res[w],
-            rebind[Float32](x[remainder_base + 2 * w]),
-            rebind[Float32](x[remainder_base + 2 * w + 1]),
+            x[remainder_base + 2 * w],
+            x[remainder_base + 2 * w + 1],
         )
 
     comptime if (BN - remainder_base) % 2 == 1:
-        res[end_iters] = max_ftz(res[end_iters], rebind[Float32](x[BN - 1]))
+        res[end_iters] = max_ftz(res[end_iters], x[BN - 1])
 
 
 @always_inline
-fn maximum(x: StaticTuple[Float32, 4]) -> Float32:
+def maximum(x: StaticTuple[Float32, 4]) -> Float32:
     return max_ftz(max_ftz(x[0], x[1], x[2]), x[3])
 
 
 @always_inline
-fn maximum(x: StaticTuple[Float32, 4], init: Float32) -> Float32:
+def maximum(x: StaticTuple[Float32, 4], init: Float32) -> Float32:
     return max_ftz(max_ftz(x[0], x[1], x[2]), x[3], init)
 
 
 @always_inline
-fn maximum(x: StaticTuple[Float32, 8]) -> Float32:
+def maximum(x: StaticTuple[Float32, 8]) -> Float32:
     var a = max_ftz(x[0], x[1], x[2])
     var b = max_ftz(x[3], x[4], x[5])
     var c = max_ftz(x[6], x[7])
@@ -1275,7 +1373,7 @@ fn maximum(x: StaticTuple[Float32, 8]) -> Float32:
 
 
 @always_inline
-fn maximum(x: StaticTuple[Float32, 8], init: Float32) -> Float32:
+def maximum(x: StaticTuple[Float32, 8], init: Float32) -> Float32:
     var a = max_ftz(init, x[0], x[1])
     var b = max_ftz(x[2], x[3], x[4])
     var c = max_ftz(x[5], x[6], x[7])
@@ -1283,7 +1381,7 @@ fn maximum(x: StaticTuple[Float32, 8], init: Float32) -> Float32:
 
 
 @always_inline
-fn sum[
+def sum[
     dtype: DType, BN: Int, //, *, width: Int = 8
 ](x: LocalTensor[dtype, row_major[BN]()]) -> SIMD[dtype, 2]:
     comptime assert BN % width == 0
@@ -1319,36 +1417,36 @@ struct StagedPipeline[num_kv_stages: Int, num_qk_stages: Int = 1](
     var state: PipelineState[Self.num_kv_stages]
 
     @always_inline
-    fn __init__(out self, mbar: MBarType):
+    def __init__(out self, mbar: MBarType):
         self.mbar = mbar
         self.state = {}
 
     @always_inline
-    fn producer_mbar[qk_stage: Int = 0](self) -> MBarType:
+    def producer_mbar[qk_stage: Int = 0](self) -> MBarType:
         var idx: UInt32 = self.state.index()
         return self.mbar + UInt32(Self.num_qk_stages) * idx + qk_stage
 
     @always_inline
-    fn consumer_mbar[qk_stage: Int = 0](self, idx: UInt32) -> MBarType:
+    def consumer_mbar[qk_stage: Int = 0](self, idx: UInt32) -> MBarType:
         comptime const_offset = qk_stage + Self.num_stages
         return self.mbar + UInt32(Self.num_qk_stages) * idx + const_offset
 
     @always_inline
-    fn consumer_mbar[qk_stage: Int = 0](self) -> MBarType:
+    def consumer_mbar[qk_stage: Int = 0](self) -> MBarType:
         return self.consumer_mbar[qk_stage](self.state.index())
 
     @always_inline("nodebug")
-    fn producer_acquire[qk_stage: Int = Self.num_qk_stages - 1](self):
+    def producer_acquire[qk_stage: Int = Self.num_qk_stages - 1](self):
         """Wait until consumer has released the buffer for this stage."""
         self.consumer_mbar[qk_stage]()[].wait(self.state.phase())
 
     @always_inline("nodebug")
-    fn consumer_wait[qk_stage: Int = Self.num_qk_stages - 1](self):
+    def consumer_wait[qk_stage: Int = Self.num_qk_stages - 1](self):
         """Wait for producer to complete this stage."""
         self.producer_mbar[qk_stage]()[].wait(self.state.phase())
 
     @always_inline("nodebug")
-    fn consumer_release[
+    def consumer_release[
         qk_stage: Int = Self.num_qk_stages - 1
     ](mut self, e: Int32):
         """Release the buffer after consuming this stage."""
@@ -1359,7 +1457,7 @@ struct StagedPipeline[num_kv_stages: Int, num_qk_stages: Int = 1](
 
     @staticmethod
     @always_inline
-    fn num_mbars() -> UInt32:
+    def num_mbars() -> UInt32:
         return UInt32(2 * Self.num_qk_stages * Self.num_kv_stages)
 
 
@@ -1374,14 +1472,14 @@ struct TMADestination[dtype: DType, layout: Layout](TrivialRegisterPassable):
     var smem: SharedMemLT[Self.dtype, Self.layout]
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self, mbar: MBarType, smem: SharedMemLT[Self.dtype, Self.layout]
     ):
         self.mbar = mbar
         self.smem = smem
 
     @always_inline
-    fn split_smem[
+    def split_smem[
         first: Layout, second: Layout
     ](self) -> Tuple[
         SharedMemLT[Self.dtype, first], SharedMemLT[Self.dtype, second]
@@ -1433,7 +1531,7 @@ struct TMAProducerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
     var smem: Self.SMemType
 
     @always_inline
-    fn __init__(out self, mbar: MBarType, smem: Self.SMemType):
+    def __init__(out self, mbar: MBarType, smem: Self.SMemType):
         comptime if Self.is_k:
             comptime assert (
                 Self.config.padded_depth % Self.config.num_qk_stages == 0
@@ -1443,7 +1541,7 @@ struct TMAProducerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
         self.pipeline.state._phase = 1
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         pipeline: StagedPipeline[
             Self.config.num_kv_stages, Self.num_qk_stages_effective
@@ -1459,7 +1557,7 @@ struct TMAProducerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
         self.pipeline.state._phase = 1
 
     @always_inline
-    fn get_smem[*, qk_stage: Int = 0](self) -> Self.SMemType:
+    def get_smem[*, qk_stage: Int = 0](self) -> Self.SMemType:
         """Get smem pointer for current stage."""
 
         comptime if Self.is_k:
@@ -1475,13 +1573,13 @@ struct TMAProducerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
             return self.smem + dyn_offset
 
     @always_inline
-    fn get_tile[*, qk_stage: Int = 0](self) -> Self.PairType:
+    def get_tile[*, qk_stage: Int = 0](self) -> Self.PairType:
         """Get TMA destination for this stage."""
         p_mbar = self.pipeline.producer_mbar[qk_stage]()
         return {p_mbar, {self.get_smem[qk_stage=qk_stage]()}}
 
     @always_inline
-    fn get_tile[*, qk_stage: Int = 0](self, e: Int32) -> Self.PairType:
+    def get_tile[*, qk_stage: Int = 0](self, e: Int32) -> Self.PairType:
         """Get TMA destination with optional expect_bytes."""
         p_mbar = self.pipeline.producer_mbar[qk_stage]()
         if e != 0:
@@ -1489,12 +1587,12 @@ struct TMAProducerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
         return {p_mbar, {self.get_smem[qk_stage=qk_stage]()}}
 
     @always_inline
-    fn acquire[*, qk_stage: Int = 0](self):
+    def acquire[*, qk_stage: Int = 0](self):
         """Wait for consumer to release the buffer."""
         self.pipeline.producer_acquire[qk_stage]()
 
     @always_inline
-    fn commit_step(mut self):
+    def commit_step(mut self):
         """Step the pipeline. Commit is handled by tma_op.async_copy."""
         self.pipeline.state.step()
 
@@ -1502,31 +1600,31 @@ struct TMAProducerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
     comptime KPairType = Self.PairType  # Alias for backward compatibility
 
     @always_inline
-    fn get_k_smem[*, qk_stage: Int](self) -> Self.SMemType:
+    def get_k_smem[*, qk_stage: Int](self) -> Self.SMemType:
         return self.get_smem[qk_stage=qk_stage]()
 
     @always_inline
-    fn get_k[*, qk_stage: Int](self) -> Self.PairType:
+    def get_k[*, qk_stage: Int](self) -> Self.PairType:
         return self.get_tile[qk_stage=qk_stage]()
 
     @always_inline
-    fn get_k[*, qk_stage: Int](self, e: Int32) -> Self.PairType:
+    def get_k[*, qk_stage: Int](self, e: Int32) -> Self.PairType:
         return self.get_tile[qk_stage=qk_stage](e)
 
     @always_inline
-    fn acquire_k[*, qk_stage: Int](self):
+    def acquire_k[*, qk_stage: Int](self):
         self.acquire[qk_stage=qk_stage]()
 
     @always_inline
-    fn get_v_smem(self) -> Self.SMemType:
+    def get_v_smem(self) -> Self.SMemType:
         return self.get_smem[qk_stage=0]()
 
     @always_inline
-    fn get_v(self, e: Int32) -> Self.PairType:
+    def get_v(self, e: Int32) -> Self.PairType:
         return self.get_tile[qk_stage=0](e)
 
     @always_inline
-    fn acquire_v(self):
+    def acquire_v(self):
         self.acquire[qk_stage=0]()
 
 
@@ -1577,7 +1675,7 @@ struct TMAConsumerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
     var smem_desc: MMASmemDescriptorPair
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         pipeline: StagedPipeline[
             Self.config.num_kv_stages, Self.num_qk_stages_effective
@@ -1593,7 +1691,7 @@ struct TMAConsumerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
         ](smem)
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         mbar: MBarType,
         smem: SharedMemPointer[Scalar[Self.dtype]],
@@ -1601,7 +1699,7 @@ struct TMAConsumerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
         return Self(type_of(self.pipeline)(mbar), smem)
 
     @always_inline("nodebug")
-    fn get(self) -> MMASmemDescriptorPair:
+    def get(self) -> MMASmemDescriptorPair:
         """Get smem descriptor for current stage."""
         var dyn_offset: UInt32 = (
             UInt32(Self.full_kv_bytes) * self.pipeline.state.index()
@@ -1609,27 +1707,27 @@ struct TMAConsumerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
         return self.smem_desc + dyn_offset
 
     @always_inline("nodebug")
-    fn wait[*, qk_stage: Int = 0](self):
+    def wait[*, qk_stage: Int = 0](self):
         """Wait for tile from producer."""
         self.pipeline.consumer_wait[qk_stage]()
 
     @always_inline("nodebug")
-    fn release[*, qk_stage: Int = 0](mut self, e: Int32):
+    def release[*, qk_stage: Int = 0](mut self, e: Int32):
         """Release buffer after consuming."""
         self.pipeline.consumer_release[qk_stage](e)
 
     # Backward-compatible K methods (for KConsumerPipeline)
     @always_inline("nodebug")
-    fn get_k(self) -> MMASmemDescriptorPair:
+    def get_k(self) -> MMASmemDescriptorPair:
         return self.get()
 
     @always_inline("nodebug")
-    fn wait_k[*, qk_stage: Int = Self.config.num_qk_stages - 1](mut self):
+    def wait_k[*, qk_stage: Int = Self.config.num_qk_stages - 1](mut self):
         """Wait on K stage from the producer."""
         self.wait[qk_stage=qk_stage]()
 
     @always_inline("nodebug")
-    fn release_k[
+    def release_k[
         *, qk_stage: Int = Self.config.num_qk_stages - 1
     ](mut self, e: Int32):
         """Release K buffer after consuming this stage."""
@@ -1637,16 +1735,16 @@ struct TMAConsumerPipeline[dtype: DType, config: FA4Config, is_k: Bool = True](
 
     # Backward-compatible V methods (for VConsumerPipeline)
     @always_inline("nodebug")
-    fn get_v(self) -> MMASmemDescriptorPair:
+    def get_v(self) -> MMASmemDescriptorPair:
         return self.get()
 
     @always_inline("nodebug")
-    fn wait_v(self):
+    def wait_v(self):
         """Wait for V tile."""
         self.wait[qk_stage=0]()
 
     @always_inline("nodebug")
-    fn release_v(mut self, e: Int32):
+    def release_v(mut self, e: Int32):
         """Release V buffer after consuming."""
         self.release[qk_stage=0](e)
 
@@ -1695,7 +1793,7 @@ struct RolePipeline[
     var state: PipelineState[Self.num_stages]
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self, producer_mbar_base: MBarType, consumer_mbar_base: MBarType
     ):
         self.producer_mbar_base = producer_mbar_base
@@ -1707,7 +1805,7 @@ struct RolePipeline[
             self.state._phase = 1
 
     @always_inline
-    fn producer_mbar[sub_stage_idx: Int = 0](self) -> MBarType:
+    def producer_mbar[sub_stage_idx: Int = 0](self) -> MBarType:
         """Get producer mbar for current stage and optional sub-stage.
 
         Parameters:
@@ -1723,7 +1821,7 @@ struct RolePipeline[
         )
 
     @always_inline
-    fn consumer_mbar[sub_stage_idx: Int = 0](self) -> MBarType:
+    def consumer_mbar[sub_stage_idx: Int = 0](self) -> MBarType:
         """Get consumer mbar for current stage and optional sub-stage.
 
         Parameters:
@@ -1740,48 +1838,48 @@ struct RolePipeline[
 
     # Producer methods
     @always_inline("nodebug")
-    fn acquire[sub_stage_idx: Int = 0](self):
+    def acquire[sub_stage_idx: Int = 0](self):
         """Wait until consumer has released the buffer. Producer-only."""
         self.consumer_mbar[sub_stage_idx]()[].wait(self.state.phase())
 
     @always_inline("nodebug")
-    fn commit(mut self):
+    def commit(mut self):
         """Commit production and step. Producer-only."""
         _ = self.producer_mbar()[].arrive()
         self.state.step()
 
     @always_inline("nodebug")
-    fn commit_mma(self):
+    def commit_mma(self):
         """Commit via MMA arrive using elected thread. Producer-only."""
         mbar = self.producer_mbar()
         elect_mma_arrive(mbar, elect())
 
     @always_inline("nodebug")
-    fn commit_mma(self, elect: Int32):
+    def commit_mma(self, elect: Int32):
         """Commit via MMA arrive with explicit elect value. Producer-only."""
         mbar = self.producer_mbar()
         elect_mma_arrive(mbar, elect)
 
     # Consumer methods
     @always_inline("nodebug")
-    fn wait(self):
+    def wait(self):
         """Wait for producer to complete. Consumer-only."""
         self.producer_mbar()[].wait(self.state.phase())
 
     @always_inline("nodebug")
-    fn release[sub_stage_idx: Int = 0](mut self):
+    def release[sub_stage_idx: Int = 0](mut self):
         """Release buffer at sub-stage and step. Consumer-only."""
         _ = self.consumer_mbar[sub_stage_idx]()[].arrive()
         self.state.step()
 
     @always_inline("nodebug")
-    fn release_no_step[sub_stage_idx: Int = 0](self):
+    def release_no_step[sub_stage_idx: Int = 0](self):
         """Release buffer without stepping. For multi-sub-stage release."""
         _ = self.consumer_mbar[sub_stage_idx]()[].arrive()
 
     # Shared method
     @always_inline("nodebug")
-    fn step(mut self):
+    def step(mut self):
         self.state.step()
 
 
@@ -1798,12 +1896,12 @@ struct MBarPipeline[number_of_stages: Int](TrivialRegisterPassable):
     var state: PipelineState[Self.num_stages]
 
     @always_inline
-    fn __init__(out self, mbar: MBarType):
+    def __init__(out self, mbar: MBarType):
         self.mbar = mbar
         self.state = {}
 
     @always_inline
-    fn init[*, num_producer: UInt32 = 1, num_consumer: UInt32 = 1](self):
+    def init[*, num_producer: UInt32 = 1, num_consumer: UInt32 = 1](self):
         comptime for i in range(Self.number_of_stages):
             self.mbar[i].init(Int32(Int(num_producer)))
 
@@ -1812,12 +1910,12 @@ struct MBarPipeline[number_of_stages: Int](TrivialRegisterPassable):
 
     @staticmethod
     @always_inline
-    fn num_mbars() -> UInt32:
+    def num_mbars() -> UInt32:
         return UInt32(2 * Self.number_of_stages)
 
 
 @always_inline
-fn apply_oob_mask[
+def apply_oob_mask[
     *,
     mask_strategy: MaskStrategy,
     apply_log2e_after_mask: Bool,
@@ -1849,7 +1947,7 @@ fn apply_oob_mask[
 
 
 @always_inline
-fn apply_mask[
+def apply_mask[
     BN: Int,
     MaskType: MHAMask,
     //,
@@ -1857,7 +1955,7 @@ fn apply_mask[
     mask_strategy: MaskStrategy,
     skip_scale: Bool = False,
 ](
-    srow: LocalTensor[DType.float32, row_major[BN]()],
+    mut srow: InlineArray[Scalar[DType.float32], BN],
     mask: MaskType,
     scale_log2e: Float32,
     *,
@@ -1870,7 +1968,6 @@ fn apply_mask[
 ):
     comptime simd_size = 2
     comptime F32x2 = SIMD[DType.float32, simd_size]
-    vs = srow.vectorize[simd_size]()
 
     comptime if (
         MaskStrategy.LOWER_TRIANGULAR in mask_strategy
@@ -1924,9 +2021,11 @@ fn apply_mask[
                 var s: F32x2
 
                 comptime if skip_scale:
-                    s = rebind[F32x2](vs[frag_col_simd])
+                    s = F32x2(srow[frag_col], srow[frag_col + 1])
                 else:
-                    s = mul_ftz(rebind[F32x2](vs[frag_col_simd]), scale_log2e)
+                    s = mul_ftz(
+                        F32x2(srow[frag_col], srow[frag_col + 1]), scale_log2e
+                    )
 
                 comptime for i in range(simd_size):
                     comptime midx = n * simd_size + i
@@ -1936,21 +2035,21 @@ fn apply_mask[
                     s[i] = val if in_bound else MASK_VALUE
 
                 var score_col: Int32 = kv_tile_start_row + Int32(frag_col)
-                vs[frag_col_simd] = rebind[vs.ElementType](
-                    apply_oob_mask[
-                        mask_strategy=mask_strategy,
-                        apply_log2e_after_mask=MaskType.apply_log2e_after_mask,
-                    ](
-                        s,
-                        prompt_idx=prompt_idx,
-                        q_head_idx=q_head_idx,
-                        kv_tile_start_row=kv_tile_start_row,
-                        max_seq_len=max_seq_len,
-                        num_keys=num_keys,
-                        score_row=score_row,
-                        score_col=score_col,
-                    )
+                var result = apply_oob_mask[
+                    mask_strategy=mask_strategy,
+                    apply_log2e_after_mask=MaskType.apply_log2e_after_mask,
+                ](
+                    s,
+                    prompt_idx=prompt_idx,
+                    q_head_idx=q_head_idx,
+                    kv_tile_start_row=kv_tile_start_row,
+                    max_seq_len=max_seq_len,
+                    num_keys=num_keys,
+                    score_row=score_row,
+                    score_col=score_col,
                 )
+                srow[frag_col] = result[0]
+                srow[frag_col + 1] = result[1]
             n_valid = max(n_valid - 32, 0)
 
     else:
@@ -1958,13 +2057,15 @@ fn apply_mask[
 
         comptime for n in range(block_size):
             # score_col = mask_frag_col + j * 8
+            comptime frag_col = simd_size * n
             var s: F32x2
 
             comptime if skip_scale:
-                s = rebind[F32x2](vs[n])
+                s = F32x2(srow[frag_col], srow[frag_col + 1])
             else:
-                s = mul_ftz(rebind[F32x2](vs[n]), scale_log2e)
-            comptime frag_col = simd_size * n
+                s = mul_ftz(
+                    F32x2(srow[frag_col], srow[frag_col + 1]), scale_log2e
+                )
             var score_col: Int32 = kv_tile_start_row + Int32(frag_col)
 
             comptime if MaskStrategy.COMPUTED in mask_strategy:
@@ -1978,21 +2079,21 @@ fn apply_mask[
                     s,
                 )
 
-            vs[n] = rebind[vs.ElementType](
-                apply_oob_mask[
-                    mask_strategy=mask_strategy,
-                    apply_log2e_after_mask=MaskType.apply_log2e_after_mask,
-                ](
-                    s,
-                    prompt_idx=prompt_idx,
-                    q_head_idx=q_head_idx,
-                    kv_tile_start_row=kv_tile_start_row,
-                    max_seq_len=max_seq_len,
-                    num_keys=num_keys,
-                    score_row=score_row,
-                    score_col=score_col,
-                )
+            var result = apply_oob_mask[
+                mask_strategy=mask_strategy,
+                apply_log2e_after_mask=MaskType.apply_log2e_after_mask,
+            ](
+                s,
+                prompt_idx=prompt_idx,
+                q_head_idx=q_head_idx,
+                kv_tile_start_row=kv_tile_start_row,
+                max_seq_len=max_seq_len,
+                num_keys=num_keys,
+                score_row=score_row,
+                score_col=score_col,
             )
+            srow[frag_col] = result[0]
+            srow[frag_col + 1] = result[1]
 
 
 struct FA4MiscMBars[
@@ -2059,11 +2160,11 @@ struct FA4MiscMBars[
     comptime number_warpgroup_count = Self.S0_producer_offset
 
     @always_inline
-    fn __init__(out self, mbar_base: MBarType):
+    def __init__(out self, mbar_base: MBarType):
         self.mbar_base = mbar_base
 
     @staticmethod
-    fn _init_count(lane_idx: Int32) -> Int32:
+    def _init_count(lane_idx: Int32) -> Int32:
         """Return the mbarrier thread count for the given barrier index.
 
         S0_consumer[0] and S1_consumer[0] get count=256 (combined softmax +
@@ -2079,7 +2180,7 @@ struct FA4MiscMBars[
         return 1
 
     @always_inline
-    fn init(self, *, lane_idx: Int32):
+    def init(self, *, lane_idx: Int32):
         comptime if Self.size < WARP_SIZE:
             if lane_idx < Int32(Self.size):
                 self.mbar_base[lane_idx].init(Self._init_count(lane_idx))
@@ -2107,7 +2208,7 @@ struct FA4MiscMBars[
     comptime SPipelineConsumer = RolePipeline[1, False, 1, Self.num_pv_stages]
 
     @always_inline
-    fn producer_s0(self) -> Self.SPipelineProducer:
+    def producer_s0(self) -> Self.SPipelineProducer:
         """Get S producer for warp group 0."""
         return {
             self.mbar_base + Self.S0_producer_offset,
@@ -2115,7 +2216,7 @@ struct FA4MiscMBars[
         }
 
     @always_inline
-    fn producer_s1(self) -> Self.SPipelineProducer:
+    def producer_s1(self) -> Self.SPipelineProducer:
         """Get S producer for warp group 1."""
         return {
             self.mbar_base + Self.S1_producer_offset,
@@ -2123,7 +2224,7 @@ struct FA4MiscMBars[
         }
 
     @always_inline
-    fn consumer_s(self, wg_idx: UInt32) -> Self.SPipelineConsumer:
+    def consumer_s(self, wg_idx: UInt32) -> Self.SPipelineConsumer:
         """Get S consumer for given warp group."""
         return {
             self.mbar_base + Self.S0_producer_offset + wg_idx,
@@ -2131,44 +2232,44 @@ struct FA4MiscMBars[
         }
 
     @always_inline
-    fn consumer_c0(self) -> ConsumerPipeline[1]:
+    def consumer_c0(self) -> ConsumerPipeline[1]:
         return {
             self.mbar_base + Self.C0_offset,
             self.mbar_base + Self.C0_offset + 1,
         }
 
     @always_inline
-    fn consumer_c1(self) -> ConsumerPipeline[1]:
+    def consumer_c1(self) -> ConsumerPipeline[1]:
         return {
             self.mbar_base + Self.C1_offset,
             self.mbar_base + Self.C1_offset + 1,
         }
 
     @always_inline
-    fn producer_c(self, wg_idx: UInt32) -> ProducerPipeline[1]:
+    def producer_c(self, wg_idx: UInt32) -> ProducerPipeline[1]:
         base = UInt32(Self.C0_offset) + 2 * wg_idx
         return {self.mbar_base + base, self.mbar_base + base + 1}
 
     @always_inline
-    fn pipeline_order_wait(self, wg_idx: UInt32) -> MBarType:
+    def pipeline_order_wait(self, wg_idx: UInt32) -> MBarType:
         return self.mbar_base + Self.order_offset + wg_idx
 
     @always_inline
-    fn pipeline_order_arrive(self, wg_idx: UInt32) -> MBarType:
+    def pipeline_order_arrive(self, wg_idx: UInt32) -> MBarType:
         return self.mbar_base + (Self.order_offset + 1) - wg_idx
 
     @always_inline
-    fn q1_wait_mbar(self) -> MBarType:
+    def q1_wait_mbar(self) -> MBarType:
         return self.mbar_base + Self.Q1SyncIdx
 
     # K/V/O barrier accessors
     @always_inline("nodebug")
-    fn get_k_mbars(self) -> MBarType:
+    def get_k_mbars(self) -> MBarType:
         """Returns base pointer for K pipeline barriers."""
         return self.mbar_base + Self.K_offset
 
     @always_inline("nodebug")
-    fn get_v_mbars(self) -> MBarType:
+    def get_v_mbars(self) -> MBarType:
         """Returns base pointer for V pipeline barriers (MHA only)."""
         comptime assert (
             Self.separate_kv
@@ -2176,12 +2277,12 @@ struct FA4MiscMBars[
         return self.mbar_base + Self.V_offset
 
     @always_inline("nodebug")
-    fn get_kv_mbars(self) -> MBarType:
+    def get_kv_mbars(self) -> MBarType:
         """Returns base pointer for unified KV pipeline barriers (MLA)."""
         return self.mbar_base + Self.K_offset
 
     @always_inline("nodebug")
-    fn combined_p_o_consumer(self, wg_idx: UInt32) -> MBarType:
+    def combined_p_o_consumer(self, wg_idx: UInt32) -> MBarType:
         """Combined P+O consumer barrier for given warp group.
 
         Arrived at by BOTH softmax (P ready) and correction (O rescaled).
@@ -2191,7 +2292,7 @@ struct FA4MiscMBars[
 
     # O pipeline convenience methods
     @always_inline("nodebug")
-    fn consumer_o(self) -> RolePipeline[2, False, 1, Self.num_pv_stages]:
+    def consumer_o(self) -> RolePipeline[2, False, 1, Self.num_pv_stages]:
         """Get O consumer pipeline.
 
         Wait side: O_producer barriers (stride 1, indexed by stage).
@@ -2204,7 +2305,7 @@ struct FA4MiscMBars[
         }
 
     @always_inline("nodebug")
-    fn producer_o0(self) -> ProducerPipeline[1]:
+    def producer_o0(self) -> ProducerPipeline[1]:
         """Get O producer for warp group 0."""
         return {
             self.mbar_base + Self.O_producer_offset,
@@ -2212,7 +2313,7 @@ struct FA4MiscMBars[
         }
 
     @always_inline("nodebug")
-    fn producer_o1(self) -> ProducerPipeline[1]:
+    def producer_o1(self) -> ProducerPipeline[1]:
         """Get O producer for warp group 1."""
         return {
             self.mbar_base + Self.O_producer_offset + 1,
@@ -2221,5 +2322,5 @@ struct FA4MiscMBars[
 
     @staticmethod
     @always_inline
-    fn num_mbars() -> UInt32:
+    def num_mbars() -> UInt32:
         return UInt32(Self.size)

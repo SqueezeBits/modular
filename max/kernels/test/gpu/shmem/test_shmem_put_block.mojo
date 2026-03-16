@@ -18,7 +18,7 @@ from shmem import *
 from std.testing import assert_equal
 
 
-fn set_and_shift_kernel(
+def set_and_shift_kernel(
     send_data: UnsafePointer[Float32, MutAnyOrigin],
     recv_data: UnsafePointer[Float32, MutAnyOrigin],
     num_elems: UInt,
@@ -55,13 +55,12 @@ fn set_and_shift_kernel(
         )
 
 
-fn test_shmem_put[use_nbi: Bool](ctx: SHMEMContext) raises:
+def test_shmem_put[use_nbi: Bool](ctx: SHMEMContext) raises:
     comptime num_elems: UInt = 8192
     comptime threads_per_block: UInt = 256
-    debug_assert(
-        num_elems % threads_per_block == 0,
-        "num_elems must be divisible by threads_per_block",
-    )
+    assert (
+        num_elems % threads_per_block == 0
+    ), "num_elems must be divisible by threads_per_block"
     comptime num_blocks = num_elems // threads_per_block
 
     var mype = shmem_my_pe()
@@ -98,7 +97,7 @@ fn test_shmem_put[use_nbi: Bool](ctx: SHMEMContext) raises:
         assert_equal(
             host[Int(i)],
             expected,
-            t"unexpected value on PE: {mype} at idx: {i}",
+            String(t"unexpected value on PE: {mype} at idx: {i}"),
         )
 
     print("[", mype, "of", npes, "] run complete. use_nbi=", use_nbi)

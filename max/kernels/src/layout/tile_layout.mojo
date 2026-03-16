@@ -46,6 +46,7 @@ from std.builtin.variadics import (
     VariadicPack,
     _MapVariadicAndIdxToType,
     _ReduceVariadicAndIdxToVariadic,
+    _ReduceVariadicAndIdxToValue,
 )
 
 from .coord import (
@@ -99,10 +100,17 @@ trait TensorLayout(TrivialRegisterPassable):
     Parameters:
         i: The dimension index.
     """
+
+    comptime static_product: Int
+    """The compile-time product of all shape dimensions."""
+
+    comptime static_cosize: Int
+    """The compile-time size of the memory region spanned by the layout."""
+
     comptime _shape_types: Variadic.TypesOfTrait[CoordLike]
     comptime _stride_types: Variadic.TypesOfTrait[CoordLike]
 
-    fn shape[i: Int](self) -> Self._shape_types[i]:
+    def shape[i: Int](self) -> Self._shape_types[i]:
         """Returns the i-th shape dimension.
 
         Parameters:
@@ -113,7 +121,7 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn stride[i: Int](self) -> Self._stride_types[i]:
+    def stride[i: Int](self) -> Self._stride_types[i]:
         """Returns the i-th stride dimension.
 
         Parameters:
@@ -124,7 +132,7 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn product(self) -> Int:
+    def product(self) -> Int:
         """Returns the total number of elements in the layout's domain.
 
         Returns:
@@ -132,7 +140,7 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn size(self) -> Int:
+    def size(self) -> Int:
         """Returns the total number of elements. Alias for `product()`.
 
         Returns:
@@ -140,7 +148,7 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn __call__[
+    def __call__[
         index_type: CoordLike,
         *,
         linear_idx_type: DType = DType.int64,
@@ -159,7 +167,7 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn idx2crd[
+    def idx2crd[
         *,
         out_dtype: DType = DType.int64,
     ](self, idx: Int) -> DynamicCoord[out_dtype, Self.rank]:
@@ -186,7 +194,7 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn shape_coord(self) -> Coord[*Self._shape_types]:
+    def shape_coord(self) -> Coord[*Self._shape_types]:
         """Returns the full shape as a `Coord`.
 
         Returns:
@@ -194,7 +202,7 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn stride_coord(self) -> Coord[*Self._stride_types]:
+    def stride_coord(self) -> Coord[*Self._stride_types]:
         """Returns the full stride as a `Coord`.
 
         Returns:
@@ -202,7 +210,23 @@ trait TensorLayout(TrivialRegisterPassable):
         """
         ...
 
-    fn make_dynamic[
+    def transpose(
+        self,
+    ) -> Layout[
+        Variadic.reverse[*Self._shape_types],
+        Variadic.reverse[*Self._stride_types],
+    ]:
+        """Transposes the layout by reversing the order of dimensions.
+
+        For an n-dimensional layout, this reverses the order of both shapes
+        and strides. For 2D layouts, this swaps rows and columns.
+
+        Returns:
+            A new Layout with transposed dimensions.
+        """
+        ...
+
+    def make_dynamic[
         dtype: DType
     ](self) -> Layout[
         _CoordToDynamic[dtype, *Self._shape_types],
@@ -282,7 +306,12 @@ struct Layout[
     comptime static_product = Coord[*Self.shape_types].static_product
     """The compile-time product of all shape dimensions."""
 
-    fn __init__(
+    comptime static_cosize = _StaticCosize[
+        Self._flat_shape_types, Self._flat_stride_types
+    ]
+    """The compile-time size of the memory region spanned by the layout."""
+
+    def __init__(
         out self,
         shape: Coord[*Self.shape_types],
         stride: Coord[*Self.stride_types],
@@ -307,7 +336,7 @@ struct Layout[
         self._shape = shape
         self._stride = stride
 
-    fn __call__[
+    def __call__[
         index_type: CoordLike,
         *,
         linear_idx_type: DType = DType.int64,
@@ -328,7 +357,7 @@ struct Layout[
             index, self._shape, self._stride
         )
 
-    fn idx2crd[
+    def idx2crd[
         *,
         out_dtype: DType = DType.int64,
     ](self, idx: Int) -> DynamicCoord[out_dtype, Self.rank]:
@@ -370,7 +399,7 @@ struct Layout[
             )
         return result
 
-    fn product(self) -> Int:
+    def product(self) -> Int:
         """Returns the total number of elements in the layout's domain.
 
         For a layout with shape (m, n), this returns m * n, representing
@@ -381,7 +410,7 @@ struct Layout[
         """
         return self._shape.product()
 
-    fn size(self) -> Int:
+    def size(self) -> Int:
         """Returns the total number of elements in the layout's domain.
 
         Alias for `product()`. Compatible with the legacy Layout API.
@@ -391,7 +420,7 @@ struct Layout[
         """
         return self.product()
 
-    fn cosize[
+    def cosize[
         linear_idx_type: DType = DType.int64
     ](self) -> Scalar[linear_idx_type]:
         """Returns the size of the memory region spanned by the layout.
@@ -409,7 +438,7 @@ struct Layout[
             self[linear_idx_type=linear_idx_type](Idx(self.product() - 1)) + 1
         )
 
-    fn to_layout(self) -> LegacyLayout:
+    def to_layout(self) -> LegacyLayout:
         """Converts this mixed layout to a legacy `Layout` using `IntTuple`.
 
         Returns:
@@ -421,7 +450,7 @@ struct Layout[
         )
 
     @always_inline("nodebug")
-    fn reverse(
+    def reverse(
         self,
     ) -> Layout[
         Variadic.reverse[*Self.shape_types],
@@ -438,7 +467,34 @@ struct Layout[
         return Layout(self._shape.reverse(), self._stride.reverse())
 
     @always_inline("nodebug")
-    fn make_dynamic[
+    def transpose(
+        self,
+    ) -> Layout[
+        Variadic.reverse[*Self.shape_types],
+        Variadic.reverse[*Self.stride_types],
+    ]:
+        """Transposes the layout by reversing the order of dimensions.
+
+        For an n-dimensional layout, this reverses the order of both shapes
+        and strides. For 2D layouts, this swaps rows and columns, converting
+        row-major to column-major and vice versa.
+
+        Returns:
+            A new Layout with transposed dimensions.
+
+        Example:
+
+        ```mojo
+        from layout.tile_layout import row_major
+
+        var layout = row_major[3, 4]()  # shape (3,4), stride (4,1)
+        var transposed = layout.transpose()  # shape (4,3), stride (1,4)
+        ```
+        """
+        return self.reverse()
+
+    @always_inline("nodebug")
+    def make_dynamic[
         dtype: DType
     ](self) -> Layout[
         _CoordToDynamic[dtype, *Self.shape_types],
@@ -466,7 +522,7 @@ struct Layout[
             self._stride.make_dynamic[dtype](),
         )
 
-    fn shape[i: Int](self) -> Self._shape_types[i]:
+    def shape[i: Int](self) -> Self._shape_types[i]:
         """Returns the i-th shape dimension.
 
         Parameters:
@@ -477,7 +533,7 @@ struct Layout[
         """
         return self._shape[i]
 
-    fn stride[i: Int](self) -> Self._stride_types[i]:
+    def stride[i: Int](self) -> Self._stride_types[i]:
         """Returns the i-th stride dimension.
 
         Parameters:
@@ -488,7 +544,7 @@ struct Layout[
         """
         return self._stride[i]
 
-    fn shape_coord(self) -> Coord[*Self._shape_types]:
+    def shape_coord(self) -> Coord[*Self._shape_types]:
         """Returns the full shape as a `Coord`.
 
         Returns:
@@ -496,13 +552,35 @@ struct Layout[
         """
         return self._shape
 
-    fn stride_coord(self) -> Coord[*Self._stride_types]:
+    def stride_coord(self) -> Coord[*Self._stride_types]:
         """Returns the full stride as a `Coord`.
 
         Returns:
             A Coord containing all stride dimensions.
         """
         return self._stride
+
+
+comptime _StaticCosizeReducer[
+    Strides: Variadic.TypesOfTrait[CoordLike],
+    Prev: Variadic.ValuesOfType[Int],
+    From: Variadic.TypesOfTrait[CoordLike],
+    idx: Int,
+] = Variadic.values[
+    (From[idx].static_value - 1) * Strides[idx].static_value + Prev[0]
+]
+
+
+comptime _StaticCosize[
+    Shapes: Variadic.TypesOfTrait[CoordLike],
+    Strides: Variadic.TypesOfTrait[CoordLike],
+] = _ReduceVariadicAndIdxToValue[
+    BaseVal=Variadic.values[1],
+    VariadicType=Shapes,
+    Reducer=_StaticCosizeReducer[Strides=Strides, ...],
+][
+    0
+]
 
 
 comptime _RowMajor[*element_types: CoordLike] = _ReduceVariadicAndIdxToVariadic[
@@ -538,7 +616,7 @@ comptime _RowMajorMapper[
 
 
 @always_inline
-fn row_major(var shape: Coord) -> RowMajorLayout[*shape.element_types]:
+def row_major(var shape: Coord) -> RowMajorLayout[*shape.element_types]:
     """Creates a row-major layout from a shape `Coord`.
 
     Row-major means the rightmost dimension has stride 1, and each preceding
@@ -596,7 +674,7 @@ fn row_major(var shape: Coord) -> RowMajorLayout[*shape.element_types]:
 
 
 @always_inline("nodebug")
-fn row_major[*idxs: Int]() -> RowMajorLayout[*_IntToComptimeInt[*idxs]]:
+def row_major[*idxs: Int]() -> RowMajorLayout[*_IntToComptimeInt[*idxs]]:
     """Creates a row-major layout from compile-time shape dimensions.
 
     Parameters:
@@ -610,7 +688,7 @@ fn row_major[*idxs: Int]() -> RowMajorLayout[*_IntToComptimeInt[*idxs]]:
 
 
 @always_inline("nodebug")
-fn row_major(
+def row_major(
     idx: ComptimeInt[...],
 ) -> Layout[
     shape_types=Variadic.types[type_of(idx)],
@@ -628,7 +706,7 @@ fn row_major(
 
 
 @always_inline("nodebug")
-fn row_major(
+def row_major(
     idx: RuntimeInt[...],
 ) -> Layout[
     shape_types=Variadic.types[type_of(idx)],
@@ -695,7 +773,7 @@ comptime _ColMajorMapper[
 
 
 @always_inline
-fn col_major(var shape: Coord) -> ColMajorLayout[*shape.element_types]:
+def col_major(var shape: Coord) -> ColMajorLayout[*shape.element_types]:
     """Create a column-major layout from a shape.
 
     Column-major means the first dimension has stride 1, and each subsequent
@@ -751,7 +829,7 @@ fn col_major(var shape: Coord) -> ColMajorLayout[*shape.element_types]:
 
 
 @always_inline("nodebug")
-fn col_major[*idxs: Int]() -> ColMajorLayout[*_IntToComptimeInt[*idxs]]:
+def col_major[*idxs: Int]() -> ColMajorLayout[*_IntToComptimeInt[*idxs]]:
     """Create a column-major layout from compile-time shape dimensions.
 
     Parameters:
@@ -774,7 +852,7 @@ fn col_major[*idxs: Int]() -> ColMajorLayout[*_IntToComptimeInt[*idxs]]:
 
 
 @always_inline("nodebug")
-fn col_major(
+def col_major(
     idx: ComptimeInt[...],
 ) -> Layout[
     shape_types=Variadic.types[type_of(idx)],
@@ -792,7 +870,7 @@ fn col_major(
 
 
 @always_inline("nodebug")
-fn col_major(
+def col_major(
     idx: RuntimeInt[...],
 ) -> Layout[
     shape_types=Variadic.types[type_of(idx)],
@@ -809,7 +887,7 @@ fn col_major(
     return Layout(Coord(idx), Coord(Idx[1]()))
 
 
-fn zipped_divide[
+def zipped_divide[
     LayoutType: TensorLayout, //, tile: Coord
 ](layout: LayoutType) -> ZippedDivideLayout[
     LayoutType._shape_types,
@@ -943,7 +1021,7 @@ The result is a layout where:
 """
 
 
-fn blocked_product[
+def blocked_product[
     BlockLayoutType: TensorLayout,
     TilerLayoutType: TensorLayout,
     //,
