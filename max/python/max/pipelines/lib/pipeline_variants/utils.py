@@ -228,12 +228,11 @@ def _maybe_adapt_flux2_klein_fp8_weight_paths(
     if any(len(p.parts) > 1 for p in model_config.weight_path):
         return weight_paths
 
+    from copy import deepcopy
+
     from max.pipelines.architectures.flux2_modulev3.weight_adapters import (
         adapt_bflabs_flux2_transformer_weights,
-        materialize_bflabs_flux2_klein_static_repo,
     )
-    from max.pipelines.lib.hf_utils import HuggingFaceRepo
-    from max.graph.weights import WeightsFormat
 
     activation_scheme = model_config.fp8_activation_scheme or "static"
     if activation_scheme != "static":
@@ -247,33 +246,38 @@ def _maybe_adapt_flux2_klein_fp8_weight_paths(
     if len(weight_paths) != 1:
         raise ValueError(
             "Expected a single flat safetensors file for FLUX.2 Klein FP8 "
-            f"materialization, got {len(weight_paths)} paths."
+            f"static loading, got {len(weight_paths)} paths."
         )
 
+    # Adapt the transformer weights once; result is cached on disk so
+    # subsequent runs skip the heavy PyTorch conversion entirely.
+    adapted_path = adapt_bflabs_flux2_transformer_weights(
+        weight_paths[0], activation_scheme="static"
+    )
+
+    # Patch diffusers_config in memory to inject the FP8 metadata needed
+    # by the pipeline's encoding-upgrade logic.  No files are written.
     diffusers_config = model_config.diffusers_config
     if diffusers_config is None:
         raise ValueError(
-            "diffusers_config is required to materialize the FLUX.2 Klein FP8 "
-            "static repo."
+            "diffusers_config is required for FLUX.2 Klein FP8 static loading."
         )
-
-    repo_root = materialize_bflabs_flux2_klein_static_repo(
-        weight_paths[0],
-        base_repo_id=model_config.model_path,
-        base_revision=model_config.huggingface_model_revision,
-        diffusers_config=diffusers_config,
-        force_download=model_config.force_download,
+    patched = deepcopy(diffusers_config)
+    transformer_comp = (
+        patched.setdefault("components", {}).setdefault("transformer", {})
     )
+    transformer_cfg = transformer_comp.setdefault("config_dict", {})
+    quant_cfg = dict(transformer_cfg.get("quantization_config") or {})
+    quant_cfg["quant_method"] = "fp8"
+    quant_cfg["activation_scheme"] = "static"
+    transformer_cfg["quantization_config"] = quant_cfg
+    transformer_cfg["activation_scheme"] = "static"
+    model_config._diffusers_config = patched
 
-    repo = HuggingFaceRepo(repo_id=str(repo_root))
-    materialized_weight_paths = [
-        Path(rel_path)
-        for rel_path in repo.weight_files.get(WeightsFormat.safetensors, [])
-    ]
-    model_config.model_path = str(repo_root)
-    model_config._weights_repo_id = str(repo_root)
-    model_config.weight_path = materialized_weight_paths
-    model_config.quantization_encoding = "bfloat16"
-    model_config._diffusers_config = None
+    # Expose only the adapted transformer file as a flat weight path.
+    # Flux2KleinPipeline.unprefixed_weight_component = "transformer" routes
+    # it to the transformer component.  VAE and text-encoder weights are
+    # downloaded from the original HF repo via the normal fallback.
+    model_config.weight_path = [Path(adapted_path.name)]
 
-    return [repo_root / rel_path for rel_path in materialized_weight_paths]
+    return [adapted_path]

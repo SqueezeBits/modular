@@ -55,6 +55,11 @@ class Flux2KleinModelInputs(Flux2ModelInputs):
 class Flux2KleinPipeline(Flux2Pipeline):
     """Flux2 Klein diffusion pipeline with Qwen3 text encoder."""
 
+    # Flat FP8 checkpoint files (no component/ prefix) are routed to the
+    # transformer.  VAE and text-encoder weights are fetched from the base
+    # HF repo via the normal download fallback.
+    unprefixed_weight_component = "transformer"
+
     components = {
         "vae": Flux2Pipeline.components["vae"],
         "text_encoder": Qwen3TextEncoderKleinModel,
