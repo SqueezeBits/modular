@@ -496,7 +496,6 @@ class MAXModelConfig(MAXModelConfigBase):
         ):
             self._weights_repo_id = self.model_path
             self.model_path = self.model_path[:-4]
-            self.model_path = "black-forest-labs/FLUX.2-klein-4B"
 
         # If we cannot infer the weight path, we lean on the model_path
         # to provide it.
