@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import shutil
+import struct
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
 from max.driver import Buffer
+from max.dtype import DType
 from max.graph.weights import WeightsFormat
 from max.graph.weights import WeightData
 
@@ -18,6 +21,60 @@ Flux2ActivationScheme = Literal["static", "dynamic"]
 _DYNAMIC_ADAPTED_FORMAT = "dynamic_block_fp8_v1"
 _STATIC_ADAPTED_FORMAT = "legacy_scalar_static_v2"
 _STATIC_REPO_FORMAT = "legacy_scalar_static_repo_v1"
+
+# Mapping from MAX DType to the dtype name string expected by safetensors'
+# framework-agnostic serialize_file (numpy/torch style names, e.g. "float32").
+_DTYPE_TO_SAFETENSORS: dict[DType, str] = {
+    DType.bool: "bool",
+    DType.uint8: "uint8",
+    DType.int8: "int8",
+    DType.int16: "int16",
+    DType.int32: "int32",
+    DType.int64: "int64",
+    DType.float16: "float16",
+    DType.bfloat16: "bfloat16",
+    DType.float32: "float32",
+    DType.float8_e4m3fn: "float8_e4m3fn",
+    DType.float8_e5m2: "float8_e5m2",
+}
+
+
+# ---------------------------------------------------------------------------
+# Low-level Buffer helpers (ctypes only, no numpy / torch)
+# ---------------------------------------------------------------------------
+
+
+def _buffer_to_bytes(buf: Buffer) -> bytes:
+    """Return a copy of *buf*'s raw memory as a Python :class:`bytes` object."""
+    nbytes = buf.num_elements * buf.element_size
+    return bytes(ctypes.string_at(buf._data_ptr(), nbytes))
+
+
+def _memmove_buffer(dst: Buffer, dst_offset_bytes: int, src: Buffer) -> None:
+    """Copy all bytes of *src* into *dst* at *dst_offset_bytes*."""
+    nbytes = src.num_elements * src.element_size
+    ctypes.memmove(dst._data_ptr() + dst_offset_bytes, src._data_ptr(), nbytes)
+
+
+def _fill_float32_buffer(shape: list[int], value: float) -> Buffer:
+    """Allocate a float32 Buffer and fill every element with *value*."""
+    n = 1
+    for d in shape:
+        n *= d
+    raw = struct.pack(f"<{n}f", *([value] * n))
+    buf = Buffer(DType.float32, shape)
+    ctypes.memmove(buf._data_ptr(), raw, len(raw))
+    return buf
+
+
+def _read_scalar_float32(buf: Buffer) -> float:
+    """Read a single float32 value from a scalar (0-d or 1-element) Buffer."""
+    return struct.unpack_from("<f", ctypes.string_at(buf._data_ptr(), 4))[0]
+
+
+# ---------------------------------------------------------------------------
+# WeightData helpers
+# ---------------------------------------------------------------------------
 
 
 def _clone_weight(weight: WeightData, new_name: str) -> WeightData:
@@ -41,24 +98,155 @@ def _legacy_fp8_input_scale_weight(
 def _slice_rows(
     weight: WeightData, start: int, end: int, new_name: str
 ) -> WeightData:
-    tensor = Buffer.from_dlpack(weight.data)[start:end, :].contiguous()
+    """Slice rows [start, end) from a 2-D WeightData using raw memory copy."""
+    src_buf = weight.data
+    cols = int(weight.shape[1])
+    elem_size = src_buf.element_size
+    new_rows = end - start
+    offset_bytes = start * cols * elem_size
+    slice_bytes = new_rows * cols * elem_size
+    new_buf = Buffer(weight.dtype, [new_rows, cols])
+    ctypes.memmove(new_buf._data_ptr(), src_buf._data_ptr() + offset_bytes, slice_bytes)
+    new_shape = weight.shape.__class__([new_rows, cols])
     return WeightData(
-        data=tensor,
+        data=new_buf,
         name=new_name,
         dtype=weight.dtype,
-        shape=weight.shape.__class__(tensor.shape),
+        shape=new_shape,
         quantization_encoding=weight.quantization_encoding,
     )
 
 
+def _swap_row_halves(weight: WeightData, new_name: str) -> WeightData:
+    """Return a new WeightData whose first and second row-halves are swapped.
+
+    BFLabs stores adaLN_modulation output as [shift; scale] but MAX expects
+    [scale; shift].  This function performs the swap without torch or numpy by
+    working directly on the underlying Buffer bytes via ctypes.
+    """
+    src_buf = weight.data
+    N = int(weight.shape[0])
+    half = N // 2
+    cols = int(weight.shape[1]) if len(weight.shape) > 1 else 1
+    half_bytes = half * cols * src_buf.element_size
+
+    new_buf = Buffer(weight.dtype, list(weight.shape))
+    # second half of src → first position of dst
+    ctypes.memmove(new_buf._data_ptr(), src_buf._data_ptr() + half_bytes, half_bytes)
+    # first half of src → second position of dst
+    ctypes.memmove(new_buf._data_ptr() + half_bytes, src_buf._data_ptr(), half_bytes)
+
+    return WeightData(
+        data=new_buf,
+        name=new_name,
+        dtype=weight.dtype,
+        shape=weight.shape,
+        quantization_encoding=weight.quantization_encoding,
+    )
+
+
+def _tile_scalar_fp8_scale(
+    scale: WeightData,
+    weight: WeightData,
+    new_name: str,
+    block_n: int = 128,
+    block_k: int = 128,
+) -> WeightData:
+    """Expand a per-tensor (scalar) FP8 weight_scale to blockwise 2-D format.
+
+    The dynamic FP8 kernel expects scale shape [out_blocks, in_blocks] where
+    every entry equals the original scalar.  Broadcasting the scalar this way
+    reproduces the original scalar dequantization (``w_fp8 * scale``) exactly
+    across all blocks with zero additional quantization error.
+    """
+    scalar_val = _read_scalar_float32(scale.data)
+    out_blocks = (int(weight.shape[0]) + block_n - 1) // block_n
+    in_blocks = (int(weight.shape[1]) + block_k - 1) // block_k
+    new_shape = [out_blocks, in_blocks]
+    new_buf = _fill_float32_buffer(new_shape, scalar_val)
+    return WeightData(
+        data=new_buf,
+        name=new_name,
+        dtype=DType.float32,
+        shape=scale.shape.__class__(new_shape),
+        quantization_encoding=scale.quantization_encoding,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Safetensors I/O (MAX-native reader, framework-agnostic writer)
+# ---------------------------------------------------------------------------
+
+
+def _read_safetensors_metadata(path: Path) -> dict[str, str]:
+    """Read the ``__metadata__`` dict from a safetensors header.
+
+    Parses the binary header using :mod:`struct` and :mod:`json` — no
+    ML framework required.
+    """
+    with open(path, "rb") as f:
+        header_size = struct.unpack_from("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_size))
+    return header.get("__metadata__") or {}
+
+
+def _load_safetensors_as_weight_data(path: Path) -> dict[str, WeightData]:
+    """Load a safetensors file into a ``{name: WeightData}`` dict.
+
+    Uses MAX's own ``max._core.safetensors.safe_open`` which returns
+    :class:`~max.driver.Buffer` objects directly — no torch or numpy.
+    """
+    from max._core.safetensors import safe_open
+
+    result: dict[str, WeightData] = {}
+    with safe_open(path) as f:
+        for key in f.keys():
+            buf = f.get_buffer(key)
+            result[key] = WeightData(
+                data=buf,
+                name=key,
+                dtype=buf.dtype,
+                shape=buf.shape,
+            )
+    return result
+
+
+def _save_weight_data_to_safetensors(
+    tensors: dict[str, WeightData],
+    path: Path,
+    metadata: dict[str, str],
+) -> None:
+    """Write *tensors* to a safetensors file using the framework-agnostic API.
+
+    ``safetensors.serialize_file`` accepts raw ``{"dtype", "shape", "data"}``
+    dicts, so no torch or numpy is needed — raw bytes are extracted from each
+    Buffer via :mod:`ctypes`.
+    """
+    from safetensors import serialize_file
+
+    raw: dict[str, dict[str, Any]] = {}
+    for name, wd in tensors.items():
+        dtype_str = _DTYPE_TO_SAFETENSORS.get(wd.dtype)
+        if dtype_str is None:
+            raise ValueError(
+                f"Unsupported dtype {wd.dtype} for safetensors serialisation "
+                f"(tensor '{name}')."
+            )
+        raw[name] = {
+            "dtype": dtype_str,
+            "shape": list(int(d) for d in wd.shape),
+            "data": _buffer_to_bytes(wd.data),
+        }
+    serialize_file(raw, str(path), metadata=metadata)
+
+
+# ---------------------------------------------------------------------------
+# BFLabs checkpoint detection helpers
+# ---------------------------------------------------------------------------
+
+
 def is_bflabs_flux2_transformer_checkpoint(
     state_dict: Mapping[str, WeightData],
-) -> bool:
-    return "img_in.weight" in state_dict and "txt_in.weight" in state_dict
-
-
-def _is_bflabs_flux2_transformer_tensor_checkpoint(
-    state_dict,
 ) -> bool:
     return "img_in.weight" in state_dict and "txt_in.weight" in state_dict
 
@@ -70,6 +258,11 @@ def uses_legacy_scalar_fp8_scales(
         key.endswith(".weight_scale") and tuple(int(d) for d in value.shape) == ()
         for key, value in state_dict.items()
     )
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
 
 
 def _adapted_flux2_transformer_path(
@@ -136,6 +329,11 @@ def _resolve_repo_file_paths(
     return dict(zip(filenames, resolved, strict=True))
 
 
+# ---------------------------------------------------------------------------
+# Main adaptation entry-point
+# ---------------------------------------------------------------------------
+
+
 def adapt_bflabs_flux2_transformer_weights(
     path: Path, *, activation_scheme: Flux2ActivationScheme = "dynamic"
 ) -> Path:
@@ -143,6 +341,10 @@ def adapt_bflabs_flux2_transformer_weights(
 
     The adapted checkpoint is created once and then reused on subsequent loads.
     Non-BFLabs checkpoints are returned unchanged.
+
+    Uses only MAX-native types (Buffer / WeightData / DType) for all tensor
+    operations.  File I/O uses ``max._core.safetensors`` for reading and
+    ``safetensors.serialize_file`` (framework-agnostic) for writing.
     """
     adapted_path = _adapted_flux2_transformer_path(path, activation_scheme)
     expected_format = (
@@ -151,37 +353,34 @@ def adapt_bflabs_flux2_transformer_weights(
         else _STATIC_ADAPTED_FORMAT
     )
     if adapted_path.exists():
-        from safetensors import safe_open
-
-        with safe_open(str(adapted_path), framework="pt", device="cpu") as f:
-            metadata = f.metadata() or {}
+        metadata = _read_safetensors_metadata(adapted_path)
         if metadata.get("max_flux2_adapted_format") == expected_format:
             return adapted_path
 
-    from safetensors import safe_open
-    from safetensors.torch import save_file
+    state_dict = _load_safetensors_as_weight_data(path)
 
-    with safe_open(str(path), framework="pt", device="cpu") as f:
-        state_dict = {key: f.get_tensor(key) for key in f.keys()}
-        metadata = f.metadata()
-
-    if not _is_bflabs_flux2_transformer_tensor_checkpoint(state_dict):
+    if not is_bflabs_flux2_transformer_checkpoint(state_dict):
         return path
 
-    if activation_scheme == "dynamic":
-        tensors = _convert_safetensor_torch_state_dict_dynamic(state_dict)
-    else:
-        tensors = _convert_safetensor_torch_state_dict_static(state_dict)
+    converted = convert_safetensor_state_dict(
+        state_dict, activation_scheme=activation_scheme
+    )
 
     adapted_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = adapted_path.with_name(f"{adapted_path.name}.tmp")
-    out_metadata = dict(metadata or {})
-    out_metadata["max_flux2_adapted"] = "true"
-    out_metadata["max_flux2_adapted_format"] = expected_format
-    out_metadata["max_flux2_activation_scheme"] = activation_scheme
-    save_file(tensors, str(tmp_path), metadata=out_metadata)
+    out_metadata: dict[str, str] = {
+        "max_flux2_adapted": "true",
+        "max_flux2_adapted_format": expected_format,
+        "max_flux2_activation_scheme": activation_scheme,
+    }
+    _save_weight_data_to_safetensors(converted, tmp_path, out_metadata)
     tmp_path.replace(adapted_path)
     return adapted_path
+
+
+# ---------------------------------------------------------------------------
+# Repo materialisation (legacy — kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 
 def materialize_bflabs_flux2_klein_static_repo(
@@ -304,235 +503,9 @@ def materialize_bflabs_flux2_klein_static_repo(
     return repo_root
 
 
-def _clone_torch_weight(tensor, /):
-    return tensor.detach().clone()
-
-
-def _legacy_fp8_input_scale_tensor(tensor, /):
-    # Static FP8 kernels consume the checkpoint's direct scalar input_scale.
-    # Keep the source value unchanged when adapting legacy scalar checkpoints.
-    return _clone_torch_weight(tensor)
-
-
-def _slice_rows_torch(tensor, start: int, end: int, /):
-    return tensor[start:end, :].contiguous()
-
-
-def _quantize_blockwise_fp8_tensor(
-    weight, *, block_n: int = 128, block_k: int = 128
-):
-    import torch
-
-    if weight.ndim != 2:
-        raise ValueError(f"expected rank-2 tensor, got {tuple(weight.shape)}")
-
-    out_dim = int(weight.shape[0])
-    in_dim = int(weight.shape[1])
-    out_blocks = (out_dim + block_n - 1) // block_n
-    in_blocks = (in_dim + block_k - 1) // block_k
-
-    w = weight.to(torch.float32)
-    padded_out = out_blocks * block_n
-    padded_in = in_blocks * block_k
-    if padded_out != out_dim or padded_in != in_dim:
-        w = torch.nn.functional.pad(
-            w,
-            (0, padded_in - in_dim, 0, padded_out - out_dim),
-            mode="constant",
-            value=0.0,
-        )
-
-    w_blocks = w.reshape(out_blocks, block_n, in_blocks, block_k)
-    block_absmax = w_blocks.abs().amax(dim=(1, 3))
-    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
-    scales = torch.clamp(block_absmax / fp8_max, min=1e-8).to(torch.float32)
-    w_scaled = w_blocks / scales[:, None, :, None]
-    w_q = (
-        w_scaled.reshape(padded_out, padded_in)[:out_dim, :in_dim]
-        .to(torch.float8_e4m3fn)
-        .contiguous()
-    )
-    return w_q, scales.contiguous()
-
-
-def _convert_safetensor_torch_state_dict_dynamic(state_dict):
-    import torch
-
-    if not _is_bflabs_flux2_transformer_tensor_checkpoint(state_dict):
-        return {name: _clone_torch_weight(tensor) for name, tensor in state_dict.items()}
-
-    converted = {}
-
-    def _convert_weight(old_key: str, tensor):
-        scale_key = old_key[: -len(".weight")] + ".weight_scale"
-        scale = state_dict.get(scale_key)
-        if tensor.dtype == torch.float8_e4m3fn and scale is not None and scale.numel() == 1:
-            # Tile the scalar weight_scale to blockwise format without re-quantizing
-            # the FP8 weights. The previous approach (dequant -> blockwise requant)
-            # added a second round of quantization error on top of the original.
-            # Instead, keep the exact original FP8 values and broadcast the scalar
-            # scale across all 128x128 blocks: the kernel dequantizes each element
-            # as w_fp8 * block_scale, so tiling the scalar reproduces the original
-            # scalar dequantization exactly with zero additional quantization error.
-            block_n, block_k = 128, 128
-            out_blocks = (int(tensor.shape[0]) + block_n - 1) // block_n
-            in_blocks = (int(tensor.shape[1]) + block_k - 1) // block_k
-            tiled_scale = (
-                scale.to(torch.float32)
-                .expand(out_blocks, in_blocks)
-                .clone()
-                .contiguous()
-            )
-            return tensor.contiguous(), tiled_scale
-        return _clone_torch_weight(tensor), None
-
-    direct_mappings = {
-        "time_in.in_layer.weight": "time_guidance_embed.timestep_embedder.linear_1.weight",
-        "time_in.out_layer.weight": "time_guidance_embed.timestep_embedder.linear_2.weight",
-        "img_in.weight": "x_embedder.weight",
-        "txt_in.weight": "context_embedder.weight",
-        "double_stream_modulation_img.lin.weight": "double_stream_modulation_img.linear.weight",
-        "double_stream_modulation_txt.lin.weight": "double_stream_modulation_txt.linear.weight",
-        "single_stream_modulation.lin.weight": "single_stream_modulation.linear.weight",
-        "final_layer.linear.weight": "proj_out.weight",
-    }
-    for old_name, new_name in direct_mappings.items():
-        if old_name in state_dict:
-            weight, weight_scale = _convert_weight(old_name, state_dict[old_name])
-            converted[new_name] = weight
-            if weight_scale is not None:
-                converted[new_name[: -len(".weight")] + ".weight_scale"] = weight_scale
-
-    # BFLabs stores adaLN_modulation output as [shift; scale] but diffusers/MAX
-    # AdaLayerNormContinuous expects [scale; shift] (scale first). Swap the halves.
-    if "final_layer.adaLN_modulation.1.weight" in state_dict:
-        raw, weight_scale = _convert_weight(
-            "final_layer.adaLN_modulation.1.weight",
-            state_dict["final_layer.adaLN_modulation.1.weight"],
-        )
-        half = int(raw.shape[0]) // 2
-        converted["norm_out.linear.weight"] = torch.cat(
-            [raw[half:], raw[:half]], dim=0
-        ).contiguous()
-        if weight_scale is not None:
-            converted["norm_out.linear.weight_scale"] = weight_scale
-
-    for key, tensor in state_dict.items():
-        if key.endswith(".input_scale") or key.endswith(".weight_scale"):
-            continue
-
-        img_match = re.fullmatch(r"double_blocks\.(\d+)\.img_attn\.qkv\.weight", key)
-        if img_match:
-            idx = img_match.group(1)
-            dim = int(tensor.shape[0]) // 3
-            for new_name, start, end in (
-                (f"transformer_blocks.{idx}.attn.to_q.weight", 0, dim),
-                (f"transformer_blocks.{idx}.attn.to_k.weight", dim, 2 * dim),
-                (f"transformer_blocks.{idx}.attn.to_v.weight", 2 * dim, 3 * dim),
-            ):
-                weight, weight_scale = _convert_weight(
-                    key, _slice_rows_torch(tensor, start, end)
-                )
-                converted[new_name] = weight
-                if weight_scale is not None:
-                    converted[new_name[: -len(".weight")] + ".weight_scale"] = (
-                        weight_scale
-                    )
-            continue
-
-        txt_match = re.fullmatch(r"double_blocks\.(\d+)\.txt_attn\.qkv\.weight", key)
-        if txt_match:
-            idx = txt_match.group(1)
-            dim = int(tensor.shape[0]) // 3
-            for new_name, start, end in (
-                (f"transformer_blocks.{idx}.attn.add_q_proj.weight", 0, dim),
-                (f"transformer_blocks.{idx}.attn.add_k_proj.weight", dim, 2 * dim),
-                (f"transformer_blocks.{idx}.attn.add_v_proj.weight", 2 * dim, 3 * dim),
-            ):
-                weight, weight_scale = _convert_weight(
-                    key, _slice_rows_torch(tensor, start, end)
-                )
-                converted[new_name] = weight
-                if weight_scale is not None:
-                    converted[new_name[: -len(".weight")] + ".weight_scale"] = (
-                        weight_scale
-                    )
-            continue
-
-        replacements = (
-            (
-                r"double_blocks\.(\d+)\.img_attn\.proj\.weight",
-                r"transformer_blocks.\1.attn.to_out.0.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_attn\.proj\.weight",
-                r"transformer_blocks.\1.attn.to_add_out.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_attn\.norm\.query_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_q.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_attn\.norm\.key_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_k.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_attn\.norm\.query_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_added_q.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_attn\.norm\.key_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_added_k.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_mlp\.0\.weight",
-                r"transformer_blocks.\1.ff.linear_in.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_mlp\.2\.weight",
-                r"transformer_blocks.\1.ff.linear_out.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_mlp\.0\.weight",
-                r"transformer_blocks.\1.ff_context.linear_in.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_mlp\.2\.weight",
-                r"transformer_blocks.\1.ff_context.linear_out.weight",
-            ),
-            (
-                r"single_blocks\.(\d+)\.linear1\.weight",
-                r"single_transformer_blocks.\1.attn.to_qkv_mlp_proj.weight",
-            ),
-            (
-                r"single_blocks\.(\d+)\.linear2\.weight",
-                r"single_transformer_blocks.\1.attn.to_out.weight",
-            ),
-            (
-                r"single_blocks\.(\d+)\.norm\.query_norm\.scale",
-                r"single_transformer_blocks.\1.attn.norm_q.weight",
-            ),
-            (
-                r"single_blocks\.(\d+)\.norm\.key_norm\.scale",
-                r"single_transformer_blocks.\1.attn.norm_k.weight",
-            ),
-        )
-        for pattern, replacement in replacements:
-            mapped = re.sub(pattern, replacement, key)
-            if mapped != key:
-                if mapped.endswith(".weight"):
-                    weight, weight_scale = _convert_weight(key, tensor)
-                    converted[mapped] = weight
-                    if weight_scale is not None:
-                        converted[mapped[: -len(".weight")] + ".weight_scale"] = (
-                            weight_scale
-                        )
-                else:
-                    converted[mapped] = _clone_torch_weight(tensor)
-                break
-
-    _validate_required_flux2_prefixes(converted)
-    return converted
+# ---------------------------------------------------------------------------
+# Validation helper
+# ---------------------------------------------------------------------------
 
 
 def _validate_required_flux2_prefixes(
@@ -556,207 +529,25 @@ def _validate_required_flux2_prefixes(
                 f"Missing required flux2 transformer weights with prefix '{prefix}'"
             )
 
-def _convert_safetensor_torch_state_dict_static(state_dict):
-    import torch
 
-    if not _is_bflabs_flux2_transformer_tensor_checkpoint(state_dict):
-        return {
-            name: _clone_torch_weight(tensor) for name, tensor in state_dict.items()
-        }
-
-    converted = {}
-
-    direct_mappings = {
-        "time_in.in_layer.weight": "time_guidance_embed.timestep_embedder.linear_1.weight",
-        "time_in.out_layer.weight": "time_guidance_embed.timestep_embedder.linear_2.weight",
-        "img_in.weight": "x_embedder.weight",
-        "txt_in.weight": "context_embedder.weight",
-        "double_stream_modulation_img.lin.weight": "double_stream_modulation_img.linear.weight",
-        "double_stream_modulation_txt.lin.weight": "double_stream_modulation_txt.linear.weight",
-        "single_stream_modulation.lin.weight": "single_stream_modulation.linear.weight",
-        "final_layer.linear.weight": "proj_out.weight",
-    }
-    for old_name, new_name in direct_mappings.items():
-        if old_name in state_dict:
-            converted[new_name] = _clone_torch_weight(state_dict[old_name])
-
-    # BFLabs stores adaLN_modulation output as [shift; scale] but diffusers/MAX
-    # AdaLayerNormContinuous expects [scale; shift] (scale first). Swap the halves.
-    if "final_layer.adaLN_modulation.1.weight" in state_dict:
-        raw = _clone_torch_weight(state_dict["final_layer.adaLN_modulation.1.weight"])
-        half = int(raw.shape[0]) // 2
-        converted["norm_out.linear.weight"] = torch.cat(
-            [raw[half:], raw[:half]], dim=0
-        ).contiguous()
-
-    for key, tensor in state_dict.items():
-        img_match = re.fullmatch(r"double_blocks\.(\d+)\.img_attn\.qkv\.weight", key)
-        if img_match:
-            idx = img_match.group(1)
-            dim = int(tensor.shape[0]) // 3
-            converted[f"transformer_blocks.{idx}.attn.to_q.weight"] = _slice_rows_torch(
-                tensor, 0, dim
-            )
-            converted[f"transformer_blocks.{idx}.attn.to_k.weight"] = _slice_rows_torch(
-                tensor, dim, 2 * dim
-            )
-            converted[f"transformer_blocks.{idx}.attn.to_v.weight"] = _slice_rows_torch(
-                tensor, 2 * dim, 3 * dim
-            )
-            continue
-
-        txt_match = re.fullmatch(r"double_blocks\.(\d+)\.txt_attn\.qkv\.weight", key)
-        if txt_match:
-            idx = txt_match.group(1)
-            dim = int(tensor.shape[0]) // 3
-            converted[
-                f"transformer_blocks.{idx}.attn.add_q_proj.weight"
-            ] = _slice_rows_torch(tensor, 0, dim)
-            converted[
-                f"transformer_blocks.{idx}.attn.add_k_proj.weight"
-            ] = _slice_rows_torch(tensor, dim, 2 * dim)
-            converted[
-                f"transformer_blocks.{idx}.attn.add_v_proj.weight"
-            ] = _slice_rows_torch(tensor, 2 * dim, 3 * dim)
-            continue
-
-        img_match = re.fullmatch(
-            r"double_blocks\.(\d+)\.img_attn\.qkv\.(input_scale|weight_scale)",
-            key,
-        )
-        if img_match:
-            idx, suffix = img_match.groups()
-            for proj in ("to_q", "to_k", "to_v"):
-                new_name = f"transformer_blocks.{idx}.attn.{proj}.{suffix}"
-                converted[new_name] = (
-                    _legacy_fp8_input_scale_tensor(tensor)
-                    if suffix == "input_scale"
-                    else _clone_torch_weight(tensor)
-                )
-            continue
-
-        txt_match = re.fullmatch(
-            r"double_blocks\.(\d+)\.txt_attn\.qkv\.(input_scale|weight_scale)",
-            key,
-        )
-        if txt_match:
-            idx, suffix = txt_match.groups()
-            for proj in ("add_q_proj", "add_k_proj", "add_v_proj"):
-                new_name = f"transformer_blocks.{idx}.attn.{proj}.{suffix}"
-                converted[new_name] = (
-                    _legacy_fp8_input_scale_tensor(tensor)
-                    if suffix == "input_scale"
-                    else _clone_torch_weight(tensor)
-                )
-            continue
-
-        replacements = (
-            (
-                r"double_blocks\.(\d+)\.img_attn\.proj\.weight",
-                r"transformer_blocks.\1.attn.to_out.0.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_attn\.proj\.(input_scale|weight_scale)",
-                r"transformer_blocks.\1.attn.to_out.0.\2",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_attn\.proj\.weight",
-                r"transformer_blocks.\1.attn.to_add_out.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_attn\.proj\.(input_scale|weight_scale)",
-                r"transformer_blocks.\1.attn.to_add_out.\2",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_attn\.norm\.query_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_q.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_attn\.norm\.key_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_k.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_attn\.norm\.query_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_added_q.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_attn\.norm\.key_norm\.scale",
-                r"transformer_blocks.\1.attn.norm_added_k.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_mlp\.0\.weight",
-                r"transformer_blocks.\1.ff.linear_in.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_mlp\.0\.(input_scale|weight_scale)",
-                r"transformer_blocks.\1.ff.linear_in.\2",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_mlp\.2\.weight",
-                r"transformer_blocks.\1.ff.linear_out.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.img_mlp\.2\.(input_scale|weight_scale)",
-                r"transformer_blocks.\1.ff.linear_out.\2",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_mlp\.0\.weight",
-                r"transformer_blocks.\1.ff_context.linear_in.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_mlp\.0\.(input_scale|weight_scale)",
-                r"transformer_blocks.\1.ff_context.linear_in.\2",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_mlp\.2\.weight",
-                r"transformer_blocks.\1.ff_context.linear_out.weight",
-            ),
-            (
-                r"double_blocks\.(\d+)\.txt_mlp\.2\.(input_scale|weight_scale)",
-                r"transformer_blocks.\1.ff_context.linear_out.\2",
-            ),
-            (
-                r"single_blocks\.(\d+)\.linear1\.weight",
-                r"single_transformer_blocks.\1.attn.to_qkv_mlp_proj.weight",
-            ),
-            (
-                r"single_blocks\.(\d+)\.linear1\.(input_scale|weight_scale)",
-                r"single_transformer_blocks.\1.attn.to_qkv_mlp_proj.\2",
-            ),
-            (
-                r"single_blocks\.(\d+)\.linear2\.weight",
-                r"single_transformer_blocks.\1.attn.to_out.weight",
-            ),
-            (
-                r"single_blocks\.(\d+)\.linear2\.(input_scale|weight_scale)",
-                r"single_transformer_blocks.\1.attn.to_out.\2",
-            ),
-            (
-                r"single_blocks\.(\d+)\.norm\.query_norm\.scale",
-                r"single_transformer_blocks.\1.attn.norm_q.weight",
-            ),
-            (
-                r"single_blocks\.(\d+)\.norm\.key_norm\.scale",
-                r"single_transformer_blocks.\1.attn.norm_k.weight",
-            ),
-        )
-        for pattern, replacement in replacements:
-            mapped = re.sub(pattern, replacement, key)
-            if mapped != key:
-                converted[mapped] = (
-                    _legacy_fp8_input_scale_tensor(tensor)
-                    if mapped.endswith(".input_scale")
-                    else _clone_torch_weight(tensor)
-                )
-                break
-
-    _validate_required_flux2_prefixes(converted)
-    return converted
+# ---------------------------------------------------------------------------
+# Runtime weight adapter  (WeightData → WeightData)
+# ---------------------------------------------------------------------------
 
 
 def convert_safetensor_state_dict(
     state_dict: Mapping[str, WeightData],
+    activation_scheme: Flux2ActivationScheme = "static",
 ) -> dict[str, WeightData]:
+    """Remap BFLabs-format Flux2 transformer keys to MAX-native names.
+
+    All tensor operations use MAX's :class:`~max.driver.Buffer` and
+    :class:`~max.graph.weights.WeightData` — no torch or numpy.
+
+    When *activation_scheme* is ``"dynamic"``, any per-tensor (scalar)
+    ``weight_scale`` associated with an FP8 weight is tiled to the blockwise
+    2-D format expected by the dynamic FP8 kernel.
+    """
     if not is_bflabs_flux2_transformer_checkpoint(state_dict):
         return dict(state_dict)
 
@@ -776,22 +567,12 @@ def convert_safetensor_state_dict(
         if old_name in state_dict:
             converted[new_name] = _clone_weight(state_dict[old_name], new_name)
 
-    # BFLabs stores adaLN_modulation output as [shift; scale] but diffusers/MAX
-    # AdaLayerNormContinuous expects [scale; shift] (scale first). Swap the halves.
+    # BFLabs stores adaLN_modulation output as [shift; scale] but MAX
+    # AdaLayerNormContinuous expects [scale; shift] (scale first). Swap rows.
     if "final_layer.adaLN_modulation.1.weight" in state_dict:
-        import torch
-
-        src = state_dict["final_layer.adaLN_modulation.1.weight"]
-        half = int(src.shape[0]) // 2
-        # WeightData implements __dlpack__ so torch.from_dlpack works directly.
-        raw_t = torch.from_dlpack(src).clone()
-        swapped_t = torch.cat([raw_t[half:], raw_t[:half]], dim=0).contiguous()
-        converted["norm_out.linear.weight"] = WeightData(
-            data=Buffer.from_dlpack(swapped_t),
-            name="norm_out.linear.weight",
-            dtype=src.dtype,
-            shape=src.shape,
-            quantization_encoding=src.quantization_encoding,
+        converted["norm_out.linear.weight"] = _swap_row_halves(
+            state_dict["final_layer.adaLN_modulation.1.weight"],
+            "norm_out.linear.weight",
         )
 
     for key, weight in state_dict.items():
@@ -800,22 +581,13 @@ def convert_safetensor_state_dict(
             idx = img_match.group(1)
             dim = int(weight.shape[0]) // 3
             converted[f"transformer_blocks.{idx}.attn.to_q.weight"] = _slice_rows(
-                weight,
-                0,
-                dim,
-                f"transformer_blocks.{idx}.attn.to_q.weight",
+                weight, 0, dim, f"transformer_blocks.{idx}.attn.to_q.weight"
             )
             converted[f"transformer_blocks.{idx}.attn.to_k.weight"] = _slice_rows(
-                weight,
-                dim,
-                2 * dim,
-                f"transformer_blocks.{idx}.attn.to_k.weight",
+                weight, dim, 2 * dim, f"transformer_blocks.{idx}.attn.to_k.weight"
             )
             converted[f"transformer_blocks.{idx}.attn.to_v.weight"] = _slice_rows(
-                weight,
-                2 * dim,
-                3 * dim,
-                f"transformer_blocks.{idx}.attn.to_v.weight",
+                weight, 2 * dim, 3 * dim, f"transformer_blocks.{idx}.attn.to_v.weight"
             )
             continue
 
@@ -824,22 +596,13 @@ def convert_safetensor_state_dict(
             idx = txt_match.group(1)
             dim = int(weight.shape[0]) // 3
             converted[f"transformer_blocks.{idx}.attn.add_q_proj.weight"] = _slice_rows(
-                weight,
-                0,
-                dim,
-                f"transformer_blocks.{idx}.attn.add_q_proj.weight",
+                weight, 0, dim, f"transformer_blocks.{idx}.attn.add_q_proj.weight"
             )
             converted[f"transformer_blocks.{idx}.attn.add_k_proj.weight"] = _slice_rows(
-                weight,
-                dim,
-                2 * dim,
-                f"transformer_blocks.{idx}.attn.add_k_proj.weight",
+                weight, dim, 2 * dim, f"transformer_blocks.{idx}.attn.add_k_proj.weight"
             )
             converted[f"transformer_blocks.{idx}.attn.add_v_proj.weight"] = _slice_rows(
-                weight,
-                2 * dim,
-                3 * dim,
-                f"transformer_blocks.{idx}.attn.add_v_proj.weight",
+                weight, 2 * dim, 3 * dim, f"transformer_blocks.{idx}.attn.add_v_proj.weight"
             )
             continue
 
@@ -973,6 +736,22 @@ def convert_safetensor_state_dict(
                 )
                 break
 
+    # For the dynamic activation scheme, tile any scalar (per-tensor)
+    # weight_scale associated with an FP8 weight to blockwise 2-D format.
+    if activation_scheme == "dynamic":
+        for name in list(converted.keys()):
+            if not name.endswith(".weight_scale"):
+                continue
+            scale_wd = converted[name]
+            if tuple(int(d) for d in scale_wd.shape) != ():
+                continue  # already blockwise
+            weight_name = name[: -len("_scale")]  # strip "_scale" → ".weight"
+            weight_wd = converted.get(weight_name)
+            if weight_wd is not None and weight_wd.dtype == DType.float8_e4m3fn:
+                converted[name] = _tile_scalar_fp8_scale(
+                    scale_wd, weight_wd, name
+                )
+
     required_prefixes = (
         "time_guidance_embed.timestep_embedder.",
         "x_embedder.",
@@ -986,7 +765,7 @@ def convert_safetensor_state_dict(
         "proj_out.",
     )
     for prefix in required_prefixes:
-        if not any(name.startswith(prefix) for name in converted):
+        if not any(n.startswith(prefix) for n in converted):
             raise ValueError(
                 f"Missing required flux2 transformer weights with prefix '{prefix}'"
             )
