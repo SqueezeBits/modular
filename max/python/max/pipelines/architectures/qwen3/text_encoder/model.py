@@ -146,27 +146,19 @@ class Qwen3TextEncoderModel(ComponentModel):
     @staticmethod
     def attention_bias_from_attention_mask_array(
         attention_mask: np.ndarray,
-        *,
-        expected_seq_len: int | None = None,
     ) -> np.ndarray:
+        """Build a broadcastable additive attention bias from a token mask.
+
+        Args:
+            attention_mask: Boolean token mask for one prompt sequence.
+
+        Returns:
+            Float32 additive mask of shape ``[1, 1, seq_len, seq_len]``.
+        """
         additive_mask = causal_attention_mask_with_token_mask(
             [0],
             attention_mask,
         )
-        # TODO: Lift this batch_size=1 restriction if the Klein text-encoder
-        # path needs batched prompt-mask handling.
-        if additive_mask.shape[0] != 1:
-            raise ValueError(
-                f"batch size must be 1, got {additive_mask.shape[0]}."
-            )
-        if (
-            expected_seq_len is not None
-            and additive_mask.shape[1] != expected_seq_len
-        ):
-            raise ValueError(
-                "seq_len must match tokens "
-                f"({additive_mask.shape[1]} != {expected_seq_len})."
-            )
         return additive_mask[:, np.newaxis, :, :].astype(np.float32, copy=False)
 
     def __call__(
@@ -176,23 +168,29 @@ class Qwen3TextEncoderModel(ComponentModel):
         *,
         hidden_state_index: int | None = None,
     ):
-        if tokens.rank == 2:
-            if int(tokens.shape[0]) != 1:
-                raise ValueError(
-                    "Qwen3TextEncoderModel expects batch_size=1 for 2D token input."
-                )
-            tokens = tokens[0]
+        """Encode one prompt sequence and optionally select a single output.
 
+        Args:
+            tokens: Token IDs for a single prompt sequence with shape
+                ``[seq_len]``.
+            attention_mask: Optional tokenizer-generated boolean mask aligned
+                with ``tokens``. When omitted, all token positions are treated
+                as valid.
+            hidden_state_index: Optional output index to select from the
+                compiled model outputs.
+
+        Returns:
+            Either the fused prompt embeddings tensor or, when
+            ``hidden_state_index`` is provided, the selected output tensor.
+        """
         if attention_mask is not None:
             attention_mask_np = np.asarray(attention_mask)
             attention_bias_np = self.attention_bias_from_attention_mask_array(
                 attention_mask_np,
-                expected_seq_len=int(tokens.shape[0]),
             )
         else:
             attention_bias_np = self.attention_bias_from_attention_mask_array(
                 np.ones((int(tokens.shape[0]),), dtype=np.bool_),
-                expected_seq_len=int(tokens.shape[0]),
             )
 
         attention_bias = Tensor(

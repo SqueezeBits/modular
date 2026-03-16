@@ -94,6 +94,9 @@ class EncoderAttention(Module[..., Tensor]):
         Args:
             x: Input tensor with shape [total_seq_len, hidden_dim]
             rope: RotaryEmbedding module
+            attention_bias: Additive attention bias with shape
+                [1, 1, seq_len, seq_len]. The singleton head axis is removed
+                before dispatching to ``masked_flash_attention_gpu``.
         Returns:
             Output tensor with shape [total_seq_len, hidden_dim]
         """

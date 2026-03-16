@@ -154,6 +154,8 @@ class TestPixelGenerationTokenizer:
         assert attention_mask.dtype == np.bool_
         assert len(token_ids) == 77  # max_length
         assert len(attention_mask) == 77
+        assert attention_mask.any()
+        assert not attention_mask.all()
 
     @pytest.mark.asyncio
     async def test_new_context_flux(
@@ -193,8 +195,12 @@ class TestPixelGenerationTokenizer:
         assert context.num_inference_steps == 50
         assert context.guidance_scale == 3.5
         assert context.tokens is not None
+        assert context.mask is not None
         assert context.latents is not None
         assert context.timesteps is not None
+        assert context.mask.shape == context.tokens.array.shape
+        assert context.mask.any()
+        assert not context.mask.all()
 
         # Verify timesteps are normalized correctly for Flux (standard)
         assert np.all(context.timesteps >= 0.0)

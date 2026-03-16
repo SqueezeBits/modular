@@ -46,6 +46,9 @@ class Flux2ModelInputs:
     tokens: Tensor
     """Primary encoder token IDs on device."""
 
+    attention_mask: npt.NDArray[np.bool_] | None = None
+    """Tokenizer-generated mask for the padded prompt sequence."""
+
     latents: Tensor
     """Initial latent noise tensor on device."""
 
@@ -184,7 +187,11 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
 
     @traced(message="Flux2Pipeline.prepare_inputs")
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:  # type: ignore[override]
-        """Convert a PixelContext into Flux2ModelInputs."""
+        """Convert a PixelContext into Flux2ModelInputs.
+
+        Moves tokenizer outputs, including the prompt attention mask, onto the
+        devices expected by the text encoder and diffusion transformer.
+        """
         if context.latents.size == 0:
             raise ValueError(
                 "Flux2Pipeline requires non-empty latents in PixelContext"
@@ -245,6 +252,7 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
                     self.text_encoder.devices[0]
                 )
             ),
+            attention_mask=context.mask,
             latents=Tensor(
                 storage=Buffer.from_dlpack(context.latents).to(device)
             ),
@@ -511,7 +519,7 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
         self,
         tokens: Tensor,
         num_images_per_prompt: int = 1,
-        attention_mask: Tensor | npt.ArrayLike | None = None,
+        attention_mask: npt.ArrayLike | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Create prompt embeddings and text position IDs for the transformer.
 
@@ -522,6 +530,8 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
         Args:
             tokens: Token ID tensor of shape (S,) on the text encoder device.
             num_images_per_prompt: Number of image generations per prompt.
+            attention_mask: Optional tokenizer-generated mask aligned with
+                ``tokens``.
 
         Returns:
             A tuple of:
@@ -535,13 +545,10 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
         batch_size = 1
 
         with Tracer("text_encoder"):
-            if attention_mask is None:
-                prompt_embeds = self.text_encoder(tokens)
-            else:
-                prompt_embeds = self.text_encoder(  # type: ignore[call-arg]
-                    tokens,
-                    attention_mask=attention_mask,
-                )
+            prompt_embeds = self.text_encoder(
+                tokens,
+                attention_mask=attention_mask,
+            )
 
         with Tracer("post_process"):
             if num_images_per_prompt != 1:
@@ -731,6 +738,7 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
         prompt_embeds, text_ids = self.prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
+            attention_mask=model_inputs.attention_mask,
         )
         batch_size = int(prompt_embeds.shape[0])
 

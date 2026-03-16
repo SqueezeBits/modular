@@ -38,9 +38,6 @@ class Flux2KleinModelInputs(Flux2ModelInputs):
     negative_tokens: Tensor | None = None
     """Negative prompt token IDs on device (for classifier-free guidance)."""
 
-    attention_mask: np.ndarray | None = None
-    """Tokenizer-generated mask for the padded positive prompt sequence."""
-
     negative_attention_mask: np.ndarray | None = None
     """Tokenizer-generated mask for the padded negative prompt sequence."""
 
@@ -159,7 +156,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
             num_images_per_prompt=base_inputs.num_images_per_prompt,
             input_image=base_inputs.input_image,
             negative_tokens=negative_tokens,
-            attention_mask=context.mask,
+            attention_mask=base_inputs.attention_mask,
             negative_attention_mask=context.negative_mask,
             guidance_scale=context.guidance_scale,
             is_distilled=is_distilled,

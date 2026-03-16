@@ -87,6 +87,8 @@ class EncoderTransformerBlock(Module[..., Tensor]):
         Args:
             x: Input hidden states [seq_len, hidden_dim]
             rope: RoPE embedding module
+            attention_bias: Additive causal+padding mask bias with shape
+                [1, 1, seq_len, seq_len].
         Returns:
             Output hidden states [seq_len, hidden_dim]
         """

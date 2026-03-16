@@ -21,10 +21,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from max.driver import Device
+import numpy as np
+import numpy.typing as npt
+from max.driver import Buffer, Device
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
+from max.pipelines.dataprocessing.causal_attention_mask import (
+    causal_attention_mask_with_token_mask,
+)
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 from max.profiler import traced
@@ -82,8 +87,42 @@ class Mistral3TextEncoderModel(ComponentModel):
         self.model = model.compile(*model.input_types(), weights=state_dict)
         return self.model
 
-    def __call__(self, tokens: Tensor) -> Tensor:
-        outputs = self.model(tokens)
+    def __call__(
+        self,
+        tokens: Tensor,
+        attention_mask: npt.ArrayLike | None = None,
+    ) -> Tensor:
+        """Encode one prompt sequence into fused diffusion prompt embeddings.
+
+        Args:
+            tokens: Token IDs for a single prompt sequence with shape ``[seq_len]``.
+            attention_mask: Optional tokenizer-generated boolean mask aligned
+                with ``tokens``. When omitted, all token positions are treated
+                as valid.
+
+        Returns:
+            Fused prompt embeddings with shape ``[1, seq_len, num_layers *
+            hidden_dim]``.
+        """
+        if attention_mask is not None:
+            attention_mask_np = np.asarray(attention_mask)
+        else:
+            attention_mask_np = np.ones(
+                (int(tokens.shape[0]),),
+                dtype=np.bool_,
+            )
+
+        attention_bias_np = causal_attention_mask_with_token_mask(
+            [0],
+            attention_mask_np,
+            mask_name="attention_mask",
+        )[:, np.newaxis, :, :].astype(np.float32, copy=False)
+
+        attention_bias = Tensor(
+            storage=Buffer.from_numpy(attention_bias_np).to(self.devices[0])
+        )
+
+        outputs = self.model(tokens, attention_bias)
         if isinstance(outputs, (list, tuple)):
             return outputs[0]
         return outputs
