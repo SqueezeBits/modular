@@ -236,12 +236,36 @@ def _maybe_adapt_flux2_klein_fp8_weight_paths(
 
     activation_scheme = model_config.fp8_activation_scheme or "static"
     if activation_scheme != "static":
-        return [
-            adapt_bflabs_flux2_transformer_weights(
-                path, activation_scheme=activation_scheme
+        if len(weight_paths) != 1:
+            raise ValueError(
+                "Expected a single flat safetensors file for FLUX.2 Klein FP8 "
+                f"dynamic loading, got {len(weight_paths)} paths."
             )
-            for path in weight_paths
-        ]
+        adapted_path = adapt_bflabs_flux2_transformer_weights(
+            weight_paths[0], activation_scheme=activation_scheme
+        )
+
+        # Patch diffusers_config and weight_path the same way the static path
+        # does, so _resolve_absolute_paths can match the adapted filename.
+        diffusers_config = model_config.diffusers_config
+        if diffusers_config is None:
+            raise ValueError(
+                "diffusers_config is required for FLUX.2 Klein FP8 dynamic loading."
+            )
+        patched = deepcopy(diffusers_config)
+        transformer_comp = (
+            patched.setdefault("components", {}).setdefault("transformer", {})
+        )
+        transformer_cfg = transformer_comp.setdefault("config_dict", {})
+        quant_cfg = dict(transformer_cfg.get("quantization_config") or {})
+        quant_cfg["quant_method"] = "fp8"
+        quant_cfg["activation_scheme"] = activation_scheme
+        transformer_cfg["quantization_config"] = quant_cfg
+        transformer_cfg["activation_scheme"] = activation_scheme
+        model_config._diffusers_config = patched
+        model_config.weight_path = [Path(adapted_path.name)]
+
+        return [adapted_path]
 
     if len(weight_paths) != 1:
         raise ValueError(
