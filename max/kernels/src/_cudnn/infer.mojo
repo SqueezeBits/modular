@@ -391,10 +391,10 @@ def cudnnSetTensor4dDescriptor(
     tensor_desc: UnsafePointer[cudnnTensorStruct, _],
     format: cudnnTensorFormat_t,
     data_type: cudnnDataType_t,
-    n: Int16,
-    c: Int16,
-    h: Int16,
-    w: Int16,
+    n: Int32,
+    c: Int32,
+    h: Int32,
+    w: Int32,
 ) raises -> cudnnStatus_t:
     return _get_dylib_function[
         "cudnnSetTensor4dDescriptor",
@@ -477,7 +477,7 @@ comptime cudnnActivationDescriptor_t = UnsafePointer[cudnnActivationStruct, _]
 
 @fieldwise_init
 struct cudnnStatus_t(Equatable, TrivialRegisterPassable, Writable):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_STATUS_SUCCESS = Self(0)
     comptime CUDNN_STATUS_NOT_INITIALIZED = Self(1)
     comptime CUDNN_STATUS_ALLOC_FAILED = Self(2)
@@ -495,7 +495,7 @@ struct cudnnStatus_t(Equatable, TrivialRegisterPassable, Writable):
     comptime CUDNN_STATUS_VERSION_MISMATCH = Self(14)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -537,7 +537,7 @@ struct cudnnStatus_t(Equatable, TrivialRegisterPassable, Writable):
             return writer.write_string("CUDNN_STATUS_RUNTIME_FP_OVERFLOW")
         if self is Self.CUDNN_STATUS_VERSION_MISMATCH:
             return writer.write_string("CUDNN_STATUS_VERSION_MISMATCH")
-        abort("invalid cudnnStatus_t entry")
+        t"CUDNN_STATUS_UNKNOWN({self._value})".write_to(writer)
 
     @no_inline
     def write_repr_to(self, mut writer: Some[Writer]):
@@ -607,13 +607,13 @@ def cudnnGetFilter4dDescriptor(
 struct cudnnTensorFormat_t(
     Equatable, Identifiable, TrivialRegisterPassable, Writable
 ):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_TENSOR_NCHW = Self(0)
     comptime CUDNN_TENSOR_NHWC = Self(1)
     comptime CUDNN_TENSOR_NCHW_VECT_C = Self(2)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -1612,7 +1612,7 @@ struct cudnnBatchNormOps_t(
 
 @fieldwise_init
 struct cudnnConvolutionFwdAlgo_t(Equatable, TrivialRegisterPassable, Writable):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM = Self(0)
     comptime CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM = Self(1)
     comptime CUDNN_CONVOLUTION_FWD_ALGO_GEMM = Self(2)
@@ -1624,7 +1624,7 @@ struct cudnnConvolutionFwdAlgo_t(Equatable, TrivialRegisterPassable, Writable):
     comptime CUDNN_CONVOLUTION_FWD_ALGO_COUNT = Self(8)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -2297,14 +2297,14 @@ comptime cudnnDebug_t = cudnnDebugStruct
 struct cudnnMathType_t(
     Equatable, Identifiable, TrivialRegisterPassable, Writable
 ):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_DEFAULT_MATH = Self(0)
     comptime CUDNN_TENSOR_OP_MATH = Self(1)
     comptime CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION = Self(2)
     comptime CUDNN_FMA_MATH = Self(3)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -2444,10 +2444,10 @@ def cudnnSetFilter4dDescriptor(
     filter_desc: UnsafePointer[cudnnFilterStruct, _],
     data_type: cudnnDataType_t,
     format: cudnnTensorFormat_t,
-    k: Int16,
-    c: Int16,
-    h: Int16,
-    w: Int16,
+    k: Int32,
+    c: Int32,
+    h: Int32,
+    w: Int32,
 ) raises -> cudnnStatus_t:
     return _get_dylib_function[
         "cudnnSetFilter4dDescriptor",
@@ -2489,7 +2489,7 @@ def cudnnGetAlgorithmSpaceSize(
 
 @fieldwise_init
 struct cudnnDataType_t(Equatable, TrivialRegisterPassable, Writable):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_DATA_FLOAT = Self(0)
     comptime CUDNN_DATA_DOUBLE = Self(1)
     comptime CUDNN_DATA_HALF = Self(2)
@@ -2507,7 +2507,7 @@ struct cudnnDataType_t(Equatable, TrivialRegisterPassable, Writable):
     comptime CUDNN_DATA_FAST_FLOAT_FOR_FP8 = Self(14)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value

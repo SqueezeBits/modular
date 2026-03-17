@@ -10,7 +10,6 @@ modular_py_library(
     ],
     deps = [
         "//max/python/max:tensor",  # Provides max.functional and max.tensor.Tensor
-        requirement("torch"),
     ],
 )
 
@@ -43,5 +42,20 @@ modular_py_binary(
         requirement("pillow"),
         requirement("sentencepiece"),
         requirement("torch"),  # for test
+    ],
+)
+
+modular_py_binary(
+    name = "web_demo",
+    srcs = ["web_demo.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("jinja2"),
+        requirement("numpy"),
+        requirement("sentencepiece"),
     ],
 )

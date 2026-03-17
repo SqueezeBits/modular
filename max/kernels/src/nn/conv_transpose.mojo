@@ -1599,10 +1599,10 @@ def _conv_transposed_cudnn[
             cudnn_handle[].ptr_filter_desc,
             cudnnDataType_t.CUDNN_DATA_FLOAT,
             cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,  # cudnn documentation correction: cudnnSetFilter4dDescriptor() takes CKRS, not KCRS
-            Int16(filter.dim[0]()),  # C (out channels)
-            Int16(filter.dim[1]()),  # K (in channels)
-            Int16(filter.dim[2]()),  # R (kernel height)
-            Int16(filter.dim[3]()),  # S (kernel width)
+            Int32(filter.dim[0]()),  # C (out channels)
+            Int32(filter.dim[1]()),  # K (in channels)
+            Int32(filter.dim[2]()),  # R (kernel height)
+            Int32(filter.dim[3]()),  # S (kernel width)
         )
     )
 
@@ -1611,10 +1611,10 @@ def _conv_transposed_cudnn[
             cudnn_handle[].ptr_input_desc,
             cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,
             cudnnDataType_t.CUDNN_DATA_FLOAT,
-            Int16(input.dim[0]()),  # N
-            Int16(input.dim[1]()),  # C_in
-            Int16(input.dim[2]()),  # H_in
-            Int16(input.dim[3]()),  # W_in
+            Int32(input.dim[0]()),  # N
+            Int32(input.dim[1]()),  # C_in
+            Int32(input.dim[2]()),  # H_in
+            Int32(input.dim[3]()),  # W_in
         )
     )
 
@@ -1623,22 +1623,22 @@ def _conv_transposed_cudnn[
             cudnn_handle[].ptr_output_desc,
             cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,
             cudnnDataType_t.CUDNN_DATA_FLOAT,
-            Int16(output.dim[0]()),  # N
-            Int16(output.dim[1]()),  # C_out
-            Int16(output.dim[2]()),  # H_out
-            Int16(output.dim[3]()),  # W_out
+            Int32(output.dim[0]()),  # N
+            Int32(output.dim[1]()),  # C_out
+            Int32(output.dim[2]()),  # H_out
+            Int32(output.dim[3]()),  # W_out
         )
     )
 
     check_cudnn_error(
         cudnnSetConvolution2dDescriptor(
             cudnn_handle[].ptr_conv_desc,
-            Int16(padding[0]),
-            Int16(padding[1]),
-            Int16(stride[0]),
-            Int16(stride[1]),
-            Int16(dilation[0]),
-            Int16(dilation[1]),
+            Int32(padding[0]),
+            Int32(padding[1]),
+            Int32(stride[0]),
+            Int32(stride[1]),
+            Int32(dilation[0]),
+            Int32(dilation[1]),
             cudnnConvolutionMode_t.CUDNN_CROSS_CORRELATION,
             cudnnDataType_t.CUDNN_DATA_FLOAT,
         )

@@ -206,12 +206,12 @@ struct cudnnConvolutionFwdAlgoPerfStruct(TrivialRegisterPassable):
 
 def cudnnSetConvolution2dDescriptor(
     conv_desc: UnsafePointer[cudnnConvolutionStruct, _],
-    pad_h: Int16,
-    pad_w: Int16,
-    u: Int16,
-    v: Int16,
-    dilation_h: Int16,
-    dilation_w: Int16,
+    pad_h: Int32,
+    pad_w: Int32,
+    u: Int32,
+    v: Int32,
+    dilation_h: Int32,
+    dilation_w: Int32,
     mode: cudnnConvolutionMode_t,
     compute_type: cudnnDataType_t,
 ) raises -> cudnnStatus_t:
@@ -251,7 +251,7 @@ def cudnnCreateConvolutionDescriptor(
 
 
 def cudnnSetConvolutionGroupCount(
-    conv_desc: UnsafePointer[cudnnConvolutionStruct, _], group_count: Int16
+    conv_desc: UnsafePointer[cudnnConvolutionStruct, _], group_count: Int32
 ) raises -> cudnnStatus_t:
     return _get_dylib_function[
         "cudnnSetConvolutionGroupCount",
@@ -600,8 +600,8 @@ def cudnnGetConvolutionForwardAlgorithm_v7(
     filter_desc: UnsafePointer[cudnnFilterStruct, _],
     conv_desc: UnsafePointer[cudnnConvolutionStruct, _],
     dest_desc: UnsafePointer[cudnnTensorStruct, _],
-    requested_algo_count: Int16,
-    returned_algo_count: UnsafePointer[Int16, _],
+    requested_algo_count: Int32,
+    returned_algo_count: UnsafePointer[Int32, _],
     perf_results: UnsafePointer[cudnnConvolutionFwdAlgoPerfStruct, _],
 ) raises -> cudnnStatus_t:
     return _get_dylib_function[
@@ -1321,12 +1321,12 @@ def cudnnGetConvolutionForwardAlgorithmMaxCount(
 struct cudnnConvolutionMode_t(
     Equatable, Identifiable, TrivialRegisterPassable, Writable
 ):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_CONVOLUTION = Self(0)
     comptime CUDNN_CROSS_CORRELATION = Self(1)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value

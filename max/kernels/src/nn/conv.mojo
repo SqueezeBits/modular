@@ -16,7 +16,7 @@ from std.math import align_down, ceildiv
 
 
 from std.os import abort
-from std.ffi import _get_global_or_null, external_call
+from std.ffi import CStringSlice, _get_global_or_null, external_call
 from std.sys.info import align_of, simd_width_of
 
 from _cudnn.cnn_infer import (
@@ -43,6 +43,7 @@ from _cudnn.infer import (
     cudnnDestroyFilterDescriptor,
     cudnnDestroyTensorDescriptor,
     cudnnFilterStruct,
+    cudnnGetErrorString,
     cudnnMathType_t,
     cudnnSetFilter4dDescriptor,
     cudnnSetStream,
@@ -3181,9 +3182,25 @@ def conv2d_gpu_naive_nhwc_rscf[
 
 
 @always_inline
-def check_cudnn_error(stat: cudnnStatus_t):
+def check_cudnn_error(stat: cudnnStatus_t) raises:
     if stat != cudnnStatus_t.CUDNN_STATUS_SUCCESS:
-        print(stat)
+        raise Error(
+            "CUDNN ERROR:",
+            stat.__int__(),
+            CStringSlice(unsafe_from_ptr=cudnnGetErrorString(stat)),
+        )
+
+
+@always_inline
+def check_cudnn_error[op_name: StaticString](stat: cudnnStatus_t) raises:
+    if stat != cudnnStatus_t.CUDNN_STATUS_SUCCESS:
+        raise Error(
+            "CUDNN ERROR in",
+            op_name,
+            ":",
+            stat.__int__(),
+            CStringSlice(unsafe_from_ptr=cudnnGetErrorString(stat)),
+        )
 
 
 struct CuDNNConvMeta(ImplicitlyCopyable, RegisterPassable):
@@ -3476,62 +3493,62 @@ def _conv_cudnn[
 
     if not params_match:
         # Update Input Descriptor (NHWC)
-        check_cudnn_error(
+        check_cudnn_error["cudnnSetTensor4dDescriptor(input)"](
             cudnnSetTensor4dDescriptor(
                 ptr_meta[].ptr_input_desc,
                 cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
                 get_cudnn_dtype[input_type](),
-                Int16(in_[0]),
-                Int16(in_[3]),
-                Int16(in_[1]),
-                Int16(in_[2]),
+                Int32(in_[0]),
+                Int32(in_[3]),
+                Int32(in_[1]),
+                Int32(in_[2]),
             )
         )
 
         # Update Filter Descriptor (NCHW for filter)
-        check_cudnn_error(
+        check_cudnn_error["cudnnSetFilter4dDescriptor(filter)"](
             cudnnSetFilter4dDescriptor(
                 ptr_meta[].ptr_filter_desc,
                 get_cudnn_dtype[filter_type](),
                 cudnnTensorFormat_t.CUDNN_TENSOR_NCHW,
-                Int16(filt[0]),
-                Int16(filt[1]),
-                Int16(filt[2]),
-                Int16(filt[3]),
+                Int32(filt[0]),
+                Int32(filt[1]),
+                Int32(filt[2]),
+                Int32(filt[3]),
             )
         )
 
         # Update Conv Descriptor
-        check_cudnn_error(
+        check_cudnn_error["cudnnSetConvolution2dDescriptor"](
             cudnnSetConvolution2dDescriptor(
                 ptr_meta[].ptr_conv_desc,
-                Int16(pad[0]),
-                Int16(pad[1]),
-                Int16(stride[0]),
-                Int16(stride[1]),
-                Int16(dil[0]),
-                Int16(dil[1]),
+                Int32(pad[0]),
+                Int32(pad[1]),
+                Int32(stride[0]),
+                Int32(stride[1]),
+                Int32(dil[0]),
+                Int32(dil[1]),
                 cudnnConvolutionMode_t.CUDNN_CROSS_CORRELATION,
                 cudnnDataType_t.CUDNN_DATA_FLOAT,
             )
         )
 
-        check_cudnn_error(
+        check_cudnn_error["cudnnSetConvolutionGroupCount"](
             cudnnSetConvolutionGroupCount(
-                ptr_meta[].ptr_conv_desc, Int16(num_groups)
+                ptr_meta[].ptr_conv_desc, Int32(num_groups)
             )
         )
 
         # Update Output Descriptor (NHWC)
-        check_cudnn_error(
+        check_cudnn_error["cudnnSetTensor4dDescriptor(output)"](
             cudnnSetTensor4dDescriptor(
                 ptr_meta[].ptr_output_desc,
                 cudnnTensorFormat_t.CUDNN_TENSOR_NHWC,
                 get_cudnn_dtype[output_type](),
-                Int16(out[0]),
-                Int16(out[3]),
-                Int16(out[1]),
-                Int16(out[2]),
+                Int32(out[0]),
+                Int32(out[3]),
+                Int32(out[1]),
+                Int32(out[2]),
             )
         )
 
@@ -3539,7 +3556,7 @@ def _conv_cudnn[
         # core acceleration. For float32, use DEFAULT_MATH to avoid incorrect
         # results on some GPU architectures (e.g., B200).
         comptime if input_type == DType.float16 or input_type == DType.bfloat16:
-            check_cudnn_error(
+            check_cudnn_error["cudnnSetConvolutionMathType"](
                 cudnnSetConvolutionMathType(
                     ptr_meta[].ptr_conv_desc,
                     cudnnMathType_t.CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION,
@@ -3552,10 +3569,10 @@ def _conv_cudnn[
         # allocating a raw 48-byte buffer matching the C ABI layout and
         # reading the algo Int32 at offset 0.
         var perf_buf = alloc[UInt8](48)
-        var requested_count: Int16 = 1
-        var returned_count: Int16 = 0
+        var requested_count: Int32 = 1
+        var returned_count: Int32 = 0
 
-        check_cudnn_error(
+        check_cudnn_error["cudnnGetConvolutionForwardAlgorithm_v7"](
             cudnnGetConvolutionForwardAlgorithm_v7(
                 ptr_meta[].ptr_handle,
                 ptr_meta[].ptr_input_desc,
@@ -3581,7 +3598,7 @@ def _conv_cudnn[
 
         # Query workspace size
         var ws_size: Int = 0
-        check_cudnn_error(
+        check_cudnn_error["cudnnGetConvolutionForwardWorkspaceSize"](
             cudnnGetConvolutionForwardWorkspaceSize(
                 ptr_meta[].ptr_handle,
                 ptr_meta[].ptr_input_desc,
@@ -3612,7 +3629,7 @@ def _conv_cudnn[
     var alpha: Float32 = 1.0
     var beta: Float32 = 0.0
 
-    check_cudnn_error(
+    check_cudnn_error["cudnnConvolutionForward"](
         cudnnConvolutionForward(
             ptr_meta[].ptr_handle,
             UnsafePointer(to=alpha).bitcast[NoneType](),
