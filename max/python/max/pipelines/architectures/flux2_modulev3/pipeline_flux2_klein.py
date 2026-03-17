@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 from max.dtype import DType
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
@@ -36,6 +37,12 @@ class Flux2KleinModelInputs(Flux2ModelInputs):
 
     negative_tokens: Tensor | None = None
     """Negative prompt token IDs on device (for classifier-free guidance)."""
+
+    attention_mask: np.ndarray | None = None
+    """Tokenizer-generated mask for the padded positive prompt sequence."""
+
+    negative_attention_mask: np.ndarray | None = None
+    """Tokenizer-generated mask for the padded negative prompt sequence."""
 
     guidance_scale: float = 4.0
     """Guidance scale for classifier-free guidance."""
@@ -106,6 +113,46 @@ class Flux2KleinPipeline(Flux2Pipeline):
         result = neg_noise_pred + scaled
         return result.cast(input_dtype)
 
+    @traced(message="Flux2KleinPipeline.prepare_prompt_embeddings")
+    def prepare_prompt_embeddings(  # type: ignore[override]
+        self,
+        tokens: Tensor,
+        num_images_per_prompt: int = 1,
+        valid_length: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        seq_len = int(tokens.shape[0])
+        batch_size = 1
+
+        with Tracer("text_encoder"):
+            prompt_embeds = self.text_encoder(
+                tokens,
+                valid_length=valid_length,
+            )
+
+        with Tracer("post_process"):
+            if num_images_per_prompt != 1:
+                prompt_embeds = F.tile(
+                    prompt_embeds, (1, num_images_per_prompt, 1)
+                )
+                prompt_embeds = F.reshape(
+                    prompt_embeds,
+                    [batch_size * num_images_per_prompt, seq_len, -1],
+                )
+
+            batch_size_final = batch_size * num_images_per_prompt
+            text_ids_key = f"{batch_size_final}_{seq_len}"
+            if text_ids_key in self._cached_text_ids:
+                text_ids = self._cached_text_ids[text_ids_key]
+            else:
+                text_ids = self._prepare_text_ids(
+                    batch_size=batch_size_final,
+                    seq_len=seq_len,
+                    device=self.text_encoder.devices[0],
+                )
+                self._cached_text_ids[text_ids_key] = text_ids
+
+        return prompt_embeds, text_ids
+
     @traced(message="Flux2KleinPipeline.prepare_inputs")
     def prepare_inputs(self, context: PixelContext) -> Flux2KleinModelInputs:  # type: ignore[override]
         """Convert a PixelContext into Flux2KleinModelInputs.
@@ -152,6 +199,8 @@ class Flux2KleinPipeline(Flux2Pipeline):
             num_images_per_prompt=base_inputs.num_images_per_prompt,
             input_image=base_inputs.input_image,
             negative_tokens=negative_tokens,
+            attention_mask=context.mask,
+            negative_attention_mask=context.negative_mask,
             guidance_scale=context.guidance_scale,
             is_distilled=is_distilled,
         )
@@ -170,6 +219,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
         prompt_embeds, text_ids = self.prepare_prompt_embeddings(
             tokens=model_inputs.tokens,
             num_images_per_prompt=model_inputs.num_images_per_prompt,
+            attention_mask=model_inputs.attention_mask,
         )
         batch_size = int(prompt_embeds.shape[0])
 
@@ -182,6 +232,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
                 self.prepare_prompt_embeddings(
                     tokens=model_inputs.negative_tokens,
                     num_images_per_prompt=model_inputs.num_images_per_prompt,
+                    attention_mask=model_inputs.negative_attention_mask,
                 )
             )
         elif (
@@ -240,6 +291,7 @@ class Flux2KleinPipeline(Flux2Pipeline):
 
         # 6) Denoising loop.
         is_img2img = image_latents is not None
+
         with Tracer("denoising_loop"):
             for i in range(model_inputs.num_inference_steps):
                 with Tracer(f"denoising_step_{i}"):

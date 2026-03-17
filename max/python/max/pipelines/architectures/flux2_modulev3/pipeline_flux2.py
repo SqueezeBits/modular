@@ -511,6 +511,7 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
         self,
         tokens: Tensor,
         num_images_per_prompt: int = 1,
+        attention_mask: Tensor | npt.ArrayLike | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Create prompt embeddings and text position IDs for the transformer.
 
@@ -529,10 +530,18 @@ class Flux2Pipeline(DiffusionPipeline, CacheMixin):
         """
         # Shape metadata is host-side; this does not trigger a GPU sync.
         seq_len = int(tokens.shape[0])
-        batch_size = 1  # text encoder always outputs a single batch
+        # TODO: Generalize this if diffusion pipelines ever need batched
+        # text-encoder inputs instead of the current batch_size=1 contract.
+        batch_size = 1
 
         with Tracer("text_encoder"):
-            prompt_embeds = self.text_encoder(tokens)
+            if attention_mask is None:
+                prompt_embeds = self.text_encoder(tokens)
+            else:
+                prompt_embeds = self.text_encoder(  # type: ignore[call-arg]
+                    tokens,
+                    attention_mask=attention_mask,
+                )
 
         with Tracer("post_process"):
             if num_images_per_prompt != 1:
