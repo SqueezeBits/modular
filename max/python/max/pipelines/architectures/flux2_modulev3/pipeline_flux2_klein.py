@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 from max.dtype import DType
+from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
 from max.pipelines.core import PixelContext
@@ -118,16 +119,19 @@ class Flux2KleinPipeline(Flux2Pipeline):
         self,
         tokens: Tensor,
         num_images_per_prompt: int = 1,
-        valid_length: Tensor | None = None,
+        attention_mask: Tensor | np.ndarray | None = None,
     ) -> tuple[Tensor, Tensor]:
         seq_len = int(tokens.shape[0])
         batch_size = 1
 
         with Tracer("text_encoder"):
-            prompt_embeds = self.text_encoder(
-                tokens,
-                valid_length=valid_length,
-            )
+            if attention_mask is None:
+                prompt_embeds = self.text_encoder(tokens)
+            else:
+                prompt_embeds = self.text_encoder(  # type: ignore[call-arg]
+                    tokens,
+                    attention_mask=attention_mask,
+                )
 
         with Tracer("post_process"):
             if num_images_per_prompt != 1:

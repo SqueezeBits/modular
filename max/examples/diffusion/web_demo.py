@@ -100,6 +100,12 @@ _PAGE_TEMPLATE = Environment(autoescape=True).from_string("""<!doctype html>
       .hero {
         margin-bottom: 28px;
       }
+      .eyebrows {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
       .eyebrow {
         display: inline-block;
         padding: 8px 12px;
@@ -110,10 +116,16 @@ _PAGE_TEMPLATE = Environment(autoescape=True).from_string("""<!doctype html>
         letter-spacing: 0.08em;
         text-transform: uppercase;
       }
+      .eyebrow-sqzb {
+        background: rgba(232, 123, 34, 0.16);
+        color: #a64d00;
+      }
       h1 {
         margin: 16px 0 10px;
-        font-size: clamp(2.2rem, 5vw, 4rem);
+        font-size: clamp(1.05rem, 4.8vw, 4rem);
         line-height: 0.96;
+        letter-spacing: -0.05em;
+        white-space: nowrap;
       }
       .subtle {
         color: var(--muted);
@@ -235,6 +247,22 @@ _PAGE_TEMPLATE = Environment(autoescape=True).from_string("""<!doctype html>
           linear-gradient(135deg, rgba(255, 255, 255, 0.85), rgba(219, 231, 224, 0.7));
         border: 1px dashed rgba(31, 40, 37, 0.16);
       }
+      .loading-state {
+        gap: 16px;
+      }
+      .spinner {
+        width: 72px;
+        height: 72px;
+        border-radius: 999px;
+        border: 5px solid rgba(31, 40, 37, 0.12);
+        border-top-color: var(--accent);
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
       @media (max-width: 920px) {
         .layout {
           grid-template-columns: 1fr;
@@ -253,11 +281,11 @@ _PAGE_TEMPLATE = Environment(autoescape=True).from_string("""<!doctype html>
   <body>
     <main class="page">
       <section class="hero">
-        <span class="eyebrow">MAX Diffusion Demo</span>
-        <h1>Prompt to image in one page.</h1>
-        <p class="subtle">
-          Submit a prompt, set resolution and seed, and render directly in the browser.
-        </p>
+        <div class="eyebrows">
+          <span class="eyebrow">Powered by Modular</span>
+          <span class="eyebrow eyebrow-sqzb">Optimized by SqueezeBits</span>
+        </div>
+        <h1>MAX Diffusion on DGX Spark</h1>
         <div class="hero-meta">
           <span class="chip">Model: {{ model_label }}</span>
           <span class="chip">{{ fixed_settings }}</span>
@@ -287,7 +315,7 @@ _PAGE_TEMPLATE = Environment(autoescape=True).from_string("""<!doctype html>
           <button id="generate-button" type="submit">Generate Image</button>
         </form>
 
-        <section class="panel result-panel">
+        <section id="result-panel" class="panel result-panel">
           {% if error %}
             <div class="message error">
               <strong>Generation failed.</strong>
@@ -320,9 +348,17 @@ _PAGE_TEMPLATE = Environment(autoescape=True).from_string("""<!doctype html>
     <script>
       const form = document.getElementById("demo-form");
       const button = document.getElementById("generate-button");
+      const resultPanel = document.getElementById("result-panel");
       form.addEventListener("submit", () => {
         button.disabled = true;
         button.textContent = "Generating...";
+        resultPanel.innerHTML = `
+          <div class="empty-state loading-state" role="status" aria-live="polite">
+            <div class="spinner" aria-hidden="true"></div>
+            <p>Generating image...</p>
+            <p class="subtle">Rendering on DGX Spark.</p>
+          </div>
+        `;
       });
     </script>
   </body>
@@ -552,7 +588,6 @@ class DiffusionWebDemo:
         return (
             f"{self._args.num_inference_steps} steps"
             f" | guidance {self._args.guidance_scale}"
-            f" | warmups {self._args.num_warmups}"
         )
 
     def _build_runtime(
