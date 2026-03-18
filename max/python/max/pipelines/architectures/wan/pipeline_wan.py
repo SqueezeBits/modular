@@ -39,6 +39,10 @@ from max.profiler import Tracer, traced
 from tqdm.auto import tqdm
 
 from ..autoencoders import AutoencoderKLWanModel
+from ..autoencoders.autoencoder_kl_wan import (
+    _buffer_to_numpy_f32,
+    _numpy_f32_to_buffer,
+)
 from ..umt5 import UMT5Model
 from .model import WanTransformerModel
 
@@ -630,6 +634,111 @@ class WanPipeline(DiffusionPipeline):
             np.ascontiguousarray(model_inputs.latents, dtype=np.float32)
         ).to(device)
 
+    def _prepare_i2v_condition(
+        self,
+        model_inputs: WanModelInputs,
+        latent_shape: tuple[int, ...],
+        device: Device,
+    ) -> Buffer | None:
+        """Prepare I2V condition tensor [B, 20, T_l, H_l, W_l].
+
+        Encodes the input image via VAE, builds a temporal mask, and
+        concatenates them. Returns None for T2V mode.
+        """
+        if model_inputs.input_image is None:
+            return None
+        if self.transformer.config.in_channels <= 16:
+            return None
+
+        logger.info("Preparing I2V condition")
+        image = model_inputs.input_image  # PIL Image or numpy [H, W, 3]
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+
+        # Normalize to [-1, 1] float32, shape [1, 3, H, W]
+        image_f32 = image.astype(np.float32) / 127.5 - 1.0
+        if image_f32.ndim == 3:
+            image_f32 = image_f32.transpose(2, 0, 1)[np.newaxis]  # [1,3,H,W]
+
+        batch_size = int(latent_shape[0])
+        num_frames = int(model_inputs.num_frames)
+        h = image_f32.shape[2]
+        w = image_f32.shape[3]
+
+        # Build video condition: first frame = image, rest = zeros
+        # shape: [B, 3, T, H, W]
+        video_cond = np.zeros(
+            (batch_size, 3, num_frames, h, w), dtype=np.float32
+        )
+        video_cond[:, :, 0, :, :] = image_f32
+
+        # Encode via VAE
+        video_buf = _numpy_f32_to_buffer(video_cond, self.vae.config.dtype, device)
+        latent_cond = self.vae.encode(video_buf)  # [B, z_dim, T_l, H_l, W_l]
+
+        # Normalize: (encoded - mean) * (1/std)
+        latent_cond_np = _buffer_to_numpy_f32(latent_cond)
+        z_dim = self.vae.config.z_dim
+        mean = np.array(self.vae.config.latents_mean, dtype=np.float32).reshape(
+            1, z_dim, 1, 1, 1
+        )
+        inv_std = 1.0 / np.array(
+            self.vae.config.latents_std, dtype=np.float32
+        ).reshape(1, z_dim, 1, 1, 1)
+        latent_cond_np = (latent_cond_np - mean) * inv_std
+
+        # Build mask [B, vae_scale_factor_temporal, T_l, H_l, W_l]
+        # First frame = 1 (conditioned), rest = 0
+        t_latent = int(latent_cond.shape[2])
+        h_latent = int(latent_cond.shape[3])
+        w_latent = int(latent_cond.shape[4])
+
+        mask = np.zeros(
+            (batch_size, 1, num_frames, h_latent, w_latent),
+            dtype=np.float32,
+        )
+        mask[:, :, 0, :, :] = 1.0  # First frame is conditioned
+
+        # Expand first frame mask by vae_scale_factor_temporal
+        vae_t = self.vae_scale_factor_temporal
+        first_mask = np.repeat(mask[:, :, 0:1, :, :], vae_t, axis=2)
+        mask_expanded = np.concatenate(
+            [first_mask, mask[:, :, 1:, :, :]], axis=2
+        )
+        # Reshape: [B, 1, T, H_l, W_l] -> [B, vae_t, T_l, H_l, W_l]
+        mask_expanded = mask_expanded.reshape(
+            batch_size, -1, vae_t, h_latent, w_latent
+        )
+        mask_expanded = mask_expanded.transpose(0, 2, 1, 3, 4)
+        # Now mask_expanded: [B, vae_t, T_l, H_l, W_l]
+
+        # Concat: [mask, latent_condition] -> [B, vae_t + z_dim, T_l, H_l, W_l]
+        condition = np.concatenate(
+            [mask_expanded, latent_cond_np], axis=1
+        ).astype(np.float32)
+
+        return _numpy_f32_to_buffer(condition, self.vae.config.dtype, device)
+
+    def _concat_i2v_condition(
+        self, latent_model_input: Buffer, condition: Buffer
+    ) -> Buffer:
+        """Concat I2V condition [B, 20, T, H, W] with latents [B, 16, T, H, W].
+
+        Returns [B, 36, T, H, W] for the I2V transformer.
+        """
+        # Both are in model dtype (bfloat16). Concat on CPU via numpy,
+        # then transfer back.
+        cpu = CPU()
+        lat_np = _buffer_to_numpy_f32(latent_model_input, cpu)
+        cond_np = _buffer_to_numpy_f32(condition, cpu)
+        concat_np = np.concatenate([lat_np, cond_np], axis=1)
+        device = latent_model_input.device
+        if hasattr(device, "to_device"):
+            device = device.to_device()
+        return _numpy_f32_to_buffer(
+            concat_np, latent_model_input.dtype, device
+        )
+
     def _prepare_guidance_scales(
         self,
         model_inputs: WanModelInputs,
@@ -750,6 +859,7 @@ class WanPipeline(DiffusionPipeline):
         has_moe: bool,
         guidance_scale_high: Buffer | None,
         guidance_scale_low: Buffer | None,
+        i2v_condition: Buffer | None = None,
     ) -> Buffer:
         step_state: WanUniPCState = (None, None, None)
         latents, step_state = self._run_denoising_phase(
@@ -768,6 +878,7 @@ class WanPipeline(DiffusionPipeline):
             desc="Denoising (high-noise)" if has_moe else "Denoising",
             spatial_shape=spatial_shape,
             step_state=step_state,
+            i2v_condition=i2v_condition,
         )
 
         if has_moe and boundary_step_idx < len(batched_timesteps):
@@ -792,6 +903,7 @@ class WanPipeline(DiffusionPipeline):
                 desc="Denoising (low-noise)",
                 spatial_shape=spatial_shape,
                 step_state=step_state,
+                i2v_condition=i2v_condition,
             )
 
         return latents
@@ -892,6 +1004,11 @@ class WanPipeline(DiffusionPipeline):
             ) = self._prepare_prompt_state(model_inputs)
         with Tracer("preprocess_latents"):
             latents = self._prepare_latents(model_inputs, device)
+        # Prepare I2V condition if input image provided
+        with Tracer("prepare_i2v_condition"):
+            i2v_condition = self._prepare_i2v_condition(
+                model_inputs, tuple(int(d) for d in latents.shape), device
+            )
         # Pre-compile VAE decoder for this latent shape so decode doesn't
         # stall after denoising completes.
         self.vae.prewarm_for_latent_shape(tuple(int(d) for d in latents.shape))
@@ -929,6 +1046,7 @@ class WanPipeline(DiffusionPipeline):
                 has_moe,
                 guidance_scale_high,
                 guidance_scale_low,
+                i2v_condition=i2v_condition,
             )
         with Tracer("decode_outputs"):
             images = self._decode_output(latents, model_inputs)
@@ -951,6 +1069,7 @@ class WanPipeline(DiffusionPipeline):
         desc: str,
         spatial_shape: Buffer,
         step_state: WanUniPCState,
+        i2v_condition: Buffer | None = None,
     ) -> tuple[Buffer, WanUniPCState]:
         progress = tqdm(  # type: ignore[call-arg]
             step_range,
@@ -964,6 +1083,11 @@ class WanPipeline(DiffusionPipeline):
                 latent_model_input = (
                     self.compiled.cast_f32_to_model_dtype.execute(latents)[0]
                 )
+                # I2V: concat condition with latents along channel dim
+                if i2v_condition is not None:
+                    latent_model_input = self._concat_i2v_condition(
+                        latent_model_input, i2v_condition
+                    )
                 with Tracer("transformer"):
                     noise_pred_buf = self._run_transformer_forward(
                         transformer_model=transformer_model,

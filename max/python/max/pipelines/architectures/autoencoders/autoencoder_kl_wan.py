@@ -1555,8 +1555,256 @@ class _CachedFramewiseDecoder:
 _VAEFramewiseKey = tuple[int, int, int, int]
 
 
+class WanDownsample2d(Module):
+    """Average-pool 2D downsample by factor 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        # x: [N, C, H, W] -> [N, C, H/2, W/2] via avg pool with stride 2
+        n = x.shape[0]
+        c = x.shape[1]
+        h = x.shape[2]
+        w = x.shape[3]
+        x = ops.reshape(x, [n, c, h // 2, 2, w // 2, 2])
+        # Average over the 2x2 blocks
+        x = (
+            x[:, :, :, 0, :, 0]
+            + x[:, :, :, 1, :, 0]
+            + x[:, :, :, 0, :, 1]
+            + x[:, :, :, 1, :, 1]
+        ) * 0.25
+        return x
+
+
+class WanDownResample(Module):
+    """Wan encoder downsampling module (mirror of WanResample)."""
+
+    def __init__(
+        self,
+        dim: int,
+        mode: str,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.mode = mode
+
+        self.resample = LayerList(
+            [
+                WanConv2dPermuted(
+                    in_channels=dim,
+                    out_channels=dim,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    dtype=dtype,
+                    device=device,
+                    has_bias=True,
+                ),
+                WanDownsample2d(),
+            ]
+        )
+
+        self.time_conv: WanCausalConv3d | None = None
+        if mode == "downsample3d":
+            self.time_conv = WanCausalConv3d(
+                in_channels=dim,
+                out_channels=dim,
+                kernel_size=(3, 1, 1),
+                stride=1,
+                padding=(1, 0, 0),
+                dtype=dtype,
+                device=device,
+                has_bias=True,
+            )
+        elif mode != "downsample2d":
+            raise ValueError(f"Unsupported WanDownResample mode: {mode}")
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        b = x.shape[0]
+        t = x.shape[2]
+        h = x.shape[3]
+        w = x.shape[4]
+
+        # Per-frame 2D conv + downsample
+        x = ops.permute(x, [0, 2, 1, 3, 4])  # [b, t, c, h, w]
+        x = ops.reshape(x, [b * t, self.dim, h, w])
+        x = self.resample[0](x)  # Conv2d: [b*t, dim, h, w]
+        x = self.resample[1](x)  # Downsample2d: [b*t, dim, h/2, w/2]
+        x = ops.reshape(x, [b, t, self.dim, h // 2, w // 2])
+        x = ops.permute(x, [0, 2, 1, 3, 4])  # [b, dim, t, h/2, w/2]
+
+        if self.mode == "downsample3d":
+            if self.time_conv is None:
+                raise ValueError(
+                    "time_conv is required for downsample3d mode"
+                )
+            # Temporal downsample: take every other frame
+            # First apply time conv, then subsample
+            x = self.time_conv(x)
+            x = x[:, :, 0::2, :, :]  # [b, dim, t/2, h/2, w/2]
+
+        return x
+
+
+class WanDownBlock(Module):
+    """Wan encoder down block (mirror of WanUpBlock)."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_res_blocks: int,
+        downsample_mode: str | None,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        super().__init__()
+        resnets: list[WanResidualBlock] = []
+        current_dim = in_dim
+        for _ in range(num_res_blocks + 1):
+            resnets.append(
+                WanResidualBlock(
+                    current_dim,
+                    out_dim,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+            current_dim = out_dim
+        self.resnets = LayerList(resnets)
+
+        self.downsamplers: LayerList | None = None
+        if downsample_mode is not None:
+            self.downsamplers = LayerList(
+                [
+                    WanDownResample(
+                        out_dim,
+                        mode=downsample_mode,
+                        dtype=dtype,
+                        device=device,
+                    )
+                ]
+            )
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        for resnet in self.resnets:
+            x = resnet(x)
+
+        if self.downsamplers is not None:
+            x = self.downsamplers[0](x)
+
+        return x
+
+
+class WanEncoder3d(Module):
+    """Wan 3D encoder module (mirror of WanDecoder3d)."""
+
+    def __init__(
+        self,
+        dim: int = 96,
+        z_dim: int = 16,
+        in_channels: int = 3,
+        dim_mult: tuple[int, ...] = (1, 2, 4, 4),
+        num_res_blocks: int = 2,
+        temperal_downsample: tuple[bool, ...] = (False, True, True),
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        super().__init__()
+
+        dims = [dim * u for u in [1, *list(dim_mult)]]
+
+        self.conv_in = WanCausalConv3d(
+            in_channels,
+            dims[0],
+            3,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+
+        down_blocks: list[WanDownBlock] = []
+        for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
+            down_flag = i != len(dim_mult) - 1
+            downsample_mode: str | None = None
+            if down_flag and temperal_downsample[i]:
+                downsample_mode = "downsample3d"
+            elif down_flag:
+                downsample_mode = "downsample2d"
+
+            down_blocks.append(
+                WanDownBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    downsample_mode=downsample_mode,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+
+        self.down_blocks = LayerList(down_blocks)
+
+        final_dim = dims[-1]
+        self.mid_block = WanMidBlock(final_dim, dtype=dtype, device=device)
+
+        self.norm_out = WanRMSNorm(
+            final_dim,
+            images=False,
+            dtype=dtype,
+            device=device,
+        )
+        # Output 2*z_dim for mean + logvar
+        self.conv_out = WanCausalConv3d(
+            final_dim,
+            z_dim * 2,
+            3,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        x = self.conv_in(x)
+
+        for down_block in self.down_blocks:
+            x = down_block(x)
+
+        x = self.mid_block(x)
+        x = self.norm_out(x)
+        x = ops.silu(x)
+        x = self.conv_out(x)
+        return x
+
+
+class _WanVAEEncoder(Module):
+    """Wrapper for VAE encoder graph compilation."""
+
+    def __init__(self, config: AutoencoderKLWanConfig) -> None:
+        super().__init__()
+        self.encoder = WanEncoder3d(
+            dim=config.base_dim,
+            z_dim=config.z_dim,
+            in_channels=3,
+            dim_mult=config.dim_mult,
+            num_res_blocks=config.num_res_blocks,
+            temperal_downsample=config.temperal_downsample,
+            dtype=config.dtype,
+            device=config.device,
+        )
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return self.encoder(x)
+
+
 class AutoencoderKLWanModel(ComponentModel):
-    """Wan VAE decoder model using MAX-native 3D modules."""
+    """Wan VAE model using MAX-native 3D modules (decoder + optional encoder)."""
 
     MAX_CACHED_DECODERS: int = 4
 
@@ -1575,6 +1823,8 @@ class AutoencoderKLWanModel(ComponentModel):
             _VAEFramewiseKey, _CachedFramewiseDecoder
         ] = {}
         self._decoder_state_dict: dict[str, Any] | None = None
+        self._encoder_state_dict: dict[str, Any] | None = None
+        self._encoder_model: Model | None = None
         self._session = session or InferenceSession(devices=devices)
         self._load_lock = threading.Lock()
         self._compile_lock = threading.Lock()
@@ -1592,11 +1842,17 @@ class AutoencoderKLWanModel(ComponentModel):
             assert self.weights is not None
             weights_obj: Any = self.weights
 
+            encoder_state_dict: dict[str, Any] = {}
+            has_encoder = False
+
             for key, value in weights_obj.items():
-                if not (
-                    key.startswith("decoder.")
-                    or key.startswith("post_quant_conv.")
-                ):
+                is_decoder = key.startswith("decoder.") or key.startswith(
+                    "post_quant_conv."
+                )
+                is_encoder = key.startswith("encoder.") or key.startswith(
+                    "quant_conv."
+                )
+                if not (is_decoder or is_encoder):
                     continue
 
                 weight_data = value.data()
@@ -1618,7 +1874,11 @@ class AutoencoderKLWanModel(ComponentModel):
                             np.from_dlpack(weight_data).transpose(2, 3, 1, 0)
                         )
 
-                decoder_state_dict[key] = weight_data
+                if is_decoder:
+                    decoder_state_dict[key] = weight_data
+                if is_encoder:
+                    encoder_state_dict[key] = weight_data
+                    has_encoder = True
 
             # Cast all weights to target dtype using a compiled graph (cached
             # per dtype pair, so the LLVM compilation only happens once).
@@ -1631,10 +1891,19 @@ class AutoencoderKLWanModel(ComponentModel):
                         target_dtype,
                         cpu_device,
                     )
+                for key in encoder_state_dict:
+                    encoder_state_dict[key] = cast_dlpack_to(
+                        encoder_state_dict[key],
+                        DType.float32,
+                        target_dtype,
+                        cpu_device,
+                    )
 
             # Defer compilation to first decode_5d() call so we have concrete
             # dimensions. Keep a small shape cache for mixed-resolution serving.
             self._decoder_state_dict = decoder_state_dict
+            if has_encoder:
+                self._encoder_state_dict = encoder_state_dict
             # Free the raw Weights object now that we have the state dict.
             self.weights = None  # type: ignore[assignment]
 
@@ -1787,6 +2056,77 @@ class AutoencoderKLWanModel(ComponentModel):
         if latents.rank == 5:
             return (self.decode_5d(latents),)
         return (self.decode_4d(latents),)
+
+    def _compile_encoder(
+        self,
+        batch_size: int,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> Model:
+        """Compile the encoder graph for a given input shape."""
+        cfg = self.config
+        sd = self._encoder_state_dict
+        assert sd is not None, "encoder state dict not initialized"
+
+        input_type = TensorType(
+            cfg.dtype,
+            [batch_size, 3, num_frames, height, width],
+            device=cfg.device,
+        )
+
+        # Quant conv (encoder output → latent space)
+        # In diffusers: quant_conv projects encoder output to latent
+        # For Wan VAE, quant_conv is a 1x1 conv: z_dim*2 → z_dim*2
+        encoder_module = _WanVAEEncoder(cfg)
+        encoder_module.load_state_dict(sd, weight_alignment=1, strict=False)
+
+        with Graph("wan_vae_encoder", input_types=[input_type]) as enc_graph:
+            out = encoder_module(enc_graph.inputs[0].tensor)
+            enc_graph.output(out)
+
+        return self._session.load(
+            enc_graph, weights_registry=encoder_module.state_dict()
+        )
+
+    def encode(self, video: Buffer) -> Buffer:
+        """Encode a video tensor [B, 3, T, H, W] to latent space.
+
+        Returns the mean of the diagonal Gaussian (argmax mode),
+        shape [B, z_dim, T_latent, H_latent, W_latent].
+        """
+        self.load_model()
+        if self._encoder_state_dict is None:
+            raise RuntimeError(
+                "VAE encoder weights not available. "
+                "Ensure the model checkpoint includes encoder weights."
+            )
+
+        with self._compile_lock:
+            if self._encoder_model is None:
+                self._encoder_model = self._compile_encoder(
+                    batch_size=int(video.shape[0]),
+                    num_frames=int(video.shape[2]),
+                    height=int(video.shape[3]),
+                    width=int(video.shape[4]),
+                )
+
+        with Tracer("wan_vae_encode"):
+            result = self._encoder_model.execute(video)
+            moments = result[0]
+
+        # Split mean and logvar, return mean (argmax mode)
+        z_dim = self.config.z_dim
+        # moments: [B, 2*z_dim, T, H, W] → mean is first z_dim channels
+        mean_shape = list(int(d) for d in moments.shape)
+        mean_shape[1] = z_dim
+        mean = moments.view(dtype=moments.dtype, shape=tuple(mean_shape))
+        # Just slice first z_dim channels via numpy
+        cpu = CPU()
+        moments_np = _buffer_to_numpy_f32(moments, cpu)
+        mean_np = np.ascontiguousarray(moments_np[:, :z_dim])
+        device = self.devices[0]
+        return _numpy_f32_to_buffer(mean_np, self.config.dtype, device)
 
     def __call__(self, latents: Buffer) -> Buffer:
         if latents.rank == 5:

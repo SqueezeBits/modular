@@ -59,3 +59,18 @@ wan_arch = SupportedArchitecture(
     tokenizer=PixelGenerationTokenizer,
     config=WanArchConfig,
 )
+
+wan_i2v_arch = SupportedArchitecture(
+    name="WanImageToVideoPipeline",
+    task=PipelineTask.PIXEL_GENERATION,
+    default_encoding="bfloat16",
+    supported_encodings={"bfloat16"},
+    example_repo_ids=[
+        "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    ],
+    pipeline_model=WanPipeline,  # type: ignore[arg-type]
+    context_type=PixelContext,
+    default_weights_format=WeightsFormat.safetensors,
+    tokenizer=PixelGenerationTokenizer,
+    config=WanArchConfig,
+)
