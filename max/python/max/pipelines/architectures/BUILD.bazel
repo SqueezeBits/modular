@@ -26,6 +26,9 @@ modular_py_library(
         # TODO: These are required for the llama3.1 model. Remove them if
         # possible.
         requirement("transformers"),
+        requirement("tqdm"),
+        requirement("diffusers"),
+        requirement("safetensors"),
         requirement("typing-extensions"),
         "//max/python/max:_core",
         "//max/python/max/driver",
