@@ -71,6 +71,7 @@ class PipelineClassName(str, Enum):
     FLUX2 = "Flux2Pipeline"
     FLUX2_KLEIN = "Flux2KleinPipeline"
     ZIMAGE = "ZImagePipeline"
+    WAN = "WanPipeline"
 
     @classmethod
     def from_diffusers_config(
@@ -206,7 +207,10 @@ class PixelGenerationTokenizer(
 
         # Store static model dimensions
         self._default_sample_size = 128
-        self._num_channels_latents = transformer_config["in_channels"] // 4
+        if self._pipeline_class_name == PipelineClassName.WAN:
+            self._num_channels_latents = transformer_config["in_channels"]
+        else:
+            self._num_channels_latents = transformer_config["in_channels"] // 4
 
         # Create scheduler
         scheduler_class_name = components.get("scheduler", {}).get(
@@ -264,6 +268,17 @@ class PixelGenerationTokenizer(
             return latent_image_ids.reshape(
                 -1, latent_image_ids.shape[-1]
             ).astype(np.float32)
+
+    def _select_wan_flow_shift(self, height: int, width: int) -> float:
+        scheduler_cfg = (
+            self.diffusers_config.get("components", {})
+            .get("scheduler", {})
+            .get("config_dict", {})
+        )
+        base_flow_shift = float(scheduler_cfg.get("flow_shift", 1.0))
+        if height >= 720 or width >= 1280:
+            return 5.0
+        return max(3.0, base_flow_shift)
 
     def _randn_tensor(
         self,
@@ -847,6 +862,13 @@ class PixelGenerationTokenizer(
                 image_options.true_cfg_scale > 1.0
                 and image_options.negative_prompt is not None
             )
+        if (
+            self._pipeline_class_name == PipelineClassName.WAN
+            and image_options.guidance_scale > 1.0
+            and image_options.negative_prompt is not None
+        ):
+            # Wan uses standard CFG controlled by guidance_scale, not true_cfg_scale.
+            do_true_cfg = True
         import PIL.Image
 
         # 1. Tokenize prompts
@@ -926,9 +948,25 @@ class PixelGenerationTokenizer(
             if "steps" in image_options.model_fields_set
             else self._default_num_inference_steps
         )
+        boundary_timestep: float | None = None
+        step_coefficients: npt.NDArray[np.float32] | None = None
+        if self._pipeline_class_name == PipelineClassName.WAN:
+            if getattr(self._scheduler, "use_flow_sigmas", False):
+                self._scheduler.flow_shift = self._select_wan_flow_shift(
+                    height, width
+                )
+            boundary_ratio = self.diffusers_config.get("boundary_ratio")
+            if boundary_ratio is not None:
+                boundary_timestep = float(boundary_ratio) * float(
+                    getattr(self._scheduler, "num_train_timesteps", 1000)
+                )
         timesteps, sigmas = self._scheduler.retrieve_timesteps_and_sigmas(
             image_seq_len, num_inference_steps
         )
+        if self._pipeline_class_name == PipelineClassName.WAN and hasattr(
+            self._scheduler, "build_step_coefficients"
+        ):
+            step_coefficients = self._scheduler.build_step_coefficients()
 
         num_warmup_steps: int = max(
             len(timesteps) - num_inference_steps * self._scheduler.order, 0
@@ -941,6 +979,21 @@ class PixelGenerationTokenizer(
             latent_width,
             request.body.seed,
         )
+
+        video_options = request.body.provider_options.video
+        if video_options and video_options.num_frames:
+            vae_scale_factor_temporal = 4
+            latent_frames = (
+                video_options.num_frames - 1
+            ) // vae_scale_factor_temporal + 1
+            shape_5d = (
+                image_options.num_images,
+                self._num_channels_latents,
+                latent_frames,
+                latent_height,
+                latent_width,
+            )
+            latents = self._randn_tensor(shape_5d, request.body.seed)
 
         # 5. Build the context
         context = PixelContext(
@@ -962,7 +1015,17 @@ class PixelGenerationTokenizer(
             true_cfg_scale=image_options.true_cfg_scale,
             num_warmup_steps=num_warmup_steps,
             model_name=request.body.model,
-            input_image=preprocessed_image_array,  # Pass numpy array instead of PIL.Image
+            residual_threshold=image_options.residual_threshold,
+            input_image=preprocessed_image_array,
+            num_frames=video_options.num_frames if video_options else None,
+            frames_per_second=(
+                video_options.frames_per_second or 16 if video_options else 16
+            ),
+            guidance_scale_2=(
+                video_options.guidance_scale_2 if video_options else None
+            ),
+            step_coefficients=step_coefficients,
+            boundary_timestep=boundary_timestep,
         )
 
         return context

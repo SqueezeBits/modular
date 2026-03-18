@@ -24,7 +24,6 @@ from max.config import (
 from .bfloat16_utils import float32_to_bfloat16_as_uint16
 from .config import (
     AudioGenerationConfig,
-    DenoisingCacheConfig,
     KVCacheConfig,
     LoRAConfig,
     MAXModelConfig,
@@ -96,7 +95,6 @@ __all__ = [
     "AlwaysSignalBuffersMixin",
     "AudioGenerationConfig",
     "CompilationTimer",
-    "DenoisingCacheConfig",
     "EAGLESpeculativeDecodingPipeline",
     "EmbeddingsPipeline",
     "EmbeddingsPipelineType",
