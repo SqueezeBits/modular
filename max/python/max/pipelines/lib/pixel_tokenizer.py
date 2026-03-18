@@ -1015,7 +1015,7 @@ class PixelGenerationTokenizer(
             true_cfg_scale=image_options.true_cfg_scale,
             num_warmup_steps=num_warmup_steps,
             model_name=request.body.model,
-            residual_threshold=image_options.residual_threshold,
+            residual_threshold=getattr(image_options, "residual_threshold", None),
             input_image=preprocessed_image_array,
             num_frames=video_options.num_frames if video_options else None,
             frames_per_second=(
