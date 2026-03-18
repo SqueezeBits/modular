@@ -259,10 +259,25 @@ class WanPipeline(DiffusionPipeline):
         self._vae_mean_buf = Buffer.from_numpy(mean_arr).to(device)
         self._vae_std_buf = Buffer.from_numpy(std_arr).to(device)
 
-        # Eagerly materialize transformer_2 state dict (including LoRA merge)
-        # so it doesn't block the first denoising step.
+        # MoE dual-load: if VRAM is sufficient, compile transformer_2 as a
+        # separate model on GPU so high→low switching is instant (no weight
+        # swap).  Otherwise fall back to weight-swap mode.
+        self._moe_dual_loaded = False
         if self.transformer_2 is not None:
             self.transformer_2.prepare_state_dict()
+            if self._try_dual_load_transformer2(device):
+                self._moe_dual_loaded = True
+                logger.info(
+                    "MoE dual-load: transformer_2 compiled on GPU "
+                    "(no weight swap needed)"
+                )
+            else:
+                # Pre-build weight registries for swap mode
+                sd2 = self.transformer_2.prepare_state_dict()
+                self.transformer._get_cached_weight_registries(sd2)
+                logger.info(
+                    "MoE swap mode: transformer_2 will use weight swap"
+                )
 
         self._compile_runtime_helpers()
         self.vae.prepare_for_serving()
@@ -756,10 +771,14 @@ class WanPipeline(DiffusionPipeline):
         )
 
         if has_moe and boundary_step_idx < len(batched_timesteps):
-            self._activate_transformer_weights(use_secondary=True)
+            if self._moe_dual_loaded:
+                low_noise_model = self.transformer_2
+            else:
+                self._activate_transformer_weights(use_secondary=True)
+                low_noise_model = self.transformer
             latents, _ = self._run_denoising_phase(
                 latents=latents,
-                transformer_model=self.transformer,
+                transformer_model=low_noise_model,
                 prompt_embeds=prompt_embeds,
                 batched_prompt_embeds=batched_prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -862,7 +881,8 @@ class WanPipeline(DiffusionPipeline):
     ) -> WanPipelineOutput:
         del kwargs
         device = self.transformer.devices[0]
-        self._activate_transformer_weights(use_secondary=False)
+        if not self._moe_dual_loaded:
+            self._activate_transformer_weights(use_secondary=False)
         with Tracer("prepare_prompt_embeddings"):
             (
                 prompt_embeds,
@@ -872,6 +892,9 @@ class WanPipeline(DiffusionPipeline):
             ) = self._prepare_prompt_state(model_inputs)
         with Tracer("preprocess_latents"):
             latents = self._prepare_latents(model_inputs, device)
+        # Pre-compile VAE decoder for this latent shape so decode doesn't
+        # stall after denoising completes.
+        self.vae.prewarm_for_latent_shape(tuple(int(d) for d in latents.shape))
         with Tracer("prepare_scheduler"):
             (
                 rope_cos,
@@ -1251,6 +1274,65 @@ class WanPipeline(DiffusionPipeline):
             int(latent_height),
             int(latent_width),
         )
+
+    @staticmethod
+    def _get_free_vram_bytes() -> int | None:
+        """Query free GPU VRAM in bytes via nvidia-smi."""
+        import subprocess
+
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+            )
+            # First GPU, value in MiB
+            return int(out.strip().split("\n")[0]) * 1024 * 1024
+        except Exception:
+            return None
+
+    def _try_dual_load_transformer2(self, device: Device) -> bool:
+        """Try to compile transformer_2 on GPU if VRAM is sufficient.
+
+        Estimates required VRAM as the primary transformer's weight size
+        (both models have identical architecture). Returns True if
+        transformer_2 was successfully compiled on GPU.
+        """
+        if self.transformer_2 is None:
+            return False
+
+        free_vram = self._get_free_vram_bytes()
+        if free_vram is None:
+            return False
+
+        # Estimate: use primary transformer's state dict size as proxy.
+        # Weights are bfloat16 (2 bytes per element). We use the DLPack
+        # shape/dtype info without converting to numpy (bf16 unsupported).
+        primary_sd = self.transformer.prepare_state_dict()
+        estimated_bytes = 0
+        for v in primary_sd.values():
+            if hasattr(v, "shape") and hasattr(v, "dtype"):
+                num_elements = 1
+                for d in v.shape:
+                    num_elements *= d
+                # bfloat16 = 2 bytes
+                estimated_bytes += num_elements * 2
+        # Add 20% headroom for compilation workspace
+        required = int(estimated_bytes * 1.2)
+        if free_vram < required:
+            logger.info(
+                "Insufficient VRAM for dual-load: %.1f GB free, "
+                "%.1f GB required",
+                free_vram / 1e9,
+                required / 1e9,
+            )
+            return False
+
+        self.transformer_2.load_model()
+        return True
 
     def _activate_transformer_weights(self, *, use_secondary: bool) -> None:
         if not use_secondary:
