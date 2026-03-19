@@ -2011,12 +2011,19 @@ class WanEncoder3dCached(Module):
         return 1 + sum(self._block_cache_slots) + 4 + 1
 
     def cache_shapes(
-        self, batch_size: int, height: int, width: int
-    ) -> list[list[int]]:
-        """Compute cache shapes for this encoder configuration."""
+        self,
+        batch_size: int,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> list[list[int | None]]:
+        """Compute cache shapes for this encoder configuration.
+
+        If height/width are None, those dimensions are dynamic.
+        """
         dims = [self._dim * u for u in [1, *list(self._dim_mult)]]
-        h, w = height, width
-        shapes: list[list[int]] = []
+        h: int | None = height
+        w: int | None = width
+        shapes: list[list[int | None]] = []
 
         # conv_in cache
         shapes.append([batch_size, self._in_channels, CACHE_T, h, w])
@@ -2024,28 +2031,23 @@ class WanEncoder3dCached(Module):
         for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
             for j in range(self._num_res_blocks):
                 block_in = in_dim if j == 0 else out_dim
-                # cache1: input channels to conv1
                 shapes.append([batch_size, block_in, CACHE_T, h, w])
-                # cache2: input channels to conv2
                 shapes.append([batch_size, out_dim, CACHE_T, h, w])
 
             down_flag = i != len(self._dim_mult) - 1
             if down_flag:
-                new_h = (h + 1) // 2
-                new_w = (w + 1) // 2
+                new_h = (h + 1) // 2 if h is not None else None
+                new_w = (w + 1) // 2 if w is not None else None
                 if self._temperal_downsample[i]:
-                    # Downsample3d cache: 1 frame at post-spatial resolution
                     shapes.append(
                         [batch_size, out_dim, 1, new_h, new_w]
                     )
                 h, w = new_h, new_w
 
-        # mid_block caches (2 resnets × 2 convs)
         final_dim = dims[-1]
         for _ in range(4):
             shapes.append([batch_size, final_dim, CACHE_T, h, w])
 
-        # conv_out cache
         shapes.append([batch_size, final_dim, CACHE_T, h, w])
 
         assert len(shapes) == self.total_cache_slots, (
@@ -2308,9 +2310,7 @@ class AutoencoderKLWanModel(ComponentModel):
         ] = {}
         self._decoder_state_dict: dict[str, Any] | None = None
         self._encoder_state_dict: dict[str, Any] | None = None
-        self._chunked_encoder_cache: dict[
-            tuple[int, int, int], _CachedChunkedEncoder
-        ] = {}
+        self._chunked_encoder: _CachedChunkedEncoder | None = None
         self._session = session or InferenceSession(devices=devices)
         self._load_lock = threading.Lock()
         self._compile_lock = threading.Lock()
@@ -2509,6 +2509,16 @@ class AutoencoderKLWanModel(ComponentModel):
                 (batch_size, z_dim, latent_h, latent_w)
             )
 
+    def prewarm_encoder(self) -> None:
+        """Pre-compile chunked encoder graphs (dynamic H/W, compile once)."""
+        self.load_model()
+        if self._encoder_state_dict is None:
+            return
+        if self._chunked_encoder is None:
+            with self._compile_lock:
+                if self._chunked_encoder is None:
+                    self._chunked_encoder = self._compile_chunked_encoder()
+
     def decode_5d(self, latents_5d: Buffer) -> Buffer:
         """Decode 5D latents [B, C, T, H, W] with the cached framewise path."""
         self.prepare_for_serving()
@@ -2554,21 +2564,16 @@ class AutoencoderKLWanModel(ComponentModel):
             return (self.decode_5d(latents),)
         return (self.decode_4d(latents),)
 
-    def _compile_chunked_encoder(
-        self,
-        batch_size: int,
-        height: int,
-        width: int,
-    ) -> _CachedChunkedEncoder:
-        """Compile chunked encoder graphs (first chunk + rest chunk)."""
+    def _compile_chunked_encoder(self) -> _CachedChunkedEncoder:
+        """Compile chunked encoder graphs with dynamic H/W."""
         cfg = self.config
         sd = self._encoder_state_dict
         assert sd is not None, "encoder state dict not initialized"
 
-        # First chunk: 1 frame, no cache inputs
+        # First chunk: 1 frame, dynamic H/W
         first_input_type = TensorType(
             cfg.dtype,
-            [batch_size, 3, 1, height, width],
+            [1, 3, 1, None, None],
             device=cfg.device,
         )
         first_module = _WanVAEEncoderFirstChunk(cfg)
@@ -2584,15 +2589,13 @@ class AutoencoderKLWanModel(ComponentModel):
             first_graph, weights_registry=first_registry
         )
 
-        # Rest chunk: CHUNK_SIZE frames + cache inputs (shares weights)
+        # Rest chunk: CHUNK_SIZE frames, dynamic H/W + cache inputs
         rest_input_type = TensorType(
             cfg.dtype,
-            [batch_size, 3, WAN_ENCODER_CHUNK_SIZE, height, width],
+            [1, 3, WAN_ENCODER_CHUNK_SIZE, None, None],
             device=cfg.device,
         )
-        cache_shapes = first_module.encoder.cache_shapes(
-            batch_size, height, width
-        )
+        cache_shapes = first_module.encoder.cache_shapes(batch_size=1)
         rest_input_types = [
             rest_input_type,
             *[
@@ -2622,8 +2625,7 @@ class AutoencoderKLWanModel(ComponentModel):
 
         Uses chunked encoding matching diffusers: first frame processed
         separately, then 4-frame chunks with temporal caching.
-        Video is converted to numpy once for chunk slicing, avoiding
-        redundant GPU→CPU→GPU round-trips.
+        Compiled once with dynamic H/W so no recompilation per resolution.
 
         Returns the mean of the diagonal Gaussian (argmax mode),
         shape [B, z_dim, T_latent, H_latent, W_latent].
@@ -2635,19 +2637,10 @@ class AutoencoderKLWanModel(ComponentModel):
                 "Ensure the model checkpoint includes encoder weights."
             )
 
-        batch_size = int(video.shape[0])
-        height = int(video.shape[3])
-        width = int(video.shape[4])
-        shape_key = (batch_size, height, width)
-        with self._compile_lock:
-            encoder = self._chunked_encoder_cache.get(shape_key)
-            if encoder is None:
-                encoder = self._compile_chunked_encoder(
-                    batch_size=batch_size,
-                    height=height,
-                    width=width,
-                )
-                self._chunked_encoder_cache[shape_key] = encoder
+        if self._chunked_encoder is None:
+            with self._compile_lock:
+                if self._chunked_encoder is None:
+                    self._chunked_encoder = self._compile_chunked_encoder()
 
         # Convert to numpy once for chunk slicing
         video_np = _buffer_to_numpy_f32(video, CPU())
@@ -2655,7 +2648,7 @@ class AutoencoderKLWanModel(ComponentModel):
         device = self.devices[0]
 
         with Tracer("wan_vae_encode"):
-            return encoder(video_np, target_dtype, device)
+            return self._chunked_encoder(video_np, target_dtype, device)
 
     def __call__(self, latents: Buffer) -> Buffer:
         if latents.rank == 5:

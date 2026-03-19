@@ -46,6 +46,11 @@ class WanI2VPipeline(WanPipeline):
     channels) at each denoising step.
     """
 
+    def init_remaining_components(self) -> None:
+        super().init_remaining_components()
+        # Pre-compile VAE encoder (dynamic H/W, single compilation).
+        self.vae.prewarm_encoder()
+
     def _prepare_i2v_condition(
         self,
         model_inputs: WanModelInputs,
