@@ -81,10 +81,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Negative prompt to guide what NOT to generate.",
     )
     parser.add_argument(
-        "--height", type=int, default=480, help="Video height in pixels."
+        "--height", type=int, default=None, help="Video height in pixels. Auto-computed from input image if omitted."
     )
     parser.add_argument(
-        "--width", type=int, default=832, help="Video width in pixels."
+        "--width", type=int, default=None, help="Video width in pixels. Auto-computed from input image if omitted."
     )
     parser.add_argument(
         "--num-frames", type=int, default=81, help="Number of video frames."
@@ -231,8 +231,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="LoRA strength multiplier for transformer_2 (low-noise). Defaults to --lora-scale.",
     )
 
+    parser.add_argument(
+        "--input-image",
+        type=str,
+        default=None,
+        help="Path to input image for I2V (image-to-video) generation.",
+    )
+
     args = parser.parse_args(argv)
     assert args.prompt, "Prompt must be a non-empty string."
+
+    # Auto-compute height/width from input image if not specified
+    if args.height is None or args.width is None:
+        if args.input_image:
+            import PIL.Image as _PIL
+
+            _img = _PIL.open(args.input_image)
+            aspect_ratio = _img.height / _img.width
+            # Default to 720p area
+            max_area = 720 * 1280
+            mod_value = 16  # vae_scale_factor_spatial(8) * patch_size(2)
+            h = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+            w = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            if args.height is None:
+                args.height = h
+            if args.width is None:
+                args.width = w
+            print(f"Auto-computed resolution: {args.width}x{args.height} (from {_img.size[0]}x{_img.size[1]})")
+        else:
+            if args.height is None:
+                args.height = 720
+            if args.width is None:
+                args.width = 1280
+
     assert args.height > 0, "Height must be positive."
     assert args.width > 0, "Width must be positive."
     assert args.num_frames > 0, "num-frames must be positive."
@@ -433,7 +464,7 @@ async def generate_video(args: argparse.Namespace) -> None:
         max_length = components_config["tokenizer"]["config_dict"].get(
             "model_max_length", None
         )
-        if arch.name == "WanPipeline":
+        if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
             max_length = 512
         print(f"Using max length: {max_length} for tokenizer")
 
@@ -472,7 +503,7 @@ async def generate_video(args: argparse.Namespace) -> None:
     )
 
     effective_num_frames = args.num_frames
-    if arch.name == "WanPipeline":
+    if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
         effective_num_frames = _normalize_wan_num_frames(
             args.num_frames, phase="main"
         )
@@ -488,7 +519,13 @@ async def generate_video(args: argparse.Namespace) -> None:
         args, args.prompt, num_frames=effective_num_frames
     )
     request = OpenResponsesRequest(request_id=RequestID(), body=body)
-    context = await tokenizer.new_context(request)
+    # Load input image for I2V if provided
+    input_image = None
+    if args.input_image:
+        import PIL.Image
+        input_image = PIL.Image.open(args.input_image).convert("RGB")
+        print(f"Input image: {args.input_image} ({input_image.size[0]}x{input_image.size[1]})")
+    context = await tokenizer.new_context(request, input_image=input_image)
     inputs = PixelGenerationInputs[PixelContext](
         batch={context.request_id: context}
     )
@@ -501,7 +538,7 @@ async def generate_video(args: argparse.Namespace) -> None:
             if args.warmup_negative_prompt is not None
             else args.negative_prompt
         )
-        if arch.name == "WanPipeline":
+        if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
             warmup_height = (
                 args.warmup_height
                 if args.warmup_height is not None
@@ -543,7 +580,7 @@ async def generate_video(args: argparse.Namespace) -> None:
                 if args.warmup_num_inference_steps is not None
                 else args.num_inference_steps
             )
-        if arch.name == "WanPipeline":
+        if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
             warmup_num_frames = _normalize_wan_num_frames(
                 warmup_num_frames, phase="warmup"
             )
@@ -618,13 +655,23 @@ async def generate_video(args: argparse.Namespace) -> None:
             )
             return
     else:
+        import time as _time
+
+        t0 = _time.perf_counter()
         model_inputs = pipeline._pipeline_model.prepare_inputs(context)
+        t1 = _time.perf_counter()
         model_outputs = pipeline._pipeline_model.execute(model_inputs)
+        t2 = _time.perf_counter()
         if not isinstance(model_outputs.images, np.ndarray):
             raise TypeError(
                 "Expected raw numpy video output from the diffusion pipeline."
             )
         print("Generation complete!")
+        print(
+            f"Timing: prepare_inputs={t1 - t0:.2f}s, "
+            f"execute={t2 - t1:.2f}s, "
+            f"total={t2 - t0:.2f}s"
+        )
         frames = _video_frames_from_raw_output(model_outputs.images)
 
     if not frames:

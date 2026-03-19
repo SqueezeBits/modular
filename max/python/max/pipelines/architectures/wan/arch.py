@@ -27,6 +27,7 @@ from max.pipelines.lib.interfaces import ArchConfig
 from typing_extensions import Self
 
 from .pipeline_wan import WanPipeline
+from .pipeline_wan_i2v import WanI2VPipeline
 
 
 @dataclass(kw_only=True)
@@ -68,7 +69,7 @@ wan_i2v_arch = SupportedArchitecture(
     example_repo_ids=[
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     ],
-    pipeline_model=WanPipeline,  # type: ignore[arg-type]
+    pipeline_model=WanI2VPipeline,  # type: ignore[arg-type]
     context_type=PixelContext,
     default_weights_format=WeightsFormat.safetensors,
     tokenizer=PixelGenerationTokenizer,

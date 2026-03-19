@@ -89,17 +89,16 @@ modular_py_binary(
 )
 
 modular_py_binary(
-    name = "vae_only_test",
+    name = "wan_comparison",
     testonly = True,
-    srcs = ["vae_only_test.py"],
+    srcs = ["wan_comparison.py"],
+    data = ["cat.jpg"],
     tags = ["no-pydeps"],
     deps = [
-        "//max/python/max/interfaces",
-        "//max/python/max/pipelines",
-        "//max/python/max/pipelines/core",
-        "//max/python/max/pipelines/lib",
+        requirement("diffusers"),
         requirement("numpy"),
-        requirement("sentencepiece"),
+        requirement("peft"),
+        requirement("pillow"),
         requirement("torch"),
     ],
 )

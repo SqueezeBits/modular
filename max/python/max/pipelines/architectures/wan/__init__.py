@@ -14,5 +14,12 @@
 from .arch import wan_arch, wan_i2v_arch
 from .model import WanTransformerModel
 from .pipeline_wan import WanPipeline
+from .pipeline_wan_i2v import WanI2VPipeline
 
-__all__ = ["WanPipeline", "WanTransformerModel", "wan_arch", "wan_i2v_arch"]
+__all__ = [
+    "WanI2VPipeline",
+    "WanPipeline",
+    "WanTransformerModel",
+    "wan_arch",
+    "wan_i2v_arch",
+]
