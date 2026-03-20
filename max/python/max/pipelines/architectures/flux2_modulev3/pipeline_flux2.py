@@ -11,11 +11,14 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+import array as _array
+import ctypes
+import struct
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-import numpy.typing as npt
+from PIL import Image
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.experimental import functional as F
@@ -81,7 +84,7 @@ class Flux2ModelInputs:
     num_images_per_prompt: int
     """Number of images to generate per prompt."""
 
-    input_image: npt.NDArray[np.uint8] | None
+    input_image: Any | None
     """Optional input image for image-to-image generation (HWC uint8)."""
 
     residual_threshold: Tensor | None = None
@@ -135,6 +138,32 @@ class Flux2Pipeline(DiffusionPipeline):
         "text_encoder": Mistral3TextEncoderModel,
         "transformer": Flux2TransformerModel,
     }
+
+    def _get_component_config_dict(
+        self, components_config: dict[str, Any], name: str
+    ) -> dict[str, Any]:
+        config_dict = super()._get_component_config_dict(components_config, name)
+        if name != "transformer":
+            return config_dict
+
+        activation_scheme = self.pipeline_config.model.fp8_activation_scheme
+        if activation_scheme is None:
+            return config_dict
+
+        config_dict = deepcopy(config_dict)
+        quant_cfg = dict(config_dict.get("quantization_config") or {})
+        quant_cfg["quant_method"] = "fp8"
+        quant_cfg["activation_scheme"] = activation_scheme
+        if activation_scheme == "dynamic":
+            quant_cfg.setdefault("weight_block_size", [128, 128])
+
+        config_dict["quantization_config"] = quant_cfg
+        config_dict["activation_scheme"] = activation_scheme
+        return config_dict
+
+    def _activation_dtype(self, dtype: DType) -> DType:
+        """Return the runtime activation dtype for a component."""
+        return DType.bfloat16 if dtype.is_float8() else dtype
 
     @traced(message="Flux2Pipeline.init_remaining_components")
     def init_remaining_components(self) -> None:
@@ -222,7 +251,7 @@ class Flux2Pipeline(DiffusionPipeline):
                 [context.num_images_per_prompt],
                 context.guidance_scale,
                 device=device,
-                dtype=self.transformer.config.dtype,
+                dtype=self._activation_dtype(self.transformer.config.dtype),
             )
             self._cached_guidance[guidance_key] = guidance
 
@@ -231,8 +260,8 @@ class Flux2Pipeline(DiffusionPipeline):
         packed_w = latent_w // 2
         for n in (packed_h, packed_w):
             if n not in self._cached_shape_carriers:
-                self._cached_shape_carriers[n] = Tensor.from_dlpack(
-                    np.empty(n, dtype=np.float32)
+                self._cached_shape_carriers[n] = Tensor(
+                    storage=Buffer(DType.float32, [n])
                 )
         h_carrier = self._cached_shape_carriers[packed_h]
         w_carrier = self._cached_shape_carriers[packed_w]
@@ -316,7 +345,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
     @traced(message="Flux2Pipeline.build_scheduler_step")
     def build_scheduler_step(self) -> None:
-        dtype = self.transformer.config.dtype
+        dtype = self._activation_dtype(self.transformer.config.dtype)
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -334,7 +363,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
     @traced(message="Flux2Pipeline.build_concat_image_latents")
     def build_concat_image_latents(self) -> None:
-        dtype = self.transformer.config.dtype
+        dtype = self._activation_dtype(self.transformer.config.dtype)
         device = self.transformer.devices[0]
         input_types = [
             TensorType(
@@ -382,23 +411,16 @@ class Flux2Pipeline(DiffusionPipeline):
         scale: int = 10,
         device: Device = CPU(),
     ) -> Tensor:
-        all_coords = []
+        flat: _array.array[int] = _array.array("q")  # signed int64
         for i, (height, width) in enumerate(latent_shapes):
             t_coord = scale + scale * i
-            t_coords = np.full((height, width), t_coord, dtype=np.int64)
-            h_coords, w_coords = np.meshgrid(
-                np.arange(height, dtype=np.int64),
-                np.arange(width, dtype=np.int64),
-                indexing="ij",
-            )
-            l_coords = np.zeros((height, width), dtype=np.int64)
-
-            coords = np.stack([t_coords, h_coords, w_coords, l_coords], axis=-1)
-            all_coords.append(coords.reshape(-1, 4))
-
-        combined = np.concatenate(all_coords, axis=0)
-        combined = np.expand_dims(combined, 0)  # (1, total_seq, 4)
-        return Tensor.from_dlpack(np.ascontiguousarray(combined)).to(device)
+            for h_idx in range(height):
+                for w_idx in range(width):
+                    flat.extend((t_coord, h_idx, w_idx, 0))
+        total_seq = sum(h * w for h, w in latent_shapes)
+        buf = Buffer(DType.int64, [1, total_seq, 4])
+        ctypes.memmove(buf._data_ptr(), flat.tobytes(), total_seq * 4 * 8)
+        return Tensor(storage=buf).to(device)
 
     def _extract_mode_and_pack_image_latent(
         self,
@@ -563,8 +585,8 @@ class Flux2Pipeline(DiffusionPipeline):
         latents: Tensor,
         h_carrier: Tensor,
         w_carrier: Tensor,
-    ) -> np.ndarray:
-        """Decode Flux2 packed latents into a (B, H, W, C) uint8 NumPy array.
+    ) -> Tensor:
+        """Decode Flux2 packed latents into a (B, H, W, C) uint8 Tensor.
 
         Args:
             latents: Packed latents, shaped (B, S, C).
@@ -572,11 +594,9 @@ class Flux2Pipeline(DiffusionPipeline):
             w_carrier: 1-D shape carrier of length packed_w (content unused).
 
         Returns:
-            uint8 NumPy array of shape (B, H, W, C) with values in [0, 255].
+            uint8 Tensor of shape (B, H, W, C) with values in [0, 255].
         """
-        decoded = self._postprocess_and_decode(latents, h_carrier, w_carrier)
-
-        return np.from_dlpack(decoded)  # (B, H, W, C)
+        return self._postprocess_and_decode(latents, h_carrier, w_carrier)
 
     @staticmethod
     def _prepare_text_ids(
@@ -592,22 +612,14 @@ class Flux2Pipeline(DiffusionPipeline):
         Returns:
             Tensor[int64] of shape (batch_size, seq_len, 4).
         """
-        coords = np.stack(
-            [
-                np.zeros(seq_len, dtype=np.int64),  # T
-                np.zeros(seq_len, dtype=np.int64),  # H
-                np.zeros(seq_len, dtype=np.int64),  # W
-                np.arange(seq_len, dtype=np.int64),  # L
-            ],
-            axis=-1,
-        )  # (seq_len, 4)
-
-        text_ids = np.tile(coords[np.newaxis, :, :], (batch_size, 1, 1))
-        return Tensor(
-            storage=Buffer.from_dlpack(np.ascontiguousarray(text_ids)).to(
-                device
-            )
-        )
+        # Build (batch_size, seq_len, 4) int64 buffer: T=0, H=0, W=0, L=token_idx
+        row: _array.array[int] = _array.array("q")
+        for l in range(seq_len):
+            row.extend((0, 0, 0, l))
+        flat = row * batch_size  # repeat for each batch element
+        buf = Buffer(DType.int64, [batch_size, seq_len, 4])
+        ctypes.memmove(buf._data_ptr(), flat.tobytes(), batch_size * seq_len * 4 * 8)
+        return Tensor(storage=buf.to(device))
 
     @traced(message="Flux2Pipeline.preprocess_latents")
     def preprocess_latents(self, latents: Tensor) -> Tensor:
@@ -615,7 +627,9 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def _patchify_and_pack(self, latents: Tensor) -> Tensor:
         """Patchify (B,C,H,W)->(B,C*4,H//2,W//2) then pack to (B,H//2*W//2,C*4)."""
-        latents = latents.cast(self.transformer.config.dtype)
+        latents = latents.cast(
+            self._activation_dtype(self.transformer.config.dtype)
+        )
         batch = latents.shape[0]
         c = latents.shape[1]
         h = latents.shape[2]
@@ -637,14 +651,27 @@ class Flux2Pipeline(DiffusionPipeline):
 
     def _numpy_image_to_tensor(
         self,
-        image: npt.NDArray[np.uint8],
+        image: Any,
     ) -> Tensor:
-        img_array = (image.astype(np.float32) / 127.5) - 1.0
-        img_array = np.transpose(img_array, (2, 0, 1))
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array = np.ascontiguousarray(img_array)
+        # image is a HWC uint8 array-like (supports __dlpack__ and .shape).
+        # Use Tensor.from_dlpack for zero-copy import, then MAX ops for
+        # normalization and HWC → BCHW transposition — no numpy functions used.
+        t = Tensor.from_dlpack(image)  # (H, W, C) uint8
+        h, w, c = int(t.shape[0]), int(t.shape[1]), int(t.shape[2])
+        n = h * w * c
+        buf = t._storage  # underlying Buffer on CPU
+        f32_ptr = ctypes.cast(buf._data_ptr(), ctypes.POINTER(ctypes.c_float))
+        out_vals = _array.array("f", [0.0] * n)
+        for c_idx in range(c):
+            for h_idx in range(h):
+                for w_idx in range(w):
+                    src = h_idx * w * c + w_idx * c + c_idx  # HWC layout
+                    dst = c_idx * h * w + h_idx * w + w_idx  # CHW layout
+                    out_vals[dst] = f32_ptr[src] / 127.5 - 1.0
+        chw_buf = Buffer(DType.float32, [1, c, h, w])
+        ctypes.memmove(chw_buf._data_ptr(), out_vals.tobytes(), n * 4)
         return (
-            Tensor.from_dlpack(img_array)
+            Tensor(storage=chw_buf)
             .to(self.vae.devices[0])
             .cast(self.vae.config.dtype)
         )
