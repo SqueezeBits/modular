@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Generic
 
 import numpy as np
-from max.driver import load_devices
+from max.driver import CPU, load_devices
+from max.experimental.tensor import Tensor as MaxTensor
 from max.interfaces import (
     GenerationStatus,
     Pipeline,
@@ -122,8 +123,13 @@ class PixelGenerationPipeline(
         num_images_per_prompt = model_inputs.num_images_per_prompt
         expected_images = len(flat_batch) * num_images_per_prompt
 
-        # Handle both numpy array (NHWC) and list of images
-        if isinstance(images, np.ndarray):
+        # Handle numpy array (NHWC), MAX Tensor (NHWC uint8), or list of images
+        if isinstance(images, MaxTensor):
+            # Already NHWC uint8 [0, 255] from GPU-side VAE decoder; move to
+            # CPU and convert via DLPack for downstream numpy processing.
+            images_np = np.from_dlpack(images.to(CPU()))
+            image_list = [images_np[i] for i in range(images_np.shape[0])]
+        elif isinstance(images, np.ndarray):
             if images.dtype == np.uint8:
                 # Already NHWC uint8 [0, 255] from GPU post-processing.
                 image_list = [images[i] for i in range(images.shape[0])]
