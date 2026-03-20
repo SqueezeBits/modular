@@ -45,7 +45,7 @@ import os
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import cast
+from typing import cast, get_args
 
 from max.driver import DeviceSpec
 from max.examples.diffusion.profiler import profile_execute
@@ -66,7 +66,12 @@ from max.interfaces.request.open_responses import (
     OutputImageContent,
     UserMessage,
 )
-from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
+from max.pipelines import (
+    PIPELINE_REGISTRY,
+    MAXModelConfig,
+    PipelineConfig,
+    SupportedEncoding,
+)
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import PixelGenerationTokenizer
 from max.pipelines.lib.interfaces import DiffusionPipeline
@@ -83,6 +88,7 @@ _FLUX2_ARCH_NAMES = {
     "Flux2Pipeline_ModuleV3",
     "Flux2KleinPipeline_ModuleV3",
 }
+SUPPORTED_ENCODING_CHOICES = tuple(get_args(SupportedEncoding))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -119,17 +125,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--quantization-encoding",
         type=str,
         default=None,
-        choices=[
-            "float32",
-            "bfloat16",
-            "q4_k",
-            "q4_0",
-            "q6_k",
-            "float8_e4m3fn",
-            "float4_e2m1fnx2",
-            "gptq",
-        ],
-        help="Weight encoding type (e.g., 'bfloat16', 'float4_e2m1fnx2' for NVFP4).",
+        choices=SUPPORTED_ENCODING_CHOICES,
+        help=(
+            "Optional weight encoding override (e.g. float8_e4m3fn). "
+            "If not set, encoding is auto-resolved from available weights."
+        ),
     )
     parser.add_argument(
         "--negative-prompt",
@@ -272,6 +272,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Use the ModuleV3 FLUX implementation instead of the default architecture.",
     )
+    parser.add_argument(
+        "--activation-scheme",
+        choices=("static", "dynamic"),
+        default=None,
+        help=(
+            "Optional FP8 activation scaling override. "
+            "If not set, the model keeps its default activation scaling mode."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -370,7 +379,12 @@ async def generate_image(args: argparse.Namespace) -> None:
             weight_path=(
                 [Path(p) for p in args.weight_path] if args.weight_path else []
             ),
-            quantization_encoding=args.quantization_encoding,
+            quantization_encoding=(
+                cast(SupportedEncoding, args.quantization_encoding)
+                if args.quantization_encoding is not None
+                else None
+            ),
+            fp8_activation_scheme=args.activation_scheme,
         ),
         runtime=PipelineRuntimeConfig(
             prefer_module_v3=args.prefer_module_v3,
@@ -419,7 +433,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         )
 
     tokenizer = PixelGenerationTokenizer(
-        model_path=args.model,
+        model_path=config.model.model_path,
         pipeline_config=config,
         subfolder="tokenizer",  # Tokenizer is in a subfolder for diffusion models
         max_length=max_length,
