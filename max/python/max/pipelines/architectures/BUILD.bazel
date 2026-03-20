@@ -22,7 +22,9 @@ modular_py_library(
         requirement("pillow"),
         requirement("pydantic"),
         requirement("requests"),
+        requirement("safetensors"),  # Required by FLUX.2-Klein FP8 weight adapter
         requirement("tiktoken"),  # Required by HF custom tokenizer for Kimi K2.5
+        requirement("tqdm"),  # Required by FLUX.2-Klein for denoising progress
         # TODO: These are required for the llama3.1 model. Remove them if
         # possible.
         requirement("transformers"),
