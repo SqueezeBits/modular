@@ -11,10 +11,14 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.nn import Linear, Module
 from max.experimental.nn.norm import LayerNorm, RMSNorm
 from max.experimental.tensor import Tensor
+from max.nn.float8_config import Float8Config
+
+from max.experimental.nn.common_layers.fp8_linear import FP8Linear
 
 
 class AdaLayerNormContinuous(Module[[Tensor, Tensor], Tensor]):
@@ -26,6 +30,8 @@ class AdaLayerNormContinuous(Module[[Tensor, Tensor], Tensor]):
         eps: float = 1e-5,
         bias: bool = True,
         norm_type: str = "layer_norm",
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
     ):
         """Initialize AdaLayerNormContinuous.
 
@@ -38,8 +44,12 @@ class AdaLayerNormContinuous(Module[[Tensor, Tensor], Tensor]):
             norm_type: Type of normalization to use ("layer_norm" or "rms_norm").
         """
         self.silu = F.silu
-        self.linear = Linear(
-            conditioning_embedding_dim, embedding_dim * 2, bias=bias
+        self.linear = FP8Linear(
+            conditioning_embedding_dim,
+            embedding_dim * 2,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
         )
         self.norm: LayerNorm | RMSNorm
         if norm_type == "layer_norm":

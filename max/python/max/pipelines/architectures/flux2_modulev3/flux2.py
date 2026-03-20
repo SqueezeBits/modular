@@ -23,6 +23,7 @@ from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
 from max.graph.dim import Dim
+from max.nn.float8_config import Float8Config
 from max.nn.quant_config import QuantConfig
 from max.pipelines.lib.interfaces.cache_mixin import (
     DenoisingCacheConfig,
@@ -30,6 +31,8 @@ from max.pipelines.lib.interfaces.cache_mixin import (
     teacache_conditional_execution,
     teacache_rescaled_delta,
 )
+
+from max.experimental.nn.common_layers.fp8_linear import FP8Linear
 
 from .layers.embeddings import TimestepEmbedding, Timesteps
 from .layers.flux2_attention import (
@@ -49,6 +52,8 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
         embedding_dim: int = 6144,
         bias: bool = False,
         guidance_embeds: bool = True,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
     ):
         """Initialize Flux2TimestepGuidanceEmbeddings.
 
@@ -67,6 +72,8 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
             in_channels=in_channels,
             time_embed_dim=embedding_dim,
             sample_proj_bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
         )
         self.guidance_embedder: TimestepEmbedding | None
         if guidance_embeds:
@@ -74,6 +81,8 @@ class Flux2TimestepGuidanceEmbeddings(Module[[Tensor, Tensor], Tensor]):
                 in_channels=in_channels,
                 time_embed_dim=embedding_dim,
                 sample_proj_bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
             )
         else:
             # Distilled checkpoints can omit guidance embedding weights.
@@ -113,6 +122,8 @@ class Flux2Modulation(
         dim: int,
         mod_param_sets: int = 2,
         bias: bool = False,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
         quant_config: QuantConfig | None = None,
     ):
         """Initialize Flux2Modulation.
@@ -121,11 +132,19 @@ class Flux2Modulation(
             dim: Input/output dimension.
             mod_param_sets: Number of parameter sets (2 for dual-stream, 1 for single-stream).
             bias: Whether to use bias in linear layer.
+            float8_config: Optional FP8 quantization config.
+            weight_dtype: Optional weight dtype for FP8.
             quant_config: Optional NVFP4 quantization config.
         """
         self.mod_param_sets = mod_param_sets
         # Modulation layers are always BF16 in NVFP4 checkpoints.
-        self.linear = Linear(dim, dim * 3 * mod_param_sets, bias=bias)
+        self.linear = FP8Linear(
+            dim,
+            dim * 3 * mod_param_sets,
+            bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
+        )
 
     def forward(
         self, temb: Tensor
@@ -170,6 +189,8 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
         quant_config: QuantConfig | None = None,
     ):
         """Initialize Flux2TransformerBlock.
@@ -181,6 +202,8 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
             mlp_ratio: Multiplier for feedforward hidden dimension.
             eps: Epsilon for layer normalization.
             bias: Whether to use bias in linear layers.
+            float8_config: Optional FP8 quantization config.
+            weight_dtype: Optional weight dtype for FP8.
             quant_config: Optional NVFP4 quantization config.
         """
         self.mlp_hidden_dim = int(dim * mlp_ratio)
@@ -204,6 +227,8 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
             quant_config=quant_config,
         )
 
@@ -216,6 +241,8 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
             dim_out=dim,
             mult=mlp_ratio,
             bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
             quant_config=quant_config,
         )
 
@@ -227,6 +254,8 @@ class Flux2TransformerBlock(Module[..., tuple[Tensor, Tensor]]):
             dim_out=dim,
             mult=mlp_ratio,
             bias=bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
             quant_config=quant_config,
         )
 
@@ -330,6 +359,8 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
         quant_config: QuantConfig | None = None,
     ):
         """Initialize Flux2SingleTransformerBlock.
@@ -341,6 +372,8 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
             mlp_ratio: Multiplier for feedforward hidden dimension.
             eps: Epsilon for layer normalization.
             bias: Whether to use bias in linear layers.
+            float8_config: Optional FP8 quantization config.
+            weight_dtype: Optional weight dtype for FP8.
             quant_config: Optional NVFP4 quantization config.
         """
         # Single normalization (elementwise_affine=False)
@@ -359,6 +392,8 @@ class Flux2SingleTransformerBlock(Module[..., Tensor | tuple[Tensor, Tensor]]):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
             quant_config=quant_config,
         )
 
@@ -462,6 +497,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
         rope_theta = config.rope_theta
         dtype = config.dtype
         eps = config.eps
+        float8_config = config.float8_config
 
         self.patch_size = patch_size
         self.out_channels = out_channels or in_channels
@@ -473,29 +509,53 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
             theta=rope_theta, axes_dim=axes_dims_rope
         )
 
-        # 2. Timestep and guidance embeddings
+        # 2. Timestep and guidance embeddings (always BF16 — not quantized in FP8 checkpoints)
         self.time_guidance_embed = Flux2TimestepGuidanceEmbeddings(
             in_channels=timestep_guidance_channels,
             embedding_dim=self.inner_dim,
             bias=False,
             guidance_embeds=getattr(config, "guidance_embeds", True),
+            float8_config=None,
+            weight_dtype=dtype,
         )
 
         # 3. Modulation layers (always BF16)
         self.double_stream_modulation_img = Flux2Modulation(
-            self.inner_dim, mod_param_sets=2, bias=False
+            self.inner_dim,
+            mod_param_sets=2,
+            bias=False,
+            float8_config=None,
+            weight_dtype=dtype,
         )
         self.double_stream_modulation_txt = Flux2Modulation(
-            self.inner_dim, mod_param_sets=2, bias=False
+            self.inner_dim,
+            mod_param_sets=2,
+            bias=False,
+            float8_config=None,
+            weight_dtype=dtype,
         )
         self.single_stream_modulation = Flux2Modulation(
-            self.inner_dim, mod_param_sets=1, bias=False
+            self.inner_dim,
+            mod_param_sets=1,
+            bias=False,
+            float8_config=None,
+            weight_dtype=dtype,
         )
 
-        # 4. Input embeddings (always BF16)
-        self.x_embedder = Linear(in_channels, self.inner_dim, bias=False)
-        self.context_embedder = Linear(
-            joint_attention_dim, self.inner_dim, bias=False
+        # 4. Input embeddings (always BF16 — not quantized in FP8 checkpoints)
+        self.x_embedder = FP8Linear(
+            in_channels,
+            self.inner_dim,
+            bias=False,
+            float8_config=None,
+            weight_dtype=dtype,
+        )
+        self.context_embedder = FP8Linear(
+            joint_attention_dim,
+            self.inner_dim,
+            bias=False,
+            float8_config=None,
+            weight_dtype=dtype,
         )
 
         # 5. Dual-stream transformer blocks
@@ -508,6 +568,8 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    float8_config=float8_config,
+                    weight_dtype=dtype,
                     quant_config=quant_config,
                 )
                 for _ in range(num_layers)
@@ -526,6 +588,8 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    float8_config=float8_config,
+                    weight_dtype=dtype,
                     quant_config=quant_config,
                 )
                 for _ in range(num_single_layers)
@@ -539,15 +603,21 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
             elementwise_affine=False,
             eps=eps,
             bias=False,
+            float8_config=None,
+            weight_dtype=dtype,
         )
-        self.proj_out = Linear(
+        self.proj_out = FP8Linear(
             self.inner_dim,
             patch_size * patch_size * self.out_channels,
             bias=False,
+            float8_config=None,
+            weight_dtype=dtype,
         )
 
         # Store config for input_types
+        self.max_device = device
         self.max_dtype = dtype
+        self.max_input_dtype = DType.bfloat16 if dtype.is_float8() else dtype
         self.in_channels = in_channels
         self.joint_attention_dim = joint_attention_dim
 
@@ -613,17 +683,17 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
     def _base_input_types(self) -> tuple[TensorType, ...]:
         """Return the base input types shared by both forward paths."""
         hidden_states_type = TensorType(
-            self.max_dtype,
+            self.max_input_dtype,
             shape=["batch_size", "image_seq_len", self.in_channels],
             device=self.device,
         )
         encoder_hidden_states_type = TensorType(
-            self.max_dtype,
+            self.max_input_dtype,
             shape=["batch_size", "text_seq_len", self.joint_attention_dim],
             device=self.device,
         )
         timestep_type = TensorType(
-            self.max_dtype, shape=["batch_size"], device=self.device
+            self.max_input_dtype, shape=["batch_size"], device=self.max_device
         )
         img_ids_type = TensorType(
             DType.int64,
@@ -636,7 +706,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
             device=self.device,
         )
         guidance_type = TensorType(
-            self.max_dtype, shape=["batch_size"], device=self.device
+            self.max_input_dtype, shape=["batch_size"], device=self.max_device
         )
         return (
             hidden_states_type,

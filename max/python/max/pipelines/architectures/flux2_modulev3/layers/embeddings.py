@@ -21,7 +21,9 @@ from max.experimental.nn.common_layers.activation import (
     activation_function_from_name,
 )
 from max.experimental.tensor import Tensor
+from max.nn.float8_config import Float8Config
 
+from max.experimental.nn.common_layers.fp8_linear import FP8Linear
 
 def get_timestep_embedding(
     timesteps: Tensor,
@@ -272,6 +274,8 @@ class TimestepEmbedding(Module[[Tensor], Tensor]):
         post_act_fn: str | None = None,
         cond_proj_dim: int | None = None,
         sample_proj_bias: bool = True,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
     ):
         """Initialize TimestepEmbedding MLP.
 
@@ -284,13 +288,23 @@ class TimestepEmbedding(Module[[Tensor], Tensor]):
             cond_proj_dim: Optional conditioning projection dimension.
             sample_proj_bias: Whether to use bias in linear layers.
         """
-        self.linear_1 = Linear(
-            in_channels, time_embed_dim, bias=sample_proj_bias
+        self.linear_1 = FP8Linear(
+            in_channels,
+            time_embed_dim,
+            bias=sample_proj_bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
         )
 
-        self.cond_proj: Linear | None
+        self.cond_proj: FP8Linear | None
         if cond_proj_dim is not None:
-            self.cond_proj = Linear(cond_proj_dim, in_channels, bias=False)
+            self.cond_proj = FP8Linear(
+                cond_proj_dim,
+                in_channels,
+                bias=False,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
         else:
             self.cond_proj = None
 
@@ -301,8 +315,12 @@ class TimestepEmbedding(Module[[Tensor], Tensor]):
         else:
             time_embed_dim_out = time_embed_dim
 
-        self.linear_2 = Linear(
-            time_embed_dim, time_embed_dim_out, bias=sample_proj_bias
+        self.linear_2 = FP8Linear(
+            time_embed_dim,
+            time_embed_dim_out,
+            bias=sample_proj_bias,
+            float8_config=float8_config,
+            weight_dtype=weight_dtype,
         )
 
         self.post_act: Callable[[Tensor], Tensor] | None
