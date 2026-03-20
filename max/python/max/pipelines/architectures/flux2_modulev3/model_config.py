@@ -11,11 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from typing import Any
+from typing import Any, Literal
 
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
+from max.nn.float8_config import Float8Config
 from max.nn.quant_config import (
     InputScaleSpec,
     QuantConfig,
@@ -23,6 +24,10 @@ from max.nn.quant_config import (
     ScaleGranularity,
     ScaleOrigin,
     WeightScaleSpec,
+)
+from max.experimental.nn.common_layers.fp8_config_utils import (
+    build_dynamic_block_fp8_config,
+    build_legacy_scalar_fp8_config,
 )
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
@@ -78,6 +83,10 @@ class Flux2Config(MAXModelConfigBase):
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
     quant_config: QuantConfig | None = None
     """NVFP4 quantization config, populated when encoding is float4_e2m1fnx2."""
+    activation_scheme: Literal["static", "dynamic"] | None = None
+    """FP8 activation scaling scheme (static or dynamic). None means auto-detect."""
+    float8_config: Float8Config | None = None
+    """FP8 quantization config, populated when encoding is float8_e4m3fn."""
 
     @classmethod
     def initialize_from_config(
@@ -101,11 +110,30 @@ class Flux2Config(MAXModelConfigBase):
                 init_dict.get("num_single_layers", 48),
             )
             raw_dtype = DType.bfloat16  # activations stay bf16
+
+        # For FP8, pre-build float8_config when activation_scheme is known.
+        float8_config: Float8Config | None = None
+        if encoding == "float8_e4m3fn":
+            activation_scheme = init_dict.get("activation_scheme")
+            if activation_scheme == "static":
+                float8_config = build_legacy_scalar_fp8_config(
+                    component_name="flux2.transformer"
+                )
+            else:
+                try:
+                    float8_config = build_dynamic_block_fp8_config(
+                        config_dict, component_name="flux2.transformer"
+                    )
+                except ValueError:
+                    float8_config = None
+            raw_dtype = DType.bfloat16  # activations stay bf16 for FP8 too
+
         init_dict.update(
             {
                 "dtype": raw_dtype,
                 "device": DeviceRef.from_device(devices[0]),
                 "quant_config": quant_config,
+                "float8_config": float8_config,
             }
         )
         return cls(**init_dict)

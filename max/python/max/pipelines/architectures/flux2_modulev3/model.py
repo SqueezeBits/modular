@@ -13,11 +13,19 @@
 
 from __future__ import annotations
 
+import ctypes
+import struct
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from max.driver import Device
+from max.driver import Buffer, Device
+from max.dtype import DType
 from max.experimental import functional as F
+from max.experimental.nn.common_layers.fp8_config_utils import (
+    build_dynamic_block_fp8_config,
+    build_legacy_scalar_fp8_config,
+    validate_fp8_weight_scale_contract,
+)
 from max.experimental.tensor import Tensor
 from max.graph.shape import Shape
 from max.graph.weights import WeightData, Weights
@@ -31,6 +39,7 @@ if TYPE_CHECKING:
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
 from .nvfp4_weight_adapter import convert_nvfp4_state_dict
+from .weight_adapters import uses_legacy_scalar_fp8_scales
 
 # Mapping from stacked QKV key infixes to the split (Q, K, V) infixes.
 _STACKED_QKV_INFIXES = {
@@ -85,6 +94,75 @@ class Flux2TransformerModel(ComponentModel):
         )
         if stacked_qkv:
             state_dict = self._split_stacked_qkv(state_dict)
+
+        # FP8 auto-detection: if encoding is float8_e4m3fn and float8_config
+        # wasn't already set by initialize_from_config, inspect the state dict.
+        requested_activation_scheme = getattr(
+            self.config, "activation_scheme", None
+        )
+        if self.encoding == "float8_e4m3fn" and getattr(
+            self.config, "float8_config", None
+        ) is None:
+            if requested_activation_scheme in (None, "dynamic") and any(
+                key.endswith(".weight_scale")
+                and len(getattr(value, "shape", ())) == 2
+                for key, value in state_dict.items()
+            ):
+                self.config = self.config.model_copy(
+                    update={
+                        "float8_config": build_dynamic_block_fp8_config(
+                            {
+                                "quantization_config": {
+                                    "quant_method": "fp8",
+                                    "activation_scheme": "dynamic",
+                                    "weight_block_size": [128, 128],
+                                }
+                            },
+                            component_name="flux2.transformer",
+                        )
+                    }
+                )
+            elif uses_legacy_scalar_fp8_scales(state_dict):
+                self.config = self.config.model_copy(
+                    update={
+                        "float8_config": build_legacy_scalar_fp8_config(
+                            component_name="flux2.transformer"
+                        )
+                    }
+                )
+
+        # Validate FP8 weight scale contract if blockwise FP8.
+        fp8_cfg = getattr(self.config, "float8_config", None)
+        if fp8_cfg is not None and fp8_cfg.weight_scale.block_size is not None:
+            validate_fp8_weight_scale_contract(
+                state_dict,
+                float8_config=fp8_cfg,
+                component_name="flux2.transformer",
+            )
+
+        # Inject default FP8 scale tensors for any missing scale parameters.
+        if fp8_cfg is not None:
+            with F.lazy():
+                _flux_tmp = Flux2Transformer2DModel(self.config)
+                for param_name, tensor in _flux_tmp.parameters:
+                    if (
+                        param_name.endswith((".input_scale", ".weight_scale"))
+                        and param_name not in state_dict
+                    ):
+                        shape = tuple(int(d) for d in tensor.shape)
+                        shape_list = list(shape) if shape else []
+                        n = 1
+                        for d in shape_list:
+                            n *= d
+                        raw = struct.pack(f"<{n}f", *([1.0] * n))
+                        buf = Buffer(DType.float32, shape_list)
+                        ctypes.memmove(buf._data_ptr(), raw, len(raw))
+                        state_dict[param_name] = WeightData(
+                            data=buf,
+                            name=param_name,
+                            dtype=DType.float32,
+                            shape=shape_list,
+                        )
 
         # Klein/distilled checkpoints can omit guidance embedder weights.
         has_guidance_embedder = any(
