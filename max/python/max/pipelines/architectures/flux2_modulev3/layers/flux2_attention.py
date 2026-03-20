@@ -19,6 +19,7 @@ from max.experimental.nn import Linear, Module, module_dataclass
 from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
 from max.nn.attention.mask_config import MHAMaskVariant
+from max.nn.float8_config import Float8Config
 from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
 from max.nn.kernels import (
     rope_ragged_with_position_ids as _rope_ragged_with_position_ids,
@@ -28,6 +29,7 @@ from max.nn.quant_config import QuantConfig
 from .embeddings import get_1d_rotary_pos_embed
 from .nvfp4_linear import NVFP4Linear
 
+from max.experimental.nn.common_layers.fp8_linear import FP8Linear
 flash_attention_gpu = F.functional(_flash_attention_gpu)
 rope_ragged_with_position_ids = F.functional(_rope_ragged_with_position_ids)
 
@@ -107,9 +109,9 @@ class Flux2SwiGLU(Module[[Tensor], Tensor]):
 
 
 class Flux2FeedForward(Module[[Tensor], Tensor]):
-    linear_in: Linear | NVFP4Linear
+    linear_in: FP8Linear | Linear | NVFP4Linear
     act_fn: Flux2SwiGLU
-    linear_out: Linear | NVFP4Linear
+    linear_out: FP8Linear | Linear | NVFP4Linear
 
     def __init__(
         self,
@@ -118,6 +120,8 @@ class Flux2FeedForward(Module[[Tensor], Tensor]):
         mult: float = 3.0,
         inner_dim: int | None = None,
         bias: bool = False,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
         quant_config: QuantConfig | None = None,
     ):
         """Initialize Flux2FeedForward.
@@ -128,6 +132,8 @@ class Flux2FeedForward(Module[[Tensor], Tensor]):
             mult: Multiplier for hidden dimension (defaults to 3.0).
             inner_dim: Explicit inner dimension (overrides mult if provided).
             bias: Whether to use bias in linear layers.
+            float8_config: Optional FP8 quantization config.
+            weight_dtype: Optional weight dtype for FP8.
             quant_config: Optional NVFP4 quantization config.
         """
         if inner_dim is None:
@@ -135,13 +141,30 @@ class Flux2FeedForward(Module[[Tensor], Tensor]):
         dim_out = dim_out or dim
 
         # Flux2SwiGLU will reduce the dimension by half
-        self.linear_in = _make_linear(
-            dim, inner_dim * 2, bias=bias, quant_config=quant_config
-        )
-        self.act_fn = Flux2SwiGLU()
-        self.linear_out = _make_linear(
-            inner_dim, dim_out, bias=bias, quant_config=quant_config
-        )
+        if quant_config is not None:
+            self.linear_in = _make_linear(
+                dim, inner_dim * 2, bias=bias, quant_config=quant_config
+            )
+            self.act_fn = Flux2SwiGLU()
+            self.linear_out = _make_linear(
+                inner_dim, dim_out, bias=bias, quant_config=quant_config
+            )
+        else:
+            self.linear_in = FP8Linear(
+                dim,
+                inner_dim * 2,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
+            self.act_fn = Flux2SwiGLU()
+            self.linear_out = FP8Linear(
+                inner_dim,
+                dim_out,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
 
     def forward(self, x: Tensor) -> Tensor:
         """Apply feedforward transformation.
@@ -220,6 +243,8 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         out_bias: bool = True,
         eps: float = 1e-5,
         out_dim: int | None = None,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
         quant_config: QuantConfig | None = None,
     ):
         """Initialize Flux2Attention.
@@ -235,6 +260,8 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
             out_bias: Whether to use bias in output projection.
             eps: Epsilon for RMSNorm.
             out_dim: Output dimension (defaults to query_dim).
+            float8_config: Optional FP8 quantization config.
+            weight_dtype: Optional weight dtype for FP8.
             quant_config: Optional NVFP4 quantization config.
         """
         self.head_dim = dim_head
@@ -243,53 +270,120 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
         self.added_kv_proj_dim = added_kv_proj_dim
         out_dim = out_dim if out_dim is not None else query_dim
 
-        # Main Q/K/V projections (FP4 when quantized)
-        self.to_q = _make_linear(
-            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
-        )
-        self.to_k = _make_linear(
-            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
-        )
-        self.to_v = _make_linear(
-            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
-        )
+        if quant_config is not None:
+            # NVFP4 path
+            self.to_q = _make_linear(
+                query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+            )
+            self.to_k = _make_linear(
+                query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+            )
+            self.to_v = _make_linear(
+                query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+            )
+        else:
+            # FP8 or plain path
+            self.to_q = FP8Linear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
+            self.to_k = FP8Linear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
+            self.to_v = FP8Linear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
 
         # QK normalization
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Output projection (FP4 when quantized)
+        # Output projection
         self.to_out = ModuleList()
-        self.to_out.append(
-            _make_linear(
-                self.inner_dim,
-                out_dim,
-                bias=out_bias,
-                quant_config=quant_config,
+        if quant_config is not None:
+            self.to_out.append(
+                _make_linear(
+                    self.inner_dim,
+                    out_dim,
+                    bias=out_bias,
+                    quant_config=quant_config,
+                )
             )
-        )
+        else:
+            self.to_out.append(
+                FP8Linear(
+                    self.inner_dim,
+                    out_dim,
+                    bias=out_bias,
+                    float8_config=float8_config,
+                    weight_dtype=weight_dtype,
+                )
+            )
 
         # Optional: encoder projections (always BF16 in NVFP4 checkpoints)
         self.norm_added_q: RMSNorm | None
         self.norm_added_k: RMSNorm | None
-        self.add_q_proj: Linear | None
-        self.add_k_proj: Linear | None
-        self.add_v_proj: Linear | None
-        self.to_add_out: Linear | None
+        self.add_q_proj: FP8Linear | Linear | None
+        self.add_k_proj: FP8Linear | Linear | None
+        self.add_v_proj: FP8Linear | Linear | None
+        self.to_add_out: FP8Linear | Linear | None
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
             add_bias = added_proj_bias if added_proj_bias is not None else False
-            self.add_q_proj = Linear(
-                added_kv_proj_dim, self.inner_dim, bias=add_bias
-            )
-            self.add_k_proj = Linear(
-                added_kv_proj_dim, self.inner_dim, bias=add_bias
-            )
-            self.add_v_proj = Linear(
-                added_kv_proj_dim, self.inner_dim, bias=add_bias
-            )
-            self.to_add_out = Linear(self.inner_dim, query_dim, bias=out_bias)
+            if quant_config is not None:
+                self.add_q_proj = Linear(
+                    added_kv_proj_dim, self.inner_dim, bias=add_bias
+                )
+                self.add_k_proj = Linear(
+                    added_kv_proj_dim, self.inner_dim, bias=add_bias
+                )
+                self.add_v_proj = Linear(
+                    added_kv_proj_dim, self.inner_dim, bias=add_bias
+                )
+                self.to_add_out = Linear(
+                    self.inner_dim, query_dim, bias=out_bias
+                )
+            else:
+                self.add_q_proj = FP8Linear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=add_bias,
+                    float8_config=float8_config,
+                    weight_dtype=weight_dtype,
+                )
+                self.add_k_proj = FP8Linear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=add_bias,
+                    float8_config=float8_config,
+                    weight_dtype=weight_dtype,
+                )
+                self.add_v_proj = FP8Linear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=add_bias,
+                    float8_config=float8_config,
+                    weight_dtype=weight_dtype,
+                )
+                self.to_add_out = FP8Linear(
+                    self.inner_dim,
+                    query_dim,
+                    bias=out_bias,
+                    float8_config=float8_config,
+                    weight_dtype=weight_dtype,
+                )
         else:
             self.norm_added_q = None
             self.norm_added_k = None
@@ -441,6 +535,8 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         out_dim: int | None = None,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        float8_config: Float8Config | None = None,
+        weight_dtype: DType | None = None,
         quant_config: QuantConfig | None = None,
     ):
         """Initialize Flux2ParallelSelfAttention.
@@ -456,6 +552,8 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
             out_dim: Output dimension (defaults to query_dim).
             mlp_ratio: Multiplier for MLP hidden dimension.
             mlp_mult_factor: Multiplier for MLP projection (2 for SwiGLU).
+            float8_config: Optional FP8 quantization config.
+            weight_dtype: Optional weight dtype for FP8.
             quant_config: Optional NVFP4 quantization config.
         """
         self.head_dim = dim_head
@@ -468,9 +566,18 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
 
         # Fused QKV + MLP input projection
         fused_dim = self.inner_dim * 3 + self.mlp_hidden_dim * mlp_mult_factor
-        self.to_qkv_mlp_proj = _make_linear(
-            query_dim, fused_dim, bias=bias, quant_config=quant_config
-        )
+        if quant_config is not None:
+            self.to_qkv_mlp_proj = _make_linear(
+                query_dim, fused_dim, bias=bias, quant_config=quant_config
+            )
+        else:
+            self.to_qkv_mlp_proj = FP8Linear(
+                query_dim,
+                fused_dim,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
 
         # MLP activation
         self.mlp_act_fn = Flux2SwiGLU()
@@ -480,12 +587,21 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Fused output projection (Attention output + MLP output)
-        self.to_out = _make_linear(
-            self.inner_dim + self.mlp_hidden_dim,
-            out_dim,
-            bias=out_bias,
-            quant_config=quant_config,
-        )
+        if quant_config is not None:
+            self.to_out = _make_linear(
+                self.inner_dim + self.mlp_hidden_dim,
+                out_dim,
+                bias=out_bias,
+                quant_config=quant_config,
+            )
+        else:
+            self.to_out = FP8Linear(
+                self.inner_dim + self.mlp_hidden_dim,
+                out_dim,
+                bias=out_bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
 
     def forward(
         self,
