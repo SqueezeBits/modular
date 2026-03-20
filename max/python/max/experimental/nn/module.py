@@ -62,6 +62,28 @@ forward pass.
 """
 
 
+def _contains_device_pinned(ann: object) -> bool:
+    """Return True if *ann* is or contains a ``PinnedDeviceTensor`` annotation.
+
+    Handles bare ``PinnedDeviceTensor``, string annotations produced by
+    ``from __future__ import annotations`` (e.g. ``"PinnedDeviceTensor | None"``),
+    and union forms such as ``PinnedDeviceTensor | None``.
+    """
+    if ann is PinnedDeviceTensor or ann == "PinnedDeviceTensor":
+        return True
+    # Deferred string annotations (from __future__ import annotations).
+    if isinstance(ann, str):
+        return "PinnedDeviceTensor" in ann
+    # Annotated[...]: _DevicePinned appears in __metadata__
+    if hasattr(ann, "__metadata__"):
+        if any(isinstance(m, _DevicePinned) for m in ann.__metadata__):
+            return True
+    # Union types: PinnedDeviceTensor | None, Optional[PinnedDeviceTensor]
+    if hasattr(ann, "__args__"):
+        return any(_contains_device_pinned(a) for a in ann.__args__)
+    return False
+
+
 def _get_pinned_device_fields(cls: type) -> frozenset[str]:
     """Returns field names annotated as `PinnedDeviceTensor` on `cls`.
 
@@ -70,7 +92,7 @@ def _get_pinned_device_fields(cls: type) -> frozenset[str]:
     pinned: set[str] = set()
     for base in cls.__mro__:
         for name, ann in getattr(base, "__annotations__", {}).items():
-            if ann is PinnedDeviceTensor or ann == "PinnedDeviceTensor":
+            if _contains_device_pinned(ann):
                 pinned.add(name)
     return frozenset(pinned)
 
@@ -356,8 +378,12 @@ class Module(Generic[_P, _R]):
                 The return value of this function is the new value that will
                 replace the value at that name.
         """
+        pinned = _get_pinned_device_fields(type(self))
         for name, attr in self.local_parameters:
-            setattr(self, name, f(name, attr))
+            result = f(name, attr)
+            if name in pinned and isinstance(result, Tensor):
+                result = result.to(CPU())
+            setattr(self, name, result)
 
     def apply_to_parameters(self, f: Callable[[str, Tensor], Tensor]) -> None:
         """Applies a transformation to all parameters in the module hierarchy.

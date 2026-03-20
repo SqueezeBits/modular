@@ -18,7 +18,9 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic
 
-from max.driver import load_devices
+import numpy as np
+from max.driver import CPU, load_devices
+from max.experimental.tensor import Tensor as MaxTensor
 from max.interfaces import (
     GenerationStatus,
     Pipeline,
@@ -118,16 +120,50 @@ class PixelGenerationPipeline(
         num_images_per_prompt = model_inputs.num_images_per_prompt
         expected_images = len(flat_batch) * num_images_per_prompt
 
-        if images.shape[0] != expected_images:
+        # Handle numpy array (NHWC), MAX Tensor (NHWC uint8), or list of images.
+        if isinstance(images, MaxTensor):
+            # Already NHWC uint8 [0, 255] from GPU-side VAE decoder; move to
+            # CPU and convert via DLPack for downstream numpy processing.
+            images_np = np.from_dlpack(images.to(CPU()))
+            image_list = [images_np[i] for i in range(images_np.shape[0])]
+        elif isinstance(images, np.ndarray):
+            if images.dtype == np.uint8:
+                # Already NHWC uint8 [0, 255] from GPU post-processing.
+                image_list = [images[i] for i in range(images.shape[0])]
+            else:
+                # images shape: (batch_size, H, W, C) or (batch_size, C, H, W)
+                # Convert NCHW to NHWC if needed.
+                if images.ndim == 4 and images.shape[1] in (1, 3, 4):
+                    images = np.transpose(images, (0, 2, 3, 1))
+                # Denormalize [-1, 1] -> [0, 255] uint8.
+                images = np.clip(images * 0.5 + 0.5, 0.0, 1.0)
+                images = (images * 255).astype(np.uint8)
+                image_list = [images[i] for i in range(images.shape[0])]
+        else:
+            # Denormalize each image from [-1, 1] to [0, 255] uint8.
+            image_list = [
+                (
+                    np.clip(
+                        np.asarray(img, dtype=np.float32) * 0.5 + 0.5,
+                        0.0,
+                        1.0,
+                    )
+                    * 255
+                ).astype(np.uint8)
+                for img in images
+            ]
+
+        actual_images = len(image_list)
+        if actual_images != expected_images:
             raise ValueError(
                 "Unexpected number of images returned from pipeline: "
-                f"expected {expected_images}, got {images.shape[0]}."
+                f"expected {expected_images}, got {actual_images}."
             )
 
         responses: dict[RequestID, GenerationOutput] = {}
         for index, (request_id, _context) in enumerate(flat_batch):
             offset = index * num_images_per_prompt
-            pixel_data = images[offset : offset + num_images_per_prompt]
+            pixel_data = image_list[offset : offset + num_images_per_prompt]
 
             output_format = getattr(_context, "output_format", "jpeg")
             responses[request_id] = GenerationOutput(

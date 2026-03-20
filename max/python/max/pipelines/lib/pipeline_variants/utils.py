@@ -189,13 +189,119 @@ def get_weight_paths(model_config: MAXModelConfig) -> list[Path]:
     weight_repo = model_config.huggingface_weight_repo
     if weight_repo.repo_type == "online":
         # Download weight files if not existent.
-        return download_weight_files(
+        weight_paths = download_weight_files(
             huggingface_model_id=weight_repo.repo_id,
             filenames=[str(x) for x in model_config.weight_path],
             revision=model_config.huggingface_weight_revision,
             force_download=model_config.force_download,
         )
+        return _maybe_adapt_flux2_klein_fp8_weight_paths(
+            model_config, weight_paths
+        )
     else:
         # Use the resolved repo_id (which points to local cache in offline mode)
         local_path = Path(weight_repo.repo_id)
-        return [local_path / x for x in model_config.weight_path]
+        weight_paths = [local_path / x for x in model_config.weight_path]
+        return _maybe_adapt_flux2_klein_fp8_weight_paths(
+            model_config, weight_paths
+        )
+
+
+def _maybe_adapt_flux2_klein_fp8_weight_paths(
+    model_config: MAXModelConfig, weight_paths: list[Path]
+) -> list[Path]:
+    model_path = model_config.model_path.lower()
+    weight_repo_id = model_config.huggingface_weight_repo_id.lower()
+
+    if (
+        "flux.2-klein" not in model_path
+        and "flux.2-klein" not in weight_repo_id
+    ):
+        return weight_paths
+
+    if not any("fp8" in path.name.lower() for path in weight_paths):
+        return weight_paths
+
+    if not all(path.suffix == ".safetensors" for path in weight_paths):
+        return weight_paths
+
+    if any(len(p.parts) > 1 for p in model_config.weight_path):
+        return weight_paths
+
+    from copy import deepcopy
+
+    from max.pipelines.architectures.flux2_modulev3.weight_adapters import (
+        adapt_bflabs_flux2_transformer_weights,
+    )
+
+    activation_scheme = model_config.fp8_activation_scheme or "static"
+    if activation_scheme != "static":
+        if len(weight_paths) != 1:
+            raise ValueError(
+                "Expected a single flat safetensors file for FLUX.2 Klein FP8 "
+                f"dynamic loading, got {len(weight_paths)} paths."
+            )
+        adapted_path = adapt_bflabs_flux2_transformer_weights(
+            weight_paths[0], activation_scheme=activation_scheme
+        )
+
+        # Patch diffusers_config and weight_path the same way the static path
+        # does, so _resolve_absolute_paths can match the adapted filename.
+        diffusers_config = model_config.diffusers_config
+        if diffusers_config is None:
+            raise ValueError(
+                "diffusers_config is required for FLUX.2 Klein FP8 dynamic loading."
+            )
+        patched = deepcopy(diffusers_config)
+        transformer_comp = (
+            patched.setdefault("components", {}).setdefault("transformer", {})
+        )
+        transformer_cfg = transformer_comp.setdefault("config_dict", {})
+        quant_cfg = dict(transformer_cfg.get("quantization_config") or {})
+        quant_cfg["quant_method"] = "fp8"
+        quant_cfg["activation_scheme"] = activation_scheme
+        transformer_cfg["quantization_config"] = quant_cfg
+        transformer_cfg["activation_scheme"] = activation_scheme
+        model_config._diffusers_config = patched
+        model_config.weight_path = [Path(adapted_path.name)]
+
+        return [adapted_path]
+
+    if len(weight_paths) != 1:
+        raise ValueError(
+            "Expected a single flat safetensors file for FLUX.2 Klein FP8 "
+            f"static loading, got {len(weight_paths)} paths."
+        )
+
+    # Adapt the transformer weights once; result is cached on disk so
+    # subsequent runs skip the heavy PyTorch conversion entirely.
+    adapted_path = adapt_bflabs_flux2_transformer_weights(
+        weight_paths[0], activation_scheme="static"
+    )
+
+    # Patch diffusers_config in memory to inject the FP8 metadata needed
+    # by the pipeline's encoding-upgrade logic.  No files are written.
+    diffusers_config = model_config.diffusers_config
+    if diffusers_config is None:
+        raise ValueError(
+            "diffusers_config is required for FLUX.2 Klein FP8 static loading."
+        )
+    patched = deepcopy(diffusers_config)
+    transformer_comp = (
+        patched.setdefault("components", {}).setdefault("transformer", {})
+    )
+    transformer_cfg = transformer_comp.setdefault("config_dict", {})
+    quant_cfg = dict(transformer_cfg.get("quantization_config") or {})
+    quant_cfg["quant_method"] = "fp8"
+    quant_cfg["activation_scheme"] = "static"
+    transformer_cfg["quantization_config"] = quant_cfg
+    transformer_cfg["activation_scheme"] = "static"
+    model_config._diffusers_config = patched
+
+    # Expose only the adapted transformer file as a flat weight path.
+    # Flux2KleinPipeline.unprefixed_weight_component = "transformer" routes
+    # it to the transformer component.  VAE and text-encoder weights are
+    # downloaded from the original HF repo via the normal fallback.
+    model_config.weight_path = [Path(adapted_path.name)]
+
+    return [adapted_path]

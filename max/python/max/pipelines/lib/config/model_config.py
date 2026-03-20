@@ -19,7 +19,7 @@ import logging
 import os
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from huggingface_hub import constants as hf_hub_constants
 from max.config import ConfigFileModel
@@ -157,6 +157,15 @@ class MAXModelConfig(MAXModelConfigBase):
         description="Weight encoding type.",
     )
     """The weight encoding type."""
+
+    fp8_activation_scheme: Literal["static", "dynamic"] | None = Field(
+        default=None,
+        description=(
+            "Optional activation scaling scheme override for FP8 pipelines. "
+            "When unset, each architecture keeps its existing default behavior."
+        ),
+    )
+    """Optional activation scaling scheme override for FP8 pipelines."""
 
     allow_safetensors_weights_fp32_bf6_bidirectional_cast: bool = Field(
         default=False,
@@ -487,6 +496,18 @@ class MAXModelConfig(MAXModelConfigBase):
         if parsed_repo_id is not None:
             self._weights_repo_id = parsed_repo_id
 
+        # Some diffusion repos only publish the transformer weights in the FP8
+        # variant and rely on the base repo for pipeline metadata plus shared
+        # components such as the VAE/text encoder. Treat the base Klein repo as
+        # the model/config source while keeping the FP8 repo as the weight source.
+        if (
+            not self.weight_path
+            and "flux.2-klein" in self.model_path.lower()
+            and self.model_path.lower().endswith("-fp8")
+        ):
+            self._weights_repo_id = self.model_path
+            self.model_path = self.model_path[:-4]
+
         # If we cannot infer the weight path, we lean on the model_path
         # to provide it.
         if len(self.weight_path) == 0:
@@ -703,11 +724,16 @@ class MAXModelConfig(MAXModelConfigBase):
                 "Local Hugging Face repository path does not exist: "
                 f"{repo_root}"
             )
-            repo_files = [
-                path.relative_to(repo_root).as_posix()
-                for path in repo_root.rglob("*")
-                if path.is_file()
-            ]
+            # Follow directory symlinks so local repos can reference shared
+            # components (e.g., `vae -> ~/.cache/huggingface/.../vae`).
+            import os
+
+            repo_files = []
+            for root, _, files in os.walk(repo_root, followlinks=True):
+                root_path = Path(root)
+                for filename in files:
+                    path = root_path / filename
+                    repo_files.append(path.relative_to(repo_root).as_posix())
         else:
             repo_files = list_repo_files(
                 repo_id=repo.repo_id,
