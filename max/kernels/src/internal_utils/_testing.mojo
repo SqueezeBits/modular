@@ -27,7 +27,7 @@ from std.utils.numerics import FPUtils
 # ===----------------------------------------------------------------------=== #
 
 
-fn _flat_to_nd_index(flat_idx: Int, shape: List[Int]) -> String:
+def _flat_to_nd_index(flat_idx: Int, shape: List[Int]) -> String:
     """Convert a flat index to an N-dimensional index string.
 
     Args:
@@ -38,7 +38,7 @@ fn _flat_to_nd_index(flat_idx: Int, shape: List[Int]) -> String:
         A string representation of the N-dimensional index, e.g., "[2, 3, 4]".
     """
     if len(shape) == 0:
-        return t"i={flat_idx}"
+        return String(t"i={flat_idx}")
 
     # Compute N-dimensional indices from flat index (row-major order)
     var indices = List[Int](capacity=len(shape))
@@ -58,7 +58,7 @@ fn _flat_to_nd_index(flat_idx: Int, shape: List[Int]) -> String:
     return result
 
 
-fn _format_index(i: Int, shape: List[Int]) -> String:
+def _format_index(i: Int, shape: List[Int]) -> String:
     """Format an index for error messages.
 
     Args:
@@ -72,7 +72,7 @@ fn _format_index(i: Int, shape: List[Int]) -> String:
     if len(shape) > 0:
         return _flat_to_nd_index(i, shape)
     else:
-        return t"i={i}"
+        return String(t"i={i}")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -81,7 +81,7 @@ fn _format_index(i: Int, shape: List[Int]) -> String:
 
 
 @always_inline
-fn assert_almost_equal[
+def assert_almost_equal[
     dtype: DType,
     //,
 ](
@@ -130,10 +130,10 @@ fn assert_almost_equal[
         ```
     """
     for i in range(num_elements):
-        testing.assert_almost_equal(
+        std.testing.assert_almost_equal(
             x[i],
             y[i],
-            msg=t"{msg} at {_format_index(i, shape)}",
+            msg=String(t"{msg} at {_format_index(i, shape)}"),
             atol=atol,
             rtol=rtol,
             equal_nan=equal_nan,
@@ -147,7 +147,7 @@ fn assert_almost_equal[
 
 
 @always_inline
-fn assert_equal[
+def assert_equal[
     dtype: DType,
     //,
 ](
@@ -187,10 +187,10 @@ fn assert_equal[
         ```
     """
     for i in range(num_elements):
-        testing.assert_equal(
+        std.testing.assert_equal(
             x[i],
             y[i],
-            msg=t"{msg} at {_format_index(i, shape)}",
+            msg=String(t"{msg} at {_format_index(i, shape)}"),
             location=location.or_else(call_location()),
         )
 
@@ -201,10 +201,10 @@ fn assert_equal[
 
 
 @always_inline
-fn assert_with_measure[
+def assert_with_measure[
     dtype: DType,
     //,
-    measure: fn[dtype: DType](
+    measure: def[dtype: DType](
         UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
         UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
         Int,
@@ -235,7 +235,7 @@ fn assert_with_measure[
     Parameters:
         dtype: The data type of the buffer elements.
         measure: A function that computes a scalar measure between two buffers.
-                 Signature: `fn[dtype](ptr1, ptr2, n) -> Float64`
+                 Signature: `def[dtype](ptr1, ptr2, n) -> Float64`
 
     Raises:
         Error: If the computed measure exceeds the threshold.
@@ -274,7 +274,7 @@ fn assert_with_measure[
 
 
 @always_inline
-fn pytorch_like_tolerances_for[dtype: DType]() -> Tuple[Float64, Float64]:
+def pytorch_like_tolerances_for[dtype: DType]() -> Tuple[Float64, Float64]:
     """Get PyTorch-like default tolerances for a given dtype.
 
     Returns tolerance values modeled after PyTorch's default tolerances
@@ -312,7 +312,7 @@ fn pytorch_like_tolerances_for[dtype: DType]() -> Tuple[Float64, Float64]:
 
 @always_inline
 @parameter
-fn test_value_for_gpu_element[
+def test_value_for_gpu_element[
     dtype: DType,
 ](gpu_rank: Int, element_idx: Int) -> Scalar[dtype]:
     """Generates unique deterministic test values per GPU and element index.

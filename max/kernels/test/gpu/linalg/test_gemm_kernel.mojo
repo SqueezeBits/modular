@@ -12,9 +12,6 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import ceildiv, isclose
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.sys import argv
 
 from buffer import DimList, NDBuffer
@@ -23,7 +20,7 @@ from std.gpu.host import DeviceContext
 from std.gpu import block_idx, thread_idx, warp_id
 from std.gpu.memory import async_copy_wait_all
 from std.gpu.sync import barrier
-from layout import Layout, LayoutTensor
+from layout import Coord, Idx, Layout, LayoutTensor, TileTensor, row_major
 from layout._ndbuffer_stub import (
     copy_from_nd_buffer,
     copy_to_nd_buffer,
@@ -41,14 +38,14 @@ from std.testing import assert_almost_equal
 from std.utils import Index
 
 
-fn is_benchmark() -> Bool:
+def is_benchmark() -> Bool:
     for arg in argv():
         if arg == "--benchmark" or arg == "-benchmark":
             return True
     return False
 
 
-fn gemm_kernel[
+def gemm_kernel[
     c_type: DType,
     c_layout: Layout,
     a_type: DType,
@@ -160,7 +157,7 @@ fn gemm_kernel[
     copy_local_to_dram[dst_thread_layout=warp_layout](c_warp_tile, c_reg)
 
 
-fn test_gemm_kernel_dynamic(ctx: DeviceContext) raises:
+def test_gemm_kernel_dynamic(ctx: DeviceContext) raises:
     comptime NUM_THREADS = 256
     comptime BM = 64
     comptime BN = 64
@@ -174,10 +171,10 @@ fn test_gemm_kernel_dynamic(ctx: DeviceContext) raises:
     comptime N = 1024
     comptime K = 128
 
-    var a_host = UnsafePointer[Float32].alloc(M * K)
-    var b_host = UnsafePointer[Float32].alloc(K * N)
-    var c_host = UnsafePointer[Float32].alloc(M * N)
-    var c_host_ref = UnsafePointer[Float32].alloc(M * N)
+    var a_host = alloc[Float32](M * K)
+    var b_host = alloc[Float32](K * N)
+    var c_host = alloc[Float32](M * N)
+    var c_host_ref = alloc[Float32](M * N)
 
     for i in range(M * K):
         a_host[i] = Float32(i)
@@ -193,13 +190,13 @@ fn test_gemm_kernel_dynamic(ctx: DeviceContext) raises:
     ctx.enqueue_copy(a_device, a_host)
     ctx.enqueue_copy(b_device, b_host)
 
-    var mat_a = NDBuffer[DType.float32, 2, MutAnyOrigin, DimList(M, K)](
+    var mat_a = NDBuffer[rank=2, DType.float32, MutAnyOrigin, DimList[M, K]()](
         a_device.unsafe_ptr(), dynamic_shape=Index(M, K)
     )
-    var mat_b = NDBuffer[DType.float32, 2, MutAnyOrigin, DimList(K, M)](
+    var mat_b = NDBuffer[rank=2, DType.float32, MutAnyOrigin, DimList[K, M]()](
         b_device.unsafe_ptr(), dynamic_shape=Index(K, M)
     )
-    var mat_c = NDBuffer[DType.float32, 2, MutAnyOrigin, DimList(M, N)](
+    var mat_c = NDBuffer[rank=2, DType.float32, MutAnyOrigin, DimList[M, N]()](
         c_device.unsafe_ptr(), dynamic_shape=Index(M, N)
     )
 
@@ -234,11 +231,28 @@ fn test_gemm_kernel_dynamic(ctx: DeviceContext) raises:
 
     ctx.enqueue_copy(c_host, c_device)
 
-    var c_buffer_ref = NDBuffer[DType.float32, 2, MutAnyOrigin, DimList(M, N)](
-        c_device_ref.unsafe_ptr()
-    )
+    # Create TileTensors for the naive kernel.
+    # a/b are constructed as immutable to match the ImmutAnyOrigin
+    # parameters that matmul_kernel_naive expects (enqueue_function_experimental
+    # requires exact type matches).
+    from std.memory import UnsafePointer
 
-    var c_tensor_ref = from_ndbuffer_row_major(c_buffer_ref)
+    var c_ref_tt = TileTensor(
+        c_device_ref.unsafe_ptr(),
+        row_major(Coord(Idx(M), Idx(N))),
+    )
+    var a_tt = TileTensor(
+        UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin](
+            unsafe_from_address=Int(a_device.unsafe_ptr())
+        ),
+        row_major(Coord(Idx(M), Idx(K))),
+    )
+    var b_tt = TileTensor(
+        UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin](
+            unsafe_from_address=Int(b_device.unsafe_ptr())
+        ),
+        row_major(Coord(Idx(K), Idx(M))),
+    )
 
     # Naive gemm.
     comptime BLOCK_DIM = 16
@@ -246,16 +260,16 @@ fn test_gemm_kernel_dynamic(ctx: DeviceContext) raises:
         DType.float32,
         DType.float32,
         DType.float32,
-        c_tensor_ref.layout,
-        a_tensor.layout,
-        b_tensor.layout,
+        type_of(c_ref_tt).LayoutType,
+        type_of(a_tt).LayoutType,
+        type_of(b_tt).LayoutType,
         BLOCK_DIM,
     ]
 
     ctx.enqueue_function_experimental[gemm_naive](
-        c_tensor_ref,
-        a_tensor,
-        b_tensor,
+        c_ref_tt,
+        a_tt,
+        b_tt,
         M,
         N,
         K,
@@ -276,7 +290,7 @@ fn test_gemm_kernel_dynamic(ctx: DeviceContext) raises:
 
         @always_inline
         @parameter
-        fn run_func(ctx: DeviceContext) raises:
+        def run_func(ctx: DeviceContext) raises:
             ctx.enqueue_function_experimental[kernel](
                 c_tensor,
                 a_tensor,

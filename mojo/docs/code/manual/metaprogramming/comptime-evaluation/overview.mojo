@@ -17,11 +17,11 @@ comptime NUM_TILES = 1024 // 32
 comptime SIZE = 3
 
 
-fn get_array_size() -> Int:
+def get_array_size() -> Int:
     return 32
 
 
-def main():
+def main() raises:
     comptime for i in range(4):
         print(i)
 

@@ -16,18 +16,18 @@ from std.sys.info import _accelerator_arch, _is_sm_100x_or_newer
 
 from std.gpu.host import get_gpu_target
 from std.gpu.host.compile import _compile_code
-from std.gpu.host.info import B200, GPUInfo
+from std.gpu.host.info import B200, GPUInfo, _is_sm10x_gpu
 from std.testing import assert_false, assert_true
 
 
 def test_operation[
     dtype: DType,
     target_arch: StaticString,
-    op_fn: fn[width: Int](
+    op_fn: def[width: Int](
         x: SIMD[dtype, width], y: type_of(x)
     ) raises -> type_of(x),
     op_name: StaticString,
-]():
+]() raises:
     var scalar: String
     var pairwise: String
     var suffix: String
@@ -62,21 +62,21 @@ def test_operation[
 
 
 def test_add[dtype: DType, target_arch: StaticString]() raises:
-    fn add[width: Int](x: SIMD[dtype, width], y: type_of(x)) -> type_of(x):
+    def add[width: Int](x: SIMD[dtype, width], y: type_of(x)) -> type_of(x):
         return x + y
 
     test_operation[dtype, target_arch, add, "add"]()
 
 
 def test_sub[dtype: DType, target_arch: StaticString]() raises:
-    fn sub[width: Int](x: SIMD[dtype, width], y: type_of(x)) -> type_of(x):
+    def sub[width: Int](x: SIMD[dtype, width], y: type_of(x)) -> type_of(x):
         return x - y
 
     test_operation[dtype, target_arch, sub, "sub"]()
 
 
 def test_mul[dtype: DType, target_arch: StaticString]() raises:
-    fn mul[width: Int](x: SIMD[dtype, width], y: type_of(x)) -> type_of(x):
+    def mul[width: Int](x: SIMD[dtype, width], y: type_of(x)) -> type_of(x):
         return x * y
 
     test_operation[dtype, target_arch, mul, "mul"]()
@@ -97,12 +97,12 @@ def test_half_float_instruction_selection() raises:
 
 
 def test_fma[dtype: DType]() raises:
-    fn fma[
+    def fma[
         width: Int
     ](x: SIMD[dtype, width], y: type_of(x), z: type_of(x)) -> type_of(x):
         return x * y + z
 
-    fn fma_manual[
+    def fma_manual[
         width: Int
     ](x: SIMD[dtype, width], y: type_of(x), z: type_of(x)) -> type_of(x):
         return x.fma(y, z)
@@ -122,7 +122,7 @@ def test_fma[dtype: DType]() raises:
 
 
 def test_cast() raises:
-    fn cast[
+    def cast[
         src_type: DType, dst_type: DType, width: Int
     ](src: SIMD[src_type, width]) -> SIMD[dst_type, width]:
         return src.cast[dst_type]()
@@ -163,7 +163,7 @@ def main() raises:
 
     comptime device = GPUInfo.from_name[_accelerator_arch()]()
 
-    comptime if device == B200:
+    comptime if _is_sm10x_gpu(device):
         test_add[DType.float32, "sm_100"]()
         test_mul[DType.float32, "sm_100"]()
         test_fma[DType.float32]()

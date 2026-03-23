@@ -12,9 +12,6 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import fma
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 
 from layout import Layout, LayoutTensor, RuntimeTuple
 
@@ -30,7 +27,7 @@ from .impl import InnerMatmulKernel
 @fieldwise_init
 struct Inner_matmul_neon(InnerMatmulKernel, Movable):
     @always_inline
-    fn _accumulate_lane[
+    def _accumulate_lane[
         simd_size: Int,
         a_col_size: Int,
         kernel_rows: Int,
@@ -101,7 +98,7 @@ struct Inner_matmul_neon(InnerMatmulKernel, Movable):
             b_ptr = b_ptr + kernel_cols
 
     @always_inline
-    fn __inner_matmul__[
+    def __inner_matmul__[
         kernel_rows: Int,
         kernel_cols: Int,
         simd_size: Int,
@@ -138,7 +135,7 @@ struct Inner_matmul_neon(InnerMatmulKernel, Movable):
                 acc.init(0)
             else:
                 acc.load(
-                    rebind[UnsafePointer[Scalar[c.dtype]]](c_ptr),
+                    rebind[UnsafePointer[Scalar[c.dtype], MutAnyOrigin]](c_ptr),
                     c_stride,
                     idx_n,
                     c_bound,
@@ -166,7 +163,7 @@ struct Inner_matmul_neon(InnerMatmulKernel, Movable):
                     Index(idx_n, idx_k1),
                 )
             acc.store(
-                rebind[UnsafePointer[Scalar[c.dtype]]](c_ptr),
+                rebind[UnsafePointer[Scalar[c.dtype], MutAnyOrigin]](c_ptr),
                 c_stride,
                 idx_n,
                 c_bound,

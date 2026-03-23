@@ -12,19 +12,15 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import ceildiv
-from std.memory import LegacyUnsafePointer, bitcast
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from std.memory import bitcast
 from std.sys import argv, size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
-from buffer.dimlist import DimList
 from std.gpu import WARP_SIZE, barrier
-from std.gpu import lane_id as get_lane_id, warp_id
+from std.gpu import warp_id, block_idx, lane_id, thread_idx
 from std.gpu.primitives.cluster import block_rank_in_cluster
 from std.gpu.host import DeviceContext, FuncAttribute
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu import block_idx, lane_id, thread_idx
 from std.gpu.memory import external_memory, fence_async_view_proxy
 from std.gpu.compute.mma import st_matrix
 from std.gpu.compute.arch.mma_nvidia_sm100 import *
@@ -33,15 +29,15 @@ from std.gpu.compute.arch.tcgen05 import *
 # Additional imports for testing
 from internal_utils import assert_almost_equal
 from layout import (
-    UNKNOWN_VALUE,
+    IntTuple,
     Layout,
     LayoutTensor,
     RuntimeLayout,
     RuntimeTuple,
+    UNKNOWN_VALUE,
 )
 from layout._fillers import arange
 from layout._utils import ManagedLayoutTensor
-from layout.int_tuple import IntTuple
 from layout.swizzle import make_ldmatrix_swizzle, make_swizzle
 from layout.tensor_core_async import (
     st_matrix_n_layout,
@@ -62,7 +58,7 @@ from std.utils.numerics import get_accum_type
 from std.utils.static_tuple import StaticTuple
 
 
-fn is_benchmark() -> Bool:
+def is_benchmark() -> Bool:
     for arg in argv():
         if arg == "--benchmark":
             return True
@@ -73,7 +69,7 @@ fn is_benchmark() -> Bool:
 @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(c_tma_op, `nvvm.grid_constant`)
-fn kernel_4[
+def kernel_4[
     a_type: DType,
     b_type: DType,
     c_type: DType,
@@ -132,7 +128,11 @@ fn kernel_4[
     comptime c_smem_layout = Layout.row_major(BM, BN)
 
     a_smem = rebind[
-        UnsafePointer[Scalar[a_type], address_space=AddressSpace.SHARED]
+        UnsafePointer[
+            Scalar[a_type],
+            address_space=AddressSpace.SHARED,
+            ExternalOrigin[mut=True],
+        ]
     ](
         external_memory[
             Scalar[a_type],
@@ -200,7 +200,7 @@ fn kernel_4[
     comptime accum_type = get_accum_type[a_type]()
 
     comptime c_frag_size = MMA_M * MMA_N // Int(num_threads)
-    var c_frag = SIMD[accum_type, c_frag_size]()
+    var c_frag: InlineArray[Scalar[accum_type], c_frag_size]
 
     comptime a_expected_bytes = a_size * size_of[a_type]()
     comptime b_expected_bytes = b_size * size_of[b_type]()
@@ -343,9 +343,19 @@ fn kernel_4[
     comptime for tma_n in range(BN // TMA_BN):
         comptime for m_mma in range(num_m_mmas):
             comptime for i in range(TMA_BN // 16):
-                var d_reg = c_frag.slice[
-                    8, offset=(i + tma_n * (TMA_BN // 16)) * 8
-                ]().cast[DType.bfloat16]()
+                var d_reg = SIMD[DType.bfloat16, 8]()
+
+                comptime for _ei in range(4):
+                    comptime _src_offset = (
+                        i + tma_n * (TMA_BN // 16)
+                    ) * 8 + 2 * _ei
+                    var pair = SIMD[DType.float32, 2](
+                        rebind[Scalar[DType.float32]](c_frag[_src_offset]),
+                        rebind[Scalar[DType.float32]](c_frag[_src_offset + 1]),
+                    )
+                    var casted = pair.cast[DType.bfloat16]()
+                    d_reg[2 * _ei] = casted[0]
+                    d_reg[2 * _ei + 1] = casted[1]
 
                 var st_matrix_args = RuntimeTuple[
                     IntTuple(
@@ -401,7 +411,7 @@ fn kernel_4[
         tcgen05_dealloc[1](tmem_addr, max_tmem_cols)
 
 
-fn blackwell_kernel_4[
+def blackwell_kernel_4[
     c_type: DType,
     c_layout: Layout,
     a_type: DType,
@@ -487,7 +497,7 @@ comptime WARP_GROUP_SIZE = 128
 comptime NumWarpPerWarpGroup = 4
 
 
-fn get_dict_of_shapes(
+def get_dict_of_shapes(
     index: Int, dict: Dict[Int, Tuple[Int, Int, Int]]
 ) -> Tuple[Int, Int, Int]:
     try:
@@ -497,13 +507,13 @@ fn get_dict_of_shapes(
         return (128, 128, 128)
 
 
-fn make_dict_of_shapes() -> Dict[Int, Tuple[Int, Int, Int]]:
+def make_dict_of_shapes() -> Dict[Int, Tuple[Int, Int, Int]]:
     var dic = Dict[Int, Tuple[Int, Int, Int]]()
     dic[0] = (4096, 4096, 4096)
     return dic^
 
 
-fn benchmark_blackwell_matmul(ctx: DeviceContext) raises:
+def benchmark_blackwell_matmul(ctx: DeviceContext) raises:
     comptime a_type = DType.bfloat16
     comptime b_type = DType.bfloat16
     comptime c_type = DType.bfloat16
@@ -573,9 +583,9 @@ def test_blackwell_kernel_4[
     ) if transpose_b else Layout.row_major(K, N)
     comptime c_layout = Layout.row_major(M, N)
 
-    var a_host_ptr = UnsafePointer[Scalar[a_type]].alloc(M * K)
+    var a_host_ptr = alloc[Scalar[a_type]](M * K)
     var a_host = LayoutTensor[a_type, a_layout](a_host_ptr)
-    var b_host_ptr = UnsafePointer[Scalar[b_type]].alloc(N * K)
+    var b_host_ptr = alloc[Scalar[b_type]](N * K)
     var b_host = LayoutTensor[b_type, b_layout](b_host_ptr)
     var c_host = ManagedLayoutTensor[c_type, c_layout](ctx)
     var c_host_ref = ManagedLayoutTensor[c_type, c_layout](ctx)
@@ -635,7 +645,7 @@ def test_blackwell_kernel_4[
 
         @always_inline
         @parameter
-        fn run_kernel(ctx: DeviceContext) raises:
+        def run_kernel(ctx: DeviceContext) raises:
             blackwell_kernel_4[
                 transpose_b=transpose_b,
                 umma_shape=umma_shape,  # 64, 128, 16

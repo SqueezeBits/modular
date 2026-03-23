@@ -29,11 +29,13 @@ from max.nn.rotary_embedding import (
 from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.lib import (
     KVCacheConfig,
+    MAXModelConfig,
     PipelineConfig,
     upper_bounded_default,
 )
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from max.pipelines.lib.interfaces.arch_config import ArchConfigWithKVCache
+from max.pipelines.lib.pipeline_variants.utils import get_rope_theta
 from transformers import AutoConfig
 from typing_extensions import Self, override
 
@@ -146,31 +148,36 @@ class Llama3Config(ArchConfigWithKVCache):
 
     @override
     @classmethod
-    def initialize(cls, pipeline_config: PipelineConfig) -> Self:
-        huggingface_config = pipeline_config.model.huggingface_config
+    def initialize(
+        cls,
+        pipeline_config: PipelineConfig,
+        model_config: MAXModelConfig | None = None,
+    ) -> Self:
+        model_config = model_config or pipeline_config.model
+        huggingface_config = model_config.huggingface_config
         if huggingface_config is None:
             raise ValueError(
-                f"HuggingFace config is required for '{pipeline_config.model.model_path}', "
+                f"HuggingFace config is required for '{model_config.model_path}', "
                 "but config could not be loaded. "
                 "Please ensure the model repository contains a valid config.json file."
             )
 
-        kv_cache_config = pipeline_config.model.kv_cache
-        quantization_encoding = pipeline_config.model.quantization_encoding
+        kv_cache_config = model_config.kv_cache
+        quantization_encoding = model_config.quantization_encoding
         if quantization_encoding is None:
             raise ValueError("quantization_encoding must not be None")
         dtype = supported_encoding_dtype(quantization_encoding)
-        cache_dtype = pipeline_config.model.kv_cache.cache_dtype
+        cache_dtype = model_config.kv_cache.cache_dtype
 
-        _weights_format = weights_format(pipeline_config.model.weight_path)
+        _weights_format = weights_format(model_config.weight_path)
         interleaved_rope_weights = (
             _weights_format == WeightsFormat.gguf
-            and pipeline_config.model.rope_type == "normal"
+            and model_config.rope_type == "normal"
         )
 
         device_refs = [
             DeviceRef(spec.device_type, spec.id)
-            for spec in pipeline_config.model.device_specs
+            for spec in model_config.device_specs
         ]
 
         embedding_multiplier = getattr(
@@ -219,7 +226,7 @@ class Llama3Config(ArchConfigWithKVCache):
             rope_embedding = LongRoPERotaryEmbedding(
                 dim=huggingface_config.hidden_size,
                 n_heads=huggingface_config.num_attention_heads,
-                theta=huggingface_config.rope_theta,
+                theta=get_rope_theta(huggingface_config),
                 max_seq_len=Llama3Config.calculate_max_seq_len(
                     pipeline_config, huggingface_config=huggingface_config
                 ),
@@ -234,7 +241,7 @@ class Llama3Config(ArchConfigWithKVCache):
             num_attention_heads=huggingface_config.num_attention_heads,
             num_key_value_heads=huggingface_config.num_key_value_heads,
             num_hidden_layers=huggingface_config.num_hidden_layers,
-            rope_theta=huggingface_config.rope_theta,
+            rope_theta=get_rope_theta(huggingface_config),
             rope_scaling_params=rope_scaling_params,
             longrope_scaling_params=longrope_scaling_params,
             intermediate_size=huggingface_config.intermediate_size,

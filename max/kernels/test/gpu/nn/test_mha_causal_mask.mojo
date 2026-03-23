@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.math import isclose
 from std.random import rand
 from std.sys import argv, size_of
@@ -21,7 +18,7 @@ from std.sys import argv, size_of
 from std.bit import count_trailing_zeros
 from std.gpu import *
 from std.gpu.host import DeviceContext
-from std.gpu.host.info import A100, B200, H100
+from std.gpu.host.info import A100, B200, H100, _is_sm10x_gpu
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
 from nn.mha import flash_attention, mha_gpu_naive
 from nn.mha_mask import CausalMask, MHAMask, SlidingWindowCausalMask
@@ -32,14 +29,14 @@ from std.utils.index import Index
 from std.utils.numerics import min_or_neg_inf
 
 
-fn is_benchmark() -> Bool:
+def is_benchmark() -> Bool:
     for arg in argv():
         if arg == "--benchmark" or arg == "-benchmark":
             return True
     return False
 
 
-fn test[
+def test[
     MaskType: MHAMask,
     //,
     qkv_type: DType,
@@ -85,11 +82,11 @@ fn test[
     var o_size = q_size
 
     # Allocate memory for all variables.
-    var q_ptr = UnsafePointer[Scalar[qkv_type]].alloc(q_size)
-    var k_ptr = UnsafePointer[Scalar[qkv_type]].alloc(k_size)
-    var v_ptr = UnsafePointer[Scalar[qkv_type]].alloc(v_size)
-    var output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
+    var q_ptr = alloc[Scalar[qkv_type]](q_size)
+    var k_ptr = alloc[Scalar[qkv_type]](k_size)
+    var v_ptr = alloc[Scalar[qkv_type]](v_size)
+    var output_ptr = alloc[Scalar[qkv_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[qkv_type]](o_size)
 
     # Construct buffers.
     comptime layout_4d = Layout.row_major[4]()
@@ -177,14 +174,15 @@ fn test[
         UInt(depth),
         BK=Optional[UInt](UInt(128 // size_of[qkv_type]())),
         num_pipeline_stages=UInt(4) if (
-            ctx.default_device_info == H100 or ctx.default_device_info == B200
+            ctx.default_device_info == H100
+            or _is_sm10x_gpu(ctx.default_device_info)
         ) else 2,
     )
 
     @parameter
     @always_inline
     @__copy_capture(q_device, k_device, v_device, output_device)
-    fn kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(ctx: DeviceContext) raises:
         flash_attention[config=config](
             output_device,
             q_device,
@@ -330,7 +328,7 @@ fn test[
     flash_output_ptr.free()
 
 
-fn construct_depths(is_sm90orsm100: Bool) -> List[Int]:
+def construct_depths(is_sm90orsm100: Bool) -> List[Int]:
     var depths = [64, 128]
     if is_sm90orsm100:
         depths.append(72)
@@ -342,7 +340,9 @@ fn construct_depths(is_sm90orsm100: Bool) -> List[Int]:
 
 def main() raises:
     with DeviceContext() as ctx:
-        comptime is_sm90orsm100 = ctx.default_device_info == H100 or ctx.default_device_info == B200
+        comptime is_sm90orsm100 = ctx.default_device_info == H100 or _is_sm10x_gpu(
+            ctx.default_device_info
+        )
         comptime depths = construct_depths(is_sm90orsm100)
 
         comptime for d in range(len(depths)):

@@ -80,7 +80,7 @@ struct String(
     ```
 
     You can convert many Mojo types to a `String` because it's common to
-    implement the [`Stringable`](/mojo/std/builtin/str/Stringable) trait:
+    implement the [`Writable`](/mojo/std/format/Writable) trait:
 
     ```mojo
     var int : Int = 42
@@ -88,16 +88,16 @@ struct String(
     ```
 
     If you have a custom type you want to convert to a string, you can implement
-    the [`Stringable`](/mojo/std/builtin/str/Stringable) trait like this:
+    the [`Writable`](/mojo/std/format/Writable) trait like this:
 
     ```mojo
     @fieldwise_init
-    struct Person(Stringable):
+    struct Person(Writable):
         var name: String
         var age: Int
 
-        fn __str__(self) -> String:
-            return self.name + " (" + String(self.age) + ")"
+        def write_to(self, mut writer: Some[Writer]):
+            t"{self.name} ({self.age})".write_to(writer)
 
     var person = Person("Alice", 30)
     print(String(person))      # => Alice (30)
@@ -160,10 +160,10 @@ struct String(
     ```mojo
     var text = "Hello"
 
-    # String properties and indexing
+    # String properties and slicing
     print(len(text))     # 5
-    print(text[1])       # e
-    print(text[-1])      # o
+    print(text[byte=1:2])     # e (byte slice)
+    print(text[byte=-1:])     # o (last character)
 
     # In-place concatenation
     text += " World"
@@ -287,18 +287,18 @@ struct String(
     # ===------------------------------------------------------------------=== #
 
     @always_inline("nodebug")
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Destroy the string data."""
         self._drop_ref()
 
     @always_inline("nodebug")
-    fn __init__(out self):
+    def __init__(out self):
         """Construct an empty string."""
         self._capacity_or_data = Self.FLAG_IS_INLINE
         __mlir_op.`lit.ownership.mark_initialized`(__get_mvalue_as_litref(self))
 
     @always_inline("nodebug")
-    fn __init__(out self, *, capacity: Int):
+    def __init__(out self, *, capacity: Int):
         """Construct an empty string with a given capacity.
 
         Args:
@@ -317,7 +317,7 @@ struct String(
 
     @always_inline("nodebug")
     @implicit  # does not allocate.
-    fn __init__(out self, data: StaticString):
+    def __init__(out self, data: StaticString):
         """Construct a `String` from a `StaticString` without allocating.
 
         Args:
@@ -337,7 +337,7 @@ struct String(
 
     @always_inline("nodebug")
     @implicit  # does not allocate.
-    fn __init__(out self, data: StringLiteral):
+    def __init__(out self, data: StringLiteral):
         """Construct a `String` from a `StringLiteral` without allocating.
 
         Args:
@@ -353,12 +353,10 @@ struct String(
         # decision until mutation to avoid unnecessary memcpy.
         self._capacity_or_data = Self.FLAG_HAS_NUL_TERMINATOR
 
-    @implicit
-    fn __init__(out self, tstring: TString):
+    def __init__(out self, tstring: TString):
         """Construct a string from a TString (template string).
 
-        This constructor enables implicit conversion from TString to String,
-        allowing t-strings to be used seamlessly where strings are expected.
+        This constructor enables explicit conversion from TString to String.
 
         Args:
             tstring: The TString to convert to a String.
@@ -366,7 +364,7 @@ struct String(
         self = Self()
         tstring.write_to(self)
 
-    fn __init__(out self, *, unsafe_from_utf8: Span[Byte, _]):
+    def __init__(out self, *, unsafe_from_utf8: Span[Byte, _]):
         """Construct a string by copying the data. This constructor is explicit
         because it can involve memory allocation.
 
@@ -380,10 +378,9 @@ struct String(
         Safety:
             `unsafe_from_utf8` MUST be valid UTF-8 encoded data.
         """
-        debug_assert(
-            _is_valid_utf8(unsafe_from_utf8),
-            "String: span is not valid UTF-8",
-        )
+        assert _is_valid_utf8(
+            unsafe_from_utf8
+        ), "String: span is not valid UTF-8"
         var length = len(unsafe_from_utf8)
         self = Self(unsafe_uninit_length=length)
         memcpy(
@@ -392,7 +389,7 @@ struct String(
             count=length,
         )
 
-    fn __init__(out self, *, from_utf8_lossy: Span[Byte, _]):
+    def __init__(out self, *, from_utf8_lossy: Span[Byte, _]):
         """Construct a string from a span of bytes, including invalid UTF-8.
 
         Since `String` is guaranteed to be valid UTF-8, invalid UTF-8 sequences
@@ -404,6 +401,8 @@ struct String(
         Examples:
 
         ```mojo
+        from testing import assert_equal
+
         # Valid UTF-8 sequence
         var fire_emoji_bytes = [Byte(0xF0), 0x9F, 0x94, 0xA5]
         var fire_emoji = String(from_utf8_lossy=fire_emoji_bytes)
@@ -425,7 +424,7 @@ struct String(
             if len(chunk.invalid) > 0:
                 self += REPLACEMENT
 
-    fn __init__(out self, *, from_utf8: Span[Byte, _]) raises:
+    def __init__(out self, *, from_utf8: Span[Byte, _]) raises:
         """Construct a string from a span of bytes, raising an error if the data
         is not valid UTF-8.
 
@@ -446,7 +445,7 @@ struct String(
     # a common callsite, as that isn't free for both compilation speed and
     # register pressure.
 
-    fn __init__[
+    def __init__[
         *Ts: Writable,
     ](out self, *args: *Ts, sep: StaticString = "", end: StaticString = ""):
         """
@@ -485,7 +484,7 @@ struct String(
     # TODO(MOCO-1791): Default arguments and param inference aren't powerful
     # to declare sep/end as StringSlice.
     @staticmethod
-    fn __init__[
+    def __init__[
         *Ts: Writable,
     ](
         out self,
@@ -507,7 +506,7 @@ struct String(
         Examples:
 
         ```mojo
-        fn variadic_pack_to_string[
+        def variadic_pack_to_string[
             *Ts: Writable,
         ](*args: *Ts) -> String:
             return String(args)
@@ -531,7 +530,7 @@ struct String(
             buffer.flush()
 
     @staticmethod
-    fn write[
+    def write[
         *Ts: Writable,
     ](*args: *Ts, sep: StaticString = "", end: StaticString = "") -> Self:
         """Construct a string by concatenating a sequence of Writable arguments.
@@ -562,7 +561,7 @@ struct String(
             buffer.flush()
             return result^
 
-    fn write[*Ts: Writable](mut self, *args: *Ts):
+    def write[*Ts: Writable](mut self, *args: *Ts):
         """Write a sequence of Writable arguments to the provided Writer.
 
         Parameters:
@@ -584,7 +583,7 @@ struct String(
             args._write_to(buffer, sep="")
             buffer.flush()
 
-    fn write[T: Writable](mut self, value: T):
+    def write[T: Writable](mut self, value: T):
         """Write a single Writable argument to the provided Writer.
 
         Parameters:
@@ -596,7 +595,7 @@ struct String(
         value.write_to(self)
 
     @staticmethod
-    fn write[T: Writable](value: T) -> Self:
+    def write[T: Writable](value: T) -> Self:
         """Write a single Writable argument to the provided Writer.
 
         Parameters:
@@ -613,7 +612,7 @@ struct String(
         return result^
 
     @always_inline("nodebug")
-    fn __init__(out self, *, unsafe_uninit_length: Int):
+    def __init__(out self, *, unsafe_uninit_length: Int):
         """Construct a String with the specified length, with uninitialized
         memory. This is unsafe, as it relies on the caller initializing the
         elements with unsafe operations, not assigning over the uninitialized
@@ -625,7 +624,7 @@ struct String(
         self = Self(capacity=unsafe_uninit_length)
         self.set_byte_length(unsafe_uninit_length)
 
-    fn __init__(
+    def __init__(
         out self,
         *,
         unsafe_from_utf8_ptr: UnsafePointer[mut=False, c_char, _],
@@ -642,7 +641,7 @@ struct String(
         # Copy the data.
         self = String(StringSlice(unsafe_from_utf8_ptr=unsafe_from_utf8_ptr))
 
-    fn __init__(
+    def __init__(
         out self, *, unsafe_from_utf8_ptr: UnsafePointer[mut=False, UInt8, _]
     ):
         """Creates a string from a UTF-8 encoded nul-terminated pointer.
@@ -658,7 +657,7 @@ struct String(
         self = String(StringSlice(unsafe_from_utf8_ptr=unsafe_from_utf8_ptr))
 
     @always_inline("nodebug")
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Copy initialize the string from another string.
 
         Args:
@@ -681,7 +680,7 @@ struct String(
     # stored in the capacity field.
 
     @always_inline("nodebug")
-    fn capacity(self) -> Int:
+    def capacity(self) -> Int:
         """Get the current capacity of the `String`'s internal buffer.
 
         Returns:
@@ -695,27 +694,27 @@ struct String(
         return self._capacity_or_data << 3
 
     @always_inline("nodebug")
-    fn _set_nul_terminated(mut self):
+    def _set_nul_terminated(mut self):
         self._capacity_or_data |= Self.FLAG_HAS_NUL_TERMINATOR
 
     @always_inline("nodebug")
-    fn _has_nul_terminator(self) -> Bool:
+    def _has_nul_terminator(self) -> Bool:
         return Bool(self._capacity_or_data & Self.FLAG_HAS_NUL_TERMINATOR)
 
     @always_inline("nodebug")
-    fn _clear_nul_terminator(mut self):
+    def _clear_nul_terminator(mut self):
         self._capacity_or_data &= ~Self.FLAG_HAS_NUL_TERMINATOR
 
     @always_inline("nodebug")
-    fn _is_inline(self) -> Bool:
+    def _is_inline(self) -> Bool:
         return Bool(self._capacity_or_data & Self.FLAG_IS_INLINE)
 
     @always_inline("nodebug")
-    fn _set_ref_counted(mut self):
+    def _set_ref_counted(mut self):
         self._capacity_or_data |= Self.FLAG_IS_REF_COUNTED
 
     @always_inline("nodebug")
-    fn _is_ref_counted(self) -> Bool:
+    def _is_ref_counted(self) -> Bool:
         return Bool(self._capacity_or_data & Self.FLAG_IS_REF_COUNTED)
 
     # ===------------------------------------------------------------------=== #
@@ -726,14 +725,14 @@ struct String(
     # out-of-line strings, which is stored before the UTF-8 data.
 
     @always_inline("nodebug")
-    fn _refcount(self) -> ref[self._ptr_or_data.origin] Atomic[DType.int]:
+    def _refcount(self) -> ref[self._ptr_or_data.origin] Atomic[DType.int]:
         # The header is stored before the string data.
         return (self._ptr_or_data - Self.REF_COUNT_SIZE).bitcast[
             Atomic[DType.int]
         ]()[]
 
     @always_inline("nodebug")
-    fn _is_unique(mut self) -> Bool:
+    def _is_unique(mut self) -> Bool:
         """Return true if the refcount is 1."""
         if self._capacity_or_data & Self.FLAG_IS_REF_COUNTED:
             return self._refcount().load[ordering=Consistency.MONOTONIC]() == 1
@@ -741,7 +740,7 @@ struct String(
             return False
 
     @always_inline("nodebug")
-    fn _add_ref(mut self):
+    def _add_ref(mut self):
         """Atomically increment the refcount."""
         if self._capacity_or_data & Self.FLAG_IS_REF_COUNTED:
             # See `ArcPointer`'s refcount implementation for more details on the
@@ -749,7 +748,7 @@ struct String(
             _ = self._refcount().fetch_add[ordering=Consistency.MONOTONIC](1)
 
     @always_inline("nodebug")
-    fn _drop_ref(mut self):
+    def _drop_ref(mut self):
         """Atomically decrement the refcount and deallocate self if the result
         hits zero."""
         # If indirect or inline we don't need to do anything.
@@ -761,7 +760,7 @@ struct String(
                 ptr.free()
 
     @staticmethod
-    fn _alloc(capacity: Int) -> UnsafePointer[Byte, MutExternalOrigin]:
+    def _alloc(capacity: Int) -> UnsafePointer[Byte, MutExternalOrigin]:
         """Allocate space for a new out-of-line string buffer."""
         var ptr = alloc[Byte](capacity + Self.REF_COUNT_SIZE)
 
@@ -778,7 +777,7 @@ struct String(
     # Factory dunders
     # ===------------------------------------------------------------------=== #
 
-    fn write_string(mut self, string: StringSlice):
+    def write_string(mut self, string: StringSlice):
         """
         Write a `StringSlice` to this `String`.
 
@@ -791,7 +790,7 @@ struct String(
     # Operator dunders
     # ===------------------------------------------------------------------=== #
 
-    fn __getitem__[
+    def __getitem__[
         I: Indexer, //
     ](self, *, byte: I) -> StringSlice[origin_of(self)]:
         """Gets a single byte at the specified byte index.
@@ -812,7 +811,9 @@ struct String(
         """
         return StringSlice(self)[byte=byte]
 
-    fn __getitem__(self, span: ContiguousSlice) -> StringSlice[origin_of(self)]:
+    def __getitem__(
+        self, *, byte: ContiguousSlice
+    ) -> StringSlice[origin_of(self)]:
         """Gets a substring at the specified byte positions.
 
         This performs byte-level slicing, not character (codepoint) slicing.
@@ -821,14 +822,14 @@ struct String(
         on codepoint boundaries will abort.
 
         Args:
-            span: A slice that specifies byte positions of the new substring.
+            byte: A slice that specifies byte positions of the new substring.
 
         Returns:
             A StringSlice containing the bytes in the specified range.
         """
-        return StringSlice(self)[span]
+        return StringSlice(self)[byte=byte]
 
-    fn __eq__(self, rhs: String) -> Bool:
+    def __eq__(self, rhs: String) -> Bool:
         """Compares two Strings if they have the same values.
 
         Args:
@@ -851,7 +852,7 @@ struct String(
         return memcmp(self_ptr, rhs_ptr, self_len) == 0
 
     @always_inline("nodebug")
-    fn __eq__(self, other: StringSlice) -> Bool:
+    def __eq__(self, other: StringSlice) -> Bool:
         """Compares two Strings if they have the same values.
 
         Args:
@@ -863,7 +864,7 @@ struct String(
         return StringSlice(self) == other
 
     @always_inline("nodebug")
-    fn __ne__(self, other: StringSlice) -> Bool:
+    def __ne__(self, other: StringSlice) -> Bool:
         """Compares two Strings if they have the same values.
 
         Args:
@@ -875,7 +876,7 @@ struct String(
         return StringSlice(self) != other
 
     @always_inline("nodebug")
-    fn __lt__(self, rhs: String) -> Bool:
+    def __lt__(self, rhs: String) -> Bool:
         """Compare this String to the RHS using LT comparison.
 
         Args:
@@ -888,7 +889,7 @@ struct String(
         return StringSlice(self) < StringSlice(rhs)
 
     @staticmethod
-    fn _add(lhs: Span[Byte, _], rhs: Span[Byte, _]) -> String:
+    def _add(lhs: Span[Byte, _], rhs: Span[Byte, _]) -> String:
         var lhs_len = len(lhs)
         var rhs_len = len(rhs)
 
@@ -898,7 +899,7 @@ struct String(
         memcpy(dest=result_ptr + lhs_len, src=rhs.unsafe_ptr(), count=rhs_len)
         return result^
 
-    fn __add__(self, other: StringSlice) -> String:
+    def __add__(self, other: StringSlice) -> String:
         """Creates a string by appending a string slice at the end.
 
         Args:
@@ -909,21 +910,20 @@ struct String(
         """
         return Self._add(self.as_bytes(), other.as_bytes())
 
-    fn _unsafe_append_byte(mut self, byte: Byte):
+    def _unsafe_append_byte(mut self, byte: Byte):
         """Appends a byte to the string assuming the capacity is sufficient.
 
         This helper is inherently unsafe as it does not check if the capacity is
         sufficient and does not check UTF-8 validity.
         """
-        debug_assert(
-            self.capacity() > self.byte_length(),
-            "String: capacity is not sufficient",
-        )
+        assert (
+            self.capacity() > self.byte_length()
+        ), "String: capacity is not sufficient"
         var length = self.byte_length()
         (self.unsafe_ptr_mut() + length).init_pointee_move(byte)
         self.set_byte_length(length + 1)
 
-    fn append(mut self, codepoint: Codepoint):
+    def append(mut self, codepoint: Codepoint):
         """Append a codepoint to the string.
 
         Args:
@@ -936,7 +936,7 @@ struct String(
         _ = codepoint.unsafe_write_utf8(self.unsafe_ptr_mut() + length)
         self.set_byte_length(new_length)
 
-    fn __radd__(self, other: StringSlice[mut=False, _]) -> String:
+    def __radd__(self, other: StringSlice[mut=False, _]) -> String:
         """Creates a string by prepending another string slice to the start.
 
         Args:
@@ -947,7 +947,7 @@ struct String(
         """
         return Self._add(other.as_bytes(), self.as_bytes())
 
-    fn _iadd(mut self, other: Span[mut=False, Byte, _]):
+    def _iadd(mut self, other: Span[mut=False, Byte, _]):
         var other_len = len(other)
         if other_len == 0:
             return
@@ -961,7 +961,7 @@ struct String(
         self.set_byte_length(new_len)
         self._clear_nul_terminator()
 
-    fn __iadd__(mut self, other: StringSlice[mut=False, _]):
+    def __iadd__(mut self, other: StringSlice[mut=False, _]):
         """Appends another string slice to this string.
 
         Args:
@@ -970,7 +970,7 @@ struct String(
         self._iadd(other.as_bytes())
 
     @deprecated("Use `str.codepoints()` or `str.codepoint_slices()` instead.")
-    fn __iter__(self) -> CodepointSliceIter[origin_of(self)]:
+    def __iter__(self) -> CodepointSliceIter[origin_of(self)]:
         """Iterate over the string, returning immutable references.
 
         Returns:
@@ -979,7 +979,7 @@ struct String(
         return self.codepoint_slices()
 
     @deprecated("Use `str.codepoint_slices_reversed()` instead.")
-    fn __reversed__(self) -> CodepointSliceIter[origin_of(self), False]:
+    def __reversed__(self) -> CodepointSliceIter[origin_of(self), False]:
         """Iterate backwards over the string, returning immutable references.
 
         Returns:
@@ -992,7 +992,7 @@ struct String(
     # ===------------------------------------------------------------------=== #
 
     @always_inline("nodebug")
-    fn __bool__(self) -> Bool:
+    def __bool__(self) -> Bool:
         """Checks if the string is not empty.
 
         Returns:
@@ -1000,7 +1000,7 @@ struct String(
         """
         return self.byte_length() > 0
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         """Get the string length of in bytes.
 
         This function returns the number of bytes in the underlying UTF-8
@@ -1039,30 +1039,8 @@ struct String(
         """
         return self.byte_length()
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
     @always_inline("nodebug")
-    fn __str__(self) -> String:
-        """Gets the string itself.
-
-        This method ensures that you can pass a `String` to a method that
-        takes a `Stringable` value.
-
-        Returns:
-            The string itself.
-        """
-        return self
-
-    @deprecated("Representable is deprecated. Use Writable instead.")
-    fn __repr__(self) -> String:
-        """Return a Mojo-compatible representation of the `String` instance.
-
-        Returns:
-            A new representation of the string.
-        """
-        return repr(StringSlice(self))
-
-    @always_inline("nodebug")
-    fn __fspath__(self) -> String:
+    def __fspath__(self) -> String:
         """Return the file system path representation (just the string itself).
 
         Returns:
@@ -1070,7 +1048,7 @@ struct String(
         """
         return self
 
-    fn to_python_object(var self) raises -> PythonObject:
+    def to_python_object(var self) raises -> PythonObject:
         """Convert this value to a PythonObject.
 
         Returns:
@@ -1081,7 +1059,7 @@ struct String(
         """
         return PythonObject(self)
 
-    fn __init__(out self, *, py: PythonObject) raises:
+    def __init__(out self, *, py: PythonObject) raises:
         """Construct a `String` from a PythonObject.
 
         Args:
@@ -1099,7 +1077,7 @@ struct String(
     # Methods
     # ===------------------------------------------------------------------=== #
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """
         Formats this string to the provided Writer.
 
@@ -1108,7 +1086,7 @@ struct String(
         """
         writer.write_string(self)
 
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    def write_repr_to(self, mut writer: Some[Writer]):
         """Formats this string slice to the provided `Writer`.
 
         Args:
@@ -1121,7 +1099,7 @@ struct String(
         """
         StringSlice(self).write_repr_to(writer)
 
-    fn join[T: Copyable & Writable](self, elems: Span[T, ...]) -> String:
+    def join[T: Copyable & Writable](self, elems: Span[T, ...]) -> String:
         """Joins string elements using the current string as a delimiter.
         Defaults to writing to the stack if total bytes of `elems` is less than
         `buffer_size`, otherwise will allocate once to the heap and write
@@ -1148,7 +1126,7 @@ struct String(
         """
         return StringSlice(self).join(elems)
 
-    fn codepoints(self) -> CodepointsIter[origin_of(self)]:
+    def codepoints(self) -> CodepointsIter[origin_of(self)]:
         """Returns an iterator over the `Codepoint`s encoded in this string slice.
 
         Returns:
@@ -1191,7 +1169,7 @@ struct String(
         """
         return StringSlice(self).codepoints()
 
-    fn codepoint_slices(self) -> CodepointSliceIter[origin_of(self)]:
+    def codepoint_slices(self) -> CodepointSliceIter[origin_of(self)]:
         """Returns an iterator over single-character slices of this string.
 
         Each returned slice points to a single Unicode codepoint encoded in the
@@ -1218,7 +1196,7 @@ struct String(
         """
         return StringSlice(self).codepoint_slices()
 
-    fn codepoint_slices_reversed(
+    def codepoint_slices_reversed(
         self,
     ) -> CodepointSliceIter[origin_of(self), False]:
         """Iterates backwards over the string, returning single-character slices.
@@ -1233,7 +1211,7 @@ struct String(
         return CodepointSliceIter[origin_of(self), forward=False](self)
 
     @always_inline("nodebug")
-    fn unsafe_ptr(
+    def unsafe_ptr(
         self,
     ) -> UnsafePointer[Byte, origin_of(self)]:
         """Retrieves a pointer to the underlying memory.
@@ -1255,7 +1233,7 @@ struct String(
                 origin_of(self)
             ]()
 
-    fn unsafe_ptr_mut(
+    def unsafe_ptr_mut(
         mut self, var capacity: Int = 0
     ) -> UnsafePointer[Byte, origin_of(self)]:
         """Retrieves a mutable pointer to the unique underlying memory. Passing
@@ -1279,7 +1257,7 @@ struct String(
         return self.unsafe_ptr().unsafe_mut_cast[True]()
 
     @always_inline
-    fn as_c_string_slice(
+    def as_c_string_slice(
         mut self,
     ) -> CStringSlice[ImmutOrigin(origin_of(self))]:
         """Return a `CStringSlice` to the underlying memory of the string.
@@ -1297,7 +1275,7 @@ struct String(
         # Safety: we ensure the string is null-terminated above.
         return CStringSlice(unsafe_from_ptr=self.unsafe_ptr().bitcast[c_char]())
 
-    fn as_bytes(self) -> Span[Byte, origin_of(self)]:
+    def as_bytes(self) -> Span[Byte, origin_of(self)]:
         """Returns a contiguous slice of the bytes owned by this string.
 
         Returns:
@@ -1308,7 +1286,7 @@ struct String(
             ptr=self.unsafe_ptr(), length=self.byte_length()
         )
 
-    fn as_bytes_mut(mut self) -> Span[Byte, origin_of(self)]:
+    def as_bytes_mut(mut self) -> Span[Byte, origin_of(self)]:
         """Returns a mutable contiguous slice of the bytes owned by this string.
         This name has a _mut suffix so the as_bytes() method doesn't have to
         guarantee mutability.
@@ -1321,7 +1299,7 @@ struct String(
         )
 
     @deprecated("Use `StringSlice(str)` instead.")
-    fn as_string_slice(self) -> StringSlice[origin_of(self)]:
+    def as_string_slice(self) -> StringSlice[origin_of(self)]:
         """Returns a string slice of the data owned by this string.
 
         Returns:
@@ -1329,7 +1307,7 @@ struct String(
         """
         return StringSlice(self)
 
-    fn byte_length(self) -> Int:
+    def byte_length(self) -> Int:
         """Get the string length in bytes.
 
         Returns:
@@ -1343,7 +1321,7 @@ struct String(
             return self._len_or_data
 
     @always_inline
-    fn count_codepoints(self) -> Int:
+    def count_codepoints(self) -> Int:
         """Calculates the length in Unicode codepoints encoded in the
         UTF-8 representation of this string.
 
@@ -1393,7 +1371,7 @@ struct String(
         """
         return StringSlice(self).count_codepoints()
 
-    fn set_byte_length(mut self, new_len: Int):
+    def set_byte_length(mut self, new_len: Int):
         """Set the byte length of the `String`.
 
         This is an internal helper method that updates the length field.
@@ -1408,7 +1386,7 @@ struct String(
         else:
             self._len_or_data = new_len
 
-    fn count(self, substr: StringSlice) -> Int:
+    def count(self, substr: StringSlice) -> Int:
         """Return the number of non-overlapping occurrences of substring
         `substr` in the string.
 
@@ -1423,7 +1401,7 @@ struct String(
         """
         return StringSlice(self).count(substr)
 
-    fn __contains__(self, substr: StringSlice) -> Bool:
+    def __contains__(self, substr: StringSlice) -> Bool:
         """Returns True if the substring is contained within the current string.
 
         Args:
@@ -1434,7 +1412,7 @@ struct String(
         """
         return substr in StringSlice(self)
 
-    fn find(self, substr: StringSlice, start: Int = 0) -> Int:
+    def find(self, substr: StringSlice, start: Int = 0) -> Int:
         """Finds the offset of the first occurrence of `substr` starting at
         `start`. If not found, returns -1.
 
@@ -1448,7 +1426,7 @@ struct String(
 
         return StringSlice(self).find(substr, start)
 
-    fn rfind(self, substr: StringSlice, start: Int = 0) -> Int:
+    def rfind(self, substr: StringSlice, start: Int = 0) -> Int:
         """Finds the offset of the last occurrence of `substr` starting at
         `start`. If not found, returns -1.
 
@@ -1462,7 +1440,7 @@ struct String(
 
         return StringSlice(self).rfind(substr, start=start)
 
-    fn isspace(self) -> Bool:
+    def isspace(self) -> Bool:
         """Determines whether every character in the given String is a
         python whitespace String. This corresponds to Python's
         [universal separators](
@@ -1476,7 +1454,7 @@ struct String(
         return StringSlice(self).isspace()
 
     @always_inline
-    fn split(self, sep: StringSlice) -> List[StringSlice[origin_of(self)]]:
+    def split(self, sep: StringSlice) -> List[StringSlice[origin_of(self)]]:
         """Split the string by a separator.
 
         Args:
@@ -1501,7 +1479,7 @@ struct String(
         return StringSlice(self).split(sep)
 
     @always_inline
-    fn split(
+    def split(
         self, sep: StringSlice, maxsplit: Int
     ) -> List[StringSlice[origin_of(self)]]:
         """Split the string by a separator.
@@ -1527,7 +1505,7 @@ struct String(
         return StringSlice(self).split(sep, maxsplit=maxsplit)
 
     @always_inline
-    fn split(self, sep: NoneType = None) -> List[StringSlice[origin_of(self)]]:
+    def split(self, sep: NoneType = None) -> List[StringSlice[origin_of(self)]]:
         """Split the string by every Whitespace separator.
 
         Args:
@@ -1547,14 +1525,14 @@ struct String(
         _ = StringSlice("      hello    world     ").split() # ["hello", "world"]
         # Splitting adjacent universal newlines:
         _ = StringSlice(
-            "hello \\t\\n\\v\\f\\r\\x1c\\x1d\\x1e\\x85\\u2028\\u2029world"
+            "hello \\t\\n\\v\\f\\r\\x1c\\x1d\\x1e\\x85world"
         ).split()  # ["hello", "world"]
         ```
         """
         return StringSlice(self).split(sep)
 
     @always_inline
-    fn split(
+    def split(
         self, sep: NoneType = None, *, maxsplit: Int
     ) -> List[StringSlice[origin_of(self)]]:
         """Split the string by every Whitespace separator.
@@ -1574,7 +1552,7 @@ struct String(
         """
         return StringSlice(self).split(sep, maxsplit=maxsplit)
 
-    fn splitlines(
+    def splitlines(
         self, keepends: Bool = False
     ) -> List[StringSlice[origin_of(self)]]:
         """Split the string at line boundaries. This corresponds to Python's
@@ -1590,7 +1568,7 @@ struct String(
         """
         return StringSlice(self).splitlines(keepends)
 
-    fn replace(self, old: StringSlice, new: StringSlice) -> String:
+    def replace(self, old: StringSlice, new: StringSlice) -> String:
         """Return a copy of the string with all occurrences of substring `old`
         if replaced by `new`.
 
@@ -1603,7 +1581,7 @@ struct String(
         """
         return StringSlice(self).replace(old, new)
 
-    fn strip(self, chars: StringSlice) -> StringSlice[origin_of(self)]:
+    def strip(self, chars: StringSlice) -> StringSlice[origin_of(self)]:
         """Return a copy of the string with leading and trailing characters
         removed.
 
@@ -1616,7 +1594,7 @@ struct String(
 
         return self.lstrip(chars).rstrip(chars)
 
-    fn strip(self) -> StringSlice[origin_of(self)]:
+    def strip(self) -> StringSlice[origin_of(self)]:
         """Return a copy of the string with leading and trailing whitespaces
         removed. This only takes ASCII whitespace into account:
         `" \\t\\n\\v\\f\\r\\x1c\\x1d\\x1e"`.
@@ -1626,7 +1604,7 @@ struct String(
         """
         return self.lstrip().rstrip()
 
-    fn rstrip(self, chars: StringSlice) -> StringSlice[origin_of(self)]:
+    def rstrip(self, chars: StringSlice) -> StringSlice[origin_of(self)]:
         """Return a copy of the string with trailing characters removed.
 
         Args:
@@ -1638,7 +1616,7 @@ struct String(
 
         return StringSlice(self).rstrip(chars)
 
-    fn rstrip(self) -> StringSlice[origin_of(self)]:
+    def rstrip(self) -> StringSlice[origin_of(self)]:
         """Return a copy of the string with trailing whitespaces removed. This
         only takes ASCII whitespace into account:
         `" \\t\\n\\v\\f\\r\\x1c\\x1d\\x1e"`.
@@ -1648,7 +1626,7 @@ struct String(
         """
         return StringSlice(self).rstrip()
 
-    fn lstrip(self, chars: StringSlice) -> StringSlice[origin_of(self)]:
+    def lstrip(self, chars: StringSlice) -> StringSlice[origin_of(self)]:
         """Return a copy of the string with leading characters removed.
 
         Args:
@@ -1660,7 +1638,7 @@ struct String(
 
         return StringSlice(self).lstrip(chars)
 
-    fn lstrip(self) -> StringSlice[origin_of(self)]:
+    def lstrip(self) -> StringSlice[origin_of(self)]:
         """Return a copy of the string with leading whitespaces removed. This
         only takes ASCII whitespace into account:
         `" \\t\\n\\v\\f\\r\\x1c\\x1d\\x1e"`.
@@ -1670,7 +1648,7 @@ struct String(
         """
         return StringSlice(self).lstrip()
 
-    fn __hash__[H: Hasher](self, mut hasher: H):
+    def __hash__[H: Hasher](self, mut hasher: H):
         """Updates hasher with the underlying bytes.
 
         Parameters:
@@ -1681,7 +1659,7 @@ struct String(
         """
         hasher.update(StringSlice(self))
 
-    fn lower(self) -> String:
+    def lower(self) -> String:
         """Returns a copy of the string with all cased characters
         converted to lowercase.
 
@@ -1691,7 +1669,7 @@ struct String(
 
         return StringSlice(self).lower()
 
-    fn upper(self) -> String:
+    def upper(self) -> String:
         """Returns a copy of the string with all cased characters
         converted to uppercase.
 
@@ -1701,7 +1679,7 @@ struct String(
 
         return StringSlice(self).upper()
 
-    fn startswith(
+    def startswith(
         self, prefix: StringSlice, start: Int = 0, end: Int = -1
     ) -> Bool:
         """Checks if the string starts with the specified prefix between start
@@ -1717,7 +1695,7 @@ struct String(
         """
         return StringSlice(self).startswith(prefix, start, end)
 
-    fn endswith(
+    def endswith(
         self, suffix: StringSlice, start: Int = 0, end: Int = -1
     ) -> Bool:
         """Checks if the string end with the specified suffix between start
@@ -1733,7 +1711,7 @@ struct String(
         """
         return StringSlice(self).endswith(suffix, start, end)
 
-    fn removeprefix(
+    def removeprefix(
         self, prefix: StringSlice, /
     ) -> StringSlice[origin_of(self)]:
         """Returns a new string with the prefix removed if it was present.
@@ -1754,7 +1732,7 @@ struct String(
         """
         return StringSlice(self).removeprefix(prefix)
 
-    fn removesuffix(
+    def removesuffix(
         self, suffix: StringSlice, /
     ) -> StringSlice[origin_of(self)]:
         """Returns a new string with the suffix removed if it was present.
@@ -1775,7 +1753,7 @@ struct String(
         """
         return StringSlice(self).removesuffix(suffix)
 
-    fn __int__(self) raises -> Int:
+    def __int__(self) raises -> Int:
         """Parses the given string as a base-10 integer and returns that value.
         If the string cannot be parsed as an int, an error is raised.
 
@@ -1787,7 +1765,7 @@ struct String(
         """
         return atol(self)
 
-    fn __float__(self) raises -> Float64:
+    def __float__(self) raises -> Float64:
         """Parses the string as a float point number and returns that value. If
         the string cannot be parsed as a float, an error is raised.
 
@@ -1799,7 +1777,7 @@ struct String(
         """
         return atof(self)
 
-    fn __mul__(self, n: Int) -> String:
+    def __mul__(self, n: Int) -> String:
         """Concatenates the string `n` times.
 
         Args:
@@ -1810,7 +1788,7 @@ struct String(
         """
         return StringSlice(self) * n
 
-    fn format[*Ts: Writable](self, *args: *Ts) raises -> String:
+    def format[*Ts: Writable](self, *args: *Ts) raises -> String:
         """Produce a formatted string using the current string as a template.
 
         The template, or "format string" can contain literal text and/or
@@ -1844,7 +1822,7 @@ struct String(
         """
         return _FormatUtils.format(self, args)
 
-    fn is_ascii_digit(self) -> Bool:
+    def is_ascii_digit(self) -> Bool:
         """A string is a digit string if all characters in the string are ASCII digits
         and there is at least one character in the string.
 
@@ -1855,7 +1833,7 @@ struct String(
         """
         return StringSlice(self).is_ascii_digit()
 
-    fn isupper(self) -> Bool:
+    def isupper(self) -> Bool:
         """Returns True if all cased characters in the string are uppercase and
         there is at least one cased character.
 
@@ -1865,7 +1843,7 @@ struct String(
         """
         return StringSlice(self).isupper()
 
-    fn islower(self) -> Bool:
+    def islower(self) -> Bool:
         """Returns True if all cased characters in the string are lowercase and
         there is at least one cased character.
 
@@ -1875,7 +1853,7 @@ struct String(
         """
         return StringSlice(self).islower()
 
-    fn is_ascii_printable(self) -> Bool:
+    def is_ascii_printable(self) -> Bool:
         """Returns True if all characters in the string are ASCII printable.
 
         Note that this currently only works with ASCII strings.
@@ -1885,7 +1863,7 @@ struct String(
         """
         return StringSlice(self).is_ascii_printable()
 
-    fn ascii_rjust(self, width: Int, fillchar: StaticString = " ") -> String:
+    def ascii_rjust(self, width: Int, fillchar: StaticString = " ") -> String:
         """Returns the string right justified in a string of specified width.
 
         Pads the string on the left with the specified fill character so that
@@ -1915,7 +1893,7 @@ struct String(
         """
         return StringSlice(self).ascii_rjust(width, fillchar)
 
-    fn ascii_ljust(self, width: Int, fillchar: StaticString = " ") -> String:
+    def ascii_ljust(self, width: Int, fillchar: StaticString = " ") -> String:
         """Returns the string left justified in a string of specified width.
 
         Pads the string on the right with the specified fill character so that
@@ -1945,7 +1923,7 @@ struct String(
         """
         return StringSlice(self).ascii_ljust(width, fillchar)
 
-    fn ascii_center(self, width: Int, fillchar: StaticString = " ") -> String:
+    def ascii_center(self, width: Int, fillchar: StaticString = " ") -> String:
         """Returns the string center justified in a string of specified width.
 
         Pads the string on both sides with the specified fill character so that
@@ -1969,14 +1947,14 @@ struct String(
 
         ```mojo
         var s = String("hello")
-        print(s.center(10))        # "  hello   "
-        print(s.center(11, "*"))   # "***hello***"
-        print(s.center(3))         # "hello" (no padding)
+        print(s.ascii_center(10))        # "  hello   "
+        print(s.ascii_center(11, "*"))   # "***hello***"
+        print(s.ascii_center(3))         # "hello" (no padding)
         ```
         """
         return StringSlice(self).ascii_center(width, fillchar)
 
-    fn resize(mut self, length: Int, fill_byte: UInt8 = 0):
+    def resize(mut self, length: Int, fill_byte: UInt8 = 0):
         """Resize the string to a new length. Panics if new_len does not
         lie on a codepoint boundary or if fill_byte is non-ascii (>=128).
 
@@ -2010,7 +1988,7 @@ struct String(
             )
         self.set_byte_length(length)
 
-    fn resize(mut self, *, unsafe_uninit_length: Int):
+    def resize(mut self, *, unsafe_uninit_length: Int):
         """Resizes the string to the given new size leaving any new data
         uninitialized. Panics if the new length does not lie on a codepoint
         boundary.
@@ -2036,7 +2014,7 @@ struct String(
             self.reserve(unsafe_uninit_length)
         self.set_byte_length(unsafe_uninit_length)
 
-    fn reserve(mut self, new_capacity: Int):
+    def reserve(mut self, new_capacity: Int):
         """Reserves the requested capacity.
 
         Args:
@@ -2051,7 +2029,7 @@ struct String(
         self._realloc_mutable(new_capacity)
 
     # Make a string mutable on the stack.
-    fn _inline_string(mut self):
+    def _inline_string(mut self):
         var length = len(self)
         var new_string = Self()
         new_string.set_byte_length(length)
@@ -2064,7 +2042,7 @@ struct String(
     # This is the out-of-line implementation of reserve called when we need
     # to grow the capacity of the string. Make sure our capacity at least
     # doubles to avoid O(n^2) behavior, and make use of extra space if it exists.
-    fn _realloc_mutable(mut self, capacity: Int):
+    def _realloc_mutable(mut self, capacity: Int):
         # Get these fields before we change _capacity_or_data
         var byte_len = self.byte_length()
         var old_ptr = self.unsafe_ptr()
@@ -2085,7 +2063,7 @@ struct String(
 # ===----------------------------------------------------------------------=== #
 
 
-fn ord(s: StringSlice) -> Int:
+def ord(s: StringSlice) -> Int:
     """Returns an integer that represents the codepoint of a single-character
     string.
 
@@ -2111,7 +2089,7 @@ fn ord(s: StringSlice) -> Int:
 comptime _LARGEST_UNICODE_ASCII_BYTE = 127
 
 
-fn chr(c: Int) -> String:
+def chr(c: Int) -> String:
     """Returns a String based on the given Unicode code point. This is the
     inverse of the `ord()` function.
 
@@ -2145,7 +2123,7 @@ fn chr(c: Int) -> String:
 # ===----------------------------------------------------------------------=== #
 
 
-fn _unsafe_chr_ascii(c: UInt8) -> String:
+def _unsafe_chr_ascii(c: UInt8) -> String:
     """Returns a string based on the given ASCII code point.
 
     Args:
@@ -2157,14 +2135,14 @@ fn _unsafe_chr_ascii(c: UInt8) -> String:
     Safety:
         The byte must be a valid single byte ASCII character (0-127).
     """
-    debug_assert(
-        c <= _LARGEST_UNICODE_ASCII_BYTE, "Character is not single byte unicode"
-    )
+    assert (
+        c <= _LARGEST_UNICODE_ASCII_BYTE
+    ), "Character is not single byte unicode"
 
     return String(unsafe_from_utf8=Span(ptr=UnsafePointer(to=c), length=1))
 
 
-fn _repr_ascii(c: UInt8) -> String:
+def _repr_ascii(c: UInt8) -> String:
     """Returns a printable representation of the given ASCII code point.
 
     Args:
@@ -2196,7 +2174,7 @@ fn _repr_ascii(c: UInt8) -> String:
             return hex(uc, prefix=r"\x")
 
 
-fn ascii(value: StringSlice) -> String:
+def ascii(value: StringSlice) -> String:
     """Get the ASCII representation of the object.
 
     Args:
@@ -2216,9 +2194,9 @@ fn ascii(value: StringSlice) -> String:
         use_dquote = use_dquote or (char == ord_squote)
 
     if use_dquote:
-        return t'"{result}"'
+        return String(t'"{result}"')
     else:
-        return t"'{result}'"
+        return String(t"'{result}'")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -2226,7 +2204,7 @@ fn ascii(value: StringSlice) -> String:
 # ===----------------------------------------------------------------------=== #
 
 
-fn atol(str_slice: StringSlice, base: Int = 10) raises -> Int:
+def atol(str_slice: StringSlice, base: Int = 10) raises -> Int:
     """Parses and returns the given string as an integer in the given base.
 
     If base is set to 0, the string is parsed as an integer literal, with the
@@ -2367,7 +2345,7 @@ fn atol(str_slice: StringSlice, base: Int = 10) raises -> Int:
     return result
 
 
-fn _trim_and_handle_sign(
+def _trim_and_handle_sign(
     str_slice: StringSlice, str_len: Int
 ) -> Tuple[Int, Bool]:
     """Trims leading whitespace, handles the sign of the number in the string.
@@ -2390,7 +2368,7 @@ fn _trim_and_handle_sign(
     return start + (Int(p) or Int(n)), n
 
 
-fn _handle_base_prefix(
+def _handle_base_prefix(
     pos: Int, str_slice: StringSlice, str_len: Int, base: Int
 ) -> Tuple[Int, Bool]:
     """Adjusts the starting position if a valid base prefix is present.
@@ -2422,7 +2400,7 @@ fn _handle_base_prefix(
     return start, start != pos
 
 
-fn _str_to_base_error(base: Int, str_slice: StringSlice) -> String:
+def _str_to_base_error(base: Int, str_slice: StringSlice) -> String:
     return String(
         "String is not convertible to integer with base ",
         base,
@@ -2432,7 +2410,7 @@ fn _str_to_base_error(base: Int, str_slice: StringSlice) -> String:
     )
 
 
-fn _identify_base(str_slice: StringSlice, start: Int) -> Tuple[Int, Int]:
+def _identify_base(str_slice: StringSlice, start: Int) -> Tuple[Int, Int]:
     var length = str_slice.byte_length()
     # just 1 digit, assume base 10
     if start == (length - 1):
@@ -2466,7 +2444,7 @@ fn _identify_base(str_slice: StringSlice, start: Int) -> Tuple[Int, Int]:
     return 10, start
 
 
-fn _atof_error[reason: StaticString = ""](str_ref: StringSlice) -> Error:
+def _atof_error[reason: StaticString = ""](str_ref: StringSlice) -> Error:
     comptime if reason:
         return Error(
             "String is not convertible to float: '",
@@ -2477,7 +2455,7 @@ fn _atof_error[reason: StaticString = ""](str_ref: StringSlice) -> Error:
     return Error("String is not convertible to float: '", str_ref, "'")
 
 
-fn atof(str_slice: StringSlice) raises -> Float64:
+def atof(str_slice: StringSlice) raises -> Float64:
     """Parses the given string as a floating point and returns that value.
 
     For example, `atof("2.25")` returns `2.25`.
@@ -2502,7 +2480,7 @@ fn atof(str_slice: StringSlice) raises -> Float64:
 # ===----------------------------------------------------------------------=== #
 
 
-fn _toggle_ascii_case(char: UInt8) -> UInt8:
+def _toggle_ascii_case(char: UInt8) -> UInt8:
     """Assuming char is a cased ASCII character, this function will return the
     opposite-cased letter.
     """
@@ -2512,7 +2490,7 @@ fn _toggle_ascii_case(char: UInt8) -> UInt8:
     return char ^ (1 << 5)
 
 
-fn _calc_initial_buffer_size_int32(n0: Int) -> Int:
+def _calc_initial_buffer_size_int32(n0: Int) -> Int:
     # See https://commaok.xyz/post/lookup_tables/ and
     # https://lemire.me/blog/2021/06/03/computing-the-number-of-digits-of-an-integer-even-faster/
     # for a description.
@@ -2560,7 +2538,7 @@ fn _calc_initial_buffer_size_int32(n0: Int) -> Int:
     return (n0 + lookup_table_ref[log2]) >> 32
 
 
-fn _calc_initial_buffer_size_int64(n0: UInt64) -> Int:
+def _calc_initial_buffer_size_int64(n0: UInt64) -> Int:
     var result: Int = 1
     var n = n0
     while True:
@@ -2576,18 +2554,18 @@ fn _calc_initial_buffer_size_int64(n0: UInt64) -> Int:
         result += 4
 
 
-fn _calc_initial_buffer_size(n0: Int) -> Int:
+def _calc_initial_buffer_size(n0: Int) -> Int:
     var sign = 0 if n0 >= 0 else 1
 
     # Add 1 for the terminator
     return sign + n0._decimal_digit_count() + 1
 
 
-fn _calc_initial_buffer_size(n: Float64) -> Int:
+def _calc_initial_buffer_size(n: Float64) -> Int:
     return 128 + 1  # Add 1 for the terminator
 
 
-fn _calc_initial_buffer_size[dtype: DType](n0: Scalar[dtype]) -> Int:
+def _calc_initial_buffer_size[dtype: DType](n0: Scalar[dtype]) -> Int:
     comptime if dtype.is_integral():
         var n = abs(n0)
         var sign = 0 if n0 >= 0 else 1
@@ -2604,7 +2582,7 @@ fn _calc_initial_buffer_size[dtype: DType](n0: Scalar[dtype]) -> Int:
     return 128 + 1  # Add 1 for the terminator
 
 
-fn _calc_format_buffer_size[dtype: DType]() -> Int:
+def _calc_format_buffer_size[dtype: DType]() -> Int:
     """Returns a buffer size in bytes that is large enough to store a formatted
     number of the specified dtype.
     """

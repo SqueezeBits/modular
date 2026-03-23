@@ -26,13 +26,12 @@ from max.driver import DeviceSpec, accelerator_api, load_devices
 from max.engine import InferenceSession
 from max.graph.quantization import QuantizationEncoding
 from max.pipelines.lib.hf_utils import is_diffusion_pipeline
+from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 from max.pipelines.lib.memory_estimation import (
     MemoryEstimator,
     to_human_readable_bytes,
 )
-from max.pipelines.lib.pipeline_runtime_config import (
-    PipelineRuntimeConfig,
-)
+from max.pipelines.lib.pipeline_runtime_config import PipelineRuntimeConfig
 from max.pipelines.lib.registry import (
     PIPELINE_REGISTRY,
     SupportedArchitecture,
@@ -62,9 +61,17 @@ _AUTO_ENABLE_OVERLAP_SCHEDULER_ARCHITECTURES = (
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
     "DeepseekV3ForCausalLMNextN",
+    "KimiK25ForConditionalGeneration",
 )
 
-_AUTO_ENABLE_DEVICE_GRAPH_CAPTURE_ARCHITECTURES = ("LlamaForCausalLM",)
+_AUTO_ENABLE_DEVICE_GRAPH_CAPTURE_ARCHITECTURES = (
+    "LlamaForCausalLM",
+    "DeepseekV2ForCausalLM",
+    "DeepseekV3ForCausalLM",
+    "DeepseekV32ForCausalLM",
+    "DeepseekV3ForCausalLMNextN",
+    "KimiK25ForConditionalGeneration",
+)
 
 
 class PipelineConfig(ConfigFileModel):
@@ -129,6 +136,12 @@ class PipelineConfig(ConfigFileModel):
     )
     """The model-agnostic runtime settings for pipeline execution."""
 
+    cache: DenoisingCacheConfig = Field(
+        default_factory=DenoisingCacheConfig,
+        description="Denoising cache configuration for diffusion pipelines.",
+    )
+    """Cache configuration for FBCache and TaylorSeer optimizations."""
+
     _config_file_section_name: str = PrivateAttr(default="pipeline_config")
     """The section name to use when loading this config from a MAXConfig file.
     This is used to differentiate between different config sections in a single
@@ -187,6 +200,17 @@ class PipelineConfig(ConfigFileModel):
 
         return extracted
 
+    def _create_cache_config_if_needed(self, kwargs: dict[str, Any]) -> None:
+        """Extract denoising cache kwargs and create DenoisingCacheConfig if any provided."""
+        cache_kwargs = PipelineConfig._extract_kwargs_for_config(
+            kwargs, DenoisingCacheConfig
+        )
+        if cache_kwargs:
+            # Remove None values so DenoisingCacheConfig defaults are used
+            filtered = {k: v for k, v in cache_kwargs.items() if v is not None}
+            if filtered:
+                self.cache = DenoisingCacheConfig(**filtered)
+
     def _create_lora_config_if_needed(self, kwargs: dict[str, Any]) -> None:
         """Extract LoRA kwargs and create valid LoRAConfig if enable_lora provided."""
         lora_kwargs = PipelineConfig._extract_kwargs_for_config(
@@ -234,9 +258,8 @@ class PipelineConfig(ConfigFileModel):
             }
             if filtered_kwargs:
                 self.speculative = SpeculativeConfig(**filtered_kwargs)
-                assert self.draft_model is not None
                 # We need to set the architecture to LlamaForCausalLMEagle for Eagle speculative decoding
-                if self.speculative.is_eagle():
+                if self.speculative.is_eagle() and self.draft_model is not None:
                     if self.draft_model.huggingface_config is None:
                         raise ValueError(
                             f"EAGLE speculative decoding requires a HuggingFace config for the draft model, "
@@ -324,25 +347,10 @@ class PipelineConfig(ConfigFileModel):
             # Create new model config with updated KVCache config
             model_config = config_class(**matched_kwargs)
 
-            if self.draft_model:
-                memory_util = kv_cache_kwargs.get(
-                    "device_memory_utilization", 0.9
-                )
-
-                if self.speculative and self.speculative.is_mtp():
-                    main_model_util = memory_util * 0.95
-                else:
-                    main_model_util = memory_util * 0.7
-
-                draft_model_util = memory_util - main_model_util
-
-                kv_cache_kwargs["device_memory_utilization"] = main_model_util
-
             model_config.create_kv_cache_config(**kv_cache_kwargs)
             setattr(self, config_name, model_config)
 
             if self.draft_model:
-                kv_cache_kwargs["device_memory_utilization"] = draft_model_util
                 self.draft_model.create_kv_cache_config(**kv_cache_kwargs)
 
         elif config_name == "sampling":
@@ -426,6 +434,7 @@ class PipelineConfig(ConfigFileModel):
         delattr(self, "_unmatched_kwargs")
 
         # Process specialized config creation
+        self._create_cache_config_if_needed(unmatched_kwargs)
         self._create_lora_config_if_needed(unmatched_kwargs)
         self._create_draft_model_config_if_needed(unmatched_kwargs)
         self._create_speculative_config_if_needed(unmatched_kwargs)
@@ -448,27 +457,6 @@ class PipelineConfig(ConfigFileModel):
         }
         if not should_defer:
             self.resolve()
-        return self
-
-    @model_validator(mode="after")
-    def _sync_max_length_for_speculative_decoding(self) -> Self:
-        """Sync max_length between target and draft models for speculative decoding.
-
-        When speculative decoding is enabled with a draft model, ensure both models
-        have a max_length value. If only one is set, copy it to the other.
-        """
-        if self.draft_model is not None:
-            if (
-                self.model.max_length is not None
-                and self.draft_model.max_length is None
-            ):
-                self.draft_model.max_length = self.model.max_length
-            elif (
-                self.draft_model.max_length is not None
-                and self.model.max_length is None
-            ):
-                self.model.max_length = self.draft_model.max_length
-
         return self
 
     def _import_custom_architectures(self) -> None:
@@ -585,18 +573,14 @@ class PipelineConfig(ConfigFileModel):
 
         # By this point, we should have a valid model_path.
 
-        # Run Baseline Validation
-        self._validate_and_resolve_remaining_pipeline_config(
-            model_config=self.model
-        )
-
-        # Run Additional Checks for Speculative Decoding
         if self.draft_model:
-            self._validate_and_resolve_remaining_pipeline_config(
-                model_config=self.draft_model
-            )
-
+            # Joint memory estimation for speculative decoding
+            self._validate_and_resolve_speculative_memory()
             self._validate_pipeline_config_for_speculative_decoding()
+        else:
+            self._validate_and_resolve_remaining_pipeline_config(
+                model_config=self.model
+            )
 
         self._validate_and_resolve_overlap_scheduler()
 
@@ -645,11 +629,18 @@ class PipelineConfig(ConfigFileModel):
 
         # Raise errors when we detect features that are not compatible with the overlap scheduler.
         if self.runtime.enable_overlap_scheduler:
-            if self.runtime.pipeline_role != "prefill_and_decode":
-                raise ValueError(
-                    "The Overlap scheduler does not support Disaggregated Inference yet. "
-                    "It is only supported with the PrefillAndDecode pipeline role. "
-                    f"Found {self.runtime.pipeline_role}."
+            if self.runtime.pipeline_role in ("decode_only", "prefill_only"):
+                if self.runtime.max_num_steps != 1:
+                    logger.info(
+                        "Setting max-num-steps=1 for overlap scheduling "
+                        "on %s worker.",
+                        self.runtime.pipeline_role,
+                    )
+                    self.runtime.max_num_steps = 1
+                logger.info(
+                    "Overlap scheduling enabled for %s worker "
+                    "(Disaggregated Inference). THIS IS EXPERIMENTAL.",
+                    self.runtime.pipeline_role,
                 )
             if self.sampling.enable_structured_output:
                 raise ValueError(
@@ -826,12 +817,13 @@ class PipelineConfig(ConfigFileModel):
             self.model.kv_cache.enable_prefix_caching = False
             self.draft_model.kv_cache.enable_prefix_caching = False
 
-    def _validate_and_resolve_remaining_pipeline_config(
+    def _validate_and_resolve_architecture(
         self, model_config: MAXModelConfig
-    ) -> None:
-        """Updates remaining pipeline config fields if not provided.
+    ) -> SupportedArchitecture:
+        """Validates and resolves architecture, quantization, rope, and encoding.
 
-        Errors out with a detailed reason if invalid config is provided.
+        This performs all validation up to (but not including) memory
+        estimation. Returns the resolved SupportedArchitecture.
         """
         # Retrieve the architecture
         arch = PIPELINE_REGISTRY.retrieve_architecture(
@@ -928,6 +920,110 @@ class PipelineConfig(ConfigFileModel):
             default_weights_format=arch.default_weights_format,
         )
 
+        return arch
+
+    def _validate_and_resolve_speculative_memory(self) -> None:
+        """Joint memory estimation for speculative decoding.
+
+        Reserves memory for the draft model's non-shared weights by
+        temporarily lowering the target's utilization, then runs
+        standard estimation for the target model.
+        """
+        assert self.draft_model is not None
+
+        # This code is a mess and really needs to be overhauled...
+        #
+        # Resolve the target model's architecture first so we can use its
+        # quantization_encoding as the default for the draft model.
+        # _validate_and_resolve_architecture is safe to call again later
+        # (via _validate_and_resolve_remaining_pipeline_config) because the
+        # second call will find quantization_encoding already set and just
+        # validate it.
+
+        # Override target architecture for unified EAGLE pipeline.
+        if not os.getenv("MODULAR_USE_LEGACY_EAGLE_PIPELINE"):
+            assert self.model.huggingface_config is not None
+            target_archs = self.model.huggingface_config.architectures
+            if target_archs and target_archs[0] == "LlamaForCausalLM":
+                target_archs[0] = "UnifiedEagleLlama3ForCausalLM"
+
+        self._validate_and_resolve_architecture(self.model)
+
+        # Default draft model's quantization encoding to the target model's
+        # resolved encoding when the user hasn't explicitly specified one.
+        if (
+            self.draft_model.quantization_encoding is None
+            and self.model.quantization_encoding is not None
+        ):
+            logger.info(
+                f"draft_quantization_encoding not specified, defaulting to"
+                f" target model encoding: {self.model.quantization_encoding}"
+            )
+            self.draft_model.quantization_encoding = (
+                self.model.quantization_encoding
+            )
+
+        draft_arch = self._validate_and_resolve_architecture(self.draft_model)
+        draft_reservation = draft_arch.pipeline_model.estimate_weights_size(
+            self
+        )
+
+        # Temporarily lower utilization to carve out space for draft weights.
+        original_util = self.model.kv_cache.device_memory_utilization
+        devices = load_devices(self.model.device_specs)
+        free_memory = MemoryEstimator.free_memory(devices)
+        adjusted_util = max(
+            0.1, original_util - draft_reservation / free_memory
+        )
+        self.model.kv_cache.device_memory_utilization = adjusted_util
+
+        # Run standard target estimation with reduced budget.
+        self._validate_and_resolve_remaining_pipeline_config(
+            model_config=self.model
+        )
+
+        # Restore utilization and propagate results to draft.
+        self.model.kv_cache.device_memory_utilization = original_util
+
+        # Hardcode the draft kvcache to 0 bytes. When allocating the draft
+        # kvcache, we will use a portion of the target's available_cache_memory.
+        # This is handled in the SpeculativeDecodingPipelineBase via
+        # MultiKVCacheParams to ensure that the same number of pages are allocated
+        # for the target and draft kv caches.
+        if self.draft_model.kv_cache._available_cache_memory is not None:
+            raise ValueError(
+                "Expected draft model's available_cache_memory to be None"
+            )
+        self.draft_model.kv_cache._available_cache_memory = 0
+
+        # Clamp max_length to the draft model's max sequence length.
+        # EAGLE and other draft models may support a shorter context than the
+        # target model (e.g. 2048 vs 131072).  Both models share a KV cache
+        # and must agree on the sequence length, so we use the minimum.
+        draft_arch_config = draft_arch.config.initialize(
+            self, model_config=self.draft_model
+        )
+        draft_max_seq_len = draft_arch_config.get_max_seq_len()
+        target_max_length = self.model.max_length
+        if (
+            target_max_length is not None
+            and target_max_length > draft_max_seq_len
+        ):
+            logger.info(
+                f"Clamping max_length from {target_max_length} to"
+                f" {draft_max_seq_len} (draft model max sequence length)"
+            )
+            self.model.max_length = draft_max_seq_len
+
+    def _validate_and_resolve_remaining_pipeline_config(
+        self, model_config: MAXModelConfig
+    ) -> None:
+        """Updates remaining pipeline config fields if not provided.
+
+        Errors out with a detailed reason if invalid config is provided.
+        """
+        arch = self._validate_and_resolve_architecture(model_config)
+
         if is_diffusion_pipeline(model_config.huggingface_model_repo):
             # Skip memory estimation for diffusion pipelines,
             # since they don't use KV cache.
@@ -941,24 +1037,26 @@ class PipelineConfig(ConfigFileModel):
                 "Please ensure the model repository contains a valid config.json file."
             )
 
-        arch_config = arch.config.initialize(self)
+        devices = load_devices(model_config.device_specs)
+        arch_config = arch.config.initialize(self, model_config=model_config)
+
+        weights_size = arch.pipeline_model.estimate_weights_size(self)
+        activation_size = arch.pipeline_model.estimate_activation_memory(
+            self, model_config.huggingface_config
+        )
 
         MemoryEstimator.estimate_memory_footprint(
             self,
             model_config,
             arch_config,
             devices,
-            arch.pipeline_model.estimate_weights_size(self),
-            arch.pipeline_model.estimate_activation_memory(
-                self, model_config.huggingface_config
-            ),
+            weights_size,
+            activation_size,
         )
 
         if clamped_max_seq_len := MemoryEstimator.max_supported_sequence_length(
-            arch.pipeline_model.estimate_weights_size(self),
-            arch.pipeline_model.estimate_activation_memory(
-                self, model_config.huggingface_config
-            ),
+            weights_size,
+            activation_size,
             model_config,
             devices,
             arch_config,

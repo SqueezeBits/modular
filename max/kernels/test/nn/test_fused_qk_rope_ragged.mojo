@@ -57,7 +57,7 @@ def test_fused_qk_rope[rope_dim: Int, dtype: DType]() raises -> None:
     comptime num_layers = 1
     var lookup_table: List[UInt32] = [0, 1]
 
-    fn _max[dtype: DType, items: List[Scalar[dtype]]]() -> Scalar[dtype]:
+    def _max[dtype: DType, items: List[Scalar[dtype]]]() -> Scalar[dtype]:
         comptime assert len(items) > 0, "empty list in _max"
         items_dyn = materialize[items]()
         max_item = items_dyn[0]
@@ -138,9 +138,7 @@ def test_fused_qk_rope[rope_dim: Int, dtype: DType]() raises -> None:
 
     # Create and initialize query buffer.
     q_buffer = q_input[dtype]()
-    debug_assert(
-        len(q_buffer) == batch_size * seq_len * dim, "invalid q_buffer init"
-    )
+    assert len(q_buffer) == batch_size * seq_len * dim, "invalid q_buffer init"
 
     # Create query tensor as a TileTensor view of the query buffer.
     var q = TileTensor(q_buffer.unsafe_ptr(), q_layout)
@@ -158,10 +156,9 @@ def test_fused_qk_rope[rope_dim: Int, dtype: DType]() raises -> None:
 
     # Create and init rotary matrix (frequencies as cos(x) + i*sin(x)).
     freqs_cis_table_buffer = freqs_cis_table_input[dtype]()
-    debug_assert(
-        len(freqs_cis_table_buffer) == 2 * max_seq_len * head_dim,
-        "invalid freqs_cis_table init",
-    )
+    assert (
+        len(freqs_cis_table_buffer) == 2 * max_seq_len * head_dim
+    ), "invalid freqs_cis_table init"
     # Create a TileTensor view into freqs_cis that only includes the roped dimensions.
     # Offset to last rope_dim elements.
     # Note: This tensor has non-row-major strides (head_dim, 1) to select every
@@ -177,18 +174,16 @@ def test_fused_qk_rope[rope_dim: Int, dtype: DType]() raises -> None:
 
     # Create and initialize golden outputs.
     expected_q_out_buffer = q_out_golden[dtype]()
-    debug_assert(
-        len(expected_q_out_buffer) == len(q_buffer),
-        "invalid expected q out init",
-    )
+    assert len(expected_q_out_buffer) == len(
+        q_buffer
+    ), "invalid expected q out init"
     var expected_q_out = TileTensor(
         expected_q_out_buffer.unsafe_ptr(), q_layout
     )
     expected_k_out_buffer = k_out_golden[dtype]()
-    debug_assert(
-        len(expected_k_out_buffer) == batch_size * seq_len * dim,
-        "invalid expected k out init",
-    )
+    assert (
+        len(expected_k_out_buffer) == batch_size * seq_len * dim
+    ), "invalid expected k out init"
 
     # Create output buffer and TileTensor.
     q_out_buffer = List[Scalar[dtype]](length=len(q_buffer), fill=0)

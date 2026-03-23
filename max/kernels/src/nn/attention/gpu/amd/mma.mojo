@@ -21,14 +21,14 @@ from .buffers import KVBuffer, RegisterBuffer, RegisterMMABuffer
 
 
 @always_inline
-fn mma[
+def mma[
     c_register_buffer_type: RegisterBuffer,
     a_register_buffer_type: RegisterMMABuffer,
     b_buffer_type: KVBuffer,
     //,
     tensor_core_mma: TiledTensorCore,
     BK: Int,
-    prefetch_function: OptionalReg[fn() capturing -> None],
+    prefetch_function: OptionalReg[def() capturing -> None],
     swap_a_b: Bool = False,
     beg_iter: Int = 0,
     num_iters: Int = 1,

@@ -32,11 +32,7 @@ struct TuningConfigAllreduce(TrivialRegisterPassable, TuningConfig):
     var sm_version: StaticString
     var num_blocks: Int
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    fn __str__(self) -> String:
-        return String.write(self)
-
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes the tuning config as a string.
 
         Args:
@@ -91,13 +87,27 @@ comptime allreduce_table = Table(
         TuningConfigAllreduce(
             ngpus=4, num_bytes=(1 << 27), sm_version="sm_100a", num_blocks=512
         ),
+        # default for CDNA3 (MI300X, encoded with ngpus=-1, num_bytes=-1)
+        TuningConfigAllreduce(
+            ngpus=-1, num_bytes=-1, sm_version="CDNA3", num_blocks=32
+        ),
+        # default for CDNA4 (MI355X, encoded with ngpus=-1, num_bytes=-1)
+        TuningConfigAllreduce(
+            ngpus=-1, num_bytes=-1, sm_version="CDNA4", num_blocks=64
+        ),
+        TuningConfigAllreduce(
+            ngpus=8, num_bytes=(1 << 20), sm_version="CDNA4", num_blocks=64
+        ),
+        TuningConfigAllreduce(
+            ngpus=8, num_bytes=(1 << 31), sm_version="CDNA4", num_blocks=44
+        ),
     ],
     "allreduce_table",
 )
 
 
 @always_inline
-fn _dispatch_max_num_blocks[
+def _dispatch_max_num_blocks[
     ngpus: Int, sm_version: StaticString
 ](num_bytes: Int) -> Int:
     """
@@ -115,7 +125,7 @@ fn _dispatch_max_num_blocks[
     # to MAX_NUM_BLOCKS_UPPER_BOUND, so an entry exceeding 512 would silently
     # corrupt barrier state.
     @parameter
-    fn _entry_exceeds_block_bound(x: TuningConfigAllreduce) -> Bool:
+    def _entry_exceeds_block_bound(x: TuningConfigAllreduce) -> Bool:
         return x.num_blocks > 512
 
     comptime _over_limit = allreduce_table.query_index[
@@ -126,28 +136,23 @@ fn _dispatch_max_num_blocks[
     ), "allreduce_table entry has num_blocks > MAX_NUM_BLOCKS_UPPER_BOUND (512)"
 
     # get default entry
-    # TODO(KERN-2503): first search for default for that sm
-    # if not found look for a generic config
     @parameter
-    fn rule_eq_arch_default(x: TuningConfigAllreduce) -> Bool:
-        return x.ngpus == -1 and x.num_bytes == -1
+    def rule_eq_arch_default(x: TuningConfigAllreduce) -> Bool:
+        return (
+            x.ngpus == -1 and x.num_bytes == -1 and x.sm_version == sm_version
+        )
 
     comptime default_idx = allreduce_table.query_index[rule_eq_arch_default]()
-    comptime assert len(default_idx) > 0
+    comptime assert len(default_idx) > 0, (
+        "allreduce_table must have a default entry for sm_version: "
+        + sm_version
+    )
     comptime default_entry = allreduce_table.configs[default_idx[0]]
     var default_num_blocks = default_entry.num_blocks
 
-    # Override defaults for specific AMD CDNA3 parts regardless of sm_version aliasing
-    comptime arch = _accelerator_arch()
-
-    comptime if "gfx950" in arch:  # MI355 family
-        default_num_blocks = 64
-    elif "gfx942" in arch:  # MI300 family
-        default_num_blocks = 32
-
     # narrowing the search space to matching sm_version and ngpus
     @parameter
-    fn rule_eq_arch_ngpus(x: TuningConfigAllreduce) -> Bool:
+    def rule_eq_arch_ngpus(x: TuningConfigAllreduce) -> Bool:
         return x.sm_version == sm_version and x.ngpus == ngpus
 
     comptime search_domain = allreduce_table.query_index[rule_eq_arch_ngpus]()
@@ -157,7 +162,7 @@ fn _dispatch_max_num_blocks[
 
     # get all static num_bytes values in table within the search space
     @parameter
-    fn rule_get_num_bytes(x: TuningConfigAllreduce) -> Int:
+    def rule_get_num_bytes(x: TuningConfigAllreduce) -> Int:
         return x.num_bytes
 
     comptime all_num_bytes_values = allreduce_table.query_values[
@@ -167,7 +172,7 @@ fn _dispatch_max_num_blocks[
     comptime for nb in all_num_bytes_values:
 
         @parameter
-        fn rule_eq_nb(x: TuningConfigAllreduce) -> Bool:
+        def rule_eq_nb(x: TuningConfigAllreduce) -> Bool:
             return x.num_bytes == nb
 
         # Find the fist config x with input 'num_bytes <= x.num_bytes'
@@ -185,6 +190,6 @@ fn _dispatch_max_num_blocks[
     return default_num_blocks
 
 
-fn get_sm_version() -> StaticString:
+def get_sm_version() -> StaticString:
     comptime default_device_info = GPUInfo.from_name[_accelerator_arch()]()
     return default_device_info.version

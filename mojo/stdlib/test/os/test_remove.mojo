@@ -18,8 +18,8 @@ from std.pathlib import Path
 from std.testing import TestSuite, assert_false, assert_raises, assert_true
 
 
-fn create_file_and_test_delete_path[
-    func: fn[PathLike: PathLike](PathLike) raises -> None,
+def create_file_and_test_delete_path[
+    func: def[PathLike: PathLike](PathLike) raises -> None,
     name: StaticString,
 ](filepath: Path) raises:
     try:

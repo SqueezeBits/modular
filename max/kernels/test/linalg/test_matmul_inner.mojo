@@ -15,7 +15,6 @@ from std.math import align_up
 from std.sys import align_of
 from std.sys.info import CompilationTarget
 
-from buffer.dimlist import DimList
 from layout import Layout, LayoutTensor, RuntimeLayout
 from linalg.matmul.cpu.default import Inner_matmul_default
 from linalg.matmul.cpu.i8mm import Inner_matmul_i8mm
@@ -31,9 +30,6 @@ from linalg.utils import (
     use_i8mm_fn,
     use_vnni_fn,
 )
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.testing import assert_equal
 
 from std.utils import IndexList
@@ -44,7 +40,7 @@ comptime N: Int = 64
 comptime K: Int = 256
 
 
-fn _matmul_inner_loop[
+def _matmul_inner_loop[
     kernel_rows: Int,
     kernel_cols: Int,
     simd_size: Int,
@@ -112,7 +108,7 @@ fn _matmul_inner_loop[
         comptime assert False, "no _run_inner_loop implementation"
 
 
-fn matmul_inner_loop[
+def matmul_inner_loop[
     config: KernelConfig,
 ](
     c: LayoutTensor[mut=True, ...],
@@ -140,7 +136,7 @@ fn matmul_inner_loop[
     )
 
 
-fn test_micro_kernel[
+def test_micro_kernel[
     a_type: DType, b_type: DType, c_type: DType, saturated_vnni: Bool = False
 ](m: Int, n: Int, k: Int) raises:
     print("== test_micro_kernel")
@@ -159,14 +155,14 @@ fn test_micro_kernel[
 
     comptime alignment = align_of[SIMD[c_type, config.simd_size]]()
 
-    var a_ptr = UnsafePointer[Scalar[a_type],].alloc(m * k, alignment=alignment)
-    var b_packed_ptr = UnsafePointer[Scalar[b_type]].alloc(
+    var a_ptr = alloc[Scalar[a_type],](m * k, alignment=alignment)
+    var b_packed_ptr = alloc[Scalar[b_type]](
         (np // config.kernel_cols)
         * (kh // factor)
         * (factor * config.kernel_cols),
         alignment=alignment,
     )
-    var c_ptr = UnsafePointer[Scalar[c_type],].alloc(m * n, alignment=alignment)
+    var c_ptr = alloc[Scalar[c_type],](m * n, alignment=alignment)
     var a = LayoutTensor[a_type, a_layout](
         a_ptr, RuntimeLayout[a_layout].row_major(Index(m, k))
     )
@@ -199,7 +195,7 @@ fn test_micro_kernel[
 
 
 @export(ABI="C")
-fn kernel_export_dynamic(m: Int, n: Int, k: Int) raises:
+def kernel_export_dynamic(m: Int, n: Int, k: Int) raises:
     test_micro_kernel[DType.float32, DType.float32, DType.float32](m, n, k)
 
 

@@ -12,9 +12,8 @@
 # ===----------------------------------------------------------------------=== #
 from max.nn import Module
 
-from ..deepseekV3.deepseekV3 import DeepseekV3
-from .layers.vision.encoder import Encoder
-from .layers.vision.patch_merger import PatchMergerMLP
+from .layers.language_model import KimiK2_5MoEDecoder
+from .layers.vision.transformer import Transformer
 from .model_config import (
     KimiK2_5Config,
 )
@@ -26,22 +25,14 @@ class KimiK2_5(Module):
     def __init__(self, config: KimiK2_5Config) -> None:
         self.config = config
         self.vision_encoder = self.build_vision_encoder()
-        self.multimodal_projector = self.build_multimodal_projector()
         self.language_model = self.build_language_model()
 
-    def build_vision_encoder(self) -> Module:
-        return Encoder(
-            **self.config.vision_config.__dict__,
-        )
+    def build_vision_encoder(self) -> Transformer:
+        return Transformer(self.config.vision_config)
 
-    def build_multimodal_projector(self) -> PatchMergerMLP:
-        return PatchMergerMLP(
-            **self.config.vision_config.__dict__,
-        )
-
-    def build_language_model(self) -> DeepseekV3:
+    def build_language_model(self) -> KimiK2_5MoEDecoder:
         """Return the language model component."""
-        return DeepseekV3(self.config.llm_config)
+        return KimiK2_5MoEDecoder(self.config.llm_config)
 
     def __call__(self, *args, **kwargs):
         """This class is not meant to be called directly. Use the component models instead."""

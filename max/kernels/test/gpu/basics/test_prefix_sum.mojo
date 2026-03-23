@@ -17,20 +17,17 @@ from std.gpu import global_idx
 from std.gpu.primitives import block, warp
 from std.gpu.globals import WARP_SIZE
 from std.gpu.host import DeviceContext
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.testing import assert_equal
 
 comptime dtype = DType.uint64
 
 
-fn warp_prefix_sum_kernel[
+def warp_prefix_sum_kernel[
     dtype: DType,
     exclusive: Bool,
 ](
-    output: UnsafePointer[Scalar[dtype]],
-    input: UnsafePointer[Scalar[dtype]],
+    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    input: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     size: Int,
 ):
     var tid = global_idx.x
@@ -44,8 +41,8 @@ def test_warp_prefix_sum[exclusive: Bool](ctx: DeviceContext) raises:
     comptime BLOCK_SIZE = WARP_SIZE
 
     # Allocate and initialize host memory
-    var in_host = UnsafePointer[Scalar[dtype]].alloc(size)
-    var out_host = UnsafePointer[Scalar[dtype]].alloc(size)
+    var in_host = alloc[Scalar[dtype]](size)
+    var out_host = alloc[Scalar[dtype]](size)
 
     for i in range(size):
         in_host[i] = UInt64(i)
@@ -82,7 +79,7 @@ def test_warp_prefix_sum[exclusive: Bool](ctx: DeviceContext) raises:
         assert_equal(
             out_host[i],
             expected,
-            msg=t"out_host[{i}] = {out_host[i]} expected = {expected}",
+            msg=String(t"out_host[{i}] = {out_host[i]} expected = {expected}"),
         )
 
     # Cleanup
@@ -90,13 +87,13 @@ def test_warp_prefix_sum[exclusive: Bool](ctx: DeviceContext) raises:
     out_host.free()
 
 
-fn block_prefix_sum_kernel[
+def block_prefix_sum_kernel[
     dtype: DType,
     block_size: Int,
     exclusive: Bool,
 ](
-    output: UnsafePointer[Scalar[dtype]],
-    input: UnsafePointer[Scalar[dtype]],
+    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    input: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     size: Int,
 ):
     var tid = global_idx.x
@@ -114,8 +111,8 @@ def test_block_prefix_sum[exclusive: Bool](ctx: DeviceContext) raises:
     comptime size = BLOCK_SIZE
 
     # Allocate and initialize host memory
-    var in_host = UnsafePointer[Scalar[dtype]].alloc(size)
-    var out_host = UnsafePointer[Scalar[dtype]].alloc(size)
+    var in_host = alloc[Scalar[dtype]](size)
+    var out_host = alloc[Scalar[dtype]](size)
 
     for i in range(size):
         in_host[i] = UInt64(i)
@@ -154,7 +151,7 @@ def test_block_prefix_sum[exclusive: Bool](ctx: DeviceContext) raises:
         assert_equal(
             out_host[i],
             expected,
-            msg=t"out_host[{i}] = {out_host[i]} expected = {expected}",
+            msg=String(t"out_host[{i}] = {out_host[i]} expected = {expected}"),
         )
 
     # Cleanup

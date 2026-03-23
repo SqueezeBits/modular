@@ -41,7 +41,7 @@ struct TVMFFIAny(Copyable, Movable):
 
     def __init__[
         rank: Int, dtype: DType
-    ](out self, tensor_ptr: UnsafePointer[DLTensor[rank, dtype], _],):
+    ](out self, tensor_ptr: UnsafePointer[DLTensor[rank, dtype], _],) raises:
         """Construct from a pointer to a DLTensor.
 
         The caller must ensure the pointed-to DLTensor outlives this
@@ -51,7 +51,7 @@ struct TVMFFIAny(Copyable, Movable):
         self.zero_padding = 0
         self.data = Int64(Int(tensor_ptr))
 
-    def __init__(out self, value: Int):
+    def __init__(out self, value: Int) raises:
         self.type_index = Types.INT
         self.zero_padding = 0
         self.data = Int64(value)
@@ -59,7 +59,7 @@ struct TVMFFIAny(Copyable, Movable):
 
 # ABI for TVMFFISafeCallType
 # https://tvm.apache.org/ffi/concepts/func_module.html#sec-function-calling-convention
-comptime SafeFunction = fn(
+comptime SafeFunction = def(
     module: UnsafePointer[NoneType, MutAnyOrigin],
     args: Pointer[TVMFFIAny, MutAnyOrigin],
     nargs: Int32,
@@ -84,7 +84,7 @@ struct TVMFFIObject:
     var _deleter: Int64  # function pointer stored as Int64
     # Object data lives here following the header
 
-    fn __getitem__[T: TVMFFIType](ref self) -> ref[self] T:
+    def __getitem_param__[T: TVMFFIType](ref self) -> ref[self] T:
         if not self.type_index == T.type_index:
             # TODO(MOCO-3215): raise instead
             abort(
@@ -94,7 +94,7 @@ struct TVMFFIObject:
 
 
 struct TVMFFIErrorCell(
-    ImplicitlyCopyable, Movable, TVMFFIType, format.Writable
+    ImplicitlyCopyable, Movable, TVMFFIType, std.format.Writable
 ):
     comptime type_index: Int32 = Types.ERROR
 
@@ -103,32 +103,32 @@ struct TVMFFIErrorCell(
     var backtrace: TVMFFIByteArray
     # Unused fields omitted (update_backtrace, cause_chain, extra_context)
 
-    fn write_to(self, mut writer: Some[format.Writer]):
+    def write_to(self, mut writer: Some[std.format.Writer]):
         writer.write(StringSlice(unsafe_from_utf8=self.kind))
         writer.write(": ")
         writer.write(StringSlice(unsafe_from_utf8=self.message))
 
-    fn write_repr_to(self, mut writer: Some[format.Writer]):
+    def write_repr_to(self, mut writer: Some[std.format.Writer]):
         writer.write("TVMFFIErrorCell('")
         self.write_to(writer)
         writer.write("')")
 
 
-fn _tvm_ffi_error_move_from_raised(
+def _tvm_ffi_error_move_from_raised(
     mut result: UnsafePointer[TVMFFIObject, MutAnyOrigin]
 ) raises:
     """Wraps TVMFFIErrorMoveFromRaised."""
     # Expects that `libtvm_ffi.so` is available, for instance loaded by python
     # importing `tvm_ffi`.
     lib = OwnedDLHandle(path="libtvm_ffi.so")
-    comptime FnType = fn(
+    comptime FnType = def(
         UnsafePointer[UnsafePointer[TVMFFIObject, MutAnyOrigin], MutAnyOrigin]
     ) -> None
     fn_ptr = lib.get_function[FnType]("TVMFFIErrorMoveFromRaised")
     fn_ptr(UnsafePointer(to=result))
 
 
-fn take_latest_error() raises -> TVMFFIErrorCell:
+def take_latest_error() raises -> TVMFFIErrorCell:
     """Retrieves the last TVM FFI error message."""
     error_ptr = UnsafePointer[TVMFFIObject, MutAnyOrigin]()
     _tvm_ffi_error_move_from_raised(error_ptr)

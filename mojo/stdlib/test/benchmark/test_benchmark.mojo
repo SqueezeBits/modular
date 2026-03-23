@@ -13,9 +13,10 @@
 
 from std.time import sleep, time_function
 
-from std.benchmark import Report, clobber_memory, keep, run
+from std.benchmark import Batch, Report, clobber_memory, keep, run
 from std.benchmark.bencher import BenchMetric, Format, ThroughputMeasure
 from std.testing import TestSuite, assert_equal, assert_true
+from test_utils import check_write_to
 
 
 def test_stopping_criteria() raises:
@@ -24,7 +25,7 @@ def test_stopping_criteria() raises:
 
     @always_inline
     @parameter
-    fn time_me():
+    def time_me():
         sleep(0.002)
         clobber_memory()
         return
@@ -37,7 +38,7 @@ def test_stopping_criteria() raises:
 
     @__copy_capture(lb, ub)
     @parameter
-    fn timer() raises:
+    def timer() raises:
         var report = run[func4=time_me](
             max_iters=max_iters_1, min_runtime_secs=lb, max_runtime_secs=ub
         )
@@ -53,7 +54,7 @@ def test_stopping_criteria() raises:
 
     @__copy_capture(ub_big, lb)
     @parameter
-    fn timer2() raises:
+    def timer2() raises:
         var report = run[func4=time_me](
             max_iters=max_iters_2,
             min_runtime_secs=lb,
@@ -73,7 +74,7 @@ def test_stopping_criteria() raises:
 
     @__copy_capture(ub_big)
     @parameter
-    fn timer3() raises:
+    def timer3() raises:
         var report = run[func4=time_me](
             max_iters=max_iters_3,
             min_runtime_secs=0,
@@ -92,7 +93,7 @@ struct SomeStruct(TrivialRegisterPassable):
     var y: Int
 
     @always_inline
-    fn __init__(out self):
+    def __init__(out self):
         self.x = 5
         self.y = 4
 
@@ -102,7 +103,7 @@ struct SomeTrivialStruct(TrivialRegisterPassable):
     var y: Int
 
     @always_inline
-    fn __init__(out self):
+    def __init__(out self):
         self.x = 3
         self.y = 5
 
@@ -125,7 +126,7 @@ def test_keep() raises:
     keep(s1)
 
 
-fn sleeper():
+def sleeper():
     sleep(0.001)
 
 
@@ -180,6 +181,24 @@ def test_throughput_measure_write_repr_to() raises:
     assert_true(s.startswith("ThroughputMeasure("))
     assert_true("metric=" in s)
     assert_true("value=1024" in s)
+
+
+def test_batch_write_to() raises:
+    var b = Batch(duration=1000, iterations=10, _is_significant=True)
+    check_write_to(
+        b,
+        expected="Batch(duration=1000ns, iterations=10, significant=True)",
+        is_repr=False,
+    )
+
+
+def test_batch_write_repr_to() raises:
+    var b = Batch(duration=2000, iterations=5, _is_significant=False)
+    check_write_to(
+        b,
+        expected="Batch(duration=2000, iterations=5, _is_significant=False)",
+        is_repr=True,
+    )
 
 
 def main() raises:

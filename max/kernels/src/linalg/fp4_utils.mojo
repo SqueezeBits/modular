@@ -16,7 +16,7 @@ from std.sys.info import _is_sm_100x_or_newer, align_of
 from std.utils.index import IndexList
 from std.utils.numerics import FPUtils
 from std.memory import bitcast
-from layout import Layout, LayoutTensor
+from layout import Coord, Idx, Layout, LayoutTensor, TileTensor
 from internal_utils._utils import ValOrDim, dynamic, static
 from std.builtin.simd import _convert_f32_to_float8_ue8m0
 
@@ -54,7 +54,7 @@ comptime E2M1_TO_FLOAT32 = SIMD[DType.float32, 16](
 )
 
 
-fn cast_uint_to_fp4e2m1[
+def cast_uint_to_fp4e2m1[
     in_dtype: DType,
     in_width: Int,
     //,
@@ -91,7 +91,7 @@ fn cast_uint_to_fp4e2m1[
     return result
 
 
-fn cast_fp_to_fp4e2m1[
+def cast_fp_to_fp4e2m1[
     dtype: DType,
     width: Int,
     //,
@@ -135,7 +135,7 @@ fn cast_fp_to_fp4e2m1[
     return result * sign
 
 
-fn cast_fp32_to_fp4e2m1[
+def cast_fp32_to_fp4e2m1[
     width: Int,
     //,
 ](x: SIMD[DType.float32, width]) -> UInt32:
@@ -161,7 +161,7 @@ mov.b32 $0, {byte0, byte1, byte2, byte3};
     ](x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7])
 
 
-fn cast_f4e2m1x2_to_fp16x2(x: Scalar[DType.uint8]) -> SIMD[DType.float16, 2]:
+def cast_f4e2m1x2_to_fp16x2(x: Scalar[DType.uint8]) -> SIMD[DType.float16, 2]:
     comptime assert (
         is_nvidia_gpu() and _is_sm_100x_or_newer()
     ), "only supported on NVIDIA GPUs with SM 100 or newer"
@@ -180,14 +180,14 @@ cvt.rn.f16x2.e2m1x2 $0, byte0;
     return bitcast[DType.float16, 2](result)
 
 
-fn set_scale_factor[
+def set_scale_factor[
     scales_dtype: DType,
     scales_layout: Layout,
     //,
     SF_VECTOR_SIZE: Int,
     width: Int,
 ](
-    scales_tensor: LayoutTensor[scales_dtype, scales_layout, MutAnyOrigin],
+    scales_tensor: LayoutTensor[mut=True, scales_dtype, scales_layout, ...],
     row_idx: Int,
     col_idx: Int,
     scale_value: SIMD[scales_dtype, width],
@@ -212,7 +212,35 @@ fn set_scale_factor[
     )
 
 
-fn get_scale_factor[
+def set_scale_factor[
+    scales_dtype: DType,
+    width: Int,
+    //,
+    SF_VECTOR_SIZE: Int,
+](
+    scales_tensor: TileTensor[mut=True, scales_dtype, ...],
+    row_idx: Int,
+    col_idx: Int,
+    scale_value: SIMD[scales_dtype, width],
+):
+    comptime assert (
+        width <= SF_ATOM_K
+    ), "width must be less than or equal to SF_ATOM_K"
+    comptime assert scales_tensor.flat_rank >= 5, "scales_tensor must be 5D"
+
+    scales_tensor.store[width=width](
+        (
+            Idx(row_idx // SF_MN_GROUP_SIZE),
+            Idx(col_idx // (SF_VECTOR_SIZE * SF_ATOM_K)),
+            Idx(row_idx % SF_ATOM_M[0]),
+            Idx((row_idx % SF_MN_GROUP_SIZE) // SF_ATOM_M[0]),
+            Idx((col_idx // SF_VECTOR_SIZE) % SF_ATOM_K),
+        ),
+        scale_value,
+    )
+
+
+def get_scale_factor[
     scales_dtype: DType,
     scales_layout: Layout,
     //,
@@ -237,7 +265,33 @@ fn get_scale_factor[
     )
 
 
-fn set_batched_scale_factor[
+def get_scale_factor[
+    scales_dtype: DType,
+    //,
+    SF_VECTOR_SIZE: Int,
+](
+    scales_tensor: TileTensor[mut=True, scales_dtype, ...],
+    row_idx: Int,
+    col_idx: Int,
+) -> Scalar[scales_dtype]:
+    comptime assert (
+        scales_tensor.flat_rank >= 5
+    ), "scales_tensor must be 5D for non-batched scales tensor"
+
+    return rebind[Scalar[scales_dtype]](
+        scales_tensor[
+            (
+                Idx(row_idx // SF_MN_GROUP_SIZE),
+                Idx(col_idx // (SF_VECTOR_SIZE * SF_ATOM_K)),
+                Idx(row_idx % SF_ATOM_M[0]),
+                Idx((row_idx % SF_MN_GROUP_SIZE) // SF_ATOM_M[0]),
+                Idx((col_idx // SF_VECTOR_SIZE) % SF_ATOM_K),
+            )
+        ]
+    )
+
+
+def set_batched_scale_factor[
     scales_dtype: DType,
     scales_layout: Layout,
     //,
@@ -263,7 +317,7 @@ fn set_batched_scale_factor[
     ] = rebind[Scalar[scales_dtype]](scale_value)
 
 
-fn get_batched_scale_factor[
+def get_batched_scale_factor[
     scales_dtype: DType,
     scales_layout: Layout,
     //,
@@ -290,7 +344,7 @@ fn get_batched_scale_factor[
     )
 
 
-fn convert_ref_scales_to_mxfp8_format[
+def convert_ref_scales_to_mxfp8_format[
     ref_scales_type: DType,
     scales_type: DType,
     ref_a_scales_layout: Layout,

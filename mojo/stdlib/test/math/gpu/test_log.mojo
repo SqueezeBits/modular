@@ -23,8 +23,8 @@ from std.utils import IndexList
 
 
 def run_elementwise[
-    dtype: DType, log_fn: fn(x: SIMD) -> type_of(x)
-](ctx: DeviceContext):
+    dtype: DType, log_fn: def(x: SIMD) -> type_of(x)
+](ctx: DeviceContext) raises:
     comptime length = 8192
 
     comptime pack_size = simd_width_of[dtype, target=get_gpu_target()]()
@@ -47,7 +47,7 @@ def run_elementwise[
     @always_inline
     @__copy_capture(out_buffer, in_buffer)
     @parameter
-    fn func[
+    def func[
         simd_width: Int, rank: Int, alignment: Int = 1
     ](idx0: IndexList[rank]):
         var idx = rebind[IndexList[1]](idx0)

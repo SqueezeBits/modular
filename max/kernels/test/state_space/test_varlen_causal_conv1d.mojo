@@ -15,11 +15,14 @@ from std.math import exp
 from std.sys.info import simd_width_of
 
 from layout import (
-    UNKNOWN_VALUE,
+    Idx,
     Layout,
     LayoutTensor,
-    RuntimeTuple,
     RuntimeLayout,
+    RuntimeTuple,
+    TileTensor,
+    UNKNOWN_VALUE,
+    row_major,
 )
 from layout._fillers import random
 from std.memory import alloc
@@ -38,7 +41,7 @@ comptime PAD_SLOT_ID: Int32 = -1
 
 
 @always_inline
-fn silu_ref[dtype: DType](x: Scalar[dtype]) -> Scalar[dtype]:
+def silu_ref[dtype: DType](x: Scalar[dtype]) -> Scalar[dtype]:
     """Reference SiLU implementation: x * sigmoid(x) = x / (1 + exp(-x))."""
     var x_f32 = x.cast[DType.float32]()
     var neg_x = -x_f32
@@ -48,7 +51,7 @@ fn silu_ref[dtype: DType](x: Scalar[dtype]) -> Scalar[dtype]:
     return (x_f32 * sigmoid_x).cast[dtype]()
 
 
-fn run_varlen_causal_conv1d_fwd[
+def run_varlen_causal_conv1d_fwd[
     dtype: DType,
     activation: StaticString,
 ](
@@ -148,6 +151,27 @@ fn run_varlen_causal_conv1d_fwd[
     random(weight_h)
     random(bias_h)
 
+    # Create TileTensor versions for kernel call
+    var x_tt = TileTensor(x_heap, row_major((Idx(dim), Idx(total_seqlen))))
+    var weight_tt = TileTensor(weight_heap, row_major((Idx(dim), Idx(width))))
+    var bias_tt = TileTensor(bias_heap, row_major((Idx(dim),)))
+    var query_start_loc_tt = TileTensor(
+        query_start_loc_heap, row_major((Idx(batch + 1),))
+    )
+    var cache_indices_tt = TileTensor(
+        cache_indices_heap, row_major((Idx(batch),))
+    )
+    var has_initial_state_tt = TileTensor(
+        has_initial_state_heap, row_major((Idx(batch),))
+    )
+    var conv_states_tt = TileTensor(
+        conv_states_heap,
+        row_major((Idx(batch), Idx(dim), Idx(state_len))),
+    )
+    var output_tt = TileTensor(
+        output_heap, row_major((Idx(dim), Idx(total_seqlen)))
+    )
+
     var x_buf = x_h
     var weight_buf = weight_h
     var bias_buf = bias_h
@@ -173,35 +197,27 @@ fn run_varlen_causal_conv1d_fwd[
 
     # Test kernel
     causal_conv1d_varlen_fwd_cpu[
-        x_buf.dtype,
-        x_buf.layout,
-        weight_buf.dtype,
-        weight_buf.layout,
-        bias_buf.dtype,
-        bias_buf.layout,
-        output_buf.dtype,
-        output_buf.layout,
-        query_start_loc_buf.dtype,
-        query_start_loc_buf.layout,
-        cache_indices_buf.dtype,
-        cache_indices_buf.layout,
-        has_initial_state_buf.dtype,
-        has_initial_state_buf.layout,
-        conv_states_buf.dtype,
-        conv_states_buf.layout,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        DType.int32,
+        DType.int32,
+        DType.bool,
+        dtype,
     ](
         dim,
         total_seqlen,
         width,
         batch,
-        x_buf,
-        weight_buf,
-        bias_buf,
-        query_start_loc_buf,
-        cache_indices_buf,
-        has_initial_state_buf,
-        conv_states_buf,
-        output_buf,
+        x_tt,
+        weight_tt,
+        bias_tt,
+        query_start_loc_tt,
+        cache_indices_tt,
+        has_initial_state_tt,
+        conv_states_tt,
+        output_tt,
         x_dim_stride,
         x_seqlen_stride,
         weight_dim_stride,
@@ -281,7 +297,7 @@ fn run_varlen_causal_conv1d_fwd[
     output_ref_heap.free()
 
 
-fn run_varlen_causal_conv1d_update[
+def run_varlen_causal_conv1d_update[
     dtype: DType,
     activation: StaticString,
 ](
@@ -371,6 +387,26 @@ fn run_varlen_causal_conv1d_update[
     for i in range(batch * dim * state_len):
         conv_state_ref_h.ptr[i] = conv_state_h.ptr[i]
 
+    # Create TileTensor versions for kernel call
+    var x_tt2 = TileTensor(
+        x_heap, row_major((Idx(batch), Idx(dim), Idx(seqlen)))
+    )
+    var weight_tt2 = TileTensor(weight_heap, row_major((Idx(dim), Idx(width))))
+    var bias_tt2 = TileTensor(bias_heap, row_major((Idx(dim),)))
+    var conv_state_tt2 = TileTensor(
+        conv_state_heap,
+        row_major((Idx(batch), Idx(dim), Idx(state_len))),
+    )
+    var cache_seqlens_tt = TileTensor(
+        cache_seqlens_heap, row_major((Idx(batch),))
+    )
+    var conv_state_indices_tt = TileTensor(
+        conv_state_indices_heap, row_major((Idx(batch),))
+    )
+    var output_tt2 = TileTensor(
+        output_heap, row_major((Idx(batch), Idx(dim), Idx(seqlen)))
+    )
+
     var x_buf = x_h
     var weight_buf = weight_h
     var bias_buf = bias_h
@@ -398,33 +434,26 @@ fn run_varlen_causal_conv1d_update[
 
     # Test kernel
     causal_conv1d_varlen_update_cpu[
-        x_buf.dtype,
-        x_buf.layout,
-        weight_buf.dtype,
-        weight_buf.layout,
-        bias_buf.dtype,
-        bias_buf.layout,
-        output_buf.dtype,
-        output_buf.layout,
-        conv_state_buf.dtype,
-        conv_state_buf.layout,
-        cache_seqlens_buf.dtype,
-        cache_seqlens_buf.layout,
-        conv_state_indices_buf.dtype,
-        conv_state_indices_buf.layout,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        DType.int32,
+        DType.int32,
     ](
         batch,
         dim,
         seqlen,
         width,
         state_len,
-        x_buf,
-        weight_buf,
-        bias_buf,
-        conv_state_buf,
-        cache_seqlens_buf,
-        conv_state_indices_buf,
-        output_buf,
+        x_tt2,
+        weight_tt2,
+        bias_tt2,
+        conv_state_tt2,
+        cache_seqlens_tt,
+        conv_state_indices_tt,
+        output_tt2,
         x_batch_stride,
         x_dim_stride,
         x_seqlen_stride,
@@ -558,7 +587,7 @@ fn run_varlen_causal_conv1d_update[
     output_ref_heap.free()
 
 
-fn run_varlen_causal_conv1d_states[
+def run_varlen_causal_conv1d_states[
     dtype: DType,
 ](
     batch: Int,
@@ -612,6 +641,15 @@ fn run_varlen_causal_conv1d_states[
     # Initialize input data
     random(x_h)
 
+    # Create TileTensor versions for kernel call
+    var x_tt3 = TileTensor(x_heap, row_major((Idx(total_tokens), Idx(dim))))
+    var cu_seqlens_tt = TileTensor(
+        cu_seqlens_heap, row_major((Idx(batch + 1),))
+    )
+    var states_tt = TileTensor(
+        states_heap, row_major((Idx(batch), Idx(dim), Idx(state_len)))
+    )
+
     var x_buf = x_h
     var cu_seqlens_buf = cu_seqlens_h
     var states_buf = states_h
@@ -626,20 +664,17 @@ fn run_varlen_causal_conv1d_states[
 
     # Test kernel
     causal_conv1d_varlen_states_cpu[
-        x_buf.dtype,
-        x_buf.layout,
-        cu_seqlens_buf.dtype,
-        cu_seqlens_buf.layout,
-        states_buf.dtype,
-        states_buf.layout,
+        dtype,
+        DType.int32,
+        dtype,
     ](
         total_tokens,
         dim,
         batch,
         state_len,
-        x_buf,
-        cu_seqlens_buf,
-        states_buf,
+        x_tt3,
+        cu_seqlens_tt,
+        states_tt,
         x_seqlen_stride,
         x_dim_stride,
         states_batch_stride,
@@ -692,28 +727,28 @@ fn run_varlen_causal_conv1d_states[
 # =============================================================================
 
 
-fn test_varlen_causal_conv1d_fwd_equal_lengths() raises:
+def test_varlen_causal_conv1d_fwd_equal_lengths() raises:
     """Test varlen causal conv1d forward with equal-length sequences."""
     run_varlen_causal_conv1d_fwd[DType.float32, "none"](
         batch=2, dim=4, seq_lengths=Index(8, 8), width=3
     )
 
 
-fn test_varlen_causal_conv1d_fwd_variable_lengths() raises:
+def test_varlen_causal_conv1d_fwd_variable_lengths() raises:
     """Test varlen causal conv1d forward with variable-length sequences."""
     run_varlen_causal_conv1d_fwd[DType.float32, "none"](
         batch=3, dim=4, seq_lengths=Index(10, 6, 1), width=3
     )
 
 
-fn test_varlen_causal_conv1d_fwd_with_silu() raises:
+def test_varlen_causal_conv1d_fwd_with_silu() raises:
     """Test varlen causal conv1d forward with SiLU activation."""
     run_varlen_causal_conv1d_fwd[DType.float32, "silu"](
         batch=2, dim=4, seq_lengths=Index(8, 8), width=3
     )
 
 
-fn test_varlen_causal_conv1d_fwd_various_widths() raises:
+def test_varlen_causal_conv1d_fwd_various_widths() raises:
     """Test varlen causal conv1d forward with various kernel widths."""
     run_varlen_causal_conv1d_fwd[DType.float32, "none"](
         batch=2, dim=4, seq_lengths=Index(8, 8), width=2
@@ -728,21 +763,21 @@ fn test_varlen_causal_conv1d_fwd_various_widths() raises:
 # =============================================================================
 
 
-fn test_varlen_causal_conv1d_update_basic() raises:
+def test_varlen_causal_conv1d_update_basic() raises:
     """Test basic varlen causal conv1d update."""
     run_varlen_causal_conv1d_update[DType.float32, "none"](
         batch=2, dim=4, seqlen=1, width=3, state_len=4
     )
 
 
-fn test_varlen_causal_conv1d_update_with_silu() raises:
+def test_varlen_causal_conv1d_update_with_silu() raises:
     """Test varlen causal conv1d update with SiLU activation."""
     run_varlen_causal_conv1d_update[DType.float32, "silu"](
         batch=2, dim=4, seqlen=1, width=3, state_len=4
     )
 
 
-fn test_varlen_causal_conv1d_update_seqlen_gt_1() raises:
+def test_varlen_causal_conv1d_update_seqlen_gt_1() raises:
     """Test varlen causal conv1d update with seqlen > 1."""
     run_varlen_causal_conv1d_update[DType.float32, "none"](
         batch=2, dim=4, seqlen=4, width=3, state_len=4
@@ -754,14 +789,14 @@ fn test_varlen_causal_conv1d_update_seqlen_gt_1() raises:
 # =============================================================================
 
 
-fn test_varlen_causal_conv1d_states_basic() raises:
+def test_varlen_causal_conv1d_states_basic() raises:
     """Test basic varlen causal conv1d states extraction."""
     run_varlen_causal_conv1d_states[DType.float32](
         batch=2, dim=4, seq_lengths=Index(8, 8), state_len=3
     )
 
 
-fn test_varlen_causal_conv1d_states_variable_lengths() raises:
+def test_varlen_causal_conv1d_states_variable_lengths() raises:
     """Test varlen causal conv1d states with variable-length sequences."""
     run_varlen_causal_conv1d_states[DType.float32](
         batch=3, dim=4, seq_lengths=Index(10, 6, 1), state_len=3

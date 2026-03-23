@@ -11,14 +11,14 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import block_dim, block_idx_int as block_idx, thread_idx
 from std.gpu.host import DeviceContext
-from layout import Coord, Idx, TileTensor, row_major
-from layout.tile_layout import TensorLayout, Layout
+from layout import Coord, Idx, TensorLayout, TileTensor, row_major
+from layout.tile_layout import Layout
 from std.utils.index import Index, IndexList
 
 
-fn spatial_merge_kernel[
+def spatial_merge_kernel[
     dtype: DType,
     InputLayoutType: TensorLayout,
     input_origin: ImmutOrigin,
@@ -51,7 +51,7 @@ fn spatial_merge_kernel[
     comptime assert grid_thw.flat_rank == 2
 
     # Global patch index.
-    var patch_idx = Int(block_idx.x)
+    var patch_idx = block_idx.x
 
     var offset_in: Int64 = 0
     var offset_out: Int64 = 0
@@ -158,7 +158,7 @@ fn spatial_merge_kernel[
         output_tensor[t, ho, wo, c_out] = input_tensor[ho, dh, wo, dw, c]
 
 
-fn spatial_merge[
+def spatial_merge[
     dtype: DType,
 ](
     output: TileTensor[

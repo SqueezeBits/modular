@@ -114,3 +114,11 @@ class ImageProviderOptions(BaseModel):
         ),
         gt=0.0,
     )
+
+    output_format: str = Field(
+        "jpeg",
+        description=(
+            "The image format to use for encoding the output (e.g., 'jpeg', "
+            "'png', 'webp'). Defaults to 'jpeg'."
+        ),
+    )

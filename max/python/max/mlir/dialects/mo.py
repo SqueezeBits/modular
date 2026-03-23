@@ -17,7 +17,7 @@ from collections.abc import Iterable
 
 from max._mlir.dialects import _ods_common
 from max._mlir.dialects.mo import *
-from max._mlir.dialects.mo import GraphOp, IfOp, _Dialect
+from max._mlir.dialects.mo import GraphOp, IfOp, ParallelOp, _Dialect
 
 from .. import Attribute, Block, FunctionType, Type, TypeAttr
 
@@ -94,6 +94,59 @@ def while_(  # type: ignore[no-redef]
 ) -> _ods_common.VariadicResultValueT:
     return _ods_common.get_op_result_or_op_results(
         WhileOp(results_=results_, inputs=inputs, loc=loc, ip=ip)
+    )
+
+
+@_ods_common._cext.register_operation(_Dialect, replace=True)
+class ParallelOp(ParallelOp):  # type: ignore[no-redef]
+    """Extends mo.parallel op with a simpler builder that creates block args."""
+
+    def __init__(
+        self,
+        results_,  # noqa: ANN001
+        inputs,  # noqa: ANN001
+        extra_inputs=None,  # noqa: ANN001
+        in_chain=None,  # noqa: ANN001
+        *,
+        loc=None,  # noqa: ANN001
+        ip=None,  # noqa: ANN001
+    ) -> None:
+        extra_inputs = extra_inputs or []
+        all_results = list(results_)
+        if in_chain is not None:
+            all_results.append(Type.parse("!mo.chain"))
+        super().__init__(
+            results_=all_results,
+            inputs=inputs,
+            extraInputs=extra_inputs,
+            inChain=in_chain,
+            loc=loc,
+            ip=ip,
+        )
+        block_arg_types = [self.inputs[0].type]
+        if extra_inputs:
+            block_arg_types.append(self.extraInputs[0].type)
+        Block.create_at_start(self.bodyRegion, block_arg_types)
+
+
+def parallel_(
+    results_,  # noqa: ANN001
+    inputs,  # noqa: ANN001
+    extra_inputs=None,  # noqa: ANN001
+    in_chain=None,  # noqa: ANN001
+    *,
+    loc=None,  # noqa: ANN001
+    ip=None,  # noqa: ANN001
+) -> _ods_common.VariadicResultValueT:
+    return _ods_common.get_op_result_or_op_results(
+        ParallelOp(  # type: ignore[call-arg]
+            results_=results_,
+            inputs=inputs,
+            extra_inputs=extra_inputs,
+            in_chain=in_chain,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 

@@ -19,16 +19,16 @@ from std.gpu.host.compile import _compile_code
 from std.gpu.host.info import MI355X
 from std.gpu.intrinsics import AMDBufferResource
 from std.gpu.memory import CacheOperation
-from std.memory import LegacyUnsafePointer, stack_allocation
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from std.memory import stack_allocation
 from std.testing import assert_equal, assert_true
 
 comptime size = 257
 comptime size_clip = size - 5
 
 
-fn kernel[dtype: DType, width: Int](a: UnsafePointer[Scalar[dtype]]):
+def kernel[
+    dtype: DType, width: Int
+](a: UnsafePointer[Scalar[dtype], MutAnyOrigin]):
     var aligned_size = align_down(size, width)
     var buffer = AMDBufferResource(a, size_clip)
     for i in range(0, aligned_size, width):
@@ -39,7 +39,9 @@ fn kernel[dtype: DType, width: Int](a: UnsafePointer[Scalar[dtype]]):
         buffer.store[dtype, 1](Int32(i), 2 * v)
 
 
-fn kernel_lds[dtype: DType, width: Int](a: UnsafePointer[Scalar[dtype]]):
+def kernel_lds[
+    dtype: DType, width: Int
+](a: UnsafePointer[Scalar[dtype], MutAnyOrigin]):
     var a_shared = stack_allocation[
         size, dtype, address_space=AddressSpace.SHARED
     ]()
@@ -61,8 +63,8 @@ fn kernel_lds[dtype: DType, width: Int](a: UnsafePointer[Scalar[dtype]]):
 
 
 # Assembly test kernels for different cache policies
-fn cache_policy_kernel_always():
-    var dummy_ptr = UnsafePointer[Float32]()
+def cache_policy_kernel_always():
+    var dummy_ptr = UnsafePointer[Float32, MutAnyOrigin]()
     var buffer = AMDBufferResource(dummy_ptr, 1024)
     var offset = Int32(thread_idx.x)  # Use dynamic offset to force offen mode
     var v = buffer.load[DType.float32, 4, cache_policy=CacheOperation.ALWAYS](
@@ -73,8 +75,8 @@ fn cache_policy_kernel_always():
     )
 
 
-fn cache_policy_kernel_streaming():
-    var dummy_ptr = UnsafePointer[Float32]()
+def cache_policy_kernel_streaming():
+    var dummy_ptr = UnsafePointer[Float32, MutAnyOrigin]()
     var buffer = AMDBufferResource(dummy_ptr, 1024)
     var offset = Int32(thread_idx.x)  # Use dynamic offset to force offen mode
     var v = buffer.load[
@@ -85,8 +87,8 @@ fn cache_policy_kernel_streaming():
     )
 
 
-fn cache_policy_kernel_global():
-    var dummy_ptr = UnsafePointer[Float32]()
+def cache_policy_kernel_global():
+    var dummy_ptr = UnsafePointer[Float32, MutAnyOrigin]()
     var buffer = AMDBufferResource(dummy_ptr, 1024)
     var offset = Int32(thread_idx.x)  # Use dynamic offset to force offen mode
     var v = buffer.load[DType.float32, 4, cache_policy=CacheOperation.GLOBAL](
@@ -97,8 +99,8 @@ fn cache_policy_kernel_global():
     )
 
 
-fn cache_policy_kernel_volatile():
-    var dummy_ptr = UnsafePointer[Float32]()
+def cache_policy_kernel_volatile():
+    var dummy_ptr = UnsafePointer[Float32, MutAnyOrigin]()
     var buffer = AMDBufferResource(dummy_ptr, 1024)
     var offset = Int32(thread_idx.x)  # Use dynamic offset to force offen mode
     var v = buffer.load[DType.float32, 4, cache_policy=CacheOperation.VOLATILE](
@@ -110,7 +112,7 @@ fn cache_policy_kernel_volatile():
 
 
 @always_inline
-fn _verify_cache_bits_always(asm: StringSlice) raises -> None:
+def _verify_cache_bits_always(asm: StringSlice) raises -> None:
     # aux = 0x00 - no cache control bits set
     # Should generate: buffer_load_dwordx4 v[...], v..., s[...], 0 offen
     assert_true("buffer_load_dwordx4" in asm)
@@ -122,7 +124,7 @@ fn _verify_cache_bits_always(asm: StringSlice) raises -> None:
 
 
 @always_inline
-fn _verify_cache_bits_streaming(asm: StringSlice) raises -> None:
+def _verify_cache_bits_streaming(asm: StringSlice) raises -> None:
     # aux = 0x02 - only NT bit set
     # Should generate: buffer_load_dwordx4 v[...], v..., s[...], 0 offen nt
     assert_true("buffer_load_dwordx4" in asm)
@@ -134,7 +136,7 @@ fn _verify_cache_bits_streaming(asm: StringSlice) raises -> None:
 
 
 @always_inline
-fn _verify_cache_bits_global(asm: StringSlice) raises -> None:
+def _verify_cache_bits_global(asm: StringSlice) raises -> None:
     # aux = 0x10 - only SC1 bit set
     # Should generate: buffer_load_dwordx4 v[...], v..., s[...], 0 offen sc1
     assert_true("buffer_load_dwordx4" in asm)
@@ -146,7 +148,7 @@ fn _verify_cache_bits_global(asm: StringSlice) raises -> None:
 
 
 @always_inline
-fn _verify_cache_bits_volatile(asm: StringSlice) raises -> None:
+def _verify_cache_bits_volatile(asm: StringSlice) raises -> None:
     # aux = 0x11 - SC0 and SC1 bits set
     # Should generate: buffer_load_dwordx4 v[...], v..., s[...], 0 offen sc0 sc1
     assert_true("buffer_load_dwordx4" in asm)
@@ -186,7 +188,7 @@ def test_cache_policy_assembly_volatile() raises:
 
 
 def test_buffer[dtype: DType, width: Int](ctx: DeviceContext) raises:
-    a_host_buf = UnsafePointer[Scalar[dtype]].alloc(size)
+    a_host_buf = alloc[Scalar[dtype]](size)
     a_device_buf = ctx.enqueue_create_buffer[dtype](size)
 
     for i in range(size):
@@ -210,7 +212,7 @@ def test_buffer[dtype: DType, width: Int](ctx: DeviceContext) raises:
 
 
 def test_buffer_lds[dtype: DType, width: Int](ctx: DeviceContext) raises:
-    a_host_buf = UnsafePointer[Scalar[dtype]].alloc(size)
+    a_host_buf = alloc[Scalar[dtype]](size)
     a_device_buf = ctx.enqueue_create_buffer[dtype](size)
 
     for i in range(size):

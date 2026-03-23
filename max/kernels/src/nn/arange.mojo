@@ -23,7 +23,7 @@ from std.utils.index import IndexList
 
 
 @always_inline
-fn arange[
+def arange[
     dtype: DType, simd_width: Int
 ](
     start: Scalar[dtype],
@@ -35,9 +35,8 @@ fn arange[
 
 
 @always_inline
-fn arange_shape[
-    dtype: DType,
-    single_thread_blocking_override: Bool,
+def arange_shape[
+    dtype: DType
 ](
     start: Scalar[dtype],
     stop: Scalar[dtype],

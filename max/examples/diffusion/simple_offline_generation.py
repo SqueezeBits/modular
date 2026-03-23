@@ -22,6 +22,18 @@ Usage:
     ./bazelw run //max/examples/diffusion:simple_offline_generation -- \
         --model black-forest-labs/FLUX.2-dev \
         --prompt "A cat in a garden"
+
+    # NVFP4 quantized model (two-repo layout: base model + quantized weights):
+    ./bazelw run //max/examples/diffusion:simple_offline_generation -- \
+        --model black-forest-labs/FLUX.2-dev \
+        --weight-path black-forest-labs/FLUX.2-dev-NVFP4/flux2-dev-nvfp4.safetensors \
+        --quantization-encoding float4_e2m1fnx2 \
+        --prompt "A cat in a garden"
+
+    ./bazelw run //max/examples/diffusion:simple_offline_generation -- \
+        --model black-forest-labs/FLUX.2-dev \
+        --prompt "A cat in a garden" \
+        --prefer-module-v3
 """
 
 from __future__ import annotations
@@ -30,7 +42,9 @@ import argparse
 import asyncio
 import base64
 import os
+import time
 from io import BytesIO
+from pathlib import Path
 from typing import cast
 
 from max.driver import DeviceSpec
@@ -56,11 +70,19 @@ from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import PixelGenerationTokenizer
 from max.pipelines.lib.interfaces import DiffusionPipeline
+from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 from max.pipelines.lib.pipeline_runtime_config import PipelineRuntimeConfig
 from max.pipelines.lib.pipeline_variants.pixel_generation import (
     PixelGenerationPipeline,
 )
 from PIL import Image
+
+_FLUX2_ARCH_NAMES = {
+    "Flux2Pipeline",
+    "Flux2KleinPipeline",
+    "Flux2Pipeline_ModuleV3",
+    "Flux2KleinPipeline_ModuleV3",
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -85,6 +107,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--prompt",
         required=True,
         help="Text prompt describing the image to generate.",
+    )
+    parser.add_argument(
+        "--weight-path",
+        type=str,
+        action="append",
+        default=None,
+        help="Path(s) to model weight files. Can be specified multiple times.",
+    )
+    parser.add_argument(
+        "--quantization-encoding",
+        type=str,
+        default=None,
+        choices=[
+            "float32",
+            "bfloat16",
+            "q4_k",
+            "q4_0",
+            "q6_k",
+            "float8_e4m3fn",
+            "float4_e2m1fnx2",
+            "gptq",
+        ],
+        help="Weight encoding type (e.g., 'bfloat16', 'float4_e2m1fnx2' for NVFP4).",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -136,7 +181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        default=42,
         help="Random seed for reproducible generation.",
     )
     parser.add_argument(
@@ -183,6 +228,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Number of iterations to run for profiling.",
     )
+    parser.add_argument(
+        "--first-block-caching",
+        action="store_true",
+        help="Enable first-block step cache optimization.",
+    )
+    parser.add_argument(
+        "--residual-threshold",
+        type=float,
+        default=None,
+        help="Relative-difference threshold for step cache.",
+    )
+    parser.add_argument(
+        "--taylorseer",
+        action="store_true",
+        help="Enable TaylorSeer cache optimization.",
+    )
+    parser.add_argument(
+        "--taylorseer-cache-interval",
+        type=int,
+        default=None,
+        help="Steps between full computations for TaylorSeer (model default if unset).",
+    )
+    parser.add_argument(
+        "--taylorseer-warmup-steps",
+        type=int,
+        default=None,
+        help="Warmup steps for TaylorSeer factor gathering (model default if unset).",
+    )
+    parser.add_argument(
+        "--taylorseer-max-order",
+        type=int,
+        default=None,
+        choices=[1, 2],
+        help="Taylor expansion order: 1=linear, 2=quadratic (model default if unset).",
+    )
+    parser.add_argument(
+        "--prefer-module-v3",
+        action="store_true",
+        help="Use the ModuleV3 FLUX implementation instead of the default architecture.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -195,9 +280,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     assert args.num_inference_steps > 0, (
         "num-inference-steps must be a positive integer."
     )
-    assert args.guidance_scale >= 0.0, "guidance-scale must be non-negative."
+    assert args.guidance_scale > 0.0, "guidance-scale must be positive."
     assert 0.0 < args.strength <= 1.0, "strength must be in (0, 1]."
     assert args.cfg_truncation > 0.0, "cfg-truncation must be positive."
+    if args.residual_threshold is not None:
+        assert args.residual_threshold >= 0.0, (
+            "residual-threshold must be non-negative."
+        )
+    if args.taylorseer_cache_interval is not None:
+        assert args.taylorseer_cache_interval >= 1, (
+            "taylorseer-cache-interval must be >= 1."
+        )
+    if args.taylorseer_warmup_steps is not None:
+        assert args.taylorseer_warmup_steps >= 1, (
+            "taylorseer-warmup-steps must be >= 1."
+        )
 
     return args
 
@@ -268,13 +365,17 @@ async def generate_image(args: argparse.Namespace) -> None:
         model=MAXModelConfig(
             model_path=args.model,
             device_specs=[DeviceSpec.accelerator()],
+            weight_path=(
+                [Path(p) for p in args.weight_path] if args.weight_path else []
+            ),
+            quantization_encoding=args.quantization_encoding,
         ),
         runtime=PipelineRuntimeConfig(
-            prefer_module_v3=True,
+            prefer_module_v3=args.prefer_module_v3,
         ),
     )
     arch = PIPELINE_REGISTRY.retrieve_architecture(
-        config.model.huggingface_weight_repo,
+        config.model.huggingface_model_repo,
         prefer_module_v3=config.runtime.prefer_module_v3,
         task=PipelineTask.PIXEL_GENERATION,
     )
@@ -297,11 +398,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         max_length = components_config["tokenizer"]["config_dict"].get(
             "model_max_length", None
         )
-        if arch.name in (
-            "Flux2Pipeline",
-            "Flux2KleinPipeline",
-            "ZImagePipeline",
-        ):
+        if arch.name in _FLUX2_ARCH_NAMES or arch.name == "ZImagePipeline":
             max_length = 512
         print(f"Using max length: {max_length} for tokenizer")
 
@@ -330,15 +427,26 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 3: Initialize the pipeline
     # The pipeline executes the diffusion model
+    if msg := getattr(arch.pipeline_model, "not_implemented_message", None):
+        raise NotImplementedError(msg)
     if not issubclass(arch.pipeline_model, DiffusionPipeline):
         raise TypeError(
             "Selected architecture does not implement DiffusionPipeline: "
             f"{arch.pipeline_model}"
         )
     pipeline_model = cast(type[DiffusionPipeline], arch.pipeline_model)
+    cache_config = DenoisingCacheConfig(
+        first_block_caching=args.first_block_caching,
+        residual_threshold=args.residual_threshold,
+        taylorseer=args.taylorseer,
+        taylorseer_cache_interval=args.taylorseer_cache_interval,
+        taylorseer_warmup_steps=args.taylorseer_warmup_steps,
+        taylorseer_max_order=args.taylorseer_max_order,
+    )
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
         pipeline_model=pipeline_model,
+        cache_config=cache_config,
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")
@@ -418,6 +526,32 @@ async def generate_image(args: argparse.Namespace) -> None:
     print(
         f"Context created: {context.height}x{context.width}, {context.num_inference_steps} steps"
     )
+    if args.first_block_caching:
+        rdt_info = (
+            f", rdt={args.residual_threshold}"
+            if args.residual_threshold is not None
+            else ""
+        )
+        print(f"First-block caching enabled{rdt_info}.")
+    if args.taylorseer:
+        order_info = (
+            f"order={args.taylorseer_max_order}"
+            if args.taylorseer_max_order is not None
+            else "order=model-default"
+        )
+        interval_info = (
+            f"interval={args.taylorseer_cache_interval}"
+            if args.taylorseer_cache_interval is not None
+            else "interval=model-default"
+        )
+        warmup_info = (
+            f"warmup={args.taylorseer_warmup_steps}"
+            if args.taylorseer_warmup_steps is not None
+            else "warmup=model-default"
+        )
+        print(
+            f"TaylorSeer enabled: {order_info}, {interval_info}, {warmup_info}."
+        )
 
     # Step 6: Prepare inputs for the pipeline
     # Create a batch with a single context
@@ -471,7 +605,10 @@ async def generate_image(args: argparse.Namespace) -> None:
                 outputs = pipeline.execute(inputs)
         prof.report(unit="ms")
     else:
+        start_time = time.perf_counter()
         outputs = pipeline.execute(inputs)
+        elapsed = time.perf_counter() - start_time
+        print(f"Generation took {elapsed:.3f}s")
 
     # Step 8: Get the output for our request
     output = outputs[context.request_id]

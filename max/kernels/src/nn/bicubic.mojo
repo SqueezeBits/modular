@@ -23,19 +23,19 @@ from std.gpu import block_dim, block_idx, thread_idx
 from layout import (
     Coord,
     Idx,
+    TensorLayout,
     TileTensor,
     coord,
     coord_to_index_list,
     row_major,
 )
-from layout.tile_layout import TensorLayout
 from std.runtime.asyncrt import DeviceContextPtr
 from std.utils import Index
 from std.itertools import product
 
 
 @always_inline
-fn map_output_to_input_coord(output_coord: Int, scale: Float32) -> Float32:
+def map_output_to_input_coord(output_coord: Int, scale: Float32) -> Float32:
     """Map output pixel coordinate to input coordinate using center alignment.
     This implements the standard coordinate mapping for image resizing:
     input_coord = (output_coord + 0.5) * scale - 0.5
@@ -49,7 +49,7 @@ fn map_output_to_input_coord(output_coord: Int, scale: Float32) -> Float32:
     return (Float32(output_coord) + 0.5) * scale - 0.5
 
 
-fn cubic_kernel(x: Float32) -> Float32:
+def cubic_kernel(x: Float32) -> Float32:
     """Cubic interpolation kernel matching PyTorch/torchvision's BICUBIC
     filter.
 
@@ -79,7 +79,7 @@ fn cubic_kernel(x: Float32) -> Float32:
 
 
 @always_inline
-fn cubic_kernel(x: SIMD) -> type_of(x):
+def cubic_kernel(x: SIMD) -> type_of(x):
     """Cubic interpolation kernel matching PyTorch/torchvision's BICUBIC
     filter.
 
@@ -112,9 +112,9 @@ fn cubic_kernel(x: SIMD) -> type_of(x):
     return abs_x.le(1).select(case_1, abs_x.lt(2).select(case_2, case_3))
 
 
-fn cpu_bicubic_kernel(
+def cpu_bicubic_kernel(
     output_host: TileTensor[mut=True, ...],
-    input_host: TileTensor[...],
+    input_host: TileTensor,
 ) -> None:
     """Perform bicubic interpolation on a TileTensor of form NCHW.
 
@@ -126,6 +126,9 @@ fn cpu_bicubic_kernel(
         output_host.flat_rank == 4 and input_host.flat_rank == 4
     ), "bicubic resize only supports rank 4 tensors"
     comptime assert output_host.dtype == input_host.dtype
+    # Provide evidence that flat_rank >= 4 for the coord[DType.int64](...) loads/stores below.
+    comptime assert input_host.flat_rank >= 4
+    comptime assert output_host.flat_rank >= 4
 
     # get dimensions
     var input_shape = coord_to_index_list(input_host.layout.shape_coord())
@@ -189,7 +192,7 @@ fn cpu_bicubic_kernel(
         )
 
 
-fn gpu_bicubic_kernel[
+def gpu_bicubic_kernel[
     dtype: DType,
     OutputLayoutType: TensorLayout,
     output_origin: MutOrigin,
@@ -208,6 +211,9 @@ fn gpu_bicubic_kernel[
 
     comptime assert input.flat_rank == 4
     comptime assert output.flat_rank == 4
+    # Provide evidence that flat_rank >= 4 for the Coord(Idx(...), ...) loads/stores below.
+    comptime assert input.flat_rank >= 4
+    comptime assert output.flat_rank >= 4
 
     var b = block_idx.x
     var c = block_idx.y
@@ -272,7 +278,7 @@ fn gpu_bicubic_kernel[
         )
 
 
-fn resize_bicubic[
+def resize_bicubic[
     dtype: DType,
     //,
     target: StaticString,

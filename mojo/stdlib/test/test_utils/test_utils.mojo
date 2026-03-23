@@ -26,6 +26,9 @@ def check_write_to(
         value: The Writable value to check.
         expected: The expected string.
         is_repr: Whether to check the repr version of the value.
+
+    Raises:
+        Error: if the written string does not equal `expected`.
     """
 
     var string = String()
@@ -45,6 +48,9 @@ def check_write_to(
         value: The Writable value to check.
         contains: The string to check for in the output.
         is_repr: Whether to check the repr version of the value.
+
+    Raises:
+        Error: if the written string does not contain `contains`.
     """
     var string = String()
     if is_repr:
@@ -55,7 +61,7 @@ def check_write_to(
 
 
 @always_inline
-fn libm_call[
+def libm_call[
     dtype: DType,
     width: Int,
     //,
@@ -79,14 +85,14 @@ fn libm_call[
 
     @always_inline("nodebug")
     @parameter
-    fn _float32_dispatch[
+    def _float32_dispatch[
         input_type: DType, result_type: DType
     ](arg: Scalar[input_type]) -> Scalar[result_type]:
         return external_call[fn_fp32, Scalar[result_type]](arg)
 
     @always_inline("nodebug")
     @parameter
-    fn _float64_dispatch[
+    def _float64_dispatch[
         input_type: DType, result_type: DType
     ](arg: Scalar[input_type]) -> Scalar[result_type]:
         return external_call[fn_fp64, Scalar[result_type]](arg)

@@ -22,7 +22,17 @@ from std.gpu import (
     lane_id,
 )
 from std.gpu.host import DeviceContext, FuncAttribute, get_gpu_target
-from layout import Layout, LayoutTensor
+from layout import (
+    Coord,
+    Idx,
+    IntTuple,
+    Layout,
+    LayoutTensor,
+    RuntimeLayout,
+    RuntimeTuple,
+    TileTensor,
+    row_major,
+)
 from std.logger import Logger
 from std.gpu.primitives.warp import shuffle_xor
 from std.math import recip
@@ -40,7 +50,7 @@ from .fp4_utils import (
     set_scale_factor,
     get_scale_factor,
 )
-from std.gpu.host.info import B200
+from std.gpu.host.info import B200, _is_sm10x_gpu
 from std.utils import StaticTuple
 from std.collections import Optional
 from linalg.utils import (
@@ -50,7 +60,7 @@ from linalg.utils import (
 from std.utils.index import Index, IndexList
 from linalg.matmul.vendor.blas import matmul
 from buffer import Dim, NDBuffer
-from layout._ndbuffer_stub import from_ndbuffer_row_major
+from buffer.dimlist import DimList
 from std.memory import bitcast
 from std.gpu.sync import named_barrier
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
@@ -65,14 +75,13 @@ from layout.layout_tensor import LayoutTensorIter
 from std.gpu.memory import external_memory, fence_async_view_proxy
 from std.gpu import barrier
 from std.sys import size_of, align_of, simd_width_of
-from layout import IntTuple, Layout, LayoutTensor, RuntimeLayout, RuntimeTuple
-from std.memory import LegacyUnsafePointer
 from layout.swizzle import make_swizzle
 from std.algorithm import elementwise
 from std.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
 from std.sys import get_defined_bool
 from linalg.matmul.gpu.sm100.block_scaled_dispatch import (
     heuristic_and_outliers_dispatch,
+    small_bn_dispatch,
 )
 from std.gpu.primitives.grid_controls import PDLLevel
 from linalg.matmul.gpu.sm100_structured.default.dispatch import (
@@ -88,12 +97,11 @@ from std.collections import OptionalReg
 # Dynamic scaled NVFP4 quantization
 ########################################################
 
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 comptime logger = Logger()
 
 
 @always_inline
-fn quantize_dynamic_scaled_fp4fp8[
+def quantize_dynamic_scaled_fp4fp8[
     out_dtype: DType,
     scales_dtype: DType,
     in_dtype: DType,
@@ -113,8 +121,8 @@ fn quantize_dynamic_scaled_fp4fp8[
     num_cols_padded: Int,
     tensor_sf: Float32 = 1.0,  # tensor-wise scale factor
 ) raises:
-    comptime assert (
-        ctx.default_device_info.compute == B200.compute
+    comptime assert _is_sm10x_gpu(
+        ctx.default_device_info
     ), "This kernel is only supported on SM100"
     comptime assert in_dtype in (
         DType.bfloat16,
@@ -188,7 +196,7 @@ fn quantize_dynamic_scaled_fp4fp8[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_max_threads))
 )
-fn quantize_dynamic_scaled_fp4fp8_kernel[
+def quantize_dynamic_scaled_fp4fp8_kernel[
     out_dtype: DType,
     scales_dtype: DType,
     in_dtype: DType,
@@ -344,7 +352,7 @@ fn quantize_dynamic_scaled_fp4fp8_kernel[
 
 
 @always_inline
-fn block_scales_interleave_fp4[
+def block_scales_interleave_fp4[
     scales_dtype: DType,
     input_scales_layout: Layout,
     output_scales_layout: Layout,
@@ -361,8 +369,8 @@ fn block_scales_interleave_fp4[
         scales_dtype, output_scales_layout, MutAnyOrigin
     ],
 ) raises:
-    comptime assert (
-        ctx.default_device_info.compute == B200.compute
+    comptime assert _is_sm10x_gpu(
+        ctx.default_device_info
     ), "This kernel is only supported on SM100"
     comptime assert scales_dtype in (
         NVFP4_SF_DTYPE,
@@ -401,7 +409,7 @@ fn block_scales_interleave_fp4[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_max_threads))
 )
-fn block_scales_interleave_fp4_kernel[
+def block_scales_interleave_fp4_kernel[
     scales_dtype: DType,
     input_scales_layout: Layout,
     output_scales_layout: Layout,
@@ -437,7 +445,7 @@ fn block_scales_interleave_fp4_kernel[
             )
 
 
-fn naive_block_scaled_matmul[
+def naive_block_scaled_matmul[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -576,7 +584,7 @@ fn naive_block_scaled_matmul[
     )
 
 
-fn naive_block_scaled_matmul_kernel[
+def naive_block_scaled_matmul_kernel[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -673,7 +681,7 @@ fn naive_block_scaled_matmul_kernel[
         c[row_idx, col_idx] = accum.cast[c_type]()
 
 
-fn quantize_dynamic_block_scaled[
+def quantize_dynamic_block_scaled[
     out_dtype: DType,
     scales_dtype: DType,
     in_dtype: DType,
@@ -682,119 +690,52 @@ fn quantize_dynamic_block_scaled[
     SF_VECTOR_SIZE: Int,
     target: StaticString = "cpu",
 ](
-    output_device: NDBuffer[mut=True, out_dtype, 2, MutAnyOrigin, _],
-    scales_device: NDBuffer[mut=True, scales_dtype, 5, MutAnyOrigin, _],
-    input_device: NDBuffer[in_dtype, 2, ImmutAnyOrigin, _],
-    tensor_sf: Float32,  # tensor-wise scale factor
+    output_device: NDBuffer[mut=True, rank=2, out_dtype, MutAnyOrigin, _],
+    scales_device: NDBuffer[mut=True, rank=5, scales_dtype, MutAnyOrigin, _],
+    input_device: NDBuffer[rank=2, in_dtype, ImmutAnyOrigin, _],
+    tensor_sf: Float32,
     ctx: DeviceContext,
 ) raises:
-    comptime assert (
-        ctx.default_device_info.compute == B200.compute
-    ), "This kernel is only supported on SM100"
-    comptime assert in_dtype in (
-        DType.bfloat16,
-    ), "input dtype should be bfloat16"
-    comptime assert out_dtype in (
-        DType.uint8,
-        DType.float8_e4m3fn,
-    ), "output dtype should be uint8 or float8_e4m3fn"
-    comptime assert scales_dtype in (
-        NVFP4_SF_DTYPE,
-        MXFP8_SF_DTYPE,
-    ), (
-        "scales dtype should be NVFP4_SF_DTYPE (float8_e4m3fn) or"
-        " MXFP8_SF_DTYPE (float8_e8m0fnu)"
-    )
-    comptime assert (
-        SF_VECTOR_SIZE == NVFP4_SF_VECTOR_SIZE
-        or SF_VECTOR_SIZE == MXFP8_SF_VECTOR_SIZE
-    ), (
-        "SF_VECTOR_SIZE must be equal to NVFP4_SF_VECTOR_SIZE (16 for NVFP4) or"
-        " MXFP8_SF_VECTOR_SIZE (32 for MXFP8)"
+    """NDBuffer overload of `quantize_dynamic_block_scaled`. Converts to
+    TileTensor and delegates."""
+    quantize_dynamic_block_scaled[
+        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+        target=target,
+    ](
+        TileTensor(output_device),
+        TileTensor(scales_device),
+        TileTensor(input_device),
+        tensor_sf,
+        ctx,
     )
 
-    var input_tensor = from_ndbuffer_row_major(input_device)
-    var output_tensor = from_ndbuffer_row_major(output_device)
-    var scales_tensor = from_ndbuffer_row_major(scales_device)
 
-    var num_rows = input_tensor.dim(0)
-    var num_cols = input_tensor.dim(1)
-    if num_rows == 0 or num_cols == 0:
-        return
-
-    comptime input_layout = input_tensor.layout
-    comptime output_layout = output_tensor.layout
-    comptime is_fp4 = out_dtype == DType.uint8 and scales_dtype == NVFP4_SF_DTYPE and SF_VECTOR_SIZE == NVFP4_SF_VECTOR_SIZE
-    comptime is_fp8 = out_dtype == DType.float8_e4m3fn and scales_dtype == MXFP8_SF_DTYPE and SF_VECTOR_SIZE == MXFP8_SF_VECTOR_SIZE
-    comptime assert is_fp4 or is_fp8, "invalid scaling kind"
-
-    comptime static_N = input_layout.shape[1].value()
-
-    comptime if is_fp4:
-        comptime assert (
-            output_layout.shape[1].value() == input_layout.shape[1].value() // 2
-        ), (
-            "output.dim(1) must be equal to input.dim(1) // 2 (each output"
-            " element (uint8) is 2 fp4-e2m1fn values)"
-        )
-
-    comptime if is_fp4 and static_N % 32 == 0:
-        quantize_dynamic_scaled_fp4_async[SF_VECTOR_SIZE=SF_VECTOR_SIZE](
-            ctx,
-            output_tensor,
-            scales_tensor,
-            input_tensor,
-            tensor_sf=tensor_sf,
-        )
-    else:
-        comptime assert (
-            static_N % (SF_VECTOR_SIZE // 2) == 0
-        ), "input.dim(1) must be a multiple of (SF_VECTOR_SIZE // 2)"
-
-        quantize_dynamic_scaled_fp4fp8[
-            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
-            num_max_threads=512,
-        ](
-            ctx,
-            output_tensor,
-            scales_tensor,
-            input_tensor,
-            num_cols=input_tensor.dim(1),
-            num_cols_padded=input_tensor.dim(1),
-            tensor_sf=tensor_sf,
-        )
-
-
-fn block_scales_interleave[
+def block_scales_interleave[
     scales_dtype: DType,
     //,
     *,
     SF_VECTOR_SIZE: Int,
     target: StaticString = "cpu",
 ](
-    output_scales_device: NDBuffer[mut=True, scales_dtype, 5, MutAnyOrigin, _],
-    input_scales_device: NDBuffer[scales_dtype, 2, ImmutAnyOrigin, _],
+    output_scales_device: NDBuffer[
+        mut=True, rank=5, scales_dtype, MutAnyOrigin, _
+    ],
+    input_scales_device: NDBuffer[rank=2, scales_dtype, ImmutAnyOrigin, _],
     ctx: DeviceContext,
 ) raises:
-    comptime assert (
-        ctx.default_device_info.compute == B200.compute
-    ), "This kernel is only supported on SM100"
-    comptime assert scales_dtype in (
-        NVFP4_SF_DTYPE,
-    ), "scales dtype should be NVFP4_SF_DTYPE (float8_e4m3fn) for now."
-
-    var output = from_ndbuffer_row_major(output_scales_device)
-    var input = from_ndbuffer_row_major(input_scales_device)
-
-    block_scales_interleave_fp4[SF_VECTOR_SIZE=SF_VECTOR_SIZE,](
-        ctx, input, output
+    """NDBuffer overload of `block_scales_interleave`. Converts to TileTensor
+    and delegates."""
+    block_scales_interleave[SF_VECTOR_SIZE=SF_VECTOR_SIZE, target=target](
+        TileTensor(output_scales_device),
+        TileTensor(input_scales_device),
+        ctx,
     )
 
 
 @__llvm_arg_metadata(input_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(output_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(scales_tma_op, `nvvm.grid_constant`)
-fn quantize_dynamic_scaled_async_fp4_kernel[
+def quantize_dynamic_scaled_async_fp4_kernel[
     input_dtype: DType,
     input_tile_rank: Int,
     input_tile_shape: IndexList[input_tile_rank],
@@ -825,7 +766,11 @@ fn quantize_dynamic_scaled_async_fp4_kernel[
     tensor_sf: Float32,  # tensor-wise scale factor
 ):
     var smem_storage = rebind[
-        UnsafePointer[Scalar[input_dtype], address_space=AddressSpace.SHARED]
+        UnsafePointer[
+            Scalar[input_dtype],
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+        ]
     ](
         external_memory[
             Scalar[input_dtype],
@@ -1060,7 +1005,7 @@ fn quantize_dynamic_scaled_async_fp4_kernel[
             output_tma_op.wait_group[0]()
 
 
-fn quantize_dynamic_scaled_fp4_async[
+def quantize_dynamic_scaled_fp4_async[
     input_dtype: DType,
     output_dtype: DType,
     scales_dtype: DType,
@@ -1214,7 +1159,7 @@ fn quantize_dynamic_scaled_fp4_async[
 ########################################################
 
 
-fn block_scaled_matmul[
+def block_scaled_matmul[
     c_type: DType,
     a_type: DType,
     b_type: DType,
@@ -1229,14 +1174,251 @@ fn block_scaled_matmul[
     _trace_description: StaticString = "",
     target: StaticString = "cpu",
 ](
-    c_device: NDBuffer[mut=True, c_type, 2, MutAnyOrigin, _],
-    a_device: NDBuffer[a_type, 2, ImmutAnyOrigin, _],
-    b_device: NDBuffer[b_type, 2, ImmutAnyOrigin, _],
-    a_scales_device: NDBuffer[scales_dtype, 5, ImmutAnyOrigin, _],
-    b_scales_device: NDBuffer[scales_dtype, 5, ImmutAnyOrigin, _],
+    c_device: NDBuffer[mut=True, rank=2, c_type, MutAnyOrigin, _],
+    a_device: NDBuffer[rank=2, a_type, ImmutAnyOrigin, _],
+    b_device: NDBuffer[rank=2, b_type, ImmutAnyOrigin, _],
+    a_scales_device: NDBuffer[rank=5, scales_dtype, ImmutAnyOrigin, _],
+    b_scales_device: NDBuffer[rank=5, scales_dtype, ImmutAnyOrigin, _],
     tensor_sf: Float32,
     ctx: DeviceContext,
 ) raises:
+    """NDBuffer overload of `block_scaled_matmul`. Converts to TileTensor and
+    delegates."""
+    block_scaled_matmul[
+        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+        transpose_b=transpose_b,
+        transpose_a=transpose_a,
+        elementwise_lambda_fn=elementwise_lambda_fn,
+        pdl_level=pdl_level,
+        _trace_description=_trace_description,
+        target=target,
+    ](
+        TileTensor(c_device),
+        TileTensor(a_device),
+        TileTensor(b_device),
+        TileTensor(a_scales_device),
+        TileTensor(b_scales_device),
+        tensor_sf,
+        ctx,
+    )
+
+
+########################################################
+# SM100 Block Scaled matmul with normal epilogue kernel dispatch
+########################################################
+
+
+def block_scaled_matmul_with_epilogue[
+    c_type: DType,
+    a_type: DType,
+    b_type: DType,
+    scales_dtype: DType,
+    //,
+    *,
+    SF_VECTOR_SIZE: Int,
+    transpose_b: Bool = True,
+    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
+](
+    c: TileTensor[mut=True, c_type, ...],
+    a: TileTensor[a_type, ...],
+    b: TileTensor[b_type, ...],
+    a_scales: TileTensor[scales_dtype, ...],
+    b_scales: TileTensor[scales_dtype, ...],
+    tensor_sf: Float32,
+    ctx: DeviceContext,
+) raises:
+    """Our sm100 block scaled matmul kernel still does not support fusion of elementwise
+    operations. This is a temporary implementation that uses our sm100 block scaled matmul
+    kernel and dispatch a separate epilogue kernel to apply the elementwise
+    operations.
+    """
+
+    comptime assert _is_sm10x_gpu(
+        ctx.default_device_info
+    ), "This kernel is only supported on SM100"
+
+    comptime assert transpose_b, "Only support transposed B"
+
+    comptime assert (
+        scales_dtype == NVFP4_SF_DTYPE
+    ), "Only support NVFP4_SF_DTYPE (float8_e4m3fn) for scales for now."
+
+    comptime assert SF_VECTOR_SIZE in (
+        NVFP4_SF_VECTOR_SIZE,
+    ), "SF_VECTOR_SIZE must be equal to NVFP4_SF_VECTOR_SIZE (16 for NVFP4)"
+
+    comptime assert (
+        a_scales.static_shape[1] == b_scales.static_shape[1]
+    ), "Both A and B scales must have the same shape in K dimension"
+    comptime assert (
+        a_scales.static_shape[2] == b_scales.static_shape[2] == SF_ATOM_M[0]
+    ), ""
+    comptime assert (
+        a_scales.static_shape[3] == b_scales.static_shape[3] == SF_ATOM_M[1]
+    ), ""
+    comptime assert (
+        a_scales.static_shape[4] == b_scales.static_shape[4] == SF_ATOM_K
+    ), ""
+
+    var m = Int(c.dim[0]())
+    var n = Int(c.dim[1]())
+    var k = Int(a.dim[1]()) * 2 if a_type == DType.uint8 else Int(a.dim[1]())
+    if m == 0 or n == 0:
+        return
+
+    @always_inline
+    @parameter
+    def description_fn() -> String:
+        # fmt: off
+        return String(
+            "(gpu",
+            ";", trace_arg("A", IndexList[2](m, k), a_type),
+            ";", trace_arg("B", IndexList[2](k, n), b_type),
+            ";", trace_arg("C", IndexList[2](m, n), c_type),
+            ";A_scales=[", a_scales.dim[0](), ",", a_scales.dim[1](), "]",
+            ";B_scales=[", b_scales.dim[0](), ",", b_scales.dim[1](), "]",
+            ";transpose_b=", transpose_b,
+            ";tensor_sf=", tensor_sf,
+            ")"
+        )
+        # fmt: on
+
+    with Trace[TraceLevel.OP, target=StaticString("gpu")](
+        get_static_string[
+            "block_scaled_matmul_with_epilogue_",
+            String("nvfp4_" if a_type == DType.uint8 else "mxfp8_"),
+            String(SF_VECTOR_SIZE) + String("_sfvs"),
+        ](),
+        Trace[TraceLevel.OP]._get_detail_str[description_fn](),
+        task_id=get_safe_task_id(ctx),
+    ):
+        comptime if not elementwise_lambda_fn:
+            if not c.ptr:
+                raise Error("c must be allocated!")
+
+            matmul[scales_type=scales_dtype](
+                ctx,
+                c,
+                a,
+                b,
+                a_scales=a_scales,
+                b_scales=b_scales,
+                transpose_b=True,
+                c_row_major=True,
+                alpha=tensor_sf,
+            )
+        else:
+            comptime epilogue = elementwise_lambda_fn.value()
+            # Nvidia GPUs >= sm_100 arch support 32B load/store to global memory.
+            comptime use_32b_simd = True
+            comptime simd_size = 32 // size_of[c_type]() if use_32b_simd else (
+                simd_width_of[c_type, target=get_gpu_target()]()
+            )
+
+            @parameter
+            @__copy_capture(c, n)
+            def epilogue_wrapper[
+                simd_width: Int, rank: Int, alignment: Int = 1
+            ](idx: IndexList[rank]):
+                var c_coord = Index(idx[0], idx[1])
+                var c_val = rebind[SIMD[c_type, simd_width]](
+                    c.ptr.load[width=simd_width](idx[0] * n + idx[1])
+                )
+                epilogue[c_type, simd_width, alignment=alignment](
+                    c_coord, c_val
+                )
+
+            # If c is already allocated, we can just use the sm100 blockwise scaled fp8 matmul and
+            # apply the epilogue.
+            if c.ptr:
+                matmul[scales_type=scales_dtype](
+                    ctx,
+                    c,
+                    a,
+                    b,
+                    a_scales=a_scales,
+                    b_scales=b_scales,
+                    alpha=tensor_sf,
+                    transpose_b=True,
+                    c_row_major=True,
+                )
+                elementwise[epilogue_wrapper, simd_size, target="gpu"](
+                    Index(m, n), ctx
+                )
+                return
+
+            # Otherwise, we need to allocate a new buffer for c and apply the epilogue.
+            var num_elems = m * n
+            var tmp_device_buffer = ctx.enqueue_create_buffer[c_type](num_elems)
+            var c_tmp = TileTensor(
+                rebind[UnsafePointer[Scalar[c_type], MutExternalOrigin]](
+                    tmp_device_buffer.unsafe_ptr()
+                ),
+                row_major(Coord(Idx(m), Idx(n))),
+            )
+
+            block_scaled_matmul_with_epilogue[
+                SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                transpose_b=transpose_b,
+                elementwise_lambda_fn=elementwise_lambda_fn,
+            ](
+                c_tmp,
+                a,
+                b,
+                a_scales,
+                b_scales,
+                tensor_sf,
+                ctx,
+            )
+
+            _ = tmp_device_buffer^
+
+
+# ===----------------------------------------------------------------------=== #
+# TileTensor primary implementations
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def block_scaled_matmul[
+    c_type: DType,
+    a_type: DType,
+    b_type: DType,
+    scales_dtype: DType,
+    //,
+    *,
+    SF_VECTOR_SIZE: Int,
+    transpose_b: Bool = True,
+    transpose_a: Bool = False,
+    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
+    pdl_level: PDLLevel = PDLLevel(),
+    _trace_description: StaticString = "",
+    target: StaticString = "cpu",
+](
+    c_device: TileTensor[
+        mut=True, c_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    a_device: TileTensor[
+        mut=False, a_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    b_device: TileTensor[
+        mut=False, b_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    a_scales_device: TileTensor[
+        mut=False, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    b_scales_device: TileTensor[
+        mut=False, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    tensor_sf: Float32,
+    ctx: DeviceContext,
+) raises:
+    comptime assert c_device.rank == 2 and c_device.flat_rank == 2
+    comptime assert a_device.rank == 2 and a_device.flat_rank == 2
+    comptime assert b_device.rank == 2 and b_device.flat_rank == 2
+    comptime assert a_scales_device.rank == 5 and a_scales_device.flat_rank == 5
+    comptime assert b_scales_device.rank == 5 and b_scales_device.flat_rank == 5
+
     comptime assert (
         ctx.default_device_info.compute == B200.compute
     ), "This kernel is only supported on SM100"
@@ -1251,35 +1433,28 @@ fn block_scaled_matmul[
         SF_VECTOR_SIZE == NVFP4_SF_VECTOR_SIZE
     ), "SF_VECTOR_SIZE must be equal to NVFP4_SF_VECTOR_SIZE (16 for NVFP4)"
 
-    var c = from_ndbuffer_row_major(c_device).as_any_origin()
-    var a = from_ndbuffer_row_major(a_device).as_any_origin()
-    var b = from_ndbuffer_row_major(b_device).as_any_origin()
-    var a_scales = from_ndbuffer_row_major(a_scales_device).as_any_origin()
-    var b_scales = from_ndbuffer_row_major(b_scales_device).as_any_origin()
-
-    comptime sfa_layout = a_scales.layout
-    comptime sfb_layout = b_scales.layout
+    var c = c_device.as_any_origin()
+    var a = a_device.as_any_origin()
+    var b = b_device.as_any_origin()
+    var a_scales = a_scales_device.as_any_origin()
+    var b_scales = b_scales_device.as_any_origin()
 
     comptime assert (
-        sfa_layout.shape[1].value() == sfb_layout.shape[1].value()
+        a_scales.static_shape[1] == b_scales.static_shape[1]
     ), "Both A and B scales must have the same shape in K dimension"
     comptime assert (
-        sfa_layout.shape[2].value()
-        == sfb_layout.shape[2].value()
-        == SF_ATOM_M[0]
+        a_scales.static_shape[2] == b_scales.static_shape[2] == SF_ATOM_M[0]
     ), ""
     comptime assert (
-        sfa_layout.shape[3].value()
-        == sfb_layout.shape[3].value()
-        == SF_ATOM_M[1]
+        a_scales.static_shape[3] == b_scales.static_shape[3] == SF_ATOM_M[1]
     ), ""
     comptime assert (
-        sfa_layout.shape[4].value() == sfb_layout.shape[4].value() == SF_ATOM_K
+        a_scales.static_shape[4] == b_scales.static_shape[4] == SF_ATOM_K
     ), ""
 
-    var m = c.dim(0)
-    var n = c.dim(1)
-    var k = a.dim(1) * 2 if a_type == DType.uint8 else a.dim(1)
+    var m = Int(c.dim[0]())
+    var n = Int(c.dim[1]())
+    var k = Int(a.dim[1]()) * 2 if a_type == DType.uint8 else Int(a.dim[1]())
 
     if m == 0 or n == 0:
         return
@@ -1303,9 +1478,27 @@ fn block_scaled_matmul[
         "]",
     )
 
-    comptime static_N = c.layout.shape[1].value()
-    comptime static_K = a.layout.shape[1].value()
+    comptime static_N = c_device.static_shape[1]
+    comptime static_K = a_device.static_shape[1] * (
+        2 if a_type == DType.uint8 else 1
+    )
     comptime static_NK = Index(static_N, static_K)
+
+    comptime if get_defined_bool[
+        "ENABLE_EXPERIMENTAL_SM100_SMALL_N_BLOCK_SCALED_MATMUL", False
+    ]():
+        var status = small_bn_dispatch[
+            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+            transpose_b=transpose_b,
+            elementwise_lambda_fn=elementwise_lambda_fn,
+            pdl_level=pdl_level,
+        ](c_device, a_device, b_device, a_scales, b_scales, tensor_sf, ctx)
+
+        if status == DISPATCH_HIT:
+            logger.info("Executing SM100 small-BN Block Scaled matmul kernel")
+            return
+        else:
+            raise Error("Small-BN dispatch failed")
 
     comptime if get_defined_bool[
         "ENABLE_EXPERIMENTAL_SM100_BLOCK_SCALED_MATMUL", False
@@ -1315,7 +1508,7 @@ fn block_scaled_matmul[
             transpose_b=transpose_b,
             elementwise_lambda_fn=elementwise_lambda_fn,
             pdl_level=pdl_level,
-        ](c, a, b, a_scales, b_scales, tensor_sf, ctx)
+        ](c_device, a_device, b_device, a_scales, b_scales, tensor_sf, ctx)
 
         if status == DISPATCH_HIT:
             logger.info("Executing SM100 Block Scaled matmul kernel")
@@ -1329,9 +1522,28 @@ fn block_scaled_matmul[
         # Index(7168, 2048),
     ]
 
+    comptime Llama_NK_256 = [
+        Index(16384, 2048),
+    ]
+
+    comptime Llama_NK_1 = [
+        Index(2304, 16384),
+        Index(16384, 2048),
+        Index(6656, 16384),
+        Index(13312, 16384),
+        Index(16384, 6656),
+    ]
+
+    comptime Kimi_NK = [
+        Index(7168, 8192),
+        Index(7168, 2048),
+        Index(7168, 18432),
+        Index(4096, 7168),
+    ]
+
     @always_inline
     @parameter
-    fn description_fn() -> String:
+    def description_fn() -> String:
         # fmt: off
         return String(
             "(",
@@ -1339,11 +1551,10 @@ fn block_scaled_matmul[
             ";", trace_arg("A", IndexList[2](m, k), a_type),
             ";", trace_arg("B", IndexList[2](k, n), b_type),
             ";", trace_arg("C", IndexList[2](m, n), c_type),
-            ";A_scales=", a_scales_device.dynamic_shape,
-            ";B_scales=", b_scales_device.dynamic_shape,
+            ";A_scales=[", a_scales.dim[0](), ",", a_scales.dim[1](), ",", a_scales.dim[2](), ",", a_scales.dim[3](), ",", a_scales.dim[4](), "]",
+            ";B_scales=[", b_scales.dim[0](), ",", b_scales.dim[1](), ",", b_scales.dim[2](), ",", b_scales.dim[3](), ",", b_scales.dim[4](), "]",
             ";transpose_a=", True,
             ";transpose_b=", transpose_b,
-            ";has_epilogue=", Bool(elementwise_lambda_fn),
             ";tensor_sf=", tensor_sf,
             ")"
         )
@@ -1363,20 +1574,99 @@ fn block_scaled_matmul[
     ):
         comptime if static_NK in DeepSeek_NK:
             if m == 1:
+                var status = small_bn_dispatch[
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                    pdl_level=pdl_level,
+                ](
+                    c_device,
+                    a_device,
+                    b_device,
+                    a_scales,
+                    b_scales,
+                    tensor_sf,
+                    ctx,
+                )
+
+                if status == DISPATCH_HIT:
+                    return
+
+        comptime if static_NK in Llama_NK_256:
+            if m > 1 and m <= 256:
                 var status = heuristic_and_outliers_dispatch[
                     SF_VECTOR_SIZE=SF_VECTOR_SIZE,
                     transpose_b=transpose_b,
                     elementwise_lambda_fn=elementwise_lambda_fn,
                     pdl_level=pdl_level,
-                ](c, a, b, a_scales, b_scales, tensor_sf, ctx)
+                ](
+                    c_device,
+                    a_device,
+                    b_device,
+                    a_scales,
+                    b_scales,
+                    tensor_sf,
+                    ctx,
+                )
 
                 if status == DISPATCH_HIT:
-                    logger.info(
-                        "Executing Mojo SM100 Block Scaled matmul kernel"
-                    )
                     return
 
-        logger.info("Executing Block Scaled matmul kernel")
+        comptime if static_NK in Llama_NK_1:
+            if m == 1:
+                var status = small_bn_dispatch[
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                    pdl_level=pdl_level,
+                ](
+                    c_device,
+                    a_device,
+                    b_device,
+                    a_scales,
+                    b_scales,
+                    tensor_sf,
+                    ctx,
+                )
+
+                if status == DISPATCH_HIT:
+                    return
+
+        comptime if static_NK in Kimi_NK:
+            if m == 1:
+                var status = small_bn_dispatch[
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                    pdl_level=pdl_level,
+                ](
+                    c_device,
+                    a_device,
+                    b_device,
+                    a_scales,
+                    b_scales,
+                    tensor_sf,
+                    ctx,
+                )
+                if status == DISPATCH_HIT:
+                    return
+            if m > 1 and m <= 128:
+                var status = heuristic_and_outliers_dispatch[
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                    pdl_level=pdl_level,
+                ](
+                    c_device,
+                    a_device,
+                    b_device,
+                    a_scales,
+                    b_scales,
+                    tensor_sf,
+                    ctx,
+                )
+                if status == DISPATCH_HIT:
+                    return
 
         block_scaled_matmul_with_epilogue[
             SF_VECTOR_SIZE=SF_VECTOR_SIZE,
@@ -1392,178 +1682,142 @@ fn block_scaled_matmul[
         )
 
 
-########################################################
-# SM100 Block Scaled matmul with normal epilogue kernel dispatch
-########################################################
-
-
-fn block_scaled_matmul_with_epilogue[
-    c_type: DType,
-    a_type: DType,
-    b_type: DType,
+@always_inline
+def quantize_dynamic_block_scaled[
+    out_dtype: DType,
     scales_dtype: DType,
-    c_layout: Layout,
-    a_layout: Layout,
-    b_layout: Layout,
-    sfa_layout: Layout,
-    sfb_layout: Layout,
+    in_dtype: DType,
     //,
     *,
     SF_VECTOR_SIZE: Int,
-    transpose_b: Bool = True,
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
+    target: StaticString = "cpu",
 ](
-    c: LayoutTensor[c_type, c_layout, MutAnyOrigin],
-    a: LayoutTensor[a_type, a_layout, ImmutAnyOrigin],
-    b: LayoutTensor[b_type, b_layout, ImmutAnyOrigin],
-    a_scales: LayoutTensor[scales_dtype, sfa_layout, ImmutAnyOrigin],
-    b_scales: LayoutTensor[scales_dtype, sfb_layout, ImmutAnyOrigin],
-    tensor_sf: Float32,
+    output_device: TileTensor[
+        mut=True, out_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    scales_device: TileTensor[
+        mut=True, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    input_device: TileTensor[
+        mut=False, in_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    tensor_sf: Float32,  # tensor-wise scale factor
     ctx: DeviceContext,
 ) raises:
-    """Our sm100 block scaled matmul kernel still does not support fusion of elementwise
-    operations. This is a temporary implementation that uses our sm100 block scaled matmul
-    kernel and dispatch a separate epilogue kernel to apply the elementwise
-    operations.
-    """
+    comptime assert output_device.rank == 2 and output_device.flat_rank == 2
+    comptime assert scales_device.rank == 5 and scales_device.flat_rank == 5
+    comptime assert input_device.rank == 2 and input_device.flat_rank == 2
 
     comptime assert (
         ctx.default_device_info.compute == B200.compute
     ), "This kernel is only supported on SM100"
-
-    comptime assert transpose_b, "Only support transposed B"
-
+    comptime assert in_dtype in (
+        DType.bfloat16,
+    ), "input dtype should be bfloat16"
+    comptime assert out_dtype in (
+        DType.uint8,
+        DType.float8_e4m3fn,
+    ), "output dtype should be uint8 or float8_e4m3fn"
+    comptime assert scales_dtype in (
+        NVFP4_SF_DTYPE,
+        MXFP8_SF_DTYPE,
+    ), (
+        "scales dtype should be NVFP4_SF_DTYPE (float8_e4m3fn) or"
+        " MXFP8_SF_DTYPE (float8_e8m0fnu)"
+    )
     comptime assert (
-        scales_dtype == NVFP4_SF_DTYPE
-    ), "Only support NVFP4_SF_DTYPE (float8_e4m3fn) for scales for now."
+        SF_VECTOR_SIZE == NVFP4_SF_VECTOR_SIZE
+        or SF_VECTOR_SIZE == MXFP8_SF_VECTOR_SIZE
+    ), (
+        "SF_VECTOR_SIZE must be equal to NVFP4_SF_VECTOR_SIZE (16 for NVFP4) or"
+        " MXFP8_SF_VECTOR_SIZE (32 for MXFP8)"
+    )
 
-    comptime assert SF_VECTOR_SIZE in (
-        NVFP4_SF_VECTOR_SIZE,
-    ), "SF_VECTOR_SIZE must be equal to NVFP4_SF_VECTOR_SIZE (16 for NVFP4)"
+    var input_tensor = input_device.to_layout_tensor().as_any_origin()
+    var output_tensor = output_device.to_layout_tensor().as_any_origin()
+    var scales_tensor = scales_device.to_layout_tensor().as_any_origin()
 
-    comptime assert (
-        sfa_layout.shape[1].value() == sfb_layout.shape[1].value()
-    ), "Both A and B scales must have the same shape in K dimension"
-    comptime assert (
-        sfa_layout.shape[2].value()
-        == sfb_layout.shape[2].value()
-        == SF_ATOM_M[0]
-    ), ""
-    comptime assert (
-        sfa_layout.shape[3].value()
-        == sfb_layout.shape[3].value()
-        == SF_ATOM_M[1]
-    ), ""
-    comptime assert (
-        sfa_layout.shape[4].value() == sfb_layout.shape[4].value() == SF_ATOM_K
-    ), ""
-
-    var m = c.dim(0)
-    var n = c.dim(1)
-    var k = a.dim(1) * 2 if a_type == DType.uint8 else a.dim(1)
-    if m == 0 or n == 0:
+    var num_rows = input_tensor.dim(0)
+    var num_cols = input_tensor.dim(1)
+    if num_rows == 0 or num_cols == 0:
         return
 
-    @always_inline
-    @parameter
-    fn description_fn() -> String:
-        # fmt: off
-        return String(
-            "(gpu",
-            ";", trace_arg("A", IndexList[2](m, k), a_type),
-            ";", trace_arg("B", IndexList[2](k, n), b_type),
-            ";", trace_arg("C", IndexList[2](m, n), c_type),
-            ";A_scales=[", a_scales.dim(0), ",", a_scales.dim(1), "]",
-            ";B_scales=[", b_scales.dim(0), ",", b_scales.dim(1), "]",
-            ";transpose_b=", transpose_b,
-            ";has_epilogue=", Bool(elementwise_lambda_fn),
-            ";tensor_sf=", tensor_sf,
-            ")"
+    comptime input_layout = input_tensor.layout
+    comptime output_layout = output_tensor.layout
+    comptime is_fp4 = out_dtype == DType.uint8 and scales_dtype == NVFP4_SF_DTYPE and SF_VECTOR_SIZE == NVFP4_SF_VECTOR_SIZE
+    comptime is_fp8 = out_dtype == DType.float8_e4m3fn and scales_dtype == MXFP8_SF_DTYPE and SF_VECTOR_SIZE == MXFP8_SF_VECTOR_SIZE
+    comptime assert is_fp4 or is_fp8, "invalid scaling kind"
+
+    comptime static_N = input_layout.shape[1].value()
+
+    comptime if is_fp4:
+        comptime assert (
+            output_layout.shape[1].value() == input_layout.shape[1].value() // 2
+        ), (
+            "output.dim(1) must be equal to input.dim(1) // 2 (each output"
+            " element (uint8) is 2 fp4-e2m1fn values)"
         )
-        # fmt: on
 
-    with Trace[TraceLevel.OP, target=StaticString("gpu")](
-        get_static_string[
-            "block_scaled_matmul_with_epilogue_",
-            String("nvfp4_" if a_type == DType.uint8 else "mxfp8_"),
-            String(SF_VECTOR_SIZE) + String("_sfvs"),
-        ](),
-        Trace[TraceLevel.OP]._get_detail_str[description_fn](),
-        task_id=get_safe_task_id(ctx),
-    ):
-        comptime if not elementwise_lambda_fn:
-            if not c.ptr:
-                raise Error("c must be allocated!")
+    comptime if is_fp4 and static_N % 32 == 0:
+        quantize_dynamic_scaled_fp4_async[SF_VECTOR_SIZE=SF_VECTOR_SIZE](
+            ctx,
+            output_tensor,
+            scales_tensor,
+            input_tensor,
+            tensor_sf=tensor_sf,
+        )
+    else:
+        comptime assert (
+            static_N % (SF_VECTOR_SIZE // 2) == 0
+        ), "input.dim(1) must be a multiple of (SF_VECTOR_SIZE // 2)"
 
-            matmul(
-                ctx,
-                c,
-                a,
-                b,
-                a_scales=a_scales,
-                b_scales=b_scales,
-                transpose_b=True,
-                c_row_major=True,
-                alpha=tensor_sf,
-            )
-        else:
-            comptime epilogue = elementwise_lambda_fn.value()
-            # Nvidia GPUs >= sm_100 arch support 32B load/store to global memory.
-            comptime use_32b_simd = True
-            comptime simd_size = 32 // size_of[c_type]() if use_32b_simd else (
-                simd_width_of[c_type, target=get_gpu_target()]()
-            )
+        quantize_dynamic_scaled_fp4fp8[
+            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+            num_max_threads=512,
+        ](
+            ctx,
+            output_tensor,
+            scales_tensor,
+            input_tensor,
+            num_cols=input_tensor.dim(1),
+            num_cols_padded=input_tensor.dim(1),
+            tensor_sf=tensor_sf,
+        )
 
-            @parameter
-            @__copy_capture(c)
-            fn epilogue_wrapper[
-                simd_width: Int, rank: Int, alignment: Int = 1
-            ](idx: IndexList[rank]):
-                var c_coord = Index(idx[0], idx[1])
-                var c_val = c.load[width=simd_width,](c_coord)
-                epilogue[c_type, simd_width, alignment=alignment](
-                    c_coord, c_val
-                )
 
-            # If c is already allocated, we can just use the sm100 blockwise scaled fp8 matmul and
-            # apply the epilogue.
-            if c.ptr:
-                var m = c.dim[0]()
-                var n = c.dim[1]()
+@always_inline
+def block_scales_interleave[
+    scales_dtype: DType,
+    //,
+    *,
+    SF_VECTOR_SIZE: Int,
+    target: StaticString = "cpu",
+](
+    output_scales_device: TileTensor[
+        mut=True, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    input_scales_device: TileTensor[
+        mut=False, scales_dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    ctx: DeviceContext,
+) raises:
+    comptime assert (
+        output_scales_device.rank == 5 and output_scales_device.flat_rank == 5
+    )
+    comptime assert (
+        input_scales_device.rank == 2 and input_scales_device.flat_rank == 2
+    )
 
-                matmul(
-                    ctx,
-                    c,
-                    a,
-                    b,
-                    a_scales=a_scales,
-                    b_scales=b_scales,
-                    alpha=tensor_sf,
-                    transpose_b=True,
-                    c_row_major=True,
-                )
-                elementwise[epilogue_wrapper, simd_size, target="gpu"](
-                    Index(m, n), ctx
-                )
-                return
+    comptime assert (
+        ctx.default_device_info.compute == B200.compute
+    ), "This kernel is only supported on SM100"
+    comptime assert scales_dtype in (
+        NVFP4_SF_DTYPE,
+    ), "scales dtype should be NVFP4_SF_DTYPE (float8_e4m3fn) for now."
 
-            # Otherwise, we need to allocate a new buffer for c and apply the epilogue.
-            var tmp_device_buffer = ctx.enqueue_create_buffer[c_type](c.size())
-            var c_tmp = c
-            c_tmp.ptr = tmp_device_buffer.unsafe_ptr()
+    var output = output_scales_device.to_layout_tensor().as_any_origin()
+    var input = input_scales_device.to_layout_tensor().as_any_origin()
 
-            block_scaled_matmul_with_epilogue[
-                SF_VECTOR_SIZE=SF_VECTOR_SIZE,
-                transpose_b=transpose_b,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](
-                c_tmp,
-                a,
-                b,
-                a_scales,
-                b_scales,
-                tensor_sf,
-                ctx,
-            )
-
-            _ = tmp_device_buffer^
+    block_scales_interleave_fp4[SF_VECTOR_SIZE=SF_VECTOR_SIZE,](
+        ctx, input, output
+    )

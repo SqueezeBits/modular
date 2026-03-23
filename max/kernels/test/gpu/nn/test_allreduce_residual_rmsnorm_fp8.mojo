@@ -51,7 +51,7 @@ comptime out_fp8_dtype = DType.float8_e4m3fnuz if is_amd_gpu() else DType.float8
 # --- Shared verification helpers ---
 
 
-fn _assert_fp8_close[
+def _assert_fp8_close[
     out_dtype: DType,
 ](
     ref_host: UnsafePointer[Scalar[out_dtype], _],
@@ -104,7 +104,7 @@ fn _assert_fp8_close[
         )
 
 
-fn _assert_scales_close(
+def _assert_scales_close(
     ref_host: UnsafePointer[Scalar[DType.float32], _],
     fused_host: UnsafePointer[Scalar[DType.float32], _],
     rows: Int,
@@ -143,7 +143,7 @@ fn _assert_scales_close(
 # --- Test: fully fused allreduce + RMSNorm + FP8 ---
 
 
-fn test_fused_allreduce_rmsnorm_fp8[
+def test_fused_allreduce_rmsnorm_fp8[
     ngpus: Int,
     in_dtype: DType,
     out_dtype: DType,
@@ -194,11 +194,11 @@ fn test_fused_allreduce_rmsnorm_fp8[
         list_of_ctx[i].enqueue_memset[DType.uint8](signal_buffers[i], 0)
         rank_sigs[i] = signal_buffers[i].unsafe_ptr().bitcast[Signal]()
 
-    var in_bufs = InlineArray[NDBuffer[in_dtype, 2, ImmutAnyOrigin], ngpus](
-        fill={}
-    )
+    var in_bufs = InlineArray[
+        NDBuffer[rank=2, in_dtype, ImmutAnyOrigin], ngpus
+    ](fill={})
     for i in range(ngpus):
-        in_bufs[i] = NDBuffer[in_dtype, 2](
+        in_bufs[i] = NDBuffer[rank=2, in_dtype](
             in_dev[i].unsafe_ptr(), IndexList[2](rows, cols)
         )
     for i in range(ngpus):
@@ -246,17 +246,17 @@ fn test_fused_allreduce_rmsnorm_fp8[
     @__copy_capture(ref_sum_ptr)
     @always_inline
     @parameter
-    fn ref_input_fn[
+    def ref_input_fn[
         width: Int, _rank: Int
     ](idx: IndexList[_rank]) -> SIMD[in_dtype, width]:
         var linear_idx = idx[0] * cols + idx[1]
         return ref_sum_ptr.load[width=width, alignment=width](linear_idx)
 
-    var ref_fp8_ndbuf = NDBuffer[out_dtype, 2, MutAnyOrigin](
+    var ref_fp8_ndbuf = NDBuffer[rank=2, out_dtype, MutAnyOrigin](
         ref_fp8_dev.unsafe_ptr(), Index(rows, cols)
     )
     var ref_scale_shape = IndexList[2](rows, 1)
-    var ref_scales_ndbuf = NDBuffer[DType.float32, 2, MutAnyOrigin](
+    var ref_scales_ndbuf = NDBuffer[rank=2, DType.float32, MutAnyOrigin](
         ref_scales_dev.unsafe_ptr(), ref_scale_shape
     )
 
@@ -268,13 +268,13 @@ fn test_fused_allreduce_rmsnorm_fp8[
         ref_input_fn,
     ](
         shape,
-        ref_fp8_ndbuf,
+        TileTensor(ref_fp8_ndbuf),
         gamma_tensor,
         epsilon,
         weight_offset,
         DeviceContextPtr(ctx),
         scale_ub,
-        ref_scales_ndbuf,
+        TileTensor(ref_scales_ndbuf),
     )
 
     ctx.synchronize()
@@ -289,24 +289,30 @@ fn test_fused_allreduce_rmsnorm_fp8[
     var fused_fp8_dev = ctx.enqueue_create_buffer[out_dtype](length)
     var fused_scales_dev = ctx.enqueue_create_buffer[DType.float32](rows)
 
-    var fused_fp8_ndbuf = NDBuffer[out_dtype, 2, MutAnyOrigin](
+    var fused_fp8_ndbuf = NDBuffer[rank=2, out_dtype, MutAnyOrigin](
         fused_fp8_dev.unsafe_ptr(), IndexList[2](rows, cols)
     )
-    var fused_scales_ndbuf = NDBuffer[DType.float32, 2, MutAnyOrigin](
+    var fused_scales_ndbuf = NDBuffer[rank=2, DType.float32, MutAnyOrigin](
         fused_scales_dev.unsafe_ptr(), IndexList[2](rows, 1)
     )
 
     group_start()
 
+    # Build TileTensor input array for the TileTensor-primary overload.
+    comptime InputTileType = type_of(TileTensor(in_bufs[0]).as_immut())
+    var tt_in_bufs = InlineArray[InputTileType, ngpus](uninitialized=True)
+    comptime for i in range(ngpus):
+        tt_in_bufs[i] = TileTensor(in_bufs[i]).as_immut()
+
     comptime for i in range(ngpus):
         allreduce_rmsnorm_fp8(
-            in_bufs,
-            fused_fp8_ndbuf,
+            tt_in_bufs,
+            TileTensor(fused_fp8_ndbuf),
             gamma_tensor,
             epsilon,
             weight_offset,
             scale_ub,
-            fused_scales_ndbuf,
+            TileTensor(fused_scales_ndbuf),
             rank_sigs,
             list_of_ctx[i],
         )
@@ -347,7 +353,7 @@ fn test_fused_allreduce_rmsnorm_fp8[
 # --- Test: fully fused allreduce + residual add + RMSNorm + FP8 ---
 
 
-fn test_fused_allreduce_residual_rmsnorm_fp8[
+def test_fused_allreduce_residual_rmsnorm_fp8[
     ngpus: Int,
     in_dtype: DType,
     out_dtype: DType,
@@ -398,11 +404,11 @@ fn test_fused_allreduce_residual_rmsnorm_fp8[
         list_of_ctx[i].enqueue_memset[DType.uint8](signal_buffers[i], 0)
         rank_sigs[i] = signal_buffers[i].unsafe_ptr().bitcast[Signal]()
 
-    var in_bufs = InlineArray[NDBuffer[in_dtype, 2, ImmutAnyOrigin], ngpus](
-        fill={}
-    )
+    var in_bufs = InlineArray[
+        NDBuffer[rank=2, in_dtype, ImmutAnyOrigin], ngpus
+    ](fill={})
     for i in range(ngpus):
-        in_bufs[i] = NDBuffer[in_dtype, 2](
+        in_bufs[i] = NDBuffer[rank=2, in_dtype](
             in_dev[i].unsafe_ptr(), IndexList[2](rows, cols)
         )
     for i in range(ngpus):
@@ -455,18 +461,18 @@ fn test_fused_allreduce_residual_rmsnorm_fp8[
     @__copy_capture(ref_sum_ptr)
     @always_inline
     @parameter
-    fn ref_input_fn[
+    def ref_input_fn[
         width: Int, _rank: Int
     ](idx: IndexList[_rank]) -> SIMD[in_dtype, width]:
         var linear_idx = idx[0] * cols + idx[1]
         return ref_sum_ptr.load[width=width, alignment=width](linear_idx)
 
     comptime shape = IndexList[2](rows, cols)
-    var ref_fp8_ndbuf = NDBuffer[out_dtype, 2, MutAnyOrigin](
+    var ref_fp8_ndbuf = NDBuffer[rank=2, out_dtype, MutAnyOrigin](
         ref_fp8_dev.unsafe_ptr(), Index(rows, cols)
     )
     var ref_scale_shape = IndexList[2](rows, 1)
-    var ref_scales_ndbuf = NDBuffer[DType.float32, 2, MutAnyOrigin](
+    var ref_scales_ndbuf = NDBuffer[rank=2, DType.float32, MutAnyOrigin](
         ref_scales_dev.unsafe_ptr(), ref_scale_shape
     )
 
@@ -478,13 +484,13 @@ fn test_fused_allreduce_residual_rmsnorm_fp8[
         ref_input_fn,
     ](
         shape,
-        ref_fp8_ndbuf,
+        TileTensor(ref_fp8_ndbuf),
         gamma_tensor,
         epsilon,
         weight_offset,
         DeviceContextPtr(ctx),
         scale_ub,
-        ref_scales_ndbuf,
+        TileTensor(ref_scales_ndbuf),
     )
 
     ctx.synchronize()
@@ -500,32 +506,38 @@ fn test_fused_allreduce_residual_rmsnorm_fp8[
     var fused_scales_dev = ctx.enqueue_create_buffer[DType.float32](rows)
     var fused_residual_output_dev = ctx.enqueue_create_buffer[in_dtype](length)
 
-    var fused_fp8_ndbuf = NDBuffer[out_dtype, 2, MutAnyOrigin](
+    var fused_fp8_ndbuf = NDBuffer[rank=2, out_dtype, MutAnyOrigin](
         fused_fp8_dev.unsafe_ptr(), IndexList[2](rows, cols)
     )
-    var fused_scales_ndbuf = NDBuffer[DType.float32, 2, MutAnyOrigin](
+    var fused_scales_ndbuf = NDBuffer[rank=2, DType.float32, MutAnyOrigin](
         fused_scales_dev.unsafe_ptr(), IndexList[2](rows, 1)
     )
-    var residual_ndbuf = NDBuffer[in_dtype, 2, MutAnyOrigin](
+    var residual_ndbuf = NDBuffer[rank=2, in_dtype, MutAnyOrigin](
         residual_dev.unsafe_ptr(), IndexList[2](rows, cols)
     )
-    var fused_residual_output_ndbuf = NDBuffer[in_dtype, 2, MutAnyOrigin](
+    var fused_residual_output_ndbuf = NDBuffer[rank=2, in_dtype, MutAnyOrigin](
         fused_residual_output_dev.unsafe_ptr(), IndexList[2](rows, cols)
     )
 
     group_start()
 
+    # Build TileTensor input array for the TileTensor-primary overload.
+    comptime InputTileType = type_of(TileTensor(in_bufs[0]).as_immut())
+    var tt_in_bufs = InlineArray[InputTileType, ngpus](uninitialized=True)
+    comptime for i in range(ngpus):
+        tt_in_bufs[i] = TileTensor(in_bufs[i]).as_immut()
+
     comptime for i in range(ngpus):
         allreduce_residual_rmsnorm_fp8(
-            in_bufs,
-            residual_ndbuf,
-            fused_fp8_ndbuf,
-            fused_residual_output_ndbuf,
+            tt_in_bufs,
+            TileTensor(residual_ndbuf).as_immut(),
+            TileTensor(fused_fp8_ndbuf),
+            TileTensor(fused_residual_output_ndbuf),
             gamma_tensor,
             epsilon,
             weight_offset,
             scale_ub,
-            fused_scales_ndbuf,
+            TileTensor(fused_scales_ndbuf),
             rank_sigs,
             list_of_ctx[i],
         )

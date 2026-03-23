@@ -40,9 +40,7 @@ Key structured patterns:
 
 from std.collections import Optional
 from std.math import ceildiv
-from std.memory import LegacyUnsafePointer, Pointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from std.memory import Pointer
 from std.sys import size_of
 
 from std.gpu import WARP_SIZE, thread_idx
@@ -104,9 +102,10 @@ from ..structured_kernels.tile_pipeline import (
     ConsumerTiles,
     BlockScaledTilePayload,
 )
-from layout.tile_layout import RowMajorLayout, _IntToComptimeInt
+from layout import RowMajorLayout
+from layout.tile_layout import _IntToComptimeInt
 from structured_kernels.tile_types import (
-    TMATile,
+    TmaOpType,
     internal_k_major_128B,
     tma_desc_layout_3d,
     tma_desc_layout_5d,
@@ -149,7 +148,6 @@ struct BlackwellBlockScaledMatmulKernel[
     elementwise_compute_lambda_fn: Optional[
         elementwise_compute_lambda_type
     ] = None,
-    register_based_epilogue: Bool = True,
     pdl_level: PDLLevel = PDLLevel(),
     max_profiled_tiles_per_SM: UInt32 = 0,
 ]:
@@ -267,12 +265,8 @@ struct BlackwellBlockScaledMatmulKernel[
 
     # ========== TMA Load Size Constants ==========
     # Expected bytes for TMA loads (used in expect_bytes)
-    comptime a_expected_bytes = Self.a_smem_layout.size() * size_of[
-        Self.a_type
-    ]()
-    comptime b_expected_bytes = Self.b_smem_layout.size() * size_of[
-        Self.b_type
-    ]()
+    comptime a_expected_bytes = Self.BM * Self.BK * size_of[Self.a_type]()
+    comptime b_expected_bytes = Self.BN * Self.BK * size_of[Self.b_type]()
     comptime sfa_expected_bytes = Self.sfa_smem_layout.size() * size_of[
         Self.sfa_dtype
     ]()
@@ -372,20 +366,15 @@ struct BlackwellBlockScaledMatmulKernel[
     ]
 
     # TMA operation types
-    comptime ATmaTile = TMATile[Self.a_type, Self.ATileLayout, Self.ADescLayout]
-    comptime ATmaOp = Self.ATmaTile.InnerType
-    comptime BTmaTile = TMATile[Self.b_type, Self.BTileLayout, Self.BDescLayout]
-    comptime BTmaOp = Self.BTmaTile.InnerType
-    comptime CTmaTile = TMATile[Self.c_type, Self.CTileLayout, Self.CDescLayout]
-    comptime CTmaOp = Self.CTmaTile.InnerType
-    comptime SFATmaTile = TMATile[
+    comptime ATmaOp = TmaOpType[Self.a_type, Self.ATileLayout, Self.ADescLayout]
+    comptime BTmaOp = TmaOpType[Self.b_type, Self.BTileLayout, Self.BDescLayout]
+    comptime CTmaOp = TmaOpType[Self.c_type, Self.CTileLayout, Self.CDescLayout]
+    comptime SFATmaOp = TmaOpType[
         Self.sfa_dtype, Self.SFATileLayout, Self.SFADescLayout
     ]
-    comptime SFATmaOp = Self.SFATmaTile.InnerType
-    comptime SFBTmaTile = TMATile[
+    comptime SFBTmaOp = TmaOpType[
         Self.sfb_dtype, Self.SFBTileLayout, Self.SFBDescLayout
     ]
-    comptime SFBTmaOp = Self.SFBTmaTile.InnerType
 
     # TMA load size constants (from desc layout dimensions)
     comptime a_tma_load_size = Self.a_tile_dim0 * Self.a_swizzle_elems
@@ -529,7 +518,7 @@ struct BlackwellBlockScaledMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn load_input_tiles[
+    def load_input_tiles[
         tiles_origin: MutOrigin,
         //,
     ](
@@ -543,8 +532,8 @@ struct BlackwellBlockScaledMatmulKernel[
             Self.SmemType.Core.num_group_pipeline_stages,
             Self.config.k_group_size,
         ],
-        peer_cta_coord: Tuple[UInt, UInt, UInt],
-        work_tile_coord: Tuple[UInt, UInt, UInt],
+        peer_cta_coord: Tuple[Int, Int, Int],
+        work_tile_coord: Tuple[Int, Int, Int],
         a_multicast_mask: UInt16,
         b_multicast_mask: UInt16,
         iter_idx: UInt32,
@@ -568,20 +557,20 @@ struct BlackwellBlockScaledMatmulKernel[
             iter_idx: K iteration index (base index for k_group).
             elect_one_cta: True if this CTA should call expect_bytes.
         """
-        var peer_rank_n = Int(peer_cta_coord[0])
-        var peer_rank_m = Int(peer_cta_coord[1])
-        var peer_m_rank = Int(peer_cta_coord[2])
+        var peer_rank_n = peer_cta_coord[0]
+        var peer_rank_m = peer_cta_coord[1]
+        var peer_m_rank = peer_cta_coord[2]
 
         # Global memory coordinates
         var a_gmem_m_coord = (
-            peer_m_rank * Self.a_tma_rows + Int(work_tile_coord[0]) * Self.BM
+            peer_m_rank * Self.a_tma_rows + work_tile_coord[0] * Self.BM
         )
         var b_gmem_n_coord = (
             peer_rank_m * Self.b_tma_rows
             + peer_rank_n * Self.BN
-            + Int(work_tile_coord[1]) * Self.MMA_N
+            + work_tile_coord[1] * Self.MMA_N
         )
-        var batch_coord = Int(work_tile_coord[2])
+        var batch_coord = work_tile_coord[2]
 
         if elect_one_sync():
             # Set expected bytes ONCE for all k_group tiles
@@ -638,7 +627,7 @@ struct BlackwellBlockScaledMatmulKernel[
                         Int(
                             (iter_idx + j) * UInt32(Self.config.num_sf_k_tiles)
                         ),
-                        Int(work_tile_coord[0]) * (Self.BM // SF_MN_GROUP_SIZE),
+                        work_tile_coord[0] * (Self.BM // SF_MN_GROUP_SIZE),
                         batch_coord,
                     ),
                 )
@@ -651,8 +640,7 @@ struct BlackwellBlockScaledMatmulKernel[
                         Int(
                             (iter_idx + j) * UInt32(Self.config.num_sf_k_tiles)
                         ),
-                        Int(work_tile_coord[1])
-                        * (Self.MMA_N // SF_MN_GROUP_SIZE),
+                        work_tile_coord[1] * (Self.MMA_N // SF_MN_GROUP_SIZE),
                         batch_coord,
                     ),
                 )
@@ -661,7 +649,7 @@ struct BlackwellBlockScaledMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn mma[
+    def mma[
         tiles_origin: MutOrigin,
         //,
     ](
@@ -736,7 +724,7 @@ struct BlackwellBlockScaledMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn epilogue(
+    def epilogue(
         c_tiles: Self.SmemType.Core.CTileArray,
         c_tma_op: Self.CTmaOp,
         stage: Self.TileWriterType.Stage,
@@ -778,7 +766,7 @@ struct BlackwellBlockScaledMatmulKernel[
     # ========== Compile-Time Validation ==========
 
     @staticmethod
-    fn validate_config():
+    def validate_config():
         """Validate configuration constraints at compile time."""
         comptime assert Self.transpose_b, "Only support transposed B"
         comptime assert (
@@ -796,7 +784,7 @@ struct BlackwellBlockScaledMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn init_barriers(
+    def init_barriers(
         ctx: Self.Context,
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
@@ -861,7 +849,7 @@ struct BlackwellBlockScaledMatmulKernel[
     @__llvm_arg_metadata(c_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(sfa_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(sfb_tma_op, `nvvm.grid_constant`)
-    fn run(
+    def run(
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
         c_tma_op: Self.CTmaOp,
@@ -976,9 +964,9 @@ struct BlackwellBlockScaledMatmulKernel[
                                         tiles,
                                         ctx.peer_cta_coord,
                                         (
-                                            UInt(current.m),
-                                            UInt(current.n),
-                                            UInt(current.k_start),
+                                            Int(current.m),
+                                            Int(current.n),
+                                            Int(current.k_start),
                                         ),
                                         ctx.a_multicast_mask,
                                         ctx.b_multicast_mask,

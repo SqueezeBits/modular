@@ -26,18 +26,14 @@ The test:
 6. Compares results with tolerances accounting for FP8 quantization
 """
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.collections import Optional
 from std.math import ceildiv, isclose
 from std.random import randn
 from std.sys import argv, has_nvidia_gpu_accelerator
 
-from buffer import Dim, DimList, NDBuffer
 from std.gpu import *
 from std.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
+from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE, lt_to_tt
 from nn.mha import _naive_attention_with_transpose, mha_gpu_naive
 from nn.mha_mask import CausalMask, MaterializedMask, NullMask
 from nn.mha_operand import LayoutTensorMHAOperand
@@ -49,7 +45,7 @@ from nn.mha_utils import MHAConfig
 from tensor import IOUnknown, ManagedTensorSlice
 from tensor.managed_tensor_slice import StaticTensorSpec
 from std.testing import assert_almost_equal
-from std.gpu.host.info import B200
+from std.gpu.host.info import B200, _is_sm10x_gpu
 from std.utils.index import Index
 from std.utils.numerics import get_accum_type
 
@@ -70,20 +66,20 @@ struct MLAMaskType(TrivialRegisterPassable):
     comptime MASK_3D = Self(2)
     comptime MASK_4D = Self(3)
 
-    fn __eq__(self, rhs: Self) -> Bool:
+    def __eq__(self, rhs: Self) -> Bool:
         return self.value == rhs.value
 
-    fn __ne__(self, rhs: Self) -> Bool:
+    def __ne__(self, rhs: Self) -> Bool:
         return self.value != rhs.value
 
 
 @always_inline
-fn host_cast_fp8_to_bf16[
+def host_cast_fp8_to_bf16[
     fp8_t: DType,
     bf16_t: DType,
 ](
-    src: UnsafePointer[Scalar[fp8_t]],
-    dst: UnsafePointer[Scalar[bf16_t]],
+    src: UnsafePointer[Scalar[fp8_t], _],
+    dst: UnsafePointer[mut=True, Scalar[bf16_t], _],
     size: Int,
 ):
     """Cast FP8 data to BF16 element-by-element on the host."""
@@ -92,12 +88,12 @@ fn host_cast_fp8_to_bf16[
 
 
 @always_inline
-fn host_quantize_bf16_to_fp8[
+def host_quantize_bf16_to_fp8[
     bf16_t: DType,
     fp8_t: DType,
 ](
-    src: UnsafePointer[Scalar[bf16_t]],
-    dst: UnsafePointer[Scalar[fp8_t]],
+    src: UnsafePointer[Scalar[bf16_t], _],
+    dst: UnsafePointer[mut=True, Scalar[fp8_t], _],
     size: Int,
 ):
     """Quantize BF16 data to FP8 element-by-element on the host."""
@@ -105,14 +101,14 @@ fn host_quantize_bf16_to_fp8[
         dst[i] = src[i].cast[fp8_t]()
 
 
-fn is_benchmark() -> Bool:
+def is_benchmark() -> Bool:
     for arg in argv():
         if arg == "--benchmark" or arg == "-benchmark":
             return True
     return False
 
 
-fn test[
+def test[
     mla_mask_type: MLAMaskType,
     q_type: DType,  # float8_e4m3fn
     kv_type: DType,  # float8_e4m3fn
@@ -172,14 +168,14 @@ fn test[
     )
 
     # Allocate memory: BF16 reference Q and K, then quantize to FP8.
-    var q_bf16_ptr = UnsafePointer[Scalar[output_type]].alloc(q_size)
-    var q_fp8_ptr = UnsafePointer[Scalar[q_type]].alloc(q_size)
-    var q_bf16_dequant_ptr = UnsafePointer[Scalar[output_type]].alloc(q_size)
-    var k_fp8_ptr = UnsafePointer[Scalar[kv_type]].alloc(k_size)
-    var k_bf16_ptr = UnsafePointer[Scalar[output_type]].alloc(k_size)
-    var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(mask_size)
-    var output_ptr = UnsafePointer[Scalar[output_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[output_type]].alloc(o_size)
+    var q_bf16_ptr = alloc[Scalar[output_type]](q_size)
+    var q_fp8_ptr = alloc[Scalar[q_type]](q_size)
+    var q_bf16_dequant_ptr = alloc[Scalar[output_type]](q_size)
+    var k_fp8_ptr = alloc[Scalar[kv_type]](k_size)
+    var k_bf16_ptr = alloc[Scalar[output_type]](k_size)
+    var mask_ptr = alloc[Scalar[mask_type]](mask_size)
+    var output_ptr = alloc[Scalar[output_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[output_type]](o_size)
 
     # Q: create as BF16, quantize to FP8, dequant back for reference
     randn[output_type](q_bf16_ptr, q_size)
@@ -303,7 +299,7 @@ fn test[
     var null_valid_length = LayoutTensor[
         DType.uint32, Layout.row_major(UNKNOWN_VALUE)
     ](
-        UnsafePointer[UInt32](),
+        UnsafePointer[UInt32, MutAnyOrigin](),
         RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(Index(0)),
     )
 
@@ -343,29 +339,26 @@ fn test[
         mask3d,
         mask4d,
     )
-    fn kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(ctx: DeviceContext) raises:
         comptime config = MHAConfig[q_type](UInt(num_heads), UInt(depth))
         comptime if mla_mask_type == MLAMaskType.CAUSAL:
             mla_decode_sm100_dispatch[
                 q_type,
-                q_fp8_layout,
                 type_of(k_operand),
                 output_type,
-                output_layout,
                 CausalMask,
-                null_valid_length.layout,
-                config=config,
-                depth=depth,
-                num_heads=num_heads,
-                group=group,
+                config,
+                depth,
+                num_heads,
+                group,
                 _is_cache_length_accurate=True,
                 decoding_warp_split_k=False,
             ](
-                q_fp8_device,
+                lt_to_tt(q_fp8_device),
                 k_operand,
-                output_device,
+                lt_to_tt(output_device),
                 scale,
-                null_valid_length,
+                lt_to_tt(null_valid_length),
                 CausalMask(),
                 scalar_args_buf_lt,
                 batch_size,
@@ -376,24 +369,21 @@ fn test[
         elif mla_mask_type == MLAMaskType.NO_MASK:
             mla_decode_sm100_dispatch[
                 q_type,
-                q_fp8_layout,
                 type_of(k_operand),
                 output_type,
-                output_layout,
                 NullMask,
-                null_valid_length.layout,
-                config=config,
-                depth=depth,
-                num_heads=num_heads,
-                group=group,
+                config,
+                depth,
+                num_heads,
+                group,
                 _is_cache_length_accurate=True,
                 decoding_warp_split_k=False,
             ](
-                q_fp8_device,
+                lt_to_tt(q_fp8_device),
                 k_operand,
-                output_device,
+                lt_to_tt(output_device),
                 scale,
-                null_valid_length,
+                lt_to_tt(null_valid_length),
                 NullMask(),
                 scalar_args_buf_lt,
                 batch_size,
@@ -404,24 +394,21 @@ fn test[
         elif mla_mask_type == MLAMaskType.MASK_3D:
             mla_decode_sm100_dispatch[
                 q_type,
-                q_fp8_layout,
                 type_of(k_operand),
                 output_type,
-                output_layout,
-                MaterializedMask[mask3d.dtype, mask3d.layout],
-                null_valid_length.layout,
-                config=config,
-                depth=depth,
-                num_heads=num_heads,
-                group=group,
+                MaterializedMask[mask3d.dtype, mask3d.layout, mask3d.origin],
+                config,
+                depth,
+                num_heads,
+                group,
                 _is_cache_length_accurate=True,
                 decoding_warp_split_k=False,
             ](
-                q_fp8_device,
+                lt_to_tt(q_fp8_device),
                 k_operand,
-                output_device,
+                lt_to_tt(output_device),
                 scale,
-                null_valid_length,
+                lt_to_tt(null_valid_length),
                 MaterializedMask(mask3d),
                 scalar_args_buf_lt,
                 batch_size,
@@ -432,24 +419,21 @@ fn test[
         elif mla_mask_type == MLAMaskType.MASK_4D:
             mla_decode_sm100_dispatch[
                 q_type,
-                q_fp8_layout,
                 type_of(k_operand),
                 output_type,
-                output_layout,
-                MaterializedMask[mask4d.dtype, mask4d.layout],
-                null_valid_length.layout,
-                config=config,
-                depth=depth,
-                num_heads=num_heads,
-                group=group,
+                MaterializedMask[mask4d.dtype, mask4d.layout, mask4d.origin],
+                config,
+                depth,
+                num_heads,
+                group,
                 _is_cache_length_accurate=True,
                 decoding_warp_split_k=False,
             ](
-                q_fp8_device,
+                lt_to_tt(q_fp8_device),
                 k_operand,
-                output_device,
+                lt_to_tt(output_device),
                 scale,
-                null_valid_length,
+                lt_to_tt(null_valid_length),
                 MaterializedMask(mask4d),
                 scalar_args_buf_lt,
                 batch_size,
@@ -566,9 +550,7 @@ fn test[
     print("  Reference completed.")
 
     # Copy reference output to host
-    var ref_full_output_ptr = UnsafePointer[Scalar[output_type]].alloc(
-        ref_full_o_size
-    )
+    var ref_full_output_ptr = alloc[Scalar[output_type]](ref_full_o_size)
     ctx.enqueue_copy(ref_full_output_ptr, output_ref_full_device_ptr)
     ctx.synchronize()
 
@@ -634,7 +616,7 @@ fn test[
     ref_full_output_ptr.free()
 
 
-fn bench[
+def bench[
     q_type: DType,
     kv_type: DType,
     output_type: DType,
@@ -654,9 +636,9 @@ fn bench[
     var o_size = batch_size * num_heads * seq_len * v_depth
 
     # Allocate and fill FP8 Q and K
-    var q_bf16_ptr = UnsafePointer[Scalar[output_type]].alloc(q_size)
-    var q_fp8_ptr = UnsafePointer[Scalar[q_type]].alloc(q_size)
-    var k_fp8_ptr = UnsafePointer[Scalar[kv_type]].alloc(k_size)
+    var q_bf16_ptr = alloc[Scalar[output_type]](q_size)
+    var q_fp8_ptr = alloc[Scalar[q_type]](q_size)
+    var k_fp8_ptr = alloc[Scalar[kv_type]](k_size)
 
     randn[output_type](q_bf16_ptr, q_size)
     host_quantize_bf16_to_fp8[bf16_t=output_type, fp8_t=q_type](
@@ -709,7 +691,7 @@ fn bench[
     var null_valid_length = LayoutTensor[
         DType.uint32, Layout.row_major(UNKNOWN_VALUE)
     ](
-        UnsafePointer[UInt32](),
+        UnsafePointer[UInt32, MutAnyOrigin](),
         RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(Index(0)),
     )
 
@@ -743,16 +725,13 @@ fn bench[
         null_valid_length,
         scalar_args_buf_lt,
     )
-    fn kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(ctx: DeviceContext) raises:
         comptime config = MHAConfig[q_type](UInt(num_heads), UInt(depth))
         mla_decode_sm100_dispatch[
             q_type,
-            q_fp8_layout,
             type_of(k_operand),
             output_type,
-            output_layout,
             NullMask,
-            null_valid_length.layout,
             config=config,
             depth=depth,
             num_heads=num_heads,
@@ -760,11 +739,11 @@ fn bench[
             _is_cache_length_accurate=True,
             decoding_warp_split_k=False,
         ](
-            q_fp8_device,
+            lt_to_tt(q_fp8_device),
             k_operand,
-            output_device,
+            lt_to_tt(output_device),
             scale,
-            null_valid_length,
+            lt_to_tt(null_valid_length),
             NullMask(),
             scalar_args_buf_lt,
             batch_size,
@@ -808,7 +787,7 @@ fn bench[
     _ = output_device_ptr
 
 
-fn test_decoding[
+def test_decoding[
     batch_size: Int,
     mla_mask_type: MLAMaskType,
 ](ctx: DeviceContext, seq_len: Int, num_keys: Int) raises:
@@ -849,10 +828,12 @@ fn test_decoding[
     ](seq_len, num_keys, ctx)
 
 
-def main():
+def main() raises:
     print("Starting test_mla_decode_qkv_fp8...")
     with DeviceContext() as ctx:
-        comptime if has_nvidia_gpu_accelerator() and ctx.default_device_info == B200:
+        comptime if has_nvidia_gpu_accelerator() and _is_sm10x_gpu(
+            ctx.default_device_info
+        ):
             # Basic functionality tests
             print("=== Basic tests ===")
             test_decoding[1, MLAMaskType.NO_MASK](ctx, 1, 256)

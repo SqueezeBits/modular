@@ -11,15 +11,11 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.collections import Optional
 from std.math import ceildiv, isclose
 from std.random import randn
 from std.sys import argv, has_nvidia_gpu_accelerator
 
-from buffer import Dim, DimList, NDBuffer
 from std.gpu import *
 from std.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
@@ -31,7 +27,7 @@ from nn.mla_decode_sm100_dispatch import MLADispatchScalarArgs
 from tensor import IOUnknown, ManagedTensorSlice
 from tensor.managed_tensor_slice import StaticTensorSpec
 from std.testing import assert_almost_equal
-from std.gpu.host.info import B200
+from std.gpu.host.info import B200, _is_sm10x_gpu
 from std.utils.index import Index
 from std.utils.numerics import get_accum_type
 
@@ -52,20 +48,20 @@ struct MLAMaskType(TrivialRegisterPassable):
     comptime MASK_3D = Self(2)
     comptime MASK_4D = Self(3)
 
-    fn __eq__(self, rhs: Self) -> Bool:
+    def __eq__(self, rhs: Self) -> Bool:
         return self.value == rhs.value
 
-    fn __ne__(self, rhs: Self) -> Bool:
+    def __ne__(self, rhs: Self) -> Bool:
         return self.value != rhs.value
 
 
 @always_inline
-fn host_cast_k_fp8_to_bf16[
+def host_cast_k_fp8_to_bf16[
     kv_fp8_t: DType,
     k_bf16_t: DType,
 ](
-    k_fp8: UnsafePointer[Scalar[kv_fp8_t]],
-    k_bf16: UnsafePointer[Scalar[k_bf16_t]],
+    k_fp8: UnsafePointer[Scalar[kv_fp8_t], _],
+    k_bf16: UnsafePointer[mut=True, Scalar[k_bf16_t], _],
     depth: Int,
     num_keys: Int,
     kv_num_heads: Int,
@@ -82,14 +78,14 @@ fn host_cast_k_fp8_to_bf16[
                     k_bf16[base + j] = k_fp8[base + j].cast[k_bf16_t]()
 
 
-fn is_benchmark() -> Bool:
+def is_benchmark() -> Bool:
     for arg in argv():
         if arg == "--benchmark" or arg == "-benchmark":
             return True
     return False
 
 
-fn test[
+def test[
     mla_mask_type: MLAMaskType,
     q_type: DType,
     kv_type: DType,
@@ -154,12 +150,12 @@ fn test[
     )
 
     # Allocate memory for all variables.
-    var q_ptr = UnsafePointer[Scalar[q_type]].alloc(q_size)
-    var k_ptr = UnsafePointer[Scalar[kv_type]].alloc(k_size)  # fp8 host
-    var k_bf16_ptr = UnsafePointer[Scalar[q_type]].alloc(k_size)
-    var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(mask_size)
-    var output_ptr = UnsafePointer[Scalar[q_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[q_type]].alloc(o_size)
+    var q_ptr = alloc[Scalar[q_type]](q_size)
+    var k_ptr = alloc[Scalar[kv_type]](k_size)  # fp8 host
+    var k_bf16_ptr = alloc[Scalar[q_type]](k_size)
+    var mask_ptr = alloc[Scalar[mask_type]](mask_size)
+    var output_ptr = alloc[Scalar[q_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[q_type]](o_size)
 
     # Q, K, V are randomly initialized.
     randn[q_type](q_ptr, q_size)
@@ -290,7 +286,7 @@ fn test[
         output_device,
         scalar_args_buf_lt,
     )
-    fn kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(ctx: DeviceContext) raises:
         comptime if mla_mask_type == MLAMaskType.CAUSAL:
             flare_mla_decoding[decoding_warp_split_k=decoding_warp_split_k](
                 output_device.as_any_origin(),
@@ -383,7 +379,7 @@ fn test[
             var null_valid_length = LayoutTensor[
                 DType.uint32, Layout.row_major(UNKNOWN_VALUE)
             ](
-                UnsafePointer[UInt32](),
+                UnsafePointer[UInt32, MutAnyOrigin](),
                 RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(
                     Index(0)
                 ),
@@ -499,7 +495,7 @@ fn test[
     flash_output_ptr.free()
 
 
-fn test_decoding[
+def test_decoding[
     batch_size: Int,
     mla_mask_type: MLAMaskType,
     split_k: Bool = False,
@@ -553,7 +549,9 @@ fn test_decoding[
 
 def main() raises:
     with DeviceContext() as ctx:
-        comptime if has_nvidia_gpu_accelerator() and ctx.default_device_info == B200:
+        comptime if has_nvidia_gpu_accelerator() and _is_sm10x_gpu(
+            ctx.default_device_info
+        ):
             # tests with mask tensor
             # Test with benchmark parameters: batch_size=1, cache_len=32768, num_heads=128
             test_decoding[1, MLAMaskType.NO_MASK](ctx, False, 1, 32768)

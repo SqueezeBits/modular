@@ -17,20 +17,20 @@ from std.ffi import _get_global
 from std.sys.compile import SanitizeAddress
 
 
-fn _init_global_runtime() -> OpaquePointer[MutExternalOrigin]:
+def _init_global_runtime() -> OpaquePointer[MutExternalOrigin]:
     return external_call[
         "KGEN_CompilerRT_AsyncRT_CreateRuntime",
         OpaquePointer[MutExternalOrigin],
     ](0)
 
 
-fn _destroy_global_runtime(ptr: OpaquePointer[MutExternalOrigin]):
+def _destroy_global_runtime(ptr: OpaquePointer[MutExternalOrigin]):
     """Destroy the global runtime if ever used."""
-    external_call["KGEN_CompilerRT_AsyncRT_DestroyRuntime", NoneType](ptr)
+    external_call["KGEN_CompilerRT_AsyncRT_ReleaseRuntime", NoneType](ptr)
 
 
 @always_inline
-fn _ensure_current_or_global_runtime_init():
+def _ensure_current_or_global_runtime_init():
     var current_runtime = external_call[
         "KGEN_CompilerRT_AsyncRT_GetCurrentRuntime", OpaquePointer[MutAnyOrigin]
     ]()
@@ -39,8 +39,8 @@ fn _ensure_current_or_global_runtime_init():
     _ = _get_global["Runtime", _init_global_runtime, _destroy_global_runtime]()
 
 
-fn __wrap_and_execute_main[
-    main_func: fn() -> None
+def __wrap_and_execute_main[
+    main_func: def() -> None
 ](
     argc: Int32,
     argv: __mlir_type[`!kgen.pointer<!kgen.pointer<scalar<ui8>>>`],
@@ -73,8 +73,8 @@ fn __wrap_and_execute_main[
     return 0
 
 
-fn __wrap_and_execute_raising_main[
-    main_func: fn() raises -> None
+def __wrap_and_execute_raising_main[
+    main_func: def() raises -> None
 ](
     argc: Int32,
     argv: __mlir_type[`!kgen.pointer<!kgen.pointer<scalar<ui8>>>`],
@@ -116,7 +116,7 @@ fn __wrap_and_execute_raising_main[
 
 # A prototype of the main entry point, used by the compiled when synthesizing
 # main.
-fn __mojo_main_prototype(
+def __mojo_main_prototype(
     argc: Int32, argv: __mlir_type[`!kgen.pointer<!kgen.pointer<scalar<ui8>>>`]
 ) -> Int32:
     return 0

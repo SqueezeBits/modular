@@ -33,6 +33,7 @@ Key Components:
 """
 
 from std.math import ceildiv, log2
+from std.math.uutils import udivmod
 from std.sys import align_of, llvm_intrinsic, simd_width_of, size_of
 from std.sys._assembly import inlined_assembly
 
@@ -69,7 +70,6 @@ from std.gpu.sync import (
 )
 from layout import IntTuple, Layout, LayoutTensor, TileTensor
 from layout.coord import ComptimeInt, Coord, Idx
-from layout.int_tuple import product, to_index_list as int_tuple_to_index_list
 from layout.runtime_tuple import (
     coalesce_nested_tuple,
     flatten,
@@ -84,7 +84,7 @@ from std.os import abort
 from layout.layout_tensor import LayoutTensorIter
 
 
-fn _default_desc_shape[
+def _default_desc_shape[
     rank: Int,
     dtype: DType,
     tile_shape: IndexList[rank],
@@ -107,7 +107,7 @@ fn _default_desc_shape[
 
 
 @parameter
-fn _idx_product[rank: Int, shape: IndexList[rank]]() -> Int:
+def _idx_product[rank: Int, shape: IndexList[rank]]() -> Int:
     """Compute the total number of elements from an IndexList shape."""
     var result = 1
     comptime for i in range(rank):
@@ -116,29 +116,52 @@ fn _idx_product[rank: Int, shape: IndexList[rank]]() -> Int:
 
 
 @parameter
-fn _idx_str[rank: Int, shape: IndexList[rank]]() -> String:
+def _idx_str[rank: Int, shape: IndexList[rank]]() -> String:
     """Build a debug string from an IndexList shape."""
     return String(shape)
 
 
-# Returns an IntTuple of variadic Int values.
-#
-fn _to_int_tuple[*vals: Int]() -> IntTuple:
-    res = IntTuple()
+@parameter
+def _desc_offset[
+    rank: Int, dims: IndexList[rank], is_k_major: Bool
+](coords: IndexList[rank]) -> Int:
+    """Compute linear offset for descriptor layout.
 
-    comptime num_vals = std.builtin.Variadic.size(vals)
+    col_major (is_k_major=True): first dim varies fastest,
+        strides (1, d0, d0*d1, ...).
+    row_major (is_k_major=False): last dim varies fastest,
+        strides (..., d2*d3, d3, 1).
+    """
+    var offset = 0
 
-    comptime for i in range(num_vals):
-        res.append(vals[i])
-    return res
+    comptime if is_k_major:
+        comptime for i in range(rank):
+            var stride = 1
+
+            comptime for j in range(i):
+                stride *= dims[j]
+            offset += coords[i] * stride
+    else:
+        comptime for i in range(rank):
+            var stride = 1
+
+            comptime for j in range(i + 1, rank):
+                stride *= dims[j]
+            offset += coords[i] * stride
+    return offset
 
 
-fn _tma_desc_tile_layout[
+def _tma_desc_tile_shape[
     dtype: DType,
     rank: Int,
     tile_shape: IndexList[rank],
     swizzle_mode: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_NONE,
-]() -> Layout:
+]() -> IndexList[rank]:
+    """Compute the TMA descriptor tile shape.
+
+    Returns an IndexList with the tile shape, where the last dimension is
+    replaced by the swizzle granularity (swizzle_mode.bytes() // size_of[dtype]()).
+    """
     comptime assert (
         size_of[dtype]() >= 1
     ), "Don't support sub-byte dtype in TMA yet."
@@ -147,45 +170,10 @@ fn _tma_desc_tile_layout[
         rank == 2 or rank == 3 or rank == 4 or rank == 5
     ), "Only support 2D/3D/4D/5D TMA descriptor for now."
 
-    comptime if rank == 2:
-        comptime dim0 = tile_shape[0]
-        comptime dim1 = tile_shape[1]
-
-        # TMA copies BM x `swizzle_mode.bytes()` Bytes each time.
-        return Layout.row_major(dim0, swizzle_mode.bytes() // size_of[dtype]())
-
-    elif rank == 3:
-        comptime dim0 = tile_shape[0]
-        comptime dim1 = tile_shape[1]
-        comptime dim2 = tile_shape[2]
-
-        return Layout(
-            [dim0, dim1, swizzle_mode.bytes() // size_of[dtype]()],
-            [1, 1, 1],
-        )
-
-    elif rank == 4:
-        comptime dim0 = tile_shape[0]
-        comptime dim1 = tile_shape[1]
-        comptime dim2 = tile_shape[2]
-        comptime dim3 = tile_shape[3]
-
-        return Layout(
-            [dim0, dim1, dim2, swizzle_mode.bytes() // size_of[dtype]()],
-            [1, 1, 1, 1],
-        )
-
-    else:  # rank == 5
-        comptime dim0 = tile_shape[0]
-        comptime dim1 = tile_shape[1]
-        comptime dim2 = tile_shape[2]
-        comptime dim3 = tile_shape[3]
-        comptime dim4 = tile_shape[4]
-
-        return Layout(
-            [dim0, dim1, dim2, dim3, swizzle_mode.bytes() // size_of[dtype]()],
-            [1, 1, 1, 1, 1],
-        )
+    comptime swizzle_bytes = swizzle_mode.bytes() // size_of[dtype]()
+    var result = tile_shape
+    result[rank - 1] = swizzle_bytes
+    return result
 
 
 struct SharedMemBarrier(TrivialRegisterPassable):
@@ -216,7 +204,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
     """
 
     @always_inline("nodebug")
-    fn init[
+    def init[
         o: MutOrigin
     ](ref[o, AddressSpace.SHARED] self, num_threads: Int32 = 1):
         """Initialize the barrier state with the expected number of threads.
@@ -235,7 +223,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         mbarrier_init(self.unsafe_ptr(), num_threads)
 
     @always_inline("nodebug")
-    fn expect_bytes[
+    def expect_bytes[
         o: MutOrigin
     ](ref[o, AddressSpace.SHARED] self, bytes: Int32):
         """Configure the barrier to expect a specific number of bytes to be transferred.
@@ -253,7 +241,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         mbarrier_arrive_expect_tx_shared(self.unsafe_ptr(), bytes)
 
     @always_inline
-    fn expect_bytes_relaxed[
+    def expect_bytes_relaxed[
         o: MutOrigin
     ](ref[o, AddressSpace.SHARED] self, bytes: Int32) -> UInt64:
         """Configure the barrier to expect a specific number of bytes to be transferred.
@@ -274,7 +262,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         return mbarrier_arrive_expect_tx_relaxed(self.unsafe_ptr(), bytes)
 
     @always_inline
-    fn arrive_and_expect_bytes[
+    def arrive_and_expect_bytes[
         o: MutOrigin
     ](
         ref[o, AddressSpace.SHARED] self,
@@ -311,7 +299,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         )
 
     @always_inline("nodebug")
-    fn wait[
+    def wait[
         ticks: Optional[UInt32] = None
     ](ref[AddressSpace.SHARED] self, phase: UInt32 = 0):
         """Wait until the barrier is satisfied.
@@ -361,7 +349,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
             )
 
     @always_inline("nodebug")
-    fn wait_acquire[
+    def wait_acquire[
         scope: Scope
     ](ref[AddressSpace.SHARED] self, phase: UInt32 = 0):
         """Acquire and wait until the barrier is satisfied.
@@ -405,7 +393,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         )
 
     @always_inline("nodebug")
-    fn wait_relaxed[
+    def wait_relaxed[
         scope: Scope
     ](ref[AddressSpace.SHARED] self, phase: UInt32 = 0):
         """Wait until the barrier is satisfied with relaxed ordering.
@@ -449,7 +437,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         )
 
     @always_inline("nodebug")
-    fn try_wait(ref[AddressSpace.SHARED] self, phase: UInt32 = 0) -> Bool:
+    def try_wait(ref[AddressSpace.SHARED] self, phase: UInt32 = 0) -> Bool:
         """Non-blocking check if barrier phase is complete.
 
         Performs a single non-blocking check to see if the barrier has completed
@@ -483,7 +471,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         ](Int32(Int(self.unsafe_ptr())), phase)
 
     @always_inline
-    fn unsafe_ptr[
+    def unsafe_ptr[
         origin: Origin
     ](
         ref[origin, AddressSpace.SHARED] self,
@@ -508,7 +496,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         return UnsafePointer(to=self.mbar).unsafe_origin_cast[origin]()
 
     @always_inline
-    fn arrive_cluster(
+    def arrive_cluster(
         ref[AddressSpace.SHARED] self, cta_id: UInt32, count: UInt32 = 1
     ):
         """Signal arrival at the barrier from a specific CTA (Cooperative Thread Array) in a cluster.
@@ -531,7 +519,7 @@ struct SharedMemBarrier(TrivialRegisterPassable):
         )
 
     @always_inline("nodebug")
-    fn arrive[o: MutOrigin](ref[o, AddressSpace.SHARED] self) -> Int:
+    def arrive[o: MutOrigin](ref[o, AddressSpace.SHARED] self) -> Int:
         """Signal arrival at the barrier and return the arrival count.
 
         This method increments the arrival count at the barrier and returns
@@ -590,7 +578,7 @@ struct PipelineState[num_stages: Int](Defaultable, TrivialRegisterPassable):
     """
 
     @always_inline
-    fn __init__(out self):
+    def __init__(out self):
         """Initialize a PipelineState with default values.
 
         Creates a new PipelineState with index 0, phase 0, and count 0.
@@ -600,7 +588,7 @@ struct PipelineState[num_stages: Int](Defaultable, TrivialRegisterPassable):
         self._count = 0
 
     @always_inline
-    fn __init__(out self, index: Int, phase: Int, count: Int):
+    def __init__(out self, index: Int, phase: Int, count: Int):
         """Initialize a PipelineState with specific values.
 
         Creates a new PipelineState with the specified index, phase, and count.
@@ -615,7 +603,7 @@ struct PipelineState[num_stages: Int](Defaultable, TrivialRegisterPassable):
         self._count = UInt32(count)
 
     @always_inline
-    fn index(self) -> UInt32:
+    def index(self) -> UInt32:
         """Get the current stage index.
 
         Returns:
@@ -624,7 +612,7 @@ struct PipelineState[num_stages: Int](Defaultable, TrivialRegisterPassable):
         return self._index
 
     @always_inline
-    fn phase(self) -> UInt32:
+    def phase(self) -> UInt32:
         """Get the current phase bit.
 
         Returns:
@@ -633,7 +621,7 @@ struct PipelineState[num_stages: Int](Defaultable, TrivialRegisterPassable):
         return self._phase
 
     @always_inline
-    fn step(mut self):
+    def step(mut self):
         """Advance the pipeline state to the next stage.
 
         Increments the index and count. When the index reaches num_stages,
@@ -655,7 +643,7 @@ struct PipelineState[num_stages: Int](Defaultable, TrivialRegisterPassable):
             self._phase ^= 1
 
     @always_inline
-    fn next(mut self) -> Self:
+    def next(mut self) -> Self:
         """Advance the pipeline state to the next stage and return the new state.
 
         This function is used to move to the next buffer in a multi-buffer
@@ -668,7 +656,7 @@ struct PipelineState[num_stages: Int](Defaultable, TrivialRegisterPassable):
         return self
 
     @always_inline
-    fn __enter__(var self) -> Self:
+    def __enter__(var self) -> Self:
         """Enter the context manager.
 
         Returns:
@@ -729,12 +717,12 @@ struct TMATensorTile[
     comptime device_type: AnyType = Self
     """The device-side type representation."""
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
+    def _to_device_type(self, target: MutOpaquePointer[_]):
         """Device type mapping is the identity function."""
         target.bitcast[Self.device_type]()[] = self
 
     @staticmethod
-    fn get_type_name() -> String:
+    def get_type_name() -> String:
         """
         Gets this type's name, for use in error messages when handing arguments
         to kernels.
@@ -758,7 +746,7 @@ struct TMATensorTile[
 
     @always_inline
     @implicit
-    fn __init__(out self, descriptor: TMADescriptor):
+    def __init__(out self, descriptor: TMADescriptor):
         """
         Initializes a new TMATensorTile with the provided TMA descriptor.
 
@@ -768,7 +756,7 @@ struct TMATensorTile[
         self.descriptor = descriptor
 
     @always_inline
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """
         Copy initializes this `TMATensorTile` from another instance.
 
@@ -778,7 +766,7 @@ struct TMATensorTile[
         self.descriptor = copy.descriptor
 
     @always_inline
-    fn prefetch_descriptor(self):
+    def prefetch_descriptor(self):
         """
         Prefetches the TMA descriptor into cache to reduce latency.
 
@@ -789,7 +777,7 @@ struct TMATensorTile[
         prefetch_tma_descriptor(desc_ptr)
 
     @always_inline
-    fn async_copy[
+    def async_copy[
         cta_group: Int = 1,
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -878,7 +866,7 @@ struct TMATensorTile[
                 )
 
     @always_inline
-    fn async_copy[
+    def async_copy[
         cta_group: Int = 1,
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -933,7 +921,7 @@ struct TMATensorTile[
                 )
 
     @always_inline("nodebug")
-    fn async_copy_3d[
+    def async_copy_3d[
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
         self,
@@ -987,18 +975,20 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
 
-        # This is the layout with which the descs themselves are arranged.
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        )
-
         comptime for m in range(num_copies_dim0):
             comptime for i in range(num_copies_dim1):
                 comptime for j in range(num_copies_dim2):
                     comptime copy_offset: UInt32 = UInt32(
-                        layout_of_descs(IntTuple(m, i, j)) * copy_size
+                        _desc_offset[
+                            3,
+                            Index(
+                                num_copies_dim0,
+                                num_copies_dim1,
+                                num_copies_dim2,
+                            ),
+                            Self.is_k_major,
+                        ](Index(m, i, j))
+                        * copy_size
                     )
 
                     cp_async_bulk_tensor_shared_cluster_global[
@@ -1015,7 +1005,72 @@ struct TMATensorTile[
                     )
 
     @always_inline
-    fn async_copy_4d[
+    def async_copy_3d[
+        eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
+    ](
+        self,
+        dst: TileTensor[
+            mut=True,
+            dtype=Self.dtype,
+            address_space=AddressSpace.SHARED,
+            ...,
+        ],
+        ref[AddressSpace.SHARED] mem_barrier: SharedMemBarrier,
+        coords: Tuple[Int, Int, Int],
+    ):
+        """TileTensor overload for 3D async copy from global to shared memory.
+
+        Assumes 128B alignment (TileTensor tiles are allocated with proper
+        alignment by the caller's SMEM layout).
+
+        Parameters:
+            eviction_policy: Cache eviction policy. Defaults to EVICT_NORMAL.
+
+        Args:
+            dst: TileTensor in shared memory where data will be copied.
+                 Must be 128-byte aligned.
+            mem_barrier: The memory barrier for synchronization.
+            coords: The 3D coordinates in the source tensor.
+        """
+        comptime copy_dim0 = Self.desc_shape[0]
+        comptime copy_dim1 = Self.desc_shape[1]
+        comptime copy_dim2 = Self.desc_shape[2]
+        comptime copy_size = _idx_product[Self.rank, Self.desc_shape]()
+        comptime num_copies_dim0 = ceildiv(Self.tile_shape[0], copy_dim0)
+        comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
+        comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
+
+        comptime for m in range(num_copies_dim0):
+            comptime for i in range(num_copies_dim1):
+                comptime for j in range(num_copies_dim2):
+                    comptime copy_offset: UInt32 = UInt32(
+                        _desc_offset[
+                            3,
+                            Index(
+                                num_copies_dim0,
+                                num_copies_dim1,
+                                num_copies_dim2,
+                            ),
+                            Self.is_k_major,
+                        ](Index(m, i, j))
+                        * copy_size
+                    )
+
+                    cp_async_bulk_tensor_shared_cluster_global[
+                        eviction_policy=eviction_policy
+                    ](
+                        dst.ptr.mut_cast[True]() + copy_offset,
+                        UnsafePointer(to=self.descriptor).bitcast[NoneType](),
+                        mem_barrier.unsafe_ptr(),
+                        Index(
+                            coords[0] + (j * copy_dim2),
+                            coords[1] + (i * copy_dim1),
+                            coords[2] + (m * copy_dim0),
+                        ),
+                    )
+
+    @always_inline
+    def async_copy_4d[
         cta_group: Int = 1,
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -1066,18 +1121,22 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
         comptime num_copies_dim3 = ceildiv(Self.tile_shape[3], copy_dim3)
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2, num_copies_dim3
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2, num_copies_dim3
-        )
-
         comptime for n in range(num_copies_dim0):
             comptime for m in range(num_copies_dim1):
                 comptime for i in range(num_copies_dim2):
                     comptime for j in range(num_copies_dim3):
                         comptime copy_offset: UInt32 = UInt32(
-                            layout_of_descs(IntTuple(n, m, i, j)) * copy_size
+                            _desc_offset[
+                                4,
+                                Index(
+                                    num_copies_dim0,
+                                    num_copies_dim1,
+                                    num_copies_dim2,
+                                    num_copies_dim3,
+                                ),
+                                Self.is_k_major,
+                            ](Index(n, m, i, j))
+                            * copy_size
                         )
 
                         cp_async_bulk_tensor_shared_cluster_global[
@@ -1098,7 +1157,7 @@ struct TMATensorTile[
                         )
 
     @always_inline
-    fn async_copy_4d[
+    def async_copy_4d[
         cta_group: Int = 1,
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -1138,18 +1197,22 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
         comptime num_copies_dim3 = ceildiv(Self.tile_shape[3], copy_dim3)
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2, num_copies_dim3
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2, num_copies_dim3
-        )
-
         comptime for n in range(num_copies_dim0):
             comptime for m in range(num_copies_dim1):
                 comptime for i in range(num_copies_dim2):
                     comptime for j in range(num_copies_dim3):
                         comptime copy_offset: UInt32 = UInt32(
-                            layout_of_descs(IntTuple(n, m, i, j)) * copy_size
+                            _desc_offset[
+                                4,
+                                Index(
+                                    num_copies_dim0,
+                                    num_copies_dim1,
+                                    num_copies_dim2,
+                                    num_copies_dim3,
+                                ),
+                                Self.is_k_major,
+                            ](Index(n, m, i, j))
+                            * copy_size
                         )
 
                         cp_async_bulk_tensor_shared_cluster_global[
@@ -1170,7 +1233,7 @@ struct TMATensorTile[
                         )
 
     @always_inline
-    fn async_copy_5d[
+    def async_copy_5d[
         cta_group: Int = 1,
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -1223,27 +1286,23 @@ struct TMATensorTile[
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
         comptime num_copies_dim3 = ceildiv(Self.tile_shape[3], copy_dim3)
         comptime num_copies_dim4 = ceildiv(Self.tile_shape[4], copy_dim4)
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0,
-            num_copies_dim1,
-            num_copies_dim2,
-            num_copies_dim3,
-            num_copies_dim4,
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0,
-            num_copies_dim1,
-            num_copies_dim2,
-            num_copies_dim3,
-            num_copies_dim4,
-        )
-
         comptime for o in range(num_copies_dim0):
             comptime for n in range(num_copies_dim1):
                 comptime for m in range(num_copies_dim2):
                     comptime for i in range(num_copies_dim3):
                         comptime for j in range(num_copies_dim4):
                             comptime copy_offset: UInt32 = UInt32(
-                                layout_of_descs(IntTuple(o, n, m, i, j))
+                                _desc_offset[
+                                    5,
+                                    Index(
+                                        num_copies_dim0,
+                                        num_copies_dim1,
+                                        num_copies_dim2,
+                                        num_copies_dim3,
+                                        num_copies_dim4,
+                                    ),
+                                    Self.is_k_major,
+                                ](Index(o, n, m, i, j))
                                 * copy_size
                             )
 
@@ -1266,7 +1325,7 @@ struct TMATensorTile[
                             )
 
     @always_inline
-    fn async_copy_5d[
+    def async_copy_5d[
         cta_group: Int = 1,
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -1308,27 +1367,23 @@ struct TMATensorTile[
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
         comptime num_copies_dim3 = ceildiv(Self.tile_shape[3], copy_dim3)
         comptime num_copies_dim4 = ceildiv(Self.tile_shape[4], copy_dim4)
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0,
-            num_copies_dim1,
-            num_copies_dim2,
-            num_copies_dim3,
-            num_copies_dim4,
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0,
-            num_copies_dim1,
-            num_copies_dim2,
-            num_copies_dim3,
-            num_copies_dim4,
-        )
-
         comptime for o in range(num_copies_dim0):
             comptime for n in range(num_copies_dim1):
                 comptime for m in range(num_copies_dim2):
                     comptime for i in range(num_copies_dim3):
                         comptime for j in range(num_copies_dim4):
                             comptime copy_offset: UInt32 = UInt32(
-                                layout_of_descs(IntTuple(o, n, m, i, j))
+                                _desc_offset[
+                                    5,
+                                    Index(
+                                        num_copies_dim0,
+                                        num_copies_dim1,
+                                        num_copies_dim2,
+                                        num_copies_dim3,
+                                        num_copies_dim4,
+                                    ),
+                                    Self.is_k_major,
+                                ](Index(o, n, m, i, j))
                                 * copy_size
                             )
 
@@ -1351,7 +1406,7 @@ struct TMATensorTile[
                             )
 
     @always_inline("nodebug")
-    fn async_copy[
+    def async_copy[
         coord_rank: Int,
         //,
         cta_group: Int = 1,
@@ -1424,8 +1479,51 @@ struct TMATensorTile[
                 ),
             )
 
+    @always_inline("nodebug")
+    def async_copy[
+        coord_rank: Int,
+        //,
+        cta_group: Int = 1,
+        eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
+    ](
+        self,
+        dst: TileTensor[
+            mut=True,
+            dtype=Self.dtype,
+            address_space=AddressSpace.SHARED,
+            ...,
+        ],
+        ref[AddressSpace.SHARED] mem_barrier: SharedMemBarrier,
+        coords: StaticTuple[UInt32, coord_rank],
+    ):
+        """TileTensor overload of the generic rank-dispatched async_copy.
+        Dispatches to the rank-specific TileTensor async_copy methods.
+
+        Parameters:
+            coord_rank: The dimensionality (must be 2 or 3).
+            cta_group: CTA group configuration. Defaults to 1.
+            eviction_policy: Cache eviction policy. Defaults to EVICT_NORMAL.
+
+        Args:
+            dst: TileTensor in shared memory where data will be copied.
+            mem_barrier: The memory barrier for synchronization.
+            coords: The N-dimensional coordinates as StaticTuple.
+        """
+        comptime assert coord_rank in (2, 3)
+
+        comptime if coord_rank == 2:
+            self.async_copy[
+                cta_group=cta_group, eviction_policy=eviction_policy
+            ](dst, mem_barrier, (Int(coords[0]), Int(coords[1])))
+        elif coord_rank == 3:
+            self.async_copy_3d[eviction_policy=eviction_policy](
+                dst,
+                mem_barrier,
+                (Int(coords[0]), Int(coords[1]), Int(coords[2])),
+            )
+
     @always_inline
-    fn async_store[
+    def async_store[
         coord_rank: Int, //, cta_group: Int = 1
     ](
         self,
@@ -1486,7 +1584,7 @@ struct TMATensorTile[
             )
 
     @always_inline
-    fn async_store[
+    def async_store[
         coord_rank: Int, //, cta_group: Int = 1
     ](
         self,
@@ -1519,7 +1617,7 @@ struct TMATensorTile[
             )
 
     @always_inline
-    fn async_multicast_load[
+    def async_multicast_load[
         cta_group: Int = 1
     ](
         self,
@@ -1587,7 +1685,7 @@ struct TMATensorTile[
                 )
 
     @always_inline
-    fn async_multicast_load[
+    def async_multicast_load[
         cta_group: Int = 1,
     ](
         self,
@@ -1643,7 +1741,7 @@ struct TMATensorTile[
                 )
 
     @always_inline
-    fn async_multicast_load_3d[
+    def async_multicast_load_3d[
         cta_group: Int = 1
     ](
         self,
@@ -1700,18 +1798,20 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
 
-        # This is the layout with which the descs themselves are arranged.
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        )
-
         comptime for m in range(num_copies_dim0):
             comptime for i in range(num_copies_dim1):
                 comptime for j in range(num_copies_dim2):
                     comptime copy_offset: UInt32 = UInt32(
-                        layout_of_descs(IntTuple(m, i, j)) * copy_size
+                        _desc_offset[
+                            3,
+                            Index(
+                                num_copies_dim0,
+                                num_copies_dim1,
+                                num_copies_dim2,
+                            ),
+                            Self.is_k_major,
+                        ](Index(m, i, j))
+                        * copy_size
                     )
 
                     cp_async_bulk_tensor_shared_cluster_global_multicast[
@@ -1729,7 +1829,7 @@ struct TMATensorTile[
                     )
 
     @always_inline
-    fn async_multicast_load_3d[
+    def async_multicast_load_3d[
         cta_group: Int = 1,
     ](
         self,
@@ -1767,17 +1867,20 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
 
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        )
-
         comptime for m in range(num_copies_dim0):
             comptime for i in range(num_copies_dim1):
                 comptime for j in range(num_copies_dim2):
                     comptime copy_offset: UInt32 = UInt32(
-                        layout_of_descs(IntTuple(m, i, j)) * copy_size
+                        _desc_offset[
+                            3,
+                            Index(
+                                num_copies_dim0,
+                                num_copies_dim1,
+                                num_copies_dim2,
+                            ),
+                            Self.is_k_major,
+                        ](Index(m, i, j))
+                        * copy_size
                     )
 
                     cp_async_bulk_tensor_shared_cluster_global_multicast[
@@ -1795,7 +1898,7 @@ struct TMATensorTile[
                     )
 
     @always_inline
-    fn async_multicast_load_partitioned[
+    def async_multicast_load_partitioned[
         tma_rows: Int,
         tma_load_size: Int,
     ](
@@ -1808,7 +1911,7 @@ struct TMATensorTile[
             ...,
         ],
         ref[AddressSpace.SHARED] mem_barrier: SharedMemBarrier,
-        cta_rank: UInt,
+        cta_rank: Int,
         coords: Tuple[Int, Int],
         multicast_mask: UInt16,
     ):
@@ -1842,17 +1945,17 @@ struct TMATensorTile[
             dst.layout,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](dst.ptr + cta_rank * UInt(tma_load_size))
+        ](dst.ptr + cta_rank * tma_load_size)
 
         self.async_multicast_load(
             dst_slice,
             mem_barrier,
-            (coords[0], coords[1] + Int(cta_rank) * tma_rows),
+            (coords[0], coords[1] + cta_rank * tma_rows),
             multicast_mask,
         )
 
     @always_inline
-    fn async_store(
+    def async_store(
         self,
         src: LayoutTensor[
             Self.dtype, _, address_space=AddressSpace.SHARED, ...
@@ -1905,7 +2008,7 @@ struct TMATensorTile[
                 )
 
     @always_inline
-    fn async_store(
+    def async_store(
         self,
         src: TileTensor[
             dtype=Self.dtype, address_space=AddressSpace.SHARED, ...
@@ -1948,7 +2051,7 @@ struct TMATensorTile[
                 )
 
     @always_inline
-    fn async_store_3d(
+    def async_store_3d(
         self,
         src: LayoutTensor[
             Self.dtype, _, address_space=AddressSpace.SHARED, ...
@@ -1993,18 +2096,20 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
 
-        # This is the layout with which the descs themselves are arranged.
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        )
-
         comptime for m in range(num_copies_dim0):
             comptime for i in range(num_copies_dim1):
                 comptime for j in range(num_copies_dim2):
                     comptime copy_offset: UInt32 = UInt32(
-                        layout_of_descs(IntTuple(m, i, j)) * copy_size
+                        _desc_offset[
+                            3,
+                            Index(
+                                num_copies_dim0,
+                                num_copies_dim1,
+                                num_copies_dim2,
+                            ),
+                            Self.is_k_major,
+                        ](Index(m, i, j))
+                        * copy_size
                     )
 
                     cp_async_bulk_tensor_global_shared_cta(
@@ -2018,7 +2123,7 @@ struct TMATensorTile[
                     )
 
     @always_inline
-    fn async_store_3d(
+    def async_store_3d(
         self,
         src: TileTensor[
             dtype=Self.dtype, address_space=AddressSpace.SHARED, ...
@@ -2043,17 +2148,20 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
 
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2
-        )
-
         comptime for m in range(num_copies_dim0):
             comptime for i in range(num_copies_dim1):
                 comptime for j in range(num_copies_dim2):
                     comptime copy_offset: UInt32 = UInt32(
-                        layout_of_descs(IntTuple(m, i, j)) * copy_size
+                        _desc_offset[
+                            3,
+                            Index(
+                                num_copies_dim0,
+                                num_copies_dim1,
+                                num_copies_dim2,
+                            ),
+                            Self.is_k_major,
+                        ](Index(m, i, j))
+                        * copy_size
                     )
 
                     cp_async_bulk_tensor_global_shared_cta(
@@ -2067,7 +2175,7 @@ struct TMATensorTile[
                     )
 
     @always_inline
-    fn async_store_4d(
+    def async_store_4d(
         self,
         src: LayoutTensor[
             Self.dtype, _, address_space=AddressSpace.SHARED, ...
@@ -2105,18 +2213,22 @@ struct TMATensorTile[
         comptime num_copies_dim1 = ceildiv(Self.tile_shape[1], copy_dim1)
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
         comptime num_copies_dim3 = ceildiv(Self.tile_shape[3], copy_dim3)
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2, num_copies_dim3
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0, num_copies_dim1, num_copies_dim2, num_copies_dim3
-        )
-
         comptime for n in range(num_copies_dim0):
             comptime for m in range(num_copies_dim1):
                 comptime for i in range(num_copies_dim2):
                     comptime for j in range(num_copies_dim3):
                         comptime copy_offset: UInt32 = UInt32(
-                            layout_of_descs(IntTuple(n, m, i, j)) * copy_size
+                            _desc_offset[
+                                4,
+                                Index(
+                                    num_copies_dim0,
+                                    num_copies_dim1,
+                                    num_copies_dim2,
+                                    num_copies_dim3,
+                                ),
+                                Self.is_k_major,
+                            ](Index(n, m, i, j))
+                            * copy_size
                         )
 
                         cp_async_bulk_tensor_global_shared_cta(
@@ -2133,7 +2245,7 @@ struct TMATensorTile[
                         )
 
     @always_inline
-    fn async_store_5d(
+    def async_store_5d(
         self,
         src: LayoutTensor[
             Self.dtype, _, address_space=AddressSpace.SHARED, ...
@@ -2173,27 +2285,23 @@ struct TMATensorTile[
         comptime num_copies_dim2 = ceildiv(Self.tile_shape[2], copy_dim2)
         comptime num_copies_dim3 = ceildiv(Self.tile_shape[3], copy_dim3)
         comptime num_copies_dim4 = ceildiv(Self.tile_shape[4], copy_dim4)
-        comptime layout_of_descs = Layout.col_major(
-            num_copies_dim0,
-            num_copies_dim1,
-            num_copies_dim2,
-            num_copies_dim3,
-            num_copies_dim4,
-        ) if Self.is_k_major else Layout.row_major(
-            num_copies_dim0,
-            num_copies_dim1,
-            num_copies_dim2,
-            num_copies_dim3,
-            num_copies_dim4,
-        )
-
         comptime for o in range(num_copies_dim0):
             comptime for n in range(num_copies_dim1):
                 comptime for m in range(num_copies_dim2):
                     comptime for i in range(num_copies_dim3):
                         comptime for j in range(num_copies_dim4):
                             comptime copy_offset: UInt32 = UInt32(
-                                layout_of_descs(IntTuple(o, n, m, i, j))
+                                _desc_offset[
+                                    5,
+                                    Index(
+                                        num_copies_dim0,
+                                        num_copies_dim1,
+                                        num_copies_dim2,
+                                        num_copies_dim3,
+                                        num_copies_dim4,
+                                    ),
+                                    Self.is_k_major,
+                                ](Index(o, n, m, i, j))
                                 * copy_size
                             )
 
@@ -2212,7 +2320,7 @@ struct TMATensorTile[
                             )
 
     @always_inline
-    fn async_reduce[
+    def async_reduce[
         reduction_kind: ReduceOp
     ](
         self,
@@ -2251,7 +2359,7 @@ struct TMATensorTile[
         )
 
     @always_inline
-    fn commit_group(self):
+    def commit_group(self):
         """
         Commits all prior initiated but uncommitted TMA instructions into a group.
 
@@ -2261,7 +2369,7 @@ struct TMATensorTile[
         cp_async_bulk_commit_group()
 
     @always_inline
-    fn wait_group[n: Int = 0](self):
+    def wait_group[n: Int = 0](self):
         """
         Wait for the completion of asynchronous copy until a specified number of groups are waiting.
 
@@ -2274,7 +2382,7 @@ struct TMATensorTile[
         cp_async_bulk_wait_group[Int32(n)]()
 
     @always_inline
-    fn smem_tensormap_init(
+    def smem_tensormap_init(
         self,
         smem_tma_descriptor_ptr: UnsafePointer[
             TMADescriptor, _, address_space=AddressSpace.SHARED
@@ -2320,7 +2428,7 @@ struct TMATensorTile[
             dst_desc.store[alignment=dst_align](src_idx * simd_width, src_vec)
 
     @always_inline
-    fn replace_tensormap_global_address_in_gmem[
+    def replace_tensormap_global_address_in_gmem[
         _dtype: DType,
     ](self, src_ptr: UnsafePointer[Scalar[_dtype], _],):
         """
@@ -2358,7 +2466,7 @@ struct TMATensorTile[
         ](desc_ptr, src_ptr.bitcast[NoneType]())
 
     @always_inline
-    fn tensormap_fence_acquire(self):
+    def tensormap_fence_acquire(self):
         """
         Establishes a memory fence for TMA operations with acquire semantics.
 
@@ -2384,7 +2492,7 @@ struct TMATensorTile[
         )
 
     @always_inline
-    fn tensormap_fence_release(self):
+    def tensormap_fence_release(self):
         """
         Establishes a memory fence for TMA operations with release semantics.
 
@@ -2407,7 +2515,7 @@ struct TMATensorTile[
         ]()
 
     @always_inline
-    fn replace_tensormap_global_address_in_shared_mem[
+    def replace_tensormap_global_address_in_shared_mem[
         _dtype: DType,
     ](
         self,
@@ -2462,7 +2570,7 @@ struct TMATensorTile[
         )
 
     @always_inline
-    fn tensormap_cp_fence_release(
+    def tensormap_cp_fence_release(
         self,
         smem_tma_descriptor_ptr: UnsafePointer[
             TMADescriptor, _, address_space=AddressSpace.SHARED
@@ -2506,7 +2614,7 @@ struct TMATensorTile[
         ](gmem_tma_descriptor_ptr, smem_tma_descriptor_ptr.bitcast[NoneType]())
 
     @always_inline
-    fn replace_tensormap_global_dim_strides_in_shared_mem[
+    def replace_tensormap_global_dim_strides_in_shared_mem[
         _dtype: DType,
         only_update_dim_0: Bool,
         /,
@@ -2586,7 +2694,7 @@ struct TMATensorTile[
                 )
 
     @always_inline
-    fn replace_tensormap_global_dim_strides_in_shared_mem[
+    def replace_tensormap_global_dim_strides_in_shared_mem[
         _dtype: DType,
         tensor_rank: Int,
         dim_idx: Int,
@@ -2637,10 +2745,9 @@ struct TMATensorTile[
         # Replace strides - note: stride for innermost dimension is implicitly 1
         # For CUDA versions >= 12.5, we use the full stride value. Note that this is not true for all CUDA versions and strides shound be left shifted by 4 for CUDA versions < 12.5
         comptime if dim_idx > 0:
-            debug_assert(
-                dim_stride is not None,
-                " dim_stride must be provided if dim_idx > 0",
-            )
+            assert (
+                dim_stride is not None
+            ), " dim_stride must be provided if dim_idx > 0"
             comptime temp = "tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [$0], " + String(
                 tensor_rank - dim_idx - 1
             ) + ", $1;"
@@ -2693,6 +2800,9 @@ def create_tma_tile[
         - The last dimension's size in bytes must not exceed the swizzle mode's byte limit
           (32B for SWIZZLE_32B, 64B for SWIZZLE_64B, 128B for SWIZZLE_128B).
         - Only supports 2D tensors in this overload.
+
+    Raises:
+        If TMA descriptor creation fails.
     """
     # the last dimension of smem shape has to be smaller or equals to the
     # swizzle bytes.
@@ -2868,6 +2978,9 @@ def create_tensor_tile[
           of the swizzle mode's byte size.
         - For MN-major layout, only SWIZZLE_128B is supported.
         - For 3D, 4D, and 5D tensors, only K-major layout is supported.
+
+    Raises:
+        If TMA descriptor creation fails.
     """
     # Current impl limitations
     comptime assert (
@@ -3070,6 +3183,9 @@ def create_tensor_tile[
 
     Returns:
         A `TMATensorTile` configured for the given tensor.
+
+    Raises:
+        If TMA descriptor creation fails.
     """
     comptime assert rank in (2, 3, 4, 5), "Only support 2D/3D/4D/5D TMA"
 
@@ -3199,65 +3315,7 @@ def create_tensor_tile[
         )
 
 
-fn _split_last_layout[
-    rank: Int, //, dtype: DType
-](
-    tile_shape: IndexList[rank],
-    swizzle_mode: TensorMapSwizzle,
-    *,
-    pad: Bool,
-) -> Layout:
-    """
-    If no padding is needed, split the last dimension so we can index
-    with `0`, `1`,... instead of `0`, `swizzle_bytes()//size_of[dtype]()`,...
-    """
-    final_dim = tile_shape[rank - 1]
-    swizzle_granularity = swizzle_mode.bytes() // size_of[dtype]()
-    num_tma = ceildiv(final_dim, swizzle_granularity)
-    if pad:
-        var padded_shape: IndexList[rank] = {}
-        for i in range(rank - 1):
-            padded_shape[i] = tile_shape[i]
-        padded_shape[rank - 1] = num_tma * swizzle_granularity
-        return Layout.row_major(padded_shape)
-    else:
-        return Layout.row_major(tile_shape)
-
-
-fn _ragged_fill_tile[
-    rank: Int
-](axis0: Int, dim0: Int, final: Int) -> IndexList[rank]:
-    var desc_shape: IndexList[rank] = {}
-    for i in range(rank - 1):
-        if i == axis0:
-            desc_shape[i] = dim0
-        else:
-            desc_shape[i] = 1
-    desc_shape[rank - 1] = final
-    return desc_shape
-
-
-fn _ragged_desc_layout[
-    rank: Int, //, dtype: DType
-](tile_shape: IndexList[rank], swizzle_mode: TensorMapSwizzle,) -> Layout:
-    swizzle_granularity = swizzle_mode.bytes() // size_of[dtype]()
-    var axis0: Int = -1
-    var dim0: Int = 1
-    for i in range(rank - 1):
-        tsi = tile_shape[i]
-        if tsi != 1:
-            if axis0 == -1:
-                axis0 = i
-                dim0 = tsi
-            else:
-                abort("Found multiple leading smem shapes with a non-1 axis.")
-
-    return Layout.row_major(
-        _ragged_fill_tile[rank](axis0, dim0, swizzle_granularity)
-    )
-
-
-fn _padded_shape[
+def _padded_shape[
     rank: Int,
     dtype: DType,
     tile_shape: IndexList[rank],
@@ -3276,7 +3334,7 @@ fn _padded_shape[
     return result
 
 
-fn _ragged_shape[
+def _ragged_shape[
     rank: Int,
     dtype: DType,
     tile_shape: IndexList[rank],
@@ -3321,7 +3379,7 @@ Parameters:
 
 
 @always_inline
-fn _split_tma_gmem_tensor[
+def _split_tma_gmem_tensor[
     dtype: DType,
     rank: Int,
     //,
@@ -3332,7 +3390,7 @@ fn _split_tma_gmem_tensor[
     dim0: Int,
     out ret: LayoutTensor[
         dtype,
-        _split_last_layout[dtype](shape, swizzle_mode, pad=False),
+        Layout.row_major(shape),
         ptr.origin,
     ],
 ):
@@ -3347,7 +3405,7 @@ fn _split_tma_gmem_tensor[
 
 
 @always_inline
-fn _split_tma_gmem_tensor[
+def _split_tma_gmem_tensor[
     dtype: DType,
     rank: Int,
     //,
@@ -3359,7 +3417,7 @@ fn _split_tma_gmem_tensor[
     dim1: Int,
     out ret: LayoutTensor[
         dtype,
-        _split_last_layout[dtype](shape, swizzle_mode, pad=False),
+        Layout.row_major(shape),
         ptr.origin,
     ],
 ):
@@ -3377,7 +3435,7 @@ fn _split_tma_gmem_tensor[
     ret = {ptr, RuntimeLayout[ret.layout].row_major(runtime_shape)}
 
 
-fn create_split_tma[
+def create_split_tma[
     rank: Int,
     dtype: DType,
     //,
@@ -3429,7 +3487,7 @@ fn create_split_tma[
     ](ctx, tensor)
 
 
-fn create_split_tma[
+def create_split_tma[
     rank: Int,
     dtype: DType,
     //,
@@ -3528,6 +3586,9 @@ def create_tma_tile_template[
           of the swizzle mode's byte size.
         - For MN-major layout, only SWIZZLE_128B is supported.
         - For 3D tensors, only K-major layout is supported.
+
+    Raises:
+        If TMA descriptor creation fails.
     """
 
     return TMATensorTile[dtype, rank, __tile_shape, __desc_shape](
@@ -3579,12 +3640,12 @@ struct TMATensorTileArray[
     comptime device_type: AnyType = Self
     """The device-side type representation."""
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
+    def _to_device_type(self, target: MutOpaquePointer[_]):
         """Device type mapping is the identity function."""
         target.bitcast[Self.device_type]()[] = self
 
     @staticmethod
-    fn get_type_name() -> String:
+    def get_type_name() -> String:
         """
         Gets this type's name, for use in error messages when handing arguments
         to kernels.
@@ -3605,7 +3666,7 @@ struct TMATensorTileArray[
         )
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         tensormaps_device: DeviceBuffer[DType.uint8],
     ):
@@ -3619,7 +3680,7 @@ struct TMATensorTileArray[
         self.tensormaps_ptr = tensormaps_device.unsafe_ptr()
 
     @always_inline
-    fn __getitem__(
+    def __getitem__(
         self, index: Int
     ) -> UnsafePointer[
         TMATensorTile[
@@ -3676,12 +3737,12 @@ struct RaggedTMA3DTile[
     ]()
     """The unswizzled-smem layout copied to/from by this tma op."""
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
+    def _to_device_type(self, target: MutOpaquePointer[_]):
         """Device type mapping is the identity function."""
         target.bitcast[Self.device_type]()[] = self
 
     @staticmethod
-    fn get_type_name() -> String:
+    def get_type_name() -> String:
         """
         Returns a string representation of the RaggedTMA3DTile type.
 
@@ -3701,7 +3762,7 @@ struct RaggedTMA3DTile[
 
     @always_inline
     @implicit
-    fn __init__(out self, descriptor: TMADescriptor):
+    def __init__(out self, descriptor: TMADescriptor):
         """
         Initializes a new TMATensorTile with the provided TMA descriptor.
 
@@ -3712,7 +3773,7 @@ struct RaggedTMA3DTile[
 
     @staticmethod
     @always_inline
-    fn create[
+    def create[
         *,
         depth: Int = Self.BN,
     ](
@@ -3754,7 +3815,7 @@ struct RaggedTMA3DTile[
         )
 
     @always_inline
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """
         Copy initializes this `RaggedTMA3DTile` from another instance.
 
@@ -3764,7 +3825,7 @@ struct RaggedTMA3DTile[
         self.descriptor = copy.descriptor
 
     @always_inline("nodebug")
-    fn async_copy_to[
+    def async_copy_to[
         cta_group: Int = 1
     ](
         self,
@@ -3793,8 +3854,8 @@ struct RaggedTMA3DTile[
 
         """
 
-        var offset_ragged_idx: UInt = UInt(ragged_idx + dynamic_dim)
-        var box_idx: UInt = UInt(UInt32(Self.BM) - dynamic_dim)
+        var offset_ragged_idx = Int(ragged_idx + dynamic_dim)
+        var box_idx = Int(UInt32(Self.BM) - dynamic_dim)
 
         comptime for col in range(ceildiv(Self.BN, Self.swizzle_granularity)):
             comptime copy_offset = col * Self.BM * Self.swizzle_granularity
@@ -3804,15 +3865,15 @@ struct RaggedTMA3DTile[
                 UnsafePointer(to=self.descriptor).bitcast[NoneType](),
                 mem_barrier.unsafe_ptr(),
                 Index(
-                    UInt(col * Self.swizzle_granularity),
+                    col * Self.swizzle_granularity,
                     box_idx,
-                    UInt(middle_idx),
+                    Int(middle_idx),
                     offset_ragged_idx,
                 ),
             )
 
     @always_inline
-    fn async_copy_from_col[
+    def async_copy_from_col[
         col: Int,
         eviction_policy: CacheEviction = CacheEviction.EVICT_FIRST,
     ](
@@ -3841,23 +3902,23 @@ struct RaggedTMA3DTile[
             dynamic_dim: Number of rows to copy.
             middle_idx: Index into the middle (generally head) dimension.
         """
-        var offset_ragged_idx: UInt = UInt(ragged_idx + dynamic_dim)
-        var box_idx: UInt = UInt(UInt32(Self.BM) - dynamic_dim)
+        var offset_ragged_idx = Int(ragged_idx + dynamic_dim)
+        var box_idx = Int(UInt32(Self.BM) - dynamic_dim)
         comptime copy_offset = col * Self.BM * Self.swizzle_granularity
 
         cp_async_bulk_tensor_global_shared_cta[eviction_policy=eviction_policy](
             src + copy_offset,
             UnsafePointer(to=self.descriptor).bitcast[NoneType](),
             Index(
-                UInt(col * Self.swizzle_granularity),
+                col * Self.swizzle_granularity,
                 box_idx,
-                UInt(middle_idx),
+                Int(middle_idx),
                 offset_ragged_idx,
             ),
         )
 
     @always_inline
-    fn async_copy_from[
+    def async_copy_from[
         eviction_policy: CacheEviction = CacheEviction.EVICT_FIRST,
     ](
         self,
@@ -3892,7 +3953,7 @@ struct RaggedTMA3DTile[
             )
 
     @always_inline
-    fn prefetch_descriptor(self):
+    def prefetch_descriptor(self):
         """
         Prefetches the TMA descriptor into cache.
         """
@@ -3945,7 +4006,7 @@ struct RaggedTensorMap[
     """The rank of the global tensor."""
 
     @staticmethod
-    fn _descriptor_shape() -> IndexList[Self.descriptor_rank + 1]:
+    def _descriptor_shape() -> IndexList[Self.descriptor_rank + 1]:
         """
         Constructs a descriptor shape that can handle one ragged dimension for loads.
 
@@ -3963,7 +4024,7 @@ struct RaggedTensorMap[
 
     @staticmethod
     @always_inline
-    fn _get_layout() -> Layout:
+    def _get_layout() -> Layout:
         var layout = Layout(
             IntTuple(num_elems=Self.global_rank),
             IntTuple(num_elems=Self.global_rank),
@@ -3981,7 +4042,7 @@ struct RaggedTensorMap[
     comptime ragged_descriptor_shape = Self._descriptor_shape()
     """The shape of the descriptor that will tile and load from shared -> global memory."""
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
+    def _to_device_type(self, target: MutOpaquePointer[_]):
         """
         Copies this descriptor array to device memory.
 
@@ -3991,7 +4052,7 @@ struct RaggedTensorMap[
         target.bitcast[Self.device_type]()[] = self
 
     @staticmethod
-    fn get_type_name() -> String:
+    def get_type_name() -> String:
         """
         Returns a string representation of the TensorMapDescriptorArray type.
 
@@ -4013,7 +4074,7 @@ struct RaggedTensorMap[
 
     @staticmethod
     @always_inline
-    fn _create_global_stride(
+    def _create_global_stride(
         ragged_stride: Int,
         remaining_global_stride: IndexList[Self.remaining_global_dim_rank],
     ) -> IndexList[Self.global_rank]:
@@ -4029,7 +4090,7 @@ struct RaggedTensorMap[
 
     @staticmethod
     @always_inline
-    fn _create_global_shape(
+    def _create_global_shape(
         cumulative_length: Int,
         max_length: Int,
         global_last_dim: Int,
@@ -4046,7 +4107,7 @@ struct RaggedTensorMap[
 
         return global_shape
 
-    fn __init__(
+    def __init__(
         out self,
         ctx: DeviceContext,
         global_ptr: UnsafePointer[Scalar[Self.dtype], _],
@@ -4139,7 +4200,7 @@ struct RaggedTensorMap[
         self.global_stride = global_stride
 
     @always_inline
-    fn _get_descriptor_ptr(self) -> UnsafePointer[NoneType, MutAnyOrigin]:
+    def _get_descriptor_ptr(self) -> UnsafePointer[NoneType, MutAnyOrigin]:
         return (
             UnsafePointer(to=self.descriptor)
             .bitcast[NoneType]()
@@ -4148,7 +4209,7 @@ struct RaggedTensorMap[
         )
 
     @always_inline
-    fn store_ragged_tile[
+    def store_ragged_tile[
         rank: Int,
         //,
         using_max_descriptor_size: Bool = False,
@@ -4294,7 +4355,7 @@ struct RaggedTensorMap[
                 tile_iterator._incr()
 
     @always_inline
-    fn prefetch_descriptor(self):
+    def prefetch_descriptor(self):
         """
         Prefetches the TMA descriptor into cache.
         """
@@ -4359,12 +4420,12 @@ struct TMATensorTileIm2col[
     comptime device_type: AnyType = Self
     """The device-side type representation."""
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
+    def _to_device_type(self, target: MutOpaquePointer[_]):
         """Device type mapping is the identity function."""
         target.bitcast[Self.device_type]()[] = self
 
     @staticmethod
-    fn get_type_name() -> String:
+    def get_type_name() -> String:
         """Gets this type's name for error messages.
 
         Returns:
@@ -4381,7 +4442,7 @@ struct TMATensorTileIm2col[
         )
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         descriptor: TMADescriptor,
         out_height: UInt32,
@@ -4414,7 +4475,7 @@ struct TMATensorTileIm2col[
         self.lower_corner_w = lower_corner_w
 
     @always_inline
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Copy initializes from another instance.
 
         Args:
@@ -4430,13 +4491,13 @@ struct TMATensorTileIm2col[
         self.lower_corner_w = copy.lower_corner_w
 
     @always_inline
-    fn prefetch_descriptor(self):
+    def prefetch_descriptor(self):
         """Prefetches the TMA descriptor into cache."""
         var desc_ptr = UnsafePointer(to=self.descriptor).bitcast[NoneType]()
         prefetch_tma_descriptor(desc_ptr)
 
     @always_inline
-    fn async_copy[
+    def async_copy[
         cta_group: Int = 1,  # Use SM90-style TMA for cluster 1x1x1
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -4445,7 +4506,7 @@ struct TMATensorTileIm2col[
             Self.dtype, _, address_space=AddressSpace.SHARED, ...
         ],
         ref[AddressSpace.SHARED] mem_barrier: SharedMemBarrier,
-        coords: Tuple[UInt, UInt],
+        coords: Tuple[Int, Int],
     ):
         """Schedules an asynchronous im2col TMA load.
 
@@ -4484,31 +4545,30 @@ struct TMATensorTileIm2col[
         comptime num_copies_dim1 = Self.tile_shape[1] // copy_dim1
 
         # Precompute spatial size for M decomposition
-        var hw = UInt(self.out_height) * UInt(self.out_width)
-        var out_w = UInt(self.out_width)
+        var hw = Int(self.out_height) * Int(self.out_width)
+        var out_w = Int(self.out_width)
 
         # Precompute filter window size for K decomposition
         # K = r * S * C + s * C + c (filter-first, channel-last ordering for NHWC)
-        var num_channels = UInt(self.in_channels)
-        var filter_w = UInt(self.filter_w)
+        var num_channels = Int(self.in_channels)
+        var filter_w = Int(self.filter_w)
 
         # OPTIMIZATION: Hoist K decomposition outside loop (constant when j=0).
         # For typical configs (num_copies_dim1=1), K coords don't change within tile.
         var k_coord = coords[0]
-        var filter_idx, c = divmod(k_coord, num_channels)
-        var r, s = divmod(filter_idx, filter_w)
+        var filter_idx, c = udivmod(k_coord, num_channels)
+        var r, s = udivmod(filter_idx, filter_w)
 
         # Initial M decomposition (done once, then use iterator)
         var m_coord_init = coords[1]
-        var n, m_remainder = divmod(m_coord_init, hw)
-        var h_out, w_out = divmod(m_remainder, out_w)
+        var n, m_remainder = udivmod(m_coord_init, hw)
+        var h_out, w_out = udivmod(m_remainder, out_w)
 
         # Pre-add lower_corner offset
-        var h = Int(h_out) + Int(self.lower_corner_h)
-        var w = Int(w_out) + Int(self.lower_corner_w)
+        var h = h_out + Int(self.lower_corner_h)
+        var w = w_out + Int(self.lower_corner_w)
 
         # Cache bounds for iterator wraparound
-        var out_w_int = Int(out_w)
         var out_h_int = Int(self.out_height)
         var lower_h = Int(self.lower_corner_h)
         var lower_w = Int(self.lower_corner_w)
@@ -4521,9 +4581,9 @@ struct TMATensorTileIm2col[
 
                 # K recomputation only needed when j > 0 (rare in practice)
                 comptime if j > 0:
-                    k_coord = coords[0] + UInt(j * copy_dim1)
-                    filter_idx, c = divmod(k_coord, num_channels)
-                    r, s = divmod(filter_idx, filter_w)
+                    k_coord = coords[0] + j * copy_dim1
+                    filter_idx, c = udivmod(k_coord, num_channels)
+                    r, s = udivmod(filter_idx, filter_w)
 
                 # Pass 4D coords (c, w, h, n) and filter offsets (s, r) to im2col PTX
                 cp_async_bulk_tensor_shared_cluster_global_im2col[
@@ -4532,22 +4592,22 @@ struct TMATensorTileIm2col[
                     dst.ptr.mut_cast[True]() + copy_offset,
                     UnsafePointer(to=self.descriptor).bitcast[NoneType](),
                     mem_barrier.unsafe_ptr(),
-                    Index(Int(c), w, h, Int(n)),
-                    Index(Int(s), Int(r)),
+                    Index(c, w, h, n),
+                    Index(s, r),
                 )
 
             # Iterator pattern: advance M by copy_dim0 using addition (not division)
             # This avoids 4 divisions per sub-tile, reducing from O(n*8) to O(8+n*3)
             w += copy_dim0
-            if w >= out_w_int + lower_w:
-                w -= out_w_int
+            if w >= out_w + lower_w:
+                w -= out_w
                 h += 1
                 if h >= out_h_int + lower_h:
                     h -= out_h_int
                     n += 1
 
     @always_inline
-    fn async_multicast_load[
+    def async_multicast_load[
         cta_group: Int = 1,  # Use SM90-style TMA for cluster 1x1x1
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -4556,7 +4616,7 @@ struct TMATensorTileIm2col[
             Self.dtype, _, address_space=AddressSpace.SHARED, ...
         ],
         ref[AddressSpace.SHARED] mem_barrier: SharedMemBarrier,
-        coords: Tuple[UInt, UInt],
+        coords: Tuple[Int, Int],
         multicast_mask: UInt16,
     ):
         """Schedules an asynchronous im2col TMA load with multicast.
@@ -4597,30 +4657,29 @@ struct TMATensorTileIm2col[
         comptime num_copies_dim1 = Self.tile_shape[1] // copy_dim1
 
         # Precompute spatial size for M decomposition
-        var hw = UInt(self.out_height) * UInt(self.out_width)
-        var out_w = UInt(self.out_width)
+        var hw = Int(self.out_height) * Int(self.out_width)
+        var out_w = Int(self.out_width)
 
         # Precompute filter window size for K decomposition
         # K = r * S * C + s * C + c (filter-first, channel-last ordering for NHWC)
-        var num_channels = UInt(self.in_channels)
-        var filter_w = UInt(self.filter_w)
+        var num_channels = Int(self.in_channels)
+        var filter_w = Int(self.filter_w)
 
         # OPTIMIZATION: Hoist K decomposition outside loop (constant when j=0).
         var k_coord = coords[0]
-        var filter_idx, c = divmod(k_coord, num_channels)
-        var r, s = divmod(filter_idx, filter_w)
+        var filter_idx, c = udivmod(k_coord, num_channels)
+        var r, s = udivmod(filter_idx, filter_w)
 
         # Initial M decomposition (done once, then use iterator)
         var m_coord_init = coords[1]
-        var n, m_remainder = divmod(m_coord_init, hw)
-        var h_out, w_out = divmod(m_remainder, out_w)
+        var n, m_remainder = udivmod(m_coord_init, hw)
+        var h_out, w_out = udivmod(m_remainder, out_w)
 
         # Pre-add lower_corner offset
-        var h = Int(h_out) + Int(self.lower_corner_h)
-        var w = Int(w_out) + Int(self.lower_corner_w)
+        var h = h_out + Int(self.lower_corner_h)
+        var w = w_out + Int(self.lower_corner_w)
 
         # Cache bounds for iterator wraparound
-        var out_w_int = Int(out_w)
         var out_h_int = Int(self.out_height)
         var lower_h = Int(self.lower_corner_h)
         var lower_w = Int(self.lower_corner_w)
@@ -4633,9 +4692,9 @@ struct TMATensorTileIm2col[
 
                 # K recomputation only needed when j > 0
                 comptime if j > 0:
-                    k_coord = coords[0] + UInt(j * copy_dim1)
-                    filter_idx, c = divmod(k_coord, num_channels)
-                    r, s = divmod(filter_idx, filter_w)
+                    k_coord = coords[0] + j * copy_dim1
+                    filter_idx, c = udivmod(k_coord, num_channels)
+                    r, s = udivmod(filter_idx, filter_w)
 
                 # Pass 4D coords (c, w, h, n) and filter offsets (s, r) to im2col PTX
                 cp_async_bulk_tensor_shared_cluster_global_im2col_multicast[
@@ -4644,22 +4703,22 @@ struct TMATensorTileIm2col[
                     dst.ptr.mut_cast[True]() + copy_offset,
                     UnsafePointer(to=self.descriptor).bitcast[NoneType](),
                     mem_barrier.unsafe_ptr(),
-                    Index(Int(c), w, h, Int(n)),
-                    Index(Int(s), Int(r)),
+                    Index(c, w, h, n),
+                    Index(s, r),
                     multicast_mask,
                 )
 
             # Iterator pattern: advance M by copy_dim0 using addition
             w += copy_dim0
-            if w >= out_w_int + lower_w:
-                w -= out_w_int
+            if w >= out_w + lower_w:
+                w -= out_w
                 h += 1
                 if h >= out_h_int + lower_h:
                     h -= out_h_int
                     n += 1
 
     @always_inline
-    fn async_copy[
+    def async_copy[
         cta_group: Int = 1,  # Use SM90-style TMA for cluster 1x1x1
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -4671,7 +4730,7 @@ struct TMATensorTileIm2col[
             ...,
         ],
         ref[AddressSpace.SHARED] mem_barrier: SharedMemBarrier,
-        coords: Tuple[UInt, UInt],
+        coords: Tuple[Int, Int],
     ):
         """Schedules an asynchronous im2col TMA load.
 
@@ -4706,30 +4765,29 @@ struct TMATensorTileIm2col[
         comptime num_copies_dim1 = Self.tile_shape[1] // copy_dim1
 
         # Precompute spatial size for M decomposition
-        var hw = UInt(self.out_height) * UInt(self.out_width)
-        var out_w = UInt(self.out_width)
+        var hw = Int(self.out_height) * Int(self.out_width)
+        var out_w = Int(self.out_width)
 
         # Precompute filter window size for K decomposition
         # K = r * S * C + s * C + c (filter-first, channel-last ordering for NHWC)
-        var num_channels = UInt(self.in_channels)
-        var filter_w = UInt(self.filter_w)
+        var num_channels = Int(self.in_channels)
+        var filter_w = Int(self.filter_w)
 
         # OPTIMIZATION: Hoist K decomposition outside loop (constant when j=0).
         var k_coord = coords[0]
-        var filter_idx, c = divmod(k_coord, num_channels)
-        var r, s = divmod(filter_idx, filter_w)
+        var filter_idx, c = udivmod(k_coord, num_channels)
+        var r, s = udivmod(filter_idx, filter_w)
 
         # Initial M decomposition (done once, then use iterator)
         var m_coord_init = coords[1]
-        var n, m_remainder = divmod(m_coord_init, hw)
-        var h_out, w_out = divmod(m_remainder, out_w)
+        var n, m_remainder = udivmod(m_coord_init, hw)
+        var h_out, w_out = udivmod(m_remainder, out_w)
 
         # Pre-add lower_corner offset
-        var h = Int(h_out) + Int(self.lower_corner_h)
-        var w = Int(w_out) + Int(self.lower_corner_w)
+        var h = h_out + Int(self.lower_corner_h)
+        var w = w_out + Int(self.lower_corner_w)
 
         # Cache bounds for iterator wraparound
-        var out_w_int = Int(out_w)
         var out_h_int = Int(self.out_height)
         var lower_h = Int(self.lower_corner_h)
         var lower_w = Int(self.lower_corner_w)
@@ -4742,9 +4800,9 @@ struct TMATensorTileIm2col[
 
                 # K recomputation only needed when j > 0
                 comptime if j > 0:
-                    k_coord = coords[0] + UInt(j * copy_dim1)
-                    filter_idx, c = divmod(k_coord, num_channels)
-                    r, s = divmod(filter_idx, filter_w)
+                    k_coord = coords[0] + j * copy_dim1
+                    filter_idx, c = udivmod(k_coord, num_channels)
+                    r, s = udivmod(filter_idx, filter_w)
 
                 # Pass 4D coords (c, w, h, n) and filter offsets (s, r) to im2col PTX
                 cp_async_bulk_tensor_shared_cluster_global_im2col[
@@ -4753,21 +4811,21 @@ struct TMATensorTileIm2col[
                     dst.ptr.mut_cast[True]() + copy_offset,
                     UnsafePointer(to=self.descriptor).bitcast[NoneType](),
                     mem_barrier.unsafe_ptr(),
-                    Index(Int(c), w, h, Int(n)),
-                    Index(Int(s), Int(r)),
+                    Index(c, w, h, n),
+                    Index(s, r),
                 )
 
             # Iterator pattern: advance M by copy_dim0 using addition
             w += copy_dim0
-            if w >= out_w_int + lower_w:
-                w -= out_w_int
+            if w >= out_w + lower_w:
+                w -= out_w
                 h += 1
                 if h >= out_h_int + lower_h:
                     h -= out_h_int
                     n += 1
 
     @always_inline
-    fn async_multicast_load[
+    def async_multicast_load[
         cta_group: Int = 1,  # Use SM90-style TMA for cluster 1x1x1
         eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL,
     ](
@@ -4779,7 +4837,7 @@ struct TMATensorTileIm2col[
             ...,
         ],
         ref[AddressSpace.SHARED] mem_barrier: SharedMemBarrier,
-        coords: Tuple[UInt, UInt],
+        coords: Tuple[Int, Int],
         multicast_mask: UInt16,
     ):
         """Schedules an asynchronous im2col TMA load with multicast.
@@ -4816,30 +4874,29 @@ struct TMATensorTileIm2col[
         comptime num_copies_dim1 = Self.tile_shape[1] // copy_dim1
 
         # Precompute spatial size for M decomposition
-        var hw = UInt(self.out_height) * UInt(self.out_width)
-        var out_w = UInt(self.out_width)
+        var hw = Int(self.out_height) * Int(self.out_width)
+        var out_w = Int(self.out_width)
 
         # Precompute filter window size for K decomposition
         # K = r * S * C + s * C + c (filter-first, channel-last ordering for NHWC)
-        var num_channels = UInt(self.in_channels)
-        var filter_w = UInt(self.filter_w)
+        var num_channels = Int(self.in_channels)
+        var filter_w = Int(self.filter_w)
 
         # OPTIMIZATION: Hoist K decomposition outside loop (constant when j=0).
         var k_coord = coords[0]
-        var filter_idx, c = divmod(k_coord, num_channels)
-        var r, s = divmod(filter_idx, filter_w)
+        var filter_idx, c = udivmod(k_coord, num_channels)
+        var r, s = udivmod(filter_idx, filter_w)
 
         # Initial M decomposition (done once, then use iterator)
         var m_coord_init = coords[1]
-        var n, m_remainder = divmod(m_coord_init, hw)
-        var h_out, w_out = divmod(m_remainder, out_w)
+        var n, m_remainder = udivmod(m_coord_init, hw)
+        var h_out, w_out = udivmod(m_remainder, out_w)
 
         # Pre-add lower_corner offset
-        var h = Int(h_out) + Int(self.lower_corner_h)
-        var w = Int(w_out) + Int(self.lower_corner_w)
+        var h = h_out + Int(self.lower_corner_h)
+        var w = w_out + Int(self.lower_corner_w)
 
         # Cache bounds for iterator wraparound
-        var out_w_int = Int(out_w)
         var out_h_int = Int(self.out_height)
         var lower_h = Int(self.lower_corner_h)
         var lower_w = Int(self.lower_corner_w)
@@ -4852,9 +4909,9 @@ struct TMATensorTileIm2col[
 
                 # K recomputation only needed when j > 0
                 comptime if j > 0:
-                    k_coord = coords[0] + UInt(j * copy_dim1)
-                    filter_idx, c = divmod(k_coord, num_channels)
-                    r, s = divmod(filter_idx, filter_w)
+                    k_coord = coords[0] + j * copy_dim1
+                    filter_idx, c = udivmod(k_coord, num_channels)
+                    r, s = udivmod(filter_idx, filter_w)
 
                 # Pass 4D coords (c, w, h, n) and filter offsets (s, r) to im2col PTX
                 cp_async_bulk_tensor_shared_cluster_global_im2col_multicast[
@@ -4863,74 +4920,22 @@ struct TMATensorTileIm2col[
                     dst.ptr.mut_cast[True]() + copy_offset,
                     UnsafePointer(to=self.descriptor).bitcast[NoneType](),
                     mem_barrier.unsafe_ptr(),
-                    Index(Int(c), w, h, Int(n)),
-                    Index(Int(s), Int(r)),
+                    Index(c, w, h, n),
+                    Index(s, r),
                     multicast_mask,
                 )
 
             # Iterator pattern: advance M by copy_dim0 using addition
             w += copy_dim0
-            if w >= out_w_int + lower_w:
-                w -= out_w_int
+            if w >= out_w + lower_w:
+                w -= out_w
                 h += 1
                 if h >= out_h_int + lower_h:
                     h -= out_h_int
                     n += 1
 
 
-@always_inline
-fn _im2col_desc_tile_layout[
-    dtype: DType,
-    tile_shape: IndexList[2],
-    swizzle_mode: TensorMapSwizzle,
-]() -> Layout:
-    """Compute the TMA descriptor layout for im2col.
-
-    For im2col TMA, each transaction loads multiple output pixels with multiple channels.
-    Following CUTLASS's approach (copy_traits_sm90_im2col.hpp:650-651):
-    - channels_per_pixel = min(K_tile, swizzle_width) (contiguous channels)
-    - pixels_per_column = computed from tile shape and TMA box constraints
-
-    The TMA im2col box is constrained by hardware limits. The maximum box size
-    is typically 256 elements for im2col TMA. This function computes the largest
-    box that fits within these constraints.
-
-    The descriptor layout is row_major(pixels_per_column, channels_per_pixel).
-    """
-    # Swizzle width in elements (bytes / element_size)
-    comptime swizzle_bytes = (
-        16 if swizzle_mode
-        == TensorMapSwizzle.SWIZZLE_NONE else (
-            32 if swizzle_mode
-            == TensorMapSwizzle.SWIZZLE_32B else (
-                64 if swizzle_mode == TensorMapSwizzle.SWIZZLE_64B else 128
-            )
-        )
-    )
-    comptime element_size = size_of[dtype]()
-    comptime swizzle_width = swizzle_bytes // element_size
-
-    # Channels per pixel is the minimum of K_tile and swizzle width
-    comptime k_tile = tile_shape[1]
-    comptime channels_per_pixel = swizzle_width if swizzle_width < k_tile else k_tile
-
-    # Maximum TMA im2col box size in elements (hardware constraint)
-    # Based on CUDA TMA documentation and CUTLASS patterns, 256 elements is
-    # a safe limit for im2col TMA transactions.
-    comptime max_tma_box_elements = 256
-
-    # Compute pixels_per_column from tile shape and TMA constraints
-    # pixels = min(M_tile, max_box_elements / channels_per_pixel)
-    comptime m_tile = tile_shape[0]
-    comptime max_pixels_from_box = max_tma_box_elements // channels_per_pixel
-    comptime pixels_per_column = (
-        m_tile if m_tile < max_pixels_from_box else max_pixels_from_box
-    )
-
-    return Layout.row_major(pixels_per_column, channels_per_pixel)
-
-
-fn _im2col_desc_shape[
+def _im2col_desc_shape[
     dtype: DType,
     tile_shape: IndexList[2],
     swizzle_mode: TensorMapSwizzle,
@@ -4959,7 +4964,88 @@ fn _im2col_desc_shape[
 
 
 @always_inline
-fn create_tensor_tile_im2col[
+def _build_im2col_descriptor[
+    dtype: DType,
+    swizzle_mode: TensorMapSwizzle,
+    *,
+    __tile_shape: IndexList[2],
+    __desc_shape: IndexList[2],
+](
+    ctx: DeviceContext,
+    ptr: UnsafePointer[Scalar[dtype], ...],
+    batch: Int,
+    height: Int,
+    width: Int,
+    channels: Int,
+    lower_corner_h: Int,
+    lower_corner_w: Int,
+    upper_corner_h: Int,
+    upper_corner_w: Int,
+    out_height: Int,
+    out_width: Int,
+    filter_h: Int,
+    filter_w: Int,
+) raises -> TMATensorTileIm2col[dtype, 2, __tile_shape, __desc_shape]:
+    """Shared implementation for building an im2col TMA descriptor.
+
+    Both the LayoutTensor and TileTensor overloads of
+    `create_tensor_tile_im2col` delegate here after extracting dimensions
+    from their respective tensor types.
+    """
+    var global_buf = DeviceBuffer(
+        ctx,
+        ptr.mut_cast[True]().address_space_cast[AddressSpace.GENERIC](),
+        1,
+        owning=False,
+    )
+
+    var global_shape = IndexList[4](batch, height, width, channels)
+
+    # Row-major NHWC strides: stride(i) = product of all dims after i
+    var global_strides = IndexList[4](
+        height * width * channels,
+        width * channels,
+        channels,
+        1,
+    )
+
+    var lower_corner = IndexList[2](lower_corner_h, lower_corner_w)
+    var upper_corner = IndexList[2](upper_corner_h, upper_corner_w)
+
+    comptime pixels_per_column = __desc_shape[0]
+    comptime channels_per_pixel = __desc_shape[1]
+
+    var swizzle = _SwizzleMode(Int32(Int(swizzle_mode)))
+
+    var tensormap = _create_tensormap_im2col[dtype, 4, 2](
+        global_buf,
+        global_shape,
+        global_strides,
+        lower_corner,
+        upper_corner,
+        channels_per_pixel,
+        pixels_per_column,
+        swizzle,
+    )
+
+    # TensorMap and TMADescriptor are both 128-byte aligned with the same layout
+    var descriptor = TMADescriptor()
+    descriptor.data = tensormap.data
+
+    return TMATensorTileIm2col[dtype, 2, __tile_shape, __desc_shape](
+        descriptor,
+        UInt32(out_height),
+        UInt32(out_width),
+        UInt32(filter_h),
+        UInt32(filter_w),
+        UInt32(channels),
+        Int32(lower_corner_h),
+        Int32(lower_corner_w),
+    )
+
+
+@always_inline
+def create_tensor_tile_im2col[
     dtype: DType,
     tile_shape: IndexList[2],  # [M_tile, K_tile] = [pixels, channels]
     swizzle_mode: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_NONE,
@@ -5030,67 +5116,112 @@ fn create_tensor_tile_im2col[
     """
     comptime assert tensor.rank == 4, "Im2col TMA requires 4D NHWC tensor"
 
-    # Extract tensor dimensions
-    var batch = tensor.dim(0)
-    var height = tensor.dim(1)
-    var width = tensor.dim(2)
-    var channels = tensor.dim(3)
+    # The helper hardcodes row-major strides from dims; verify the tensor
+    # is actually contiguous so the strides match.
+    var h = Int(tensor.dim(1))
+    var w = Int(tensor.dim(2))
+    var c = Int(tensor.dim(3))
+    debug_assert(
+        tensor.stride(3) == 1
+        and tensor.stride(2) == c
+        and tensor.stride(1) == w * c
+        and tensor.stride(0) == h * w * c,
+        "im2col TMA requires a contiguous NHWC tensor",
+    )
 
-    # Create device buffer wrapper
-    var global_buf = DeviceBuffer(
+    return _build_im2col_descriptor[
+        swizzle_mode=swizzle_mode,
+        __tile_shape=__tile_shape,
+        __desc_shape=__desc_shape,
+    ](
         ctx,
-        tensor.ptr.mut_cast[True]().address_space_cast[AddressSpace.GENERIC](),
-        1,
-        owning=False,
+        tensor.ptr,
+        Int(tensor.dim(0)),
+        h,
+        w,
+        c,
+        lower_corner_h,
+        lower_corner_w,
+        upper_corner_h,
+        upper_corner_w,
+        out_height,
+        out_width,
+        filter_h,
+        filter_w,
     )
 
-    # Global shape in NHWC order
-    var global_shape = IndexList[4](batch, height, width, channels)
 
-    # Compute row-major strides for NHWC layout
-    # When tensor.stride() returns -1 (unknown at compile-time), compute from dims
-    # For row-major NHWC: stride(i) = product of all dims after i
-    var stride_n = height * width * channels  # batch stride
-    var stride_h = width * channels  # height stride
-    var stride_w = channels  # width stride
-    var stride_c = 1  # channel stride (innermost)
+@always_inline
+def create_tensor_tile_im2col[
+    dtype: DType,
+    tile_shape: IndexList[2],  # [M_tile, K_tile] = [pixels, channels]
+    swizzle_mode: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_NONE,
+    *,
+    __tile_shape: IndexList[2] = tile_shape,
+    __desc_shape: IndexList[2] = _im2col_desc_shape[
+        dtype, tile_shape, swizzle_mode
+    ](),
+](
+    ctx: DeviceContext,
+    tensor: TileTensor[dtype, ...],  # 4D NHWC tensor
+    lower_corner_h: Int,
+    lower_corner_w: Int,
+    upper_corner_h: Int,
+    upper_corner_w: Int,
+    out_height: Int,
+    out_width: Int,
+    filter_h: Int,
+    filter_w: Int,
+) raises -> TMATensorTileIm2col[dtype, 2, __tile_shape, __desc_shape]:
+    """Creates a TMA tensor tile with im2col transformation for 2D convolution.
 
-    var global_strides = IndexList[4](stride_n, stride_h, stride_w, stride_c)
+    TileTensor overload — delegates to the shared `_build_im2col_descriptor`
+    helper. See the LayoutTensor overload for full background.
 
-    # Spatial corners (H, W order)
-    var lower_corner = IndexList[2](lower_corner_h, lower_corner_w)
-    var upper_corner = IndexList[2](upper_corner_h, upper_corner_w)
+    Parameters:
+        dtype: The data type of tensor elements.
+        tile_shape: Shape `[M_tile, K_tile]` for the GEMM tile.
+        swizzle_mode: Memory swizzling pattern.
+        __tile_shape: Internal parameter for the tile shape.
+        __desc_shape: Internal parameter for the descriptor shape.
 
-    # Tile dimensions for TMA im2col box (from desc_shape)
-    # desc_shape is (pixels_per_column, channels_per_pixel)
-    comptime pixels_per_column = __desc_shape[0]
-    comptime channels_per_pixel = __desc_shape[1]
+    Args:
+        ctx: The CUDA device context.
+        tensor: The 4D activation tensor in NHWC layout.
+        lower_corner_h: Lower corner offset for height (negative for padding).
+        lower_corner_w: Lower corner offset for width (negative for padding).
+        upper_corner_h: Upper corner offset for height.
+        upper_corner_w: Upper corner offset for width.
+        out_height: Output height (H_out) for M coordinate decomposition.
+        out_width: Output width (W_out) for M coordinate decomposition.
+        filter_h: Filter height (R) for K coordinate decomposition.
+        filter_w: Filter width (S) for K coordinate decomposition.
 
-    # Convert TensorMapSwizzle to SwizzleMode (same underlying values)
-    var swizzle = _SwizzleMode(Int32(Int(swizzle_mode)))
+    Returns:
+        A TMATensorTileIm2col configured for im2col loads.
 
-    var tensormap = _create_tensormap_im2col[dtype, 4, 2](
-        global_buf,
-        global_shape,
-        global_strides,
-        lower_corner,
-        upper_corner,
-        channels_per_pixel,
-        pixels_per_column,
-        swizzle,
-    )
+    Raises:
+        Error if TMA descriptor creation fails.
+    """
+    comptime assert tensor.rank == 4, "Im2col TMA requires 4D NHWC tensor"
 
-    # Convert TensorMap to TMADescriptor (both are 128-byte aligned, same layout)
-    var descriptor = TMADescriptor()
-    descriptor.data = tensormap.data
-
-    return TMATensorTileIm2col[dtype, 2, __tile_shape, __desc_shape](
-        descriptor,
-        UInt32(out_height),
-        UInt32(out_width),
-        UInt32(filter_h),
-        UInt32(filter_w),
-        UInt32(channels),  # in_channels from the NHWC tensor
-        Int32(lower_corner_h),  # CUTLASS ArithmeticTupleIterator pattern
-        Int32(lower_corner_w),
+    return _build_im2col_descriptor[
+        swizzle_mode=swizzle_mode,
+        __tile_shape=__tile_shape,
+        __desc_shape=__desc_shape,
+    ](
+        ctx,
+        tensor.ptr,
+        Int(tensor.dim[0]()),
+        Int(tensor.dim[1]()),
+        Int(tensor.dim[2]()),
+        Int(tensor.dim[3]()),
+        lower_corner_h,
+        lower_corner_w,
+        upper_corner_h,
+        upper_corner_w,
+        out_height,
+        out_width,
+        filter_h,
+        filter_w,
     )

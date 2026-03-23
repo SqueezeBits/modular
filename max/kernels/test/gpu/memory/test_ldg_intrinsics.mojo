@@ -16,23 +16,20 @@ from std.gpu import thread_idx
 from std.gpu.host import get_gpu_target
 from std.gpu.host.compile import _compile_code
 from std.gpu.intrinsics import ldg
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.testing import *
 
 
-fn register_intrinsics(
-    i8: UnsafePointer[Int8],
-    ui8: UnsafePointer[UInt8],
-    i16: UnsafePointer[Int16],
-    ui16: UnsafePointer[UInt16],
-    i32: UnsafePointer[Int32],
-    ui32: UnsafePointer[UInt32],
-    i64: UnsafePointer[Int64],
-    ui64: UnsafePointer[UInt64],
-    f32: UnsafePointer[Float32],
-    f64: UnsafePointer[Float64],
+def register_intrinsics(
+    i8: UnsafePointer[Int8, MutAnyOrigin],
+    ui8: UnsafePointer[UInt8, MutAnyOrigin],
+    i16: UnsafePointer[Int16, MutAnyOrigin],
+    ui16: UnsafePointer[UInt16, MutAnyOrigin],
+    i32: UnsafePointer[Int32, MutAnyOrigin],
+    ui32: UnsafePointer[UInt32, MutAnyOrigin],
+    i64: UnsafePointer[Int64, MutAnyOrigin],
+    ui64: UnsafePointer[UInt64, MutAnyOrigin],
+    f32: UnsafePointer[Float32, MutAnyOrigin],
+    f64: UnsafePointer[Float64, MutAnyOrigin],
 ):
     # Note we perform the store purely to avoid the compiler from optimizing
     # away the statements.
@@ -50,7 +47,7 @@ fn register_intrinsics(
 
 
 @always_inline
-fn _verify_register_intrinsics(asm: StringSlice) raises -> None:
+def _verify_register_intrinsics(asm: StringSlice) raises -> None:
     assert_true("ld.global.nc.b8" in asm)
     assert_true("ld.global.nc.b16" in asm)
     assert_true("ld.global.nc.b32" in asm)

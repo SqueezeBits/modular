@@ -13,9 +13,7 @@
 
 from std.hashlib import default_comp_time_hasher
 from std.math import align_up, ceildiv
-from std.memory import LegacyUnsafePointer, bitcast
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
+from std.memory import bitcast
 from std.sys import argv, size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
@@ -49,13 +47,7 @@ from std.gpu.sync import (
 from std.gpu.compute.arch.tcgen05 import *
 from internal_utils import assert_almost_equal
 from std.random import rand
-from layout import (
-    UNKNOWN_VALUE,
-    IntTuple,
-    Layout,
-    LayoutTensor,
-    RuntimeTuple,
-)
+from layout import IntTuple, Layout, LayoutTensor, RuntimeTuple, UNKNOWN_VALUE
 from layout._utils import ManagedLayoutTensor
 from layout.layout_tensor import LayoutTensorIter
 from layout.swizzle import Swizzle, make_ldmatrix_swizzle, make_swizzle
@@ -81,7 +73,7 @@ from std.utils.numerics import get_accum_type
 from std.utils.static_tuple import StaticTuple
 
 
-fn is_benchmark() -> Bool:
+def is_benchmark() -> Bool:
     for arg in argv():
         if arg == "--benchmark":
             return True
@@ -98,44 +90,44 @@ struct WarpRole(TrivialRegisterPassable):
     comptime Epilogue = Self(3)
 
     @always_inline
-    fn __eq__(self, other: UInt) -> Bool:
+    def __eq__(self, other: UInt) -> Bool:
         return self._role == Int32(other)
 
     @always_inline
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         return self._role == other._role
 
     @always_inline
-    fn __ne__(self, other: Self) -> Bool:
+    def __ne__(self, other: Self) -> Bool:
         return self._role != other._role
 
     @always_inline
-    fn __ge__(self, other: UInt) -> Bool:
+    def __ge__(self, other: UInt) -> Bool:
         return self._role >= Int32(other)
 
     @staticmethod
     @always_inline
-    fn is_main_load() -> Bool:
+    def is_main_load() -> Bool:
         return Self.MainLoad == get_warp_id()
 
     @staticmethod
     @always_inline
-    fn is_mma() -> Bool:
+    def is_mma() -> Bool:
         return Self.Mma == get_warp_id()
 
     @staticmethod
     @always_inline
-    fn is_epilogue() -> Bool:
+    def is_epilogue() -> Bool:
         return Self.Epilogue >= get_warp_id()
 
     @staticmethod
     @always_inline
-    fn is_scheduler() -> Bool:
+    def is_scheduler() -> Bool:
         return Self.Scheduler == get_warp_id()
 
 
 @always_inline
-fn load_AB[
+def load_AB[
     a_type: DType,
     b_type: DType,
     a_tma_rank: Int,
@@ -170,10 +162,10 @@ fn load_AB[
         alignment=128,
     ],
     mma_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        mut=True, SharedMemBarrier, address_space=AddressSpace.SHARED, _
     ],
     tma_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        mut=True, SharedMemBarrier, address_space=AddressSpace.SHARED, _
     ],
     producer_phase: PipelineState[Int(num_pipeline_stages)],
     peer_cta_coord: Tuple[UInt, UInt, UInt],
@@ -243,7 +235,7 @@ fn load_AB[
 
 
 @always_inline
-fn consumer_main_loop[
+def consumer_main_loop[
     accum_type: DType,
     c_type: DType,
     a_type: DType,
@@ -277,10 +269,10 @@ fn consumer_main_loop[
         alignment=128,
     ],
     mma_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        mut=True, SharedMemBarrier, address_space=AddressSpace.SHARED, _
     ],
     tma_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        mut=True, SharedMemBarrier, address_space=AddressSpace.SHARED, _
     ],
     consumer_phase: PipelineState[pipeline_stages],
     mma_op: MmaOpSM100_SS[
@@ -319,10 +311,12 @@ fn consumer_main_loop[
 
 
 @always_inline
-fn stsm_helper[
-    swizzle: Swizzle
+def stsm_helper[
+    swizzle: Swizzle,
+    vec_dtype: DType,
+    vec_size: Int,
 ](
-    vec: SIMD,
+    vec: InlineArray[Scalar[vec_dtype], vec_size],
     dst: LayoutTensor[mut=True, _, _, address_space=AddressSpace.SHARED, ...],
 ):
     # Number of elements in one row per stsmx4 tile, a row is 32B.
@@ -343,14 +337,23 @@ fn stsm_helper[
     comptime for i in range(shape0 // stsmx4_row_size):
         comptime n_offset = i * stsmx4_row_size
         var offset = swizzle(Int(stsm_lane_offset + UInt(n_offset)))
-        var v = vec.slice[stsmx4_lane_size, offset=i * stsmx4_lane_size]().cast[
-            dst.dtype
-        ]()
+        var v = SIMD[dst.dtype, stsmx4_lane_size]()
+
+        comptime for k in range(stsmx4_lane_size // 2):
+            var pair = SIMD[vec_dtype, 2](
+                rebind[Scalar[vec_dtype]](vec[i * stsmx4_lane_size + 2 * k]),
+                rebind[Scalar[vec_dtype]](
+                    vec[i * stsmx4_lane_size + 2 * k + 1]
+                ),
+            )
+            var casted = pair.cast[dst.dtype]()
+            v[2 * k] = casted[0]
+            v[2 * k + 1] = casted[1]
         st_matrix[simd_width=4](dst.ptr + offset, bitcast[DType.float32, 4](v))
 
 
 @always_inline
-fn multi_stage_store_C[
+def multi_stage_store_C[
     c_type: DType,
     c_smem_layout: Layout,
     c_tma_rank: Int,
@@ -378,10 +381,10 @@ fn multi_stage_store_C[
     c_tma_op: TMATensorTile[c_type, c_tma_rank, c_tile_shape, c_desc_shape],
     accum_pipeline_consumer_state: PipelineState[num_accum_pipeline_stages],
     accum_full_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        mut=True, SharedMemBarrier, address_space=AddressSpace.SHARED, _
     ],
     accum_empty_mbar: UnsafePointer[
-        SharedMemBarrier, address_space=AddressSpace.SHARED
+        mut=True, SharedMemBarrier, address_space=AddressSpace.SHARED, _
     ],
     tmem_addr: UInt32,
     work_tile_coord: Tuple[UInt, UInt],
@@ -461,11 +464,14 @@ fn multi_stage_store_C[
         var c_smem_warp_tile = c_smem_tile.tile[32, stageN](Int(warp_id), 0)
 
         # Pack the upper frag to shared memory
+        comptime frag_width = rep * data_paths * (bits // 32) // WARP_SIZE
         stsm_helper[swizzle](
-            upper_frag, c_smem_warp_tile.tile[16, stageN](0, 0)
+            rebind[InlineArray[Scalar[accum_type], frag_width]](upper_frag),
+            c_smem_warp_tile.tile[16, stageN](0, 0),
         )
         stsm_helper[swizzle](
-            lower_frag, c_smem_warp_tile.tile[16, stageN](1, 0)
+            rebind[InlineArray[Scalar[accum_type], frag_width]](lower_frag),
+            c_smem_warp_tile.tile[16, stageN](1, 0),
         )
 
         # Guard the write to shared memory is done.
@@ -500,7 +506,7 @@ fn multi_stage_store_C[
 @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(c_tma_op, `nvvm.grid_constant`)
-fn kernel_8[
+def kernel_8[
     a_type: DType,
     b_type: DType,
     c_type: DType,
@@ -763,9 +769,10 @@ fn kernel_8[
     var rank_n = block_id_in_cluster.y
 
     # (peer_id, mma_coord_m, mma_coord_n)
+    var peer_cta_quot, peer_cta_rem = divmod(rank_m, UInt(cta_group))
     var peer_cta_coord = (
-        rank_m % UInt(cta_group),
-        rank_m // UInt(cta_group),
+        peer_cta_rem,
+        peer_cta_quot,
         rank_n,
     )  # v,m,n
 
@@ -966,7 +973,7 @@ fn kernel_8[
         _ = tmem_dealloc_mbar[].arrive()
 
 
-fn blackwell_kernel_8[
+def blackwell_kernel_8[
     c_type: DType,
     c_layout: Layout,
     a_type: DType,
@@ -1175,9 +1182,9 @@ def test_blackwell_kernel_8[
     comptime c_layout = Layout.row_major(M, N)
 
     # Host memory allocation
-    var a_host_ptr = UnsafePointer[Scalar[a_type]].alloc(M * K)
+    var a_host_ptr = alloc[Scalar[a_type]](M * K)
     var a_host = LayoutTensor[a_type, a_layout](a_host_ptr)
-    var b_host_ptr = UnsafePointer[Scalar[b_type]].alloc(N * K)
+    var b_host_ptr = alloc[Scalar[b_type]](N * K)
     var b_host = LayoutTensor[b_type, b_layout](b_host_ptr)
     var c_host_managed = ManagedLayoutTensor[c_type, c_layout](ctx)
     var c_host = c_host_managed.tensor[update=False]()
@@ -1234,7 +1241,7 @@ def test_blackwell_kernel_8[
 
         @always_inline
         @parameter
-        fn run_kernel(ctx: DeviceContext) raises:
+        def run_kernel(ctx: DeviceContext) raises:
             blackwell_kernel_8[
                 transpose_b=transpose_b,
                 umma_shape=mma_shape,
@@ -1304,7 +1311,7 @@ def test_blackwell_kernel_8[
     b_host_ptr.free()
 
 
-fn get_dic_of_shapes(
+def get_dic_of_shapes(
     index: Int, dic_bro: Dict[Int, Tuple[Int, Int, Int], ...]
 ) -> Tuple[Int, Int, Int]:
     try:
@@ -1314,7 +1321,7 @@ fn get_dic_of_shapes(
         return (128, 128, 128)
 
 
-fn make_dic_of_shapes() -> (
+def make_dic_of_shapes() -> (
     Dict[Int, Tuple[Int, Int, Int], default_comp_time_hasher]
 ):
     var dic = Dict[Int, Tuple[Int, Int, Int], default_comp_time_hasher]()
@@ -1322,7 +1329,7 @@ fn make_dic_of_shapes() -> (
     return dic^
 
 
-fn benchmark_blackwell_matmul(ctx: DeviceContext) raises:
+def benchmark_blackwell_matmul(ctx: DeviceContext) raises:
     comptime for swizzle in [TensorMapSwizzle.SWIZZLE_128B]:
         print("Benchmarking blackwell_matmul_tma_umma_kernel")
         print("============================================")

@@ -61,7 +61,7 @@ comptime _FULL_MASK = UInt(2**WARP_SIZE - 1)
 comptime _WIDTH_MASK_SHUFFLE_UP = 0
 
 # Common function type for binary SIMD reduction operations (add, max, min).
-comptime _ReduceFn = fn[dtype: DType, width: Int](
+comptime _ReduceFn = def[dtype: DType, width: Int](
     SIMD[dtype, width], SIMD[dtype, width]
 ) capturing -> SIMD[dtype, width]
 
@@ -72,7 +72,7 @@ comptime _ReduceFn = fn[dtype: DType, width: Int](
 
 
 @always_inline
-fn _dpp_update_i32[
+def _dpp_update_i32[
     dpp_ctrl: Int,
     row_mask: Int = 0xF,
     bank_mask: Int = 0xF,
@@ -112,7 +112,7 @@ fn _dpp_update_i32[
 
 
 @always_inline
-fn _dpp_move[
+def _dpp_move[
     dtype: DType, simd_width: Int, //, dpp_ctrl: Int
 ](val: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
     """Returns a neighboring lane's value via a DPP cross-lane operation.
@@ -154,7 +154,7 @@ fn _dpp_move[
 
 
 @always_inline
-fn _dpp_reduce_and_broadcast[
+def _dpp_reduce_and_broadcast[
     dtype: DType,
     simd_width: Int,
     //,
@@ -229,7 +229,7 @@ fn _dpp_reduce_and_broadcast[
     # shuffle_xor (ds_bpermute through LDS). permlane_shuffle only
     # supports 32-bit operands, so fall back to shuffle_xor for wider types.
     @always_inline
-    fn _cross_row_step[
+    def _cross_row_step[
         shuffle_width: Int
     ](v: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
         comptime if _cdna_4_or_newer() and size_of[
@@ -253,7 +253,7 @@ fn _dpp_reduce_and_broadcast[
 
 
 @always_inline
-fn _shuffle[
+def _shuffle[
     mnemonic: StringSlice,
     dtype: DType,
     simd_width: Int,
@@ -311,7 +311,7 @@ fn _shuffle[
 
 
 @always_inline
-fn _shuffle_amd_helper[
+def _shuffle_amd_helper[
     dtype: DType, simd_width: Int
 ](dst_lane: UInt32, val: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
     comptime if size_of[SIMD[dtype, simd_width]]() == 4:
@@ -342,7 +342,7 @@ fn _shuffle_amd_helper[
 
 
 @always_inline
-fn _shuffle_apple_helper[
+def _shuffle_apple_helper[
     op: StringSlice, dtype: DType, simd_width: Int
 ](
     mask: UInt,  # Ignored, for API parity
@@ -413,7 +413,7 @@ fn _shuffle_apple_helper[
 
 
 @always_inline
-fn shuffle_idx[
+def shuffle_idx[
     dtype: DType, simd_width: Int, //
 ](val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[dtype, simd_width]:
     """Copies a value from a source lane to other lanes in a warp.
@@ -451,7 +451,7 @@ fn shuffle_idx[
 
 
 @always_inline
-fn _shuffle_idx_amd[
+def _shuffle_idx_amd[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -468,7 +468,7 @@ fn _shuffle_idx_amd[
 
 
 @always_inline
-fn shuffle_idx[
+def shuffle_idx[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -516,8 +516,7 @@ fn shuffle_idx[
             mask, val, offset
         )
     else:
-        return CompilationTarget.unsupported_target_error[
-            SIMD[dtype, simd_width],
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name(),
         ]()
 
@@ -528,7 +527,7 @@ fn shuffle_idx[
 
 
 @always_inline
-fn shuffle_up[
+def shuffle_up[
     dtype: DType, simd_width: Int, //
 ](val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[dtype, simd_width]:
     """Copies values from threads with lower lane IDs in the warp.
@@ -557,7 +556,7 @@ fn shuffle_up[
 
 
 @always_inline
-fn _shuffle_up_amd[
+def _shuffle_up_amd[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -571,7 +570,7 @@ fn _shuffle_up_amd[
 
 
 @always_inline
-fn shuffle_up[
+def shuffle_up[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -612,8 +611,7 @@ fn shuffle_up[
     elif is_apple_gpu():
         return _shuffle_apple_helper["up", dtype, simd_width](mask, val, offset)
     else:
-        return CompilationTarget.unsupported_target_error[
-            SIMD[dtype, simd_width],
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name(),
         ]()
 
@@ -624,7 +622,7 @@ fn shuffle_up[
 
 
 @always_inline
-fn shuffle_down[
+def shuffle_down[
     dtype: DType, simd_width: Int, //
 ](val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[dtype, simd_width]:
     """Copies values from threads with higher lane IDs in the warp.
@@ -654,7 +652,7 @@ fn shuffle_down[
 
 
 @always_inline
-fn _shuffle_down_amd[
+def _shuffle_down_amd[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -669,7 +667,7 @@ fn _shuffle_down_amd[
 
 
 @always_inline
-fn shuffle_down[
+def shuffle_down[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -713,8 +711,7 @@ fn shuffle_down[
             mask, val, offset
         )
     else:
-        return CompilationTarget.unsupported_target_error[
-            SIMD[dtype, simd_width],
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name(),
         ]()
 
@@ -725,7 +722,7 @@ fn shuffle_down[
 
 
 @always_inline
-fn shuffle_xor[
+def shuffle_xor[
     dtype: DType, simd_width: Int, //
 ](val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[dtype, simd_width]:
     """Exchanges values between threads in a warp using a butterfly pattern.
@@ -750,7 +747,7 @@ fn shuffle_xor[
 
 
 @always_inline
-fn _shuffle_xor_amd[
+def _shuffle_xor_amd[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -766,7 +763,7 @@ fn _shuffle_xor_amd[
 
 
 @always_inline
-fn shuffle_xor[
+def shuffle_xor[
     dtype: DType, simd_width: Int, //
 ](mask: UInt, val: SIMD[dtype, simd_width], offset: UInt32) -> SIMD[
     dtype, simd_width
@@ -815,8 +812,7 @@ fn shuffle_xor[
             mask, val, offset
         )
     else:
-        return CompilationTarget.unsupported_target_error[
-            SIMD[dtype, simd_width],
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name(),
         ]()
 
@@ -827,11 +823,11 @@ fn shuffle_xor[
 
 
 @always_inline
-fn lane_group_reduce[
+def lane_group_reduce[
     val_type: DType,
     simd_width: Int,
     //,
-    shuffle: fn[dtype: DType, simd_width: Int](
+    shuffle: def[dtype: DType, simd_width: Int](
         val: SIMD[dtype, simd_width], offset: UInt32
     ) -> SIMD[dtype, simd_width],
     func: _ReduceFn,
@@ -867,7 +863,7 @@ fn lane_group_reduce[
 
             # Compute sum across 16 threads using shuffle down
             @parameter
-            fn add[dtype: DType, width: Int](x: SIMD[dtype, width], y: SIMD[dtype, width]) -> SIMD[dtype, width]:
+            def add[dtype: DType, width: Int](x: SIMD[dtype, width], y: SIMD[dtype, width]) -> SIMD[dtype, width]:
                 return x + y
             var val = SIMD[DType.float32, 16](42.0)
             var result = lane_group_reduce[shuffle_down, add, num_lanes=16](val)
@@ -885,11 +881,11 @@ fn lane_group_reduce[
 
 
 @always_inline
-fn reduce[
+def reduce[
     val_type: DType,
     simd_width: Int,
     //,
-    shuffle: fn[dtype: DType, simd_width: Int](
+    shuffle: def[dtype: DType, simd_width: Int](
         val: SIMD[dtype, simd_width], offset: UInt32
     ) -> SIMD[dtype, simd_width],
     func: _ReduceFn,
@@ -920,7 +916,7 @@ fn reduce[
 
         # Compute warp-wide sum using shuffle down
         @parameter
-        fn add[dtype: DType, width: Int](x: SIMD[dtype, width], y: SIMD[dtype, width]) capturing -> SIMD[dtype, width]:
+        def add[dtype: DType, width: Int](x: SIMD[dtype, width], y: SIMD[dtype, width]) capturing -> SIMD[dtype, width]:
             return x + y
 
         val = SIMD[DType.float32, 4](2.0, 4.0, 6.0, 8.0)
@@ -931,88 +927,30 @@ fn reduce[
 
 
 # ===-----------------------------------------------------------------------===#
-# Warp Sum
+# Shared broadcast-reduce dispatch
 # ===-----------------------------------------------------------------------===#
 
 
 @always_inline
-fn lane_group_sum[
+def _lane_group_broadcast_reduce[
     val_type: DType,
     simd_width: Int,
     //,
+    func: _ReduceFn,
     num_lanes: Int,
     stride: Int = 1,
 ](val: SIMD[val_type, simd_width]) -> SIMD[val_type, simd_width]:
-    """Computes the sum of values across a group of lanes using warp-level operations.
-
-    This function performs a parallel reduction across a group of lanes to compute their sum.
-    The reduction is done using warp shuffle operations for efficient communication between lanes.
-    The result is stored in all participating lanes.
-
-    Parameters:
-        val_type: The data type of the SIMD elements (e.g. float32, int32).
-        simd_width: The number of elements in the SIMD vector.
-        num_lanes: The number of threads participating in the reduction.
-        stride: The stride between lanes participating in the reduction.
-
-    Args:
-        val: The SIMD value to reduce. Each lane contributes its value to the sum.
-
-    Returns:
-        A SIMD value where all participating lanes contain the sum found across the lane group.
-        Non-participating lanes (lane_id >= num_lanes) retain their original values.
-    """
-
-    @parameter
-    fn _reduce_add(x: SIMD, y: type_of(x)) -> type_of(x):
-        return x + y
-
-    return lane_group_reduce[
-        shuffle_down, _reduce_add, num_lanes=num_lanes, stride=stride
-    ](val)
-
-
-@always_inline
-fn lane_group_sum_and_broadcast[
-    val_type: DType,
-    simd_width: Int,
-    //,
-    num_lanes: Int,
-    stride: Int = 1,
-](val: SIMD[val_type, simd_width]) -> SIMD[val_type, simd_width]:
-    """Computes the sum across a lane group and broadcasts the result to all lanes.
-
-    This function performs a parallel reduction using a butterfly pattern to compute the sum,
-    then broadcasts the result to all participating lanes. The butterfly pattern ensures
-    efficient communication between lanes through warp shuffle operations.
-
-    Parameters:
-        val_type: The data type of the SIMD elements (e.g. float32, int32).
-        simd_width: The number of elements in the SIMD vector.
-        num_lanes: The number of threads participating in the reduction.
-        stride: The stride between lanes participating in the reduction.
-
-    Args:
-        val: The SIMD value to reduce. Each lane contributes its value to the sum.
-
-    Returns:
-        A SIMD value where all participating lanes contain the sum found across the lane group.
-        Non-participating lanes (lane_id >= num_lanes) retain their original values.
-    """
-
-    @parameter
-    fn _reduce_add(x: SIMD, y: type_of(x)) -> type_of(x):
-        return x + y
-
+    """Shared broadcast-reduce dispatch: CDNA4 permlane, AMD DPP, or
+    shuffle_xor fallback."""
     comptime if (
         num_lanes == WARP_SIZE // stride
         and stride in (16, 32)
         and _cdna_4_or_newer()
     ):
-        var out = _reduce_add(val, permlane_shuffle[32](val))
+        var out = func(val, permlane_shuffle[32](val))
 
         comptime if stride == 16:
-            out = _reduce_add(out, permlane_shuffle[16](out))
+            out = func(out, permlane_shuffle[16](out))
 
         return out
     elif (
@@ -1021,20 +959,62 @@ fn lane_group_sum_and_broadcast[
         and num_lanes.is_power_of_two()
         and is_amd_gpu()
     ):
-        return _dpp_reduce_and_broadcast[_reduce_add, num_lanes=num_lanes](val)
+        return _dpp_reduce_and_broadcast[func, num_lanes=num_lanes](val)
     else:
         return lane_group_reduce[
-            shuffle_xor, _reduce_add, num_lanes=num_lanes, stride=stride
+            shuffle_xor, func, num_lanes=num_lanes, stride=stride
         ](val)
 
 
+# ===-----------------------------------------------------------------------===#
+# Warp Sum
+# ===-----------------------------------------------------------------------===#
+
+
 @always_inline
-fn sum(val: SIMD) -> Scalar[val.dtype]:
+def lane_group_sum[
+    val_type: DType,
+    simd_width: Int,
+    //,
+    num_lanes: Int,
+    stride: Int = 1,
+](val: SIMD[val_type, simd_width]) -> SIMD[val_type, simd_width]:
+    """Computes the sum of values across a group of lanes and broadcasts to all lanes.
+
+    This function performs a parallel reduction across a group of lanes to compute their sum.
+    The result is broadcast to all participating lanes using optimized hardware-specific
+    paths (AMD DPP, Blackwell redux, or butterfly shuffle pattern).
+
+    Parameters:
+        val_type: The data type of the SIMD elements (e.g. float32, int32).
+        simd_width: The number of elements in the SIMD vector.
+        num_lanes: The number of threads participating in the reduction.
+        stride: The stride between lanes participating in the reduction.
+
+    Args:
+        val: The SIMD value to reduce. Each lane contributes its value to the sum.
+
+    Returns:
+        A SIMD value where all participating lanes contain the sum found across the lane group.
+        Non-participating lanes (lane_id >= num_lanes) retain their original values.
+    """
+
+    @parameter
+    def _reduce_add(x: SIMD, y: type_of(x)) -> type_of(x):
+        return x + y
+
+    return _lane_group_broadcast_reduce[
+        _reduce_add, num_lanes=num_lanes, stride=stride
+    ](val)
+
+
+@always_inline
+def sum(val: SIMD) -> Scalar[val.dtype]:
     """Computes the sum of values across all lanes in a warp.
 
-    This is a convenience wrapper around lane_group_sum_and_broadcast that
-    operates on the entire warp.  It performs a parallel reduction using warp
-    shuffle operations to find the global sum across all lanes in the warp.
+    This is a convenience wrapper around `lane_group_sum` that operates on the
+    entire warp. It performs a parallel reduction using warp shuffle operations
+    to find the global sum across all lanes in the warp.
 
     Args:
         val: The SIMD value to reduce. Each lane contributes its value to the sum.
@@ -1042,7 +1022,7 @@ fn sum(val: SIMD) -> Scalar[val.dtype]:
     Returns:
         The scalar sum of values across all lanes in the warp.
     """
-    return lane_group_sum_and_broadcast[num_lanes=WARP_SIZE](val.reduce_add())
+    return lane_group_sum[num_lanes=WARP_SIZE](val.reduce_add())
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1051,7 +1031,7 @@ fn sum(val: SIMD) -> Scalar[val.dtype]:
 
 
 @always_inline
-fn prefix_sum[
+def prefix_sum[
     dtype: DType,
     //,
     intermediate_type: DType = dtype,
@@ -1116,7 +1096,7 @@ fn prefix_sum[
 
 
 @always_inline("nodebug")
-fn _has_redux_f32_support[dtype: DType, simd_width: Int]() -> Bool:
+def _has_redux_f32_support[dtype: DType, simd_width: Int]() -> Bool:
     return (
         (is_nvidia_gpu["sm_100a"]() or is_nvidia_gpu["sm_101a"]())
         and dtype == DType.float32
@@ -1125,7 +1105,7 @@ fn _has_redux_f32_support[dtype: DType, simd_width: Int]() -> Bool:
 
 
 @always_inline("nodebug")
-fn _redux_f32_max_min[direction: StaticString](val: SIMD) -> type_of(val):
+def _redux_f32_max_min[direction: StaticString](val: SIMD) -> type_of(val):
     comptime instruction = StaticString("redux.sync.") + direction + ".NaN.f32"
     return inlined_assembly[
         instruction + " $0, $1, $2;",
@@ -1136,18 +1116,18 @@ fn _redux_f32_max_min[direction: StaticString](val: SIMD) -> type_of(val):
 
 
 @always_inline
-fn lane_group_max[
+def lane_group_max[
     val_type: DType,
     simd_width: Int,
     //,
     num_lanes: Int,
     stride: Int = 1,
 ](val: SIMD[val_type, simd_width]) -> SIMD[val_type, simd_width]:
-    """Reduces a SIMD value to its maximum within a lane group using warp-level operations.
+    """Reduces a SIMD value to its maximum within a lane group and broadcasts to all lanes.
 
     This function performs a parallel reduction across a group of lanes to find the maximum value.
-    The reduction is done using warp shuffle operations for efficient communication between lanes.
-    The result is stored in all participating lanes.
+    The result is broadcast to all participating lanes using optimized hardware-specific
+    paths (AMD DPP, Blackwell redux, or butterfly shuffle pattern).
 
     Parameters:
         val_type: The data type of the SIMD elements (e.g. float32, int32).
@@ -1170,78 +1150,16 @@ fn lane_group_max[
         return _redux_f32_max_min["max"](val)
 
     @parameter
-    fn _reduce_max(x: SIMD, y: type_of(x)) -> type_of(x):
+    def _reduce_max(x: SIMD, y: type_of(x)) -> type_of(x):
         return _max(x, y)
 
-    return lane_group_reduce[
-        shuffle_down, _reduce_max, num_lanes=num_lanes, stride=stride
+    return _lane_group_broadcast_reduce[
+        _reduce_max, num_lanes=num_lanes, stride=stride
     ](val)
 
 
 @always_inline
-fn lane_group_max_and_broadcast[
-    val_type: DType,
-    simd_width: Int,
-    //,
-    num_lanes: Int,
-    stride: Int = 1,
-](val: SIMD[val_type, simd_width]) -> SIMD[val_type, simd_width]:
-    """Reduces and broadcasts the maximum value within a lane group using warp-level operations.
-
-    This function performs a parallel reduction to find the maximum value and broadcasts it to all lanes.
-    The reduction and broadcast are done using warp shuffle operations in a butterfly pattern for
-    efficient all-to-all communication between lanes.
-
-    Parameters:
-        val_type: The data type of the SIMD elements (e.g. float32, int32).
-        simd_width: The number of elements in the SIMD vector.
-        num_lanes: The number of threads participating in the reduction.
-        stride: The stride between lanes participating in the reduction.
-
-    Args:
-        val: The SIMD value to reduce and broadcast. Each lane contributes its value.
-
-    Returns:
-        A SIMD value where all participating lanes contain the maximum value found across the lane group.
-        Non-participating lanes (lane_id >= num_lanes) retain their original values.
-    """
-
-    comptime if (
-        _has_redux_f32_support[val_type, simd_width]()
-        and num_lanes == WARP_SIZE
-    ):
-        return _redux_f32_max_min["max"](val)
-
-    @parameter
-    fn _reduce_max(x: SIMD, y: type_of(x)) -> type_of(x):
-        return _max(x, y)
-
-    comptime if (
-        num_lanes == WARP_SIZE // stride
-        and stride in (16, 32)
-        and _cdna_4_or_newer()
-    ):
-        var out = _reduce_max(val, permlane_shuffle[32](val))
-
-        comptime if stride == 16:
-            out = _reduce_max(out, permlane_shuffle[16](out))
-
-        return out
-    elif (
-        stride == 1
-        and num_lanes >= 2
-        and num_lanes.is_power_of_two()
-        and is_amd_gpu()
-    ):
-        return _dpp_reduce_and_broadcast[_reduce_max, num_lanes=num_lanes](val)
-    else:
-        return lane_group_reduce[
-            shuffle_xor, _reduce_max, num_lanes=num_lanes, stride=stride
-        ](val)
-
-
-@always_inline
-fn max(val: SIMD) -> Scalar[val.dtype]:
+def max(val: SIMD) -> Scalar[val.dtype]:
     """Computes the maximum value across all lanes in a warp.
 
     This is a convenience wrapper around lane_group_max that operates on the entire warp.
@@ -1263,18 +1181,18 @@ fn max(val: SIMD) -> Scalar[val.dtype]:
 
 
 @always_inline
-fn lane_group_min[
+def lane_group_min[
     val_type: DType,
     simd_width: Int,
     //,
     num_lanes: Int,
     stride: Int = 1,
 ](val: SIMD[val_type, simd_width]) -> SIMD[val_type, simd_width]:
-    """Reduces a SIMD value to its minimum within a lane group using warp-level operations.
+    """Reduces a SIMD value to its minimum within a lane group and broadcasts to all lanes.
 
     This function performs a parallel reduction across a group of lanes to find the minimum value.
-    The reduction is done using warp shuffle operations for efficient communication between lanes.
-    The result is stored in all participating lanes.
+    The result is broadcast to all participating lanes using optimized hardware-specific
+    paths (AMD DPP, Blackwell redux, or butterfly shuffle pattern).
 
     Parameters:
         val_type: The data type of the SIMD elements (e.g. float32, int32).
@@ -1297,16 +1215,16 @@ fn lane_group_min[
         return _redux_f32_max_min["min"](val)
 
     @parameter
-    fn _reduce_min(x: SIMD, y: type_of(x)) -> type_of(x):
+    def _reduce_min(x: SIMD, y: type_of(x)) -> type_of(x):
         return _min(x, y)
 
-    return lane_group_reduce[
-        shuffle_down, _reduce_min, num_lanes=num_lanes, stride=stride
+    return _lane_group_broadcast_reduce[
+        _reduce_min, num_lanes=num_lanes, stride=stride
     ](val)
 
 
 @always_inline
-fn min(val: SIMD) -> Scalar[val.dtype]:
+def min(val: SIMD) -> Scalar[val.dtype]:
     """Computes the minimum value across all lanes in a warp.
 
     This is a convenience wrapper around lane_group_min that operates on the entire warp.
@@ -1328,7 +1246,7 @@ fn min(val: SIMD) -> Scalar[val.dtype]:
 
 
 @always_inline
-fn broadcast[
+def broadcast[
     val_type: DType, simd_width: Int, //
 ](val: SIMD[val_type, simd_width]) -> SIMD[val_type, simd_width]:
     """Broadcasts a SIMD value from lane 0 to all lanes in the warp.
@@ -1350,7 +1268,7 @@ fn broadcast[
     return shuffle_idx(val, 0)
 
 
-fn broadcast(val: Int) -> Int:
+def broadcast(val: Int) -> Int:
     """Broadcasts an integer value from lane 0 to all lanes in the warp.
 
     This function takes an integer value from lane 0 and copies it to all other lanes in the warp.
@@ -1365,7 +1283,7 @@ fn broadcast(val: Int) -> Int:
     return Int(shuffle_idx(Int32(val), 0))
 
 
-fn broadcast(val: UInt) -> UInt:
+def broadcast(val: UInt) -> UInt:
     """Broadcasts an unsigned integer value from lane 0 to all lanes in the warp.
 
     This function takes an unsigned integer value from lane 0 and copies it to all other lanes in the warp.
@@ -1386,7 +1304,7 @@ fn broadcast(val: UInt) -> UInt:
 
 
 @always_inline
-fn _vote_nvidia_helper(vote: Bool) -> UInt32:
+def _vote_nvidia_helper(vote: Bool) -> UInt32:
     return llvm_intrinsic[
         "llvm.nvvm.vote.ballot.sync",
         UInt32,
@@ -1397,7 +1315,7 @@ fn _vote_nvidia_helper(vote: Bool) -> UInt32:
 
 
 @always_inline
-fn _vote_amd_helper[ret_type: DType](vote: Bool) -> Scalar[ret_type]:
+def _vote_amd_helper[ret_type: DType](vote: Bool) -> Scalar[ret_type]:
     comptime assert ret_type in (
         DType.uint32,
         DType.uint64,
@@ -1414,7 +1332,7 @@ fn _vote_amd_helper[ret_type: DType](vote: Bool) -> Scalar[ret_type]:
 
 
 @always_inline
-fn vote[ret_type: DType](val: Bool) -> Scalar[ret_type]:
+def vote[ret_type: DType](val: Bool) -> Scalar[ret_type]:
     """Creates a 32 or 64 bit mask among all threads in the warp, where each bit is set to 1 if the
     corresponding thread voted True, and 0 otherwise.
 
@@ -1438,6 +1356,6 @@ fn vote[ret_type: DType](val: Bool) -> Scalar[ret_type]:
     elif is_amd_gpu():
         return _vote_amd_helper[ret_type](val)
     else:
-        return CompilationTarget.unsupported_target_error[
-            Scalar[ret_type], operation=__get_current_function_name()
+        CompilationTarget.unsupported_target_error[
+            operation=__get_current_function_name()
         ]()

@@ -36,11 +36,12 @@ from layout import (
     Coord,
     CoordLike,
     Idx,
+    TensorLayout,
+    TileTensor,
     coord_to_index_list,
     row_major,
+    stack_allocation as tensor_alloc,
 )
-from layout.tile_layout import TensorLayout
-from layout.tile_tensor import TileTensor, stack_allocation as tensor_alloc
 from std.runtime.asyncrt import DeviceContextPtr
 from std.runtime.tracing import Trace, TraceLevel
 
@@ -53,7 +54,7 @@ from nn.topk import TopK_2
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_threads))
 )
-fn moe_create_indices_kernel[
+def moe_create_indices_kernel[
     input_type: DType,
     num_threads: Int,
     TokenExpertOrderLayoutType: TensorLayout,
@@ -117,7 +118,7 @@ fn moe_create_indices_kernel[
 
     # Use Bitonic sort algorithm to sort expert IDs and their corresponding token indices.
     @always_inline
-    fn bitonic_sort_step[
+    def bitonic_sort_step[
         IndicesLayoutType: TensorLayout,
         InputLayoutType: TensorLayout,
     ](
@@ -261,7 +262,9 @@ fn moe_create_indices_kernel[
 
 
 @always_inline
-fn calculate_warp_offset[MaskType: DType](state: Bool) -> Tuple[UInt64, UInt64]:
+def calculate_warp_offset[
+    MaskType: DType
+](state: Bool) -> Tuple[UInt64, UInt64]:
     # sets bits to 1 for all threads that voted true
     var mask = UInt64(warp.vote[MaskType](state))
 
@@ -288,7 +291,7 @@ struct _BucketGroupParams[num_threads: Int, input_type: DType]:
     var start_idx: Int
     var remainder_start_idx: Int
 
-    fn __init__(out self, top_k_length: Int):
+    def __init__(out self, top_k_length: Int):
         self.expert = block_idx.x
         self.reads_per_iteration = Self.num_threads * Self.width
         self.topk_ids_length = top_k_length
@@ -302,7 +305,7 @@ struct _BucketGroupParams[num_threads: Int, input_type: DType]:
 
 
 @always_inline
-fn _count_expert_tokens[
+def _count_expert_tokens[
     num_threads: Int,
     input_type: DType,
     //,
@@ -314,6 +317,7 @@ fn _count_expert_tokens[
 ) -> UInt64:
     comptime assert topk_ids.flat_rank == 2
     comptime assert smem.flat_rank == 2
+    comptime assert topk_ids.flat_rank >= 2
 
     comptime width = bg_params.width
     comptime MaskType = bg_params.MaskType
@@ -381,7 +385,7 @@ fn _count_expert_tokens[
 
 
 @always_inline
-fn _get_index_and_offset(
+def _get_index_and_offset(
     lock: TileTensor[mut=True, DType.uint32, ...],
     total_writes: UInt64,
 ) -> Tuple[UInt32, UInt32]:
@@ -407,7 +411,7 @@ fn _get_index_and_offset(
 
 
 @always_inline
-fn _copy_tokens_smem_to_gmem[
+def _copy_tokens_smem_to_gmem[
     num_threads: Int,
     input_type: DType,
     //,
@@ -423,6 +427,8 @@ fn _copy_tokens_smem_to_gmem[
     comptime assert smem.flat_rank == 2
     comptime assert token_expert_order.flat_rank == 1
     comptime assert restore_token_order.flat_rank == 1
+    comptime assert smem.flat_rank >= 2
+    comptime assert token_expert_order.flat_rank >= 1
 
     var g_offset_copy = g_offset
     comptime width = bg_params.width
@@ -470,7 +476,7 @@ fn _copy_tokens_smem_to_gmem[
 
 
 @always_inline
-fn _copy_tokens_to_gmem[
+def _copy_tokens_to_gmem[
     num_threads: Int,
     input_type: DType,
     //,
@@ -487,6 +493,7 @@ fn _copy_tokens_to_gmem[
     comptime assert topk_ids.flat_rank == 2
     comptime assert token_expert_order.flat_rank == 1
     comptime assert restore_token_order.flat_rank == 1
+    comptime assert topk_ids.flat_rank >= 2
 
     comptime width = bg_params.width
     comptime MaskType = bg_params.MaskType
@@ -563,7 +570,7 @@ fn _copy_tokens_to_gmem[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_threads))
 )
-fn moe_create_indices_bucket_group_kernel[
+def moe_create_indices_bucket_group_kernel[
     input_type: DType,
     TokenExpertOrderLayoutType: TensorLayout,
     LockLayoutType: TensorLayout,
@@ -707,7 +714,7 @@ fn moe_create_indices_bucket_group_kernel[
 
 
 @always_inline
-fn moe_create_indices[
+def moe_create_indices[
     input_type: DType,
     //,
     target: StaticString,
@@ -781,7 +788,7 @@ fn moe_create_indices[
 # Function to perform warp-level sorting
 @always_inline
 @parameter
-fn _warp_bitonic_sort[
+def _warp_bitonic_sort[
     T: DType,
     num_lanes: Int = WARP_SIZE,
     descending: Bool = True,
@@ -804,7 +811,7 @@ fn _warp_bitonic_sort[
     comptime assert num_lanes.is_power_of_two(), "num_lanes must be power of 2"
 
     @always_inline
-    fn bitonic_sort_step(
+    def bitonic_sort_step(
         v: TopK_2[T],
         step: UInt32,
         stage: UInt32,
@@ -843,7 +850,7 @@ fn _warp_bitonic_sort[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_threads))
 )
-fn group_limited_router_kernel[
+def group_limited_router_kernel[
     scores_type: DType,
     bias_type: DType,
     ExpertIndicesLayoutType: TensorLayout,
@@ -857,7 +864,7 @@ fn group_limited_router_kernel[
     norm_weights: Bool,
     num_threads: Int,
     scores_input_fn: OptionalReg[
-        fn[width: Int](IndexList[2]) capturing -> SIMD[scores_type, width]
+        def[width: Int](IndexList[2]) capturing -> SIMD[scores_type, width]
     ] = None,
 ](
     expert_indices: TileTensor[
@@ -884,6 +891,9 @@ fn group_limited_router_kernel[
     comptime assert expert_weights.flat_rank == 2
     comptime assert expert_scores.flat_rank == 2
     comptime assert expert_bias.flat_rank == 1
+    comptime assert expert_bias.flat_rank >= 1
+    comptime assert expert_scores.flat_rank >= 2
+    comptime assert expert_indices.flat_rank >= 2
 
     comptime assert (
         expert_scores.static_shape[1] == n_routed_experts
@@ -1011,9 +1021,9 @@ fn group_limited_router_kernel[
                     ).cast[scores_type]()
                 )
 
-            weights_sum = warp.lane_group_sum_and_broadcast[
-                num_lanes=n_experts_per_tok
-            ](original_weight)
+            weights_sum = warp.lane_group_sum[num_lanes=n_experts_per_tok](
+                original_weight
+            )
 
             comptime if norm_weights:
                 original_weight /= weights_sum
@@ -1028,7 +1038,7 @@ fn group_limited_router_kernel[
 
 
 @always_inline
-fn router_group_limited[
+def router_group_limited[
     scores_type: DType,
     bias_type: DType,
     //,
@@ -1039,7 +1049,7 @@ fn router_group_limited[
     norm_weights: Bool,
     target: StaticString,
     scores_input_fn: OptionalReg[
-        fn[width: Int](IndexList[2]) capturing -> SIMD[scores_type, width]
+        def[width: Int](IndexList[2]) capturing -> SIMD[scores_type, width]
     ] = None,
 ](
     expert_indices: TileTensor[mut=True, DType.int32, ...],

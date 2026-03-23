@@ -25,7 +25,7 @@ from std.utils import IndexList
 
 
 @always_inline
-fn tile[
+def tile[
     dtype: DType, type_repeats: DType
 ](
     input: TileTensor[dtype, address_space=AddressSpace.GENERIC, ...],
@@ -230,10 +230,9 @@ fn tile[
 
 
 @always_inline
-fn tile_shape[
+def tile_shape[
     input_type: DType,
     repeats_type: DType,
-    single_thread_blocking_override: Bool,
 ](
     input_buf: TileTensor[input_type, ...],
     repeats_buf: TileTensor[repeats_type, ...],
@@ -245,8 +244,6 @@ fn tile_shape[
     Parameters:
         input_type: Type of the input tensor.
         repeats_type: Type of the repeats tensor.
-        single_thread_blocking_override: If True, then the operation is run
-          synchronously using a single thread.
 
     Args:
         input_buf: The input tensor.

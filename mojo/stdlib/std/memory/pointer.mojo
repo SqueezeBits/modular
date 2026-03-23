@@ -20,6 +20,8 @@ from std.memory import Pointer
 """
 
 from std.format._utils import FormatStruct, Named, TypeNames
+from std.memory import UnsafeMaybeUninit
+from std.utils._nicheable import UnsafeSingleNicheable, NicheIndex
 
 # ===-----------------------------------------------------------------------===#
 # AddressSpace
@@ -64,7 +66,7 @@ struct AddressSpace(
     """Buffer resource GPU memory address space (AMD-specific)."""
 
     @always_inline("builtin")
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         """Initializes the address space from the underlying integral value.
 
         Args:
@@ -73,7 +75,7 @@ struct AddressSpace(
         self._value = value
 
     @always_inline("builtin")
-    fn value(self) -> Int:
+    def value(self) -> Int:
         """The integral value of the address space.
 
         Returns:
@@ -82,7 +84,7 @@ struct AddressSpace(
         return self._value
 
     @always_inline("builtin")
-    fn __int__(self) -> Int:
+    def __int__(self) -> Int:
         """The integral value of the address space.
 
         Returns:
@@ -91,7 +93,7 @@ struct AddressSpace(
         return self._value
 
     @always_inline("builtin")
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Checks if the two address spaces are equal.
 
         Args:
@@ -102,18 +104,8 @@ struct AddressSpace(
         """
         return self._value == other._value
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
     @always_inline("nodebug")
-    fn __str__(self) -> String:
-        """Gets a string representation of the AddressSpace.
-
-        Returns:
-            The string representation of the AddressSpace.
-        """
-        return String.write(self)
-
-    @always_inline("nodebug")
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Formats the address space to the provided Writer.
 
         Args:
@@ -134,7 +126,7 @@ struct AddressSpace(
         else:
             writer.write("AddressSpace(", self.value(), ")")
 
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    def write_repr_to(self, mut writer: Some[Writer]):
         """Write the string representation of the AddressSpace.
 
         Args:
@@ -201,7 +193,7 @@ struct Pointer[
     type: AnyType,
     origin: Origin[mut=mut],
     address_space: AddressSpace = AddressSpace.GENERIC,
-](TrivialRegisterPassable, Writable):
+](TrivialRegisterPassable, UnsafeSingleNicheable, Writable):
     """Defines a non-nullable safe pointer.
 
     For a comparison with other pointer types, see [Intro to
@@ -236,10 +228,10 @@ struct Pointer[
     # Initializers
     # ===------------------------------------------------------------------===#
 
-    @doc_private
+    @doc_hidden
     @implicit
     @always_inline("nodebug")
-    fn __init__(
+    def __init__(
         other: Pointer,
         out self: Pointer[
             other.type,
@@ -254,9 +246,9 @@ struct Pointer[
         """
         self = {_mlir_value = other._value}
 
-    @doc_private
+    @doc_hidden
     @always_inline("nodebug")
-    fn __init__(out self, *, _mlir_value: Self._mlir_type):
+    def __init__(out self, *, _mlir_value: Self._mlir_type):
         """Constructs a Pointer from its MLIR prepresentation.
 
         Args:
@@ -265,7 +257,7 @@ struct Pointer[
         self._value = _mlir_value
 
     @always_inline("nodebug")
-    fn __init__(
+    def __init__(
         out self,
         *,
         ref[Self.origin, Self.address_space._value._mlir_value] to: Self.type,
@@ -278,7 +270,7 @@ struct Pointer[
         self = Self(_mlir_value=__get_mvalue_as_litref(to))
 
     @always_inline
-    fn get_immutable(self) -> Self.Immutable:
+    def get_immutable(self) -> Self.Immutable:
         """Constructs a new Pointer with the same underlying target
         and an ImmutOrigin.
 
@@ -295,7 +287,7 @@ struct Pointer[
     # ===------------------------------------------------------------------===#
 
     @always_inline("nodebug")
-    fn __getitem__(self) -> ref[Self.origin, Self.address_space] Self.type:
+    def __getitem__(self) -> ref[Self.origin, Self.address_space] Self.type:
         """Enable subscript syntax `ptr[]` to access the element.
 
         Returns:
@@ -309,7 +301,7 @@ struct Pointer[
     # accesses to the origin.
     @__unsafe_disable_nested_origin_exclusivity
     @always_inline("nodebug")
-    fn __eq__(self, rhs: Pointer[Self.type, _, Self.address_space]) -> Bool:
+    def __eq__(self, rhs: Pointer[Self.type, _, Self.address_space]) -> Bool:
         """Returns True if the two pointers are equal.
 
         Args:
@@ -322,7 +314,7 @@ struct Pointer[
 
     @__unsafe_disable_nested_origin_exclusivity
     @always_inline("nodebug")
-    fn __ne__(self, rhs: Pointer[Self.type, _, Self.address_space]) -> Bool:
+    def __ne__(self, rhs: Pointer[Self.type, _, Self.address_space]) -> Bool:
         """Returns True if the two pointers are not equal.
 
         Args:
@@ -333,17 +325,7 @@ struct Pointer[
         """
         return not (self == rhs)
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    @no_inline
-    fn __str__(self) -> String:
-        """Gets a string representation of the Pointer.
-
-        Returns:
-            The string representation of the Pointer.
-        """
-        return String(UnsafePointer(to=self[]))
-
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Formats this pointer address to the provided Writer.
 
         Args:
@@ -351,7 +333,7 @@ struct Pointer[
         """
         UnsafePointer(to=self[]).write_to(writer)
 
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    def write_repr_to(self, mut writer: Some[Writer]):
         """Write the string representation of the Pointer.
 
         Args:
@@ -364,7 +346,7 @@ struct Pointer[
         ).fields(self)
 
     @always_inline("nodebug")
-    fn __merge_with__[
+    def __merge_with__[
         other_type: type_of(Pointer[Self.type, _, Self.address_space]),
     ](
         self,
@@ -384,3 +366,27 @@ struct Pointer[
             A pointer merged with the specified `other_type`.
         """
         return {_mlir_value = self._value}  # allow lit.ref to convert.
+
+    # ===------------------------------------------------------------------===#
+    # UnsafeNicheable
+    # ===------------------------------------------------------------------===#
+
+    comptime _NullPointerType = UnsafePointer[
+        Self.type, MutAnyOrigin, address_space=Self.address_space
+    ]
+
+    @staticmethod
+    @always_inline
+    @doc_hidden
+    def write_niche(
+        memory: UnsafePointer[mut=True, UnsafeMaybeUninit[Self], _]
+    ):
+        memory.bitcast[Self._NullPointerType]().init_pointee_move({})
+
+    @staticmethod
+    @always_inline
+    @doc_hidden
+    def isa_niche(
+        memory: UnsafePointer[mut=False, UnsafeMaybeUninit[Self], _]
+    ) -> Bool:
+        return not Bool(memory.bitcast[Self._NullPointerType]()[])

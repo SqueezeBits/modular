@@ -68,9 +68,16 @@ trait Hashable:
     equal values produce equal hashes (i.e., if `a == b` then `hash(a) == hash(b)`).
     The default implementations of both traits satisfy this property when all
     fields implement both traits correctly.
+
+    Note: The default reflection-based implementation iterates over all fields
+    at compile time. For mutually recursive types (e.g., struct `A` has a field
+    of type `List[B]` and struct `B` has a field of type `A`), this creates an
+    infinite monomorphization cycle that causes the compiler to hang. To fix
+    this, provide an explicit `__hash__()` implementation for at least one type
+    in the cycle.
     """
 
-    fn __hash__[H: Hasher](self, mut hasher: H):
+    def __hash__[H: Hasher](self, mut hasher: H):
         """Accepts a hasher and contributes to the hash value
         by calling the update function of the hasher.
 
@@ -94,7 +101,7 @@ trait Hashable:
             hasher.update(trait_downcast[Hashable](__struct_field_ref(i, self)))
 
 
-fn hash[
+def hash[
     T: Hashable, HasherType: Hasher = default_hasher
 ](hashable: T) -> UInt64:
     """Hash a Hashable type using its underlying hash implementation.
@@ -115,7 +122,7 @@ fn hash[
     return value
 
 
-fn hash[
+def hash[
     HasherType: Hasher = default_hasher
 ](bytes: UnsafePointer[mut=False, UInt8, _], n: Int) -> UInt64:
     """Hash a sequence of bytes using the specified hasher.

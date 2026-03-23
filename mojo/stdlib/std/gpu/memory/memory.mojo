@@ -138,7 +138,7 @@ struct CacheOperation(Equatable, TrivialRegisterPassable):
     Caches data in the L1 cache and streams it to the wave.
     """
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Tests if two `CacheOperation` instances are equal.
 
         Args:
@@ -149,7 +149,7 @@ struct CacheOperation(Equatable, TrivialRegisterPassable):
         """
         return self._value == other._value
 
-    fn __or__(self, other: Self) -> Self:
+    def __or__(self, other: Self) -> Self:
         """Returns the bitwise OR of two `CacheOperation` instances.
 
         Args:
@@ -161,7 +161,7 @@ struct CacheOperation(Equatable, TrivialRegisterPassable):
         return Self(self._value | other._value)
 
     @always_inline
-    fn mnemonic(self) -> StaticString:
+    def mnemonic(self) -> StaticString:
         """Returns the PTX mnemonic string for this cache operation.
 
         Converts the cache operation into its corresponding PTX assembly
@@ -253,7 +253,7 @@ struct CacheEviction(Equatable, TrivialRegisterPassable):
     - Streaming operations with no data reuse
     """
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Tests if two CacheEviction instances are equal.
 
         Args:
@@ -265,7 +265,7 @@ struct CacheEviction(Equatable, TrivialRegisterPassable):
         return self._value == other._value
 
     @always_inline
-    fn mnemonic(self) -> StaticString:
+    def mnemonic(self) -> StaticString:
         """Returns the string mnemonic for this cache eviction policy.
 
         Converts the cache eviction policy into its corresponding string
@@ -293,7 +293,7 @@ struct CacheEviction(Equatable, TrivialRegisterPassable):
 
 
 @fieldwise_init
-struct Fill(Equatable, TrivialRegisterPassable):
+struct Fill(Equatable, TrivialRegisterPassable, Writable):
     """Represents memory fill patterns for GPU memory operations.
 
     This struct defines different fill patterns that can be used when allocating or
@@ -312,7 +312,7 @@ struct Fill(Equatable, TrivialRegisterPassable):
     comptime NAN = Self(2)
     """Fill memory with NaN values. Useful for debugging floating point computations."""
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Tests if two Fill instances have the same fill pattern.
 
         Args:
@@ -324,22 +324,22 @@ struct Fill(Equatable, TrivialRegisterPassable):
         return self._value == other._value
 
     @no_inline
-    fn __str__(self) -> String:
-        """Returns a string representation of the fill pattern.
+    def write_to(self, mut writer: Some[Writer]):
+        """Writes a string representation of the fill pattern.
 
         Converts the fill pattern into a human-readable string for debugging
         and display purposes.
 
-        Returns:
-            A string describing the fill pattern.
+        Args:
+            writer: The object to write to.
         """
         if self == Self.NONE:
-            return "none"
+            return writer.write_string("none")
         if self == Self.ZERO:
-            return "zero"
+            return writer.write_string("zero")
         if self == Self.NAN:
-            return "nan"
-        return "unknown fill"
+            return writer.write_string("nan")
+        writer.write_string("unknown fill")
 
 
 # ===-----------------------------------------------------------------------===#
@@ -348,7 +348,7 @@ struct Fill(Equatable, TrivialRegisterPassable):
 
 
 @fieldwise_init
-struct Consistency(Equatable, TrivialRegisterPassable):
+struct Consistency(Equatable, TrivialRegisterPassable, Writable):
     """Represents memory consistency models for GPU memory operations.
 
     This struct defines different memory consistency levels that control how memory
@@ -382,7 +382,7 @@ struct Consistency(Equatable, TrivialRegisterPassable):
     Ensures all previous memory operations are ordered before this operation.
     Paired with acquire operations for synchronization."""
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Tests if two Consistency instances are equal.
 
         Args:
@@ -393,16 +393,24 @@ struct Consistency(Equatable, TrivialRegisterPassable):
         """
         return self._value == other._value
 
-    fn __str__(self) -> String:
-        """Returns a string representation of the consistency level.
+    def write_to(self, mut writer: Some[Writer]):
+        """Writes a string representation of the consistency level.
 
-        Returns:
-            A string describing the consistency level.
+        Args:
+            writer: The object to write to.
         """
-        return String(self.mnemonic())
+        writer.write_string(self.mnemonic())
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        """Writes a string representation of the consistency level.
+
+        Args:
+            writer: The object to write to.
+        """
+        t"Consistency({self})".write_to(writer)
 
     @always_inline
-    fn mnemonic(self) -> StaticString:
+    def mnemonic(self) -> StaticString:
         """Returns the mnemonic string for the consistency level.
 
         Returns:
@@ -426,7 +434,7 @@ struct Consistency(Equatable, TrivialRegisterPassable):
 
 
 @fieldwise_init
-struct ReduceOp(Equatable, TrivialRegisterPassable):
+struct ReduceOp(Equatable, TrivialRegisterPassable, Writable):
     """Represents reduction operations for parallel reduction algorithms.
 
     This struct defines different reduction operations that can be performed
@@ -466,7 +474,7 @@ struct ReduceOp(Equatable, TrivialRegisterPassable):
 
     Performs bitwise XOR across all inputs."""
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Tests if two ReduceOp instances are equal.
 
         Args:
@@ -477,7 +485,7 @@ struct ReduceOp(Equatable, TrivialRegisterPassable):
         """
         return self._value == other._value
 
-    fn __is__(self, other: Self) -> Bool:
+    def __is__(self, other: Self) -> Bool:
         """Tests if two ReduceOp instances are identical.
 
         Args:
@@ -489,16 +497,25 @@ struct ReduceOp(Equatable, TrivialRegisterPassable):
         return self == other
 
     @no_inline
-    fn __str__(self) -> String:
-        """Returns a string representation of the reduction operation.
+    def write_to(self, mut writer: Some[Writer]):
+        """Writes a string representation of the reduction operation.
 
-        Returns:
-            A string describing the reduction operation.
+        Args:
+            writer: The object to write to.
         """
-        return String(self.mnemonic())
+        writer.write_string(self.mnemonic())
+
+    @no_inline
+    def write_repr_to(self, mut writer: Some[Writer]):
+        """Writes a string representation of the reduction operation.
+
+        Args:
+            writer: The object to write to.
+        """
+        t"ReduceOp({self})".write_to(writer)
 
     @always_inline
-    fn mnemonic(self) -> StaticString:
+    def mnemonic(self) -> StaticString:
         """Returns the mnemonic string for the reduction operation.
 
         Returns:
@@ -526,7 +543,7 @@ struct ReduceOp(Equatable, TrivialRegisterPassable):
 
 
 @always_inline
-fn _mark_eviction[
+def _mark_eviction[
     eviction_policy: CacheEviction = CacheEviction.EVICT_NORMAL
 ]() -> UInt64:
     """Returns the eviction policy value for GPU cache operations.
@@ -560,7 +577,7 @@ fn _mark_eviction[
 
 
 @always_inline("nodebug")
-fn async_copy[
+def async_copy[
     dtype: DType,
     //,
     size: Int,
@@ -651,9 +668,7 @@ fn async_copy[
     comptime cp_async_asm = "cp.async." + cache_op + ".shared.global" + cache_hint + l2_prefetch_substr
 
     comptime if Bool(fill) and fill.value() == 0:
-        debug_assert(
-            not predicate, "Predicate bit has to be set False for zero fill."
-        )
+        assert not predicate, "Predicate bit has to be set False for zero fill."
 
         comptime args_with_fill = " [$0], [$1], $2, $3"
         comptime asm = cp_async_asm + args_with_fill
@@ -673,7 +688,7 @@ fn async_copy[
 
         # Pack filling values into 4B registers.
         @always_inline
-        fn _i32_repr[fill: Scalar[dtype]]() -> Int32:
+        def _i32_repr[fill: Scalar[dtype]]() -> Int32:
             comptime if size_of[dtype]() == 1:
                 return bitcast[DType.int32, 1](
                     SIMD[dtype, 4](fill, fill, fill, fill)
@@ -687,7 +702,9 @@ fn async_copy[
 
         var fill_val = _i32_repr[fill.value()]()
         comptime header_asm = "{\n.reg .pred p;\nsetp.ne.b32 p, $0, 0;\n"
-        comptime footer_asm = "@!p st.shared.v4.b32 [$1], {$4, $5, $6, $7};\n}\n"
+        comptime footer_asm = (
+            "@!p st.shared.v4.b32 [$1], {$4, $5, $6, $7};\n}\n"
+        )
         comptime args_with_fill = " [$1], [$2], $3"
         comptime copy_asm = header_asm + "@p " + cp_async_asm + args_with_fill
 
@@ -724,9 +741,7 @@ fn async_copy[
             )
 
     else:
-        debug_assert(
-            not predicate, "Predicate bit has to set False for no fill."
-        )
+        assert not predicate, "Predicate bit has to set False for no fill."
 
         comptime args = " [$0], [$1], $2"
         comptime asm = cp_async_asm + args
@@ -742,7 +757,7 @@ fn async_copy[
 
 
 @always_inline
-fn async_copy_commit_group():
+def async_copy_commit_group():
     """Commits all prior initiated but uncommitted cp.async instructions into a cp.async-group.
 
     This function creates a new cp.async-group containing all previously initiated but uncommitted
@@ -762,13 +777,13 @@ fn async_copy_commit_group():
         # This operation is a no-op on AMD and CPU.
         pass
     else:
-        return CompilationTarget.unsupported_target_error[
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name()
         ]()
 
 
 @always_inline
-fn async_copy_wait_group(n: Int32):
+def async_copy_wait_group(n: Int32):
     """Waits for the completion of `n` most recently committed cp.async-groups.
 
     This function blocks execution until the specified number of previously committed
@@ -791,13 +806,13 @@ fn async_copy_wait_group(n: Int32):
         # This operation is a no-op on AMD and CPU.
         pass
     else:
-        return CompilationTarget.unsupported_target_error[
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name()
         ]()
 
 
 @always_inline
-fn async_copy_wait_all():
+def async_copy_wait_all():
     """Waits for completion of all committed cp.async-groups.
 
     This function blocks execution until all previously committed cp.async-groups
@@ -818,13 +833,13 @@ fn async_copy_wait_all():
         # This operation is a no-op on AMD and CPU.
         pass
     else:
-        return CompilationTarget.unsupported_target_error[
+        CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name()
         ]()
 
 
 @always_inline
-fn external_memory[
+def external_memory[
     dtype: TrivialRegisterPassable,
     *,
     address_space: AddressSpace,
@@ -880,7 +895,7 @@ fn external_memory[
 
 
 @always_inline
-fn fence_proxy_tensormap_generic_sys_acquire[
+def fence_proxy_tensormap_generic_sys_acquire[
     dtype: AnyType,
 ](
     ptr: UnsafePointer[mut=True, dtype, _, address_space=AddressSpace.GENERIC],
@@ -910,7 +925,7 @@ fn fence_proxy_tensormap_generic_sys_acquire[
 
 
 @always_inline
-fn fence_proxy_tensormap_generic_sys_release():
+def fence_proxy_tensormap_generic_sys_release():
     """Releases the system-wide memory fence for tensor map operations.
 
     This function releases the memory fence previously established by the acquire operation.
@@ -928,7 +943,7 @@ fn fence_proxy_tensormap_generic_sys_release():
 
 
 @always_inline
-fn fence_async_view_proxy():
+def fence_async_view_proxy():
     """Establishes a memory fence for shared memory view operations.
 
     This function creates a memory barrier that ensures all previous shared memory
@@ -946,7 +961,7 @@ fn fence_async_view_proxy():
 
 
 @always_inline
-fn fence_mbarrier_init():
+def fence_mbarrier_init():
     """Creates a memory fence after mbarrier initialization.
 
     This function establishes a memory barrier that ensures the proper initialization
@@ -963,7 +978,7 @@ fn fence_mbarrier_init():
 
 
 @always_inline("nodebug")
-fn cp_async_bulk_tensor_shared_cluster_global[
+def cp_async_bulk_tensor_shared_cluster_global[
     dst_type: AnyType,  # Type of the destination memory
     mbr_type: AnyType,  # Type of the memory barrier
     rank: Int,  # Dimensionality of the tensor (1, 2, or 3)
@@ -1170,7 +1185,7 @@ fn cp_async_bulk_tensor_shared_cluster_global[
 
 
 @always_inline("nodebug")
-fn cp_async_bulk_tensor_shared_cluster_global_im2col[
+def cp_async_bulk_tensor_shared_cluster_global_im2col[
     dst_type: AnyType,
     mbr_type: AnyType,
     tensor_rank: Int,
@@ -1354,7 +1369,7 @@ fn cp_async_bulk_tensor_shared_cluster_global_im2col[
 
 
 @always_inline("nodebug")
-fn cp_async_bulk_tensor_shared_cluster_global_im2col_multicast[
+def cp_async_bulk_tensor_shared_cluster_global_im2col_multicast[
     dst_type: AnyType,
     mbr_type: AnyType,
     tensor_rank: Int,
@@ -1547,7 +1562,7 @@ fn cp_async_bulk_tensor_shared_cluster_global_im2col_multicast[
 
 
 @always_inline
-fn cp_async_bulk_tensor_shared_cluster_global_multicast[
+def cp_async_bulk_tensor_shared_cluster_global_multicast[
     dst_type: AnyType,
     mbr_type: AnyType,
     rank: Int,
@@ -1704,7 +1719,7 @@ fn cp_async_bulk_tensor_shared_cluster_global_multicast[
 
 
 @always_inline
-fn cp_async_bulk_tensor_global_shared_cta[
+def cp_async_bulk_tensor_global_shared_cta[
     src_type: AnyType,
     rank: Int,
     /,
@@ -1808,7 +1823,7 @@ fn cp_async_bulk_tensor_global_shared_cta[
 
 
 @always_inline
-fn cp_async_bulk_tensor_reduce[
+def cp_async_bulk_tensor_reduce[
     src_type: AnyType,
     rank: Int,
     /,
@@ -1891,7 +1906,7 @@ fn cp_async_bulk_tensor_reduce[
 
 
 @always_inline
-fn _load_impl[
+def _load_impl[
     dtype: DType,
     //,
     width: Int = 1,
@@ -2071,7 +2086,7 @@ fn _load_impl[
 
 
 @always_inline
-fn load[
+def load[
     dtype: DType,
     //,
     width: Int = 1,
@@ -2115,7 +2130,7 @@ fn load[
 
 
 @always_inline
-fn load[
+def load[
     OffsetType: Indexer,
     dtype: DType,
     //,
@@ -2167,7 +2182,7 @@ fn load[
 
 
 @always_inline("nodebug")
-fn _get_multimem_ld_reduce_asm[
+def _get_multimem_ld_reduce_asm[
     dtype: DType,
     *,
     count: Int,
@@ -2236,7 +2251,7 @@ fn _get_multimem_ld_reduce_asm[
 
 
 @always_inline("nodebug")
-fn multimem_ld_reduce[
+def multimem_ld_reduce[
     dtype: DType,
     *,
     count: Int,
@@ -2358,7 +2373,7 @@ fn multimem_ld_reduce[
 
 
 @always_inline("nodebug")
-fn multimem_ld_reduce[
+def multimem_ld_reduce[
     dtype: DType,
     *,
     simd_width: Int,
@@ -2436,7 +2451,7 @@ fn multimem_ld_reduce[
 
 
 @always_inline("nodebug")
-fn _get_multimem_st_asm[
+def _get_multimem_st_asm[
     dtype: DType,
     *,
     count: Int,
@@ -2475,7 +2490,7 @@ fn _get_multimem_st_asm[
 
 
 @always_inline("nodebug")
-fn multimem_st[
+def multimem_st[
     dtype: DType,
     *,
     count: Int,
@@ -2593,7 +2608,7 @@ fn multimem_st[
         )
 
 
-fn multimem_st[
+def multimem_st[
     dtype: DType,
     *,
     simd_width: Int,
@@ -2672,7 +2687,7 @@ fn multimem_st[
 # ===-----------------------------------------------------------------------===#
 
 
-fn _get_type_mnemonic[dtype: DType]() -> StaticString:
+def _get_type_mnemonic[dtype: DType]() -> StaticString:
     """Returns the mnemonic string representation for a given DType.
 
     This internal utility function converts floating point DTypes into their
@@ -2694,6 +2709,6 @@ fn _get_type_mnemonic[dtype: DType]() -> StaticString:
     return "unknown dtype mnemonic"
 
 
-fn _int_to_str[val: Int]() -> StaticString:
+def _int_to_str[val: Int]() -> StaticString:
     """Converts an integer value to a static string."""
     return get_static_string[String(val)]()

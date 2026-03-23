@@ -18,20 +18,14 @@ from std.sys.info import _current_target
 from std.algorithm import elementwise, sync_parallelize
 from std.gpu.host import DeviceContext, get_gpu_target
 from std.gpu.host.info import is_cpu
-from layout import (
-    Coord,
-    Idx,
-    TileTensor,
-    coord_to_index_list,
-    row_major,
-)
+from layout import Coord, Idx, TileTensor, coord_to_index_list, row_major
 from std.runtime.asyncrt import DeviceContextPtr, parallelism_level
 
 from std.utils import IndexList
 
 
 @always_inline
-fn index_tensor_shape[
+def index_tensor_shape[
     output_rank: Int,
     input_type: DType,
     indices_type: DType,
@@ -144,7 +138,7 @@ fn index_tensor_shape[
 # We intend to merge `index_tensor` with the `gather_nd` operations in the future.
 
 
-fn index_tensor[
+def index_tensor[
     dtype: DType,
     indices_type: DType,
     batch_dims: Int,
@@ -195,7 +189,7 @@ fn index_tensor[
 # Note: this is an extremely specialized version of the kernel that only handles
 # the [:, :, x, y] case where x and y are 1D tensors.
 # Batch dims refer to the number of sliced dimensions at the beginning
-fn _index_tensor_1d[
+def _index_tensor_1d[
     dtype: DType,
     indices_type: DType,
     //,
@@ -211,13 +205,14 @@ fn _index_tensor_1d[
     comptime assert (
         data.flat_rank >= 2 and indices.flat_rank == 2
     ), "Constraint: data_rank >= 2 and indices_rank == 2"
+    # Provide evidence that flat_rank >= 2 for the Coord(Idx(...), Idx(...)) loads below.
+    comptime assert indices.flat_rank >= 2
 
     var last_index_dim = Int(indices.dim(indices.rank - 1))
 
-    debug_assert(
-        last_index_dim + batch_dims == data.rank,
-        "kernel doesn't support slicing after specified dims",
-    )
+    assert (
+        last_index_dim + batch_dims == data.rank
+    ), "kernel doesn't support slicing after specified dims"
 
     var data_shape = coord_to_index_list(data.layout.shape_coord())
     var batch_volume: Int = 1
@@ -255,7 +250,7 @@ fn _index_tensor_1d[
 
     @__copy_capture(work_per_thread, batch_volume, last_index_dim)
     @parameter
-    fn calc_batch_dim(task_id: Int):
+    def calc_batch_dim(task_id: Int):
         # each thread gets a chunk of output embedding vectors to avoid inter-thread reduction
         var work_start = task_id * work_per_thread
         var work_end = min((task_id + 1) * work_per_thread, batch_volume)
@@ -269,14 +264,18 @@ fn _index_tensor_1d[
                         indices.load[width=1](Coord(Idx(j), Idx(k)))
                     )
 
+                var rd_coord = Coord(data_coord)
+                comptime assert (
+                    type_of(reshaped_data).flat_rank >= rd_coord.flat_rank
+                )
                 output.ptr[i * Int(indices.dim(0)) + j] = reshaped_data.load[
                     width=1
-                ](Coord(data_coord))
+                ](rd_coord)
 
     sync_parallelize[calc_batch_dim](num_tasks)
 
 
-fn _index_tensor_impl[
+def _index_tensor_impl[
     dtype: DType,
     indices_type: DType,
     //,
@@ -296,7 +295,7 @@ fn _index_tensor_impl[
     # This is modeled as an elementwise function mapping an index in the
     # output to an index in the input
     @parameter
-    fn index_tensor_elementwise_fn[
+    def index_tensor_elementwise_fn[
         simd_width: Int, rank: Int, alignment: Int = 1
     ](output_idx_arg: IndexList[rank]) capturing -> None:
         var output_idx = rebind[IndexList[output.rank]](output_idx_arg)
@@ -316,7 +315,7 @@ fn _index_tensor_impl[
         for i in range(indices_last_dim):
             indices_idx[indices.rank - 1] = i
             var coord = Coord(indices_idx)
-            comptime assert coord.flat_rank == indices.flat_rank
+            comptime assert indices.flat_rank >= coord.flat_rank
             data_idx[batch_dims + i] = Int(indices.load[width=1](coord))
 
         # fill in the last slices in the input
@@ -327,9 +326,9 @@ fn _index_tensor_impl[
             data_idx[src_start + i] = output_idx[output_start + i]
 
         var data_coord = Coord(data_idx)
-        comptime assert data_coord.flat_rank == data.flat_rank
+        comptime assert data.flat_rank >= data_coord.flat_rank
         var out_coord = Coord(output_idx)
-        comptime assert out_coord.flat_rank == output.flat_rank
+        comptime assert output.flat_rank >= out_coord.flat_rank
         output.store[width=simd_width, alignment=1](
             out_coord, data.load[width=simd_width, alignment=1](data_coord)
         )
@@ -372,9 +371,7 @@ fn _index_tensor_impl[
                 target=target,
             ](coord_to_index_list(output.layout.shape_coord()))
     else:
-        debug_assert(
-            Bool(ctx), "Must provide DeviceContext if executing on GPU."
-        )
+        assert Bool(ctx), "Must provide DeviceContext if executing on GPU."
         var cuda_ctx = ctx.value()
         if use_simd:
             elementwise[
@@ -396,7 +393,7 @@ fn _index_tensor_impl[
 # Advanced Indexing
 # ===-----------------------------------------------------------------------===#
 @always_inline
-fn _advanced_indexing_use_simd[
+def _advanced_indexing_use_simd[
     start_axis: Int, num_index_tensors: Int, input_rank: Int
 ](read_strides: IndexList, write_strides: IndexList) -> Bool:
     """Return whether we can use vectorized loads/stores for advanced indexing
@@ -426,7 +423,7 @@ fn _advanced_indexing_use_simd[
 
 
 @always_inline
-fn advanced_indexing_getitem[
+def advanced_indexing_getitem[
     input_rank: Int,
     index_rank: Int,
     input_type: DType,
@@ -437,10 +434,10 @@ fn advanced_indexing_getitem[
     target: StaticString,
     single_thread_blocking_override: Bool,
     trace_description: StaticString,
-    input_tensor_fn: fn[width: Int](IndexList[input_rank]) capturing -> SIMD[
+    input_tensor_fn: def[width: Int](IndexList[input_rank]) capturing -> SIMD[
         input_type, width
     ],
-    indices_fn: fn[indices_index: Int](
+    indices_fn: def[indices_index: Int](
         IndexList[index_rank]
     ) capturing -> Scalar[index_type],
 ](
@@ -509,7 +506,7 @@ fn advanced_indexing_getitem[
 
     @parameter
     @always_inline
-    fn elementwise_fn_wrapper[
+    def elementwise_fn_wrapper[
         width: Int,
         out_tensor_rank: Int,
         alignment: Int = 1,
@@ -537,7 +534,7 @@ fn advanced_indexing_getitem[
                 )
 
         var out_coord = Coord(output_index)
-        comptime assert out_coord.flat_rank == out_tensor.flat_rank
+        comptime assert out_tensor.flat_rank >= out_coord.flat_rank
         out_tensor.store[width=width, alignment=1](
             out_coord,
             input_tensor_fn[width=width](input_index),
@@ -574,7 +571,7 @@ fn advanced_indexing_getitem[
 
 
 @always_inline
-fn advanced_indexing_getitem_shape[
+def advanced_indexing_getitem_shape[
     input_rank: Int,
     index_rank: Int,
     //,
@@ -613,7 +610,7 @@ fn advanced_indexing_getitem_shape[
 
 
 @always_inline
-fn advanced_indexing_setitem_inplace[
+def advanced_indexing_setitem_inplace[
     index_rank: Int,
     updates_rank: Int,
     input_type: DType,
@@ -624,10 +621,10 @@ fn advanced_indexing_setitem_inplace[
     target: StaticString,
     single_thread_blocking_override: Bool,
     trace_description: StaticString,
-    updates_tensor_fn: fn[width: Int](
+    updates_tensor_fn: def[width: Int](
         IndexList[updates_rank]
     ) capturing -> SIMD[input_type, width],
-    indices_fn: fn[indices_index: Int](
+    indices_fn: def[indices_index: Int](
         IndexList[index_rank]
     ) capturing -> Scalar[index_type],
 ](
@@ -730,7 +727,7 @@ fn advanced_indexing_setitem_inplace[
 
     @parameter
     @always_inline
-    fn elementwise_fn_wrapper[
+    def elementwise_fn_wrapper[
         width: Int, iteration_rank: Int, alignment: Int = 1
     ](iteration_indices: IndexList[iteration_rank]) capturing:
         var index_tensor_indices = IndexList[index_rank]()
@@ -756,7 +753,7 @@ fn advanced_indexing_setitem_inplace[
                 )
 
         var input_tensor_coord = Coord(input_tensor_indices)
-        comptime assert input_tensor_coord.flat_rank == input_tensor.flat_rank
+        comptime assert input_tensor.flat_rank >= input_tensor_coord.flat_rank
         input_tensor.store[width=width, alignment=1](
             input_tensor_coord,
             updates_tensor_fn[width=width](

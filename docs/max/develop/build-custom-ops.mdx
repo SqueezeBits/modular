@@ -108,7 +108,7 @@ Let's inspect the struct and function signatures:
 @compiler.register("add_one")
 struct AddOne:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor,
@@ -155,7 +155,7 @@ the tensor happens in the `elementwise_add_one()` closure function.
 @compiler.register("add_one")
 struct AddOne:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor,
@@ -164,7 +164,7 @@ struct AddOne:
     ) raises:
         @parameter
         @always_inline
-        fn elementwise_add_one[
+        def elementwise_add_one[
             width: Int
         ](idx: IndexList[x.rank]) -> SIMD[x.dtype, width]:
             return x.load[width](idx) + 1
@@ -190,7 +190,7 @@ the [next example](#example-2-write-device-specific-kernels).)
 Let's now look at the corresponding
 [`custom_ops/addition.py`](https://github.com/modular/modular/tree/main/max/examples/custom_ops/addition.py)
 file where we load the `add_one` custom op into a graph using
-[`ops.custom()`](/max/api/python/graph/ops#max.graph.ops.custom).
+[`ops.custom()`](/max/api/python/graph.ops#max.graph.ops.custom).
 
 Here's the code that specifies the path to the Mojo custom op and adds it to the
 graph:
@@ -235,14 +235,14 @@ containing an `__init__.mojo` file (which can be empty).
 
 :::
 
-The [`Graph()`](/max/api/python/graph/Graph.md) takes an input tensor with five
+The [`Graph()`](/max/api/python/generated/max.graph.Graph) takes an input tensor with five
 rows and ten columns, runs the custom `add_one` operation on it, and returns the
 result.
 
 That's basically it. We created a custom op and added it to a graph!
 
 Now we can run an inference, using
-[`InferenceSession`](/max/api/python/engine#max.engine.InferenceSession). We
+[`InferenceSession`](/max/api/python/generated/max.engine.InferenceSession). We
 start by loading the graph onto the selected `device` (see above; either a CPU or
 GPU "accelerator"):
 
@@ -271,7 +271,7 @@ assert isinstance(result, Buffer)
 result = result.to(CPU())
 ```
 
-Notice that the [`Buffer`](/max/api/python/driver#max.driver.Buffer) is initially
+Notice that the [`Buffer`](/max/api/python/generated/max.driver.Buffer) is initially
 resident on the host (CPU), so we move it to the accelerator to be ready for use
 with the graph on that device (if the device is the host CPU and not an
 accelerator, the `to()` function is a no-op). Likewise, after we get results, we
@@ -311,7 +311,7 @@ The vector addition op in `kernels/vector_addition.mojo` looks like this:
 @compiler.register("vector_addition")
 struct VectorAddition:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[rank=1, ...],
@@ -338,7 +338,7 @@ that makes it easy to optimize code for specific hardware.
 The `_vector_addition_gpu()` function looks like this:
 
 ```mojo title="kernels/vector_addition.mojo"
-fn _vector_addition_gpu(
+def _vector_addition_gpu(
     output: ManagedTensorSlice[mut=True, ...],
     lhs: ManagedTensorSlice[dtype=output.dtype, rank=output.rank, ...],
     rhs: ManagedTensorSlice[dtype=output.dtype, rank=output.rank, ...],
@@ -349,7 +349,7 @@ fn _vector_addition_gpu(
     var vector_length = output.dim_size(0)
 
     @parameter
-    fn vector_addition_gpu_kernel(length: Int):
+    def vector_addition_gpu_kernel(length: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
         if tid < UInt(length):
             var idx = IndexList[output.rank](Int(tid))

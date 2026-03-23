@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.random import rand, randint
 
 from std.benchmark import *
@@ -23,10 +20,10 @@ from nn.gather_scatter import gather_elements
 from std.utils.index import Index
 
 
-fn bench_gather(mut m: Bench, spec: GatherSpec) raises:
+def bench_gather(mut m: Bench, spec: GatherSpec) raises:
     @parameter
     @always_inline
-    fn bench_gather_wrapper(mut b: Bencher, concrete_spec: GatherSpec) raises:
+    def bench_gather_wrapper(mut b: Bencher, concrete_spec: GatherSpec) raises:
         bench_gather(b, concrete_spec)
 
     m.bench_with_input[GatherSpec, bench_gather_wrapper](
@@ -35,20 +32,18 @@ fn bench_gather(mut m: Bench, spec: GatherSpec) raises:
 
 
 @parameter
-fn bench_gather(mut bencher: Bencher, spec: GatherSpec):
+def bench_gather(mut bencher: Bencher, spec: GatherSpec):
     var index_rand_min = 0
     var index_rand_max = spec.m1 - 1
 
     var input_shape = Index(spec.m1, spec.m2)
     var indices_shape = Index(spec.n1, spec.n2)
 
-    var data_ptr = UnsafePointer[Float32].alloc(input_shape.flattened_length())
+    var data_ptr = alloc[Float32](input_shape.flattened_length())
     rand(data_ptr, input_shape.flattened_length())
     var data_tensor = TileTensor(data_ptr, row_major(Coord(input_shape)))
 
-    var indices_ptr = UnsafePointer[Int32].alloc(
-        indices_shape.flattened_length()
-    )
+    var indices_ptr = alloc[Int32](indices_shape.flattened_length())
     randint(
         indices_ptr,
         indices_shape.flattened_length(),
@@ -59,14 +54,12 @@ fn bench_gather(mut bencher: Bencher, spec: GatherSpec):
         indices_ptr, row_major(Coord(indices_shape))
     )
 
-    var output_ptr = UnsafePointer[Float32].alloc(
-        indices_shape.flattened_length()
-    )
+    var output_ptr = alloc[Float32](indices_shape.flattened_length())
     var output_tensor = TileTensor(output_ptr, row_major(Coord(indices_shape)))
 
     @always_inline
     @parameter
-    fn bench_fn():
+    def bench_fn():
         try:
             gather_elements(
                 data_tensor,
@@ -92,13 +85,8 @@ struct GatherSpec(ImplicitlyCopyable, Writable):
     var n1: Int
     var n2: Int
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    @no_inline
-    fn __str__(self) -> String:
-        return String.write(self)
-
     # fmt: off
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes a string representation of the gather spec.
 
         Args:

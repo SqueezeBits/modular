@@ -11,13 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.gpu import *
 from std.gpu.host import DeviceContext
 from std.random import randn
-from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
+from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE, lt_to_tt
 from nn.mha import _naive_attention_with_transpose, mha_gpu_naive
 from nn.mha_mask import CausalMask, MaterializedMask
 from nn.mha_operand import LayoutTensorMHAOperand
@@ -31,7 +28,7 @@ from std.utils.index import Index
 from std.utils.numerics import get_accum_type
 
 
-fn test_prefill[
+def test_prefill[
     qkv_type: DType,
     k_rope_type: DType,
     output_type: DType,
@@ -75,16 +72,16 @@ fn test_prefill[
     var o_size = batch_size * seq_len * num_heads * kv_depth
     var cache_size = batch_size * num_keys * cache_num_heads * cache_depth
 
-    var q_ptr = UnsafePointer[Scalar[qkv_type]].alloc(q_size)
-    var k_ptr = UnsafePointer[Scalar[qkv_type]].alloc(k_size)
-    var v_ptr = UnsafePointer[Scalar[qkv_type]].alloc(v_size)
-    var cache_ptr = UnsafePointer[Scalar[k_rope_type]].alloc(cache_size)
-    var output_ptr = UnsafePointer[Scalar[output_type]].alloc(o_size)
+    var q_ptr = alloc[Scalar[qkv_type]](q_size)
+    var k_ptr = alloc[Scalar[qkv_type]](k_size)
+    var v_ptr = alloc[Scalar[qkv_type]](v_size)
+    var cache_ptr = alloc[Scalar[k_rope_type]](cache_size)
+    var output_ptr = alloc[Scalar[output_type]](o_size)
 
-    var q_bf16_ptr = UnsafePointer[BFloat16].alloc(q_size)
-    var k_bf16_ptr = UnsafePointer[BFloat16].alloc(k_size)
-    var v_bf16_ptr = UnsafePointer[BFloat16].alloc(v_size)
-    var cache_bf16_ptr = UnsafePointer[BFloat16].alloc(cache_size)
+    var q_bf16_ptr = alloc[BFloat16](q_size)
+    var k_bf16_ptr = alloc[BFloat16](k_size)
+    var v_bf16_ptr = alloc[BFloat16](v_size)
+    var cache_bf16_ptr = alloc[BFloat16](cache_size)
 
     randn[DType.bfloat16](q_bf16_ptr, q_size)
     randn[DType.bfloat16](k_bf16_ptr, k_size)
@@ -119,8 +116,8 @@ fn test_prefill[
         cache_bf16_ptr[i] = cache_val.cast[DType.bfloat16]()
 
     # input row offsets and cache row offsets
-    var input_row_offsets = UnsafePointer[UInt32].alloc(batch_size + 1)
-    var cache_row_offsets = UnsafePointer[UInt32].alloc(batch_size + 1)
+    var input_row_offsets = alloc[UInt32](batch_size + 1)
+    var cache_row_offsets = alloc[UInt32](batch_size + 1)
     for i in range(batch_size):
         input_row_offsets[i] = UInt32(i * seq_len)
         cache_row_offsets[i] = UInt32(i * num_keys)
@@ -248,15 +245,15 @@ fn test_prefill[
         cache_row_offsets_device,
         output_device,
     )
-    fn kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(ctx: DeviceContext) raises:
         flare_mla_prefill[rank=q.rank](
-            output_device,
-            q_device,
+            lt_to_tt(output_device),
+            lt_to_tt(q_device),
             k_device,
             v_device,
             cache_device,
             CausalMask(),
-            input_row_offsets_device,
+            lt_to_tt(input_row_offsets_device),
             cache_row_offsets_device,
             scale,
             ctx,
@@ -270,13 +267,9 @@ fn test_prefill[
 
     # create reference K and V
     # unlike flare_mla_prefill, K_ref and V_ref each head is of size depth (not kv_depth)
-    var k_ref_ptr = UnsafePointer[BFloat16].alloc(
-        batch_size * num_keys * num_heads * depth
-    )
-    var v_ref_ptr = UnsafePointer[BFloat16].alloc(
-        batch_size * num_keys * num_heads * depth
-    )
-    var output_ref_ptr = UnsafePointer[Scalar[output_type]].alloc(
+    var k_ref_ptr = alloc[BFloat16](batch_size * num_keys * num_heads * depth)
+    var v_ref_ptr = alloc[BFloat16](batch_size * num_keys * num_heads * depth)
+    var output_ref_ptr = alloc[Scalar[output_type]](
         batch_size * seq_len * num_heads * depth
     )
 
@@ -381,7 +374,7 @@ fn test_prefill[
     var null_valid_length = LayoutTensor[
         DType.uint32, Layout.row_major(UNKNOWN_VALUE)
     ](
-        UnsafePointer[UInt32](),
+        UnsafePointer[UInt32, MutAnyOrigin](),
         RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(Index(0)),
     )
 
@@ -468,7 +461,7 @@ fn test_prefill[
     cache_row_offsets.free()
 
 
-fn test_mla_prefill_qkv_fp8[
+def test_mla_prefill_qkv_fp8[
     qkv_type: DType,
     k_rope_type: DType,
     output_type: DType,

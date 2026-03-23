@@ -27,13 +27,10 @@ from std.sys import align_of
 from buffer import NDBuffer
 from buffer.dimlist import DimList
 from std.gpu.host import DeviceContext
+from layout import TileTensor
 from internal_utils import assert_almost_equal
 from std.random import rand
 from internal_utils._utils import ValOrDim
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-
 from std.utils.index import Index, IndexList
 
 from .config import MatmulConfig as MatmulConfigSM90
@@ -44,7 +41,7 @@ from .matmul import warp_specialize_gemm_with_multicasting
 from ...vendor.blas import matmul as vendor_matmul
 
 
-fn test_matmul_sm90_swapAB_comparison[
+def test_matmul_sm90_swapAB_comparison[
     a_type: DType,
     b_type: DType,
     c_type: DType,
@@ -84,9 +81,9 @@ fn test_matmul_sm90_swapAB_comparison[
     comptime CLUSTER_N_SWAPAB = config_swapAB.cluster_shape[0]
 
     # Static shapes - C shape is the same for both kernels
-    comptime static_a_shape = DimList(m.dim, k.dim)
-    comptime static_b_shape = DimList(n.dim, k.dim)
-    comptime static_c_shape = DimList(m.dim, n.dim)  # [M, N] for both
+    comptime static_a_shape = DimList[m.dim, k.dim]()
+    comptime static_b_shape = DimList[n.dim, k.dim]()
+    comptime static_c_shape = DimList[m.dim, n.dim]()  # [M, N] for both
 
     var dynamic_a_shape = IndexList[2](m.value, k.value)
     var dynamic_b_shape = IndexList[2](n.value, k.value)
@@ -98,21 +95,21 @@ fn test_matmul_sm90_swapAB_comparison[
     var c_size = M * N
 
     # Host allocations
-    var a_host_ptr = UnsafePointer[Scalar[a_type]].alloc(a_size)
-    var b_host_ptr = UnsafePointer[Scalar[b_type]].alloc(b_size)
-    var c_normal_host_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
-    var c_swapAB_host_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
+    var a_host_ptr = alloc[Scalar[a_type]](a_size)
+    var b_host_ptr = alloc[Scalar[b_type]](b_size)
+    var c_normal_host_ptr = alloc[Scalar[c_type]](c_size)
+    var c_swapAB_host_ptr = alloc[Scalar[c_type]](c_size)
 
-    var a_host = NDBuffer[a_type, 2, _, static_a_shape](
+    var a_host = NDBuffer[rank=2, a_type, _, static_a_shape](
         a_host_ptr, dynamic_a_shape
     )
-    var b_host = NDBuffer[b_type, 2, _, static_b_shape](
+    var b_host = NDBuffer[rank=2, b_type, _, static_b_shape](
         b_host_ptr, dynamic_b_shape
     )
-    var c_normal_host = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_normal_host = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_normal_host_ptr, dynamic_c_shape
     )
-    var c_swapAB_host = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_swapAB_host = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_swapAB_host_ptr, dynamic_c_shape
     )
 
@@ -122,16 +119,16 @@ fn test_matmul_sm90_swapAB_comparison[
     var c_normal_dev_buffer = ctx.enqueue_create_buffer[c_type](c_size)
     var c_swapAB_dev_buffer = ctx.enqueue_create_buffer[c_type](c_size)
 
-    var a_device = NDBuffer[a_type, 2, _, static_a_shape](
+    var a_device = NDBuffer[rank=2, a_type, _, static_a_shape](
         a_dev_buffer.unsafe_ptr(), dynamic_a_shape
     )
-    var b_device = NDBuffer[b_type, 2, _, static_b_shape](
+    var b_device = NDBuffer[rank=2, b_type, _, static_b_shape](
         b_dev_buffer.unsafe_ptr(), dynamic_b_shape
     )
-    var c_normal_device = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_normal_device = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_normal_dev_buffer.unsafe_ptr(), dynamic_c_shape
     )
-    var c_swapAB_device = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_swapAB_device = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_swapAB_dev_buffer.unsafe_ptr(), dynamic_c_shape
     )
 
@@ -204,61 +201,49 @@ fn test_matmul_sm90_swapAB_comparison[
     )
 
     # Assertions for normal kernel
-    debug_assert(
-        (ceildiv(M, BM) % CLUSTER_M) == 0,
-        String(
-            (
-                "Normal: Number of blocks on M axis should be multiple of"
-                " cluster dim. M"
-            ),
-            "(M // BM=",
-            String(M // BM),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_M),
+    assert (ceildiv(M, BM) % CLUSTER_M) == 0, String(
+        (
+            "Normal: Number of blocks on M axis should be multiple of"
+            " cluster dim. M"
         ),
+        "(M // BM=",
+        String(M // BM),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_M),
     )
 
-    debug_assert(
-        (ceildiv(N, BN) % CLUSTER_N) == 0,
-        String(
-            (
-                "Normal: Number of blocks on N axis should be multiple of"
-                " cluster dim. N"
-            ),
-            "(N // BN=",
-            String(N // BN),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_N),
+    assert (ceildiv(N, BN) % CLUSTER_N) == 0, String(
+        (
+            "Normal: Number of blocks on N axis should be multiple of"
+            " cluster dim. N"
         ),
+        "(N // BN=",
+        String(N // BN),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_N),
     )
 
     # Assertions for swapAB kernel
-    debug_assert(
-        (ceildiv(M, BM_SWAPAB) % CLUSTER_M_SWAPAB) == 0,
-        String(
-            (
-                "SwapAB: Number of blocks on M axis should be multiple of"
-                " cluster dim. M"
-            ),
-            "(M // BM=",
-            String(M // BM_SWAPAB),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_M_SWAPAB),
+    assert (ceildiv(M, BM_SWAPAB) % CLUSTER_M_SWAPAB) == 0, String(
+        (
+            "SwapAB: Number of blocks on M axis should be multiple of"
+            " cluster dim. M"
         ),
+        "(M // BM=",
+        String(M // BM_SWAPAB),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_M_SWAPAB),
     )
 
-    debug_assert(
-        (ceildiv(N, BN_SWAPAB) % CLUSTER_N_SWAPAB) == 0,
-        String(
-            (
-                "SwapAB: Number of blocks on N axis should be multiple of"
-                " cluster dim. N"
-            ),
-            "(N // BN=",
-            String(N // BN_SWAPAB),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_N_SWAPAB),
+    assert (ceildiv(N, BN_SWAPAB) % CLUSTER_N_SWAPAB) == 0, String(
+        (
+            "SwapAB: Number of blocks on N axis should be multiple of"
+            " cluster dim. N"
         ),
+        "(N // BN=",
+        String(N // BN_SWAPAB),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_N_SWAPAB),
     )
 
     # =========================================================================
@@ -271,9 +256,9 @@ fn test_matmul_sm90_swapAB_comparison[
         schedule=MatmulSchedule.NONE,
         swapAB=False,
     ](
-        c_normal_device,
-        a_device,
-        b_device,
+        TileTensor(c_normal_device),
+        TileTensor(a_device),
+        TileTensor(b_device),
         ctx,
     )
 
@@ -290,9 +275,9 @@ fn test_matmul_sm90_swapAB_comparison[
         schedule=MatmulSchedule.NONE,
         swapAB=True,
     ](
-        c_swapAB_device,
-        a_device,
-        b_device,
+        TileTensor(c_swapAB_device),
+        TileTensor(a_device),
+        TileTensor(b_device),
         ctx,
     )
 
@@ -387,7 +372,7 @@ fn test_matmul_sm90_swapAB_comparison[
     _ = c_swapAB_dev_buffer^
 
 
-fn test_matmul_sm90_swapAB_comparison_v2[
+def test_matmul_sm90_swapAB_comparison_v2[
     a_type: DType,
     b_type: DType,
     c_type: DType,
@@ -398,10 +383,10 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     MMA_M: Int,
     MMA_N: Int,
     MMA_K: Int,
-    num_pipeline_stages: UInt,
-    num_consumer: UInt,
-    k_group_size: UInt = 1,
-    num_k_partitions: UInt = 1,
+    num_pipeline_stages: Int,
+    num_consumer: Int,
+    k_group_size: Int = 1,
+    num_k_partitions: Int = 1,
     partitioned_multicast: Bool = False,
     # Config parameters for swapAB kernel (compile-time, defaults to normal values)
     BM_SWAPAB: Int = BM,
@@ -410,10 +395,10 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     MMA_M_SWAPAB: Int = MMA_M,
     MMA_N_SWAPAB: Int = MMA_N,
     MMA_K_SWAPAB: Int = MMA_K,
-    num_pipeline_stages_swapAB: UInt = num_pipeline_stages,
-    num_consumer_swapAB: UInt = num_consumer,
-    k_group_size_swapAB: UInt = k_group_size,
-    num_k_partitions_swapAB: UInt = num_k_partitions,
+    num_pipeline_stages_swapAB: Int = num_pipeline_stages,
+    num_consumer_swapAB: Int = num_consumer,
+    k_group_size_swapAB: Int = k_group_size,
+    num_k_partitions_swapAB: Int = num_k_partitions,
     partitioned_multicast_swapAB: Bool = partitioned_multicast,
     # Use vendor matmul (cuBLAS) as reference instead of normal kernel
     use_vendor_reference: Bool = False,
@@ -483,11 +468,11 @@ fn test_matmul_sm90_swapAB_comparison_v2[
         warp_tile_shape=Index(MMA_M, MMA_N, BK),
         mma_shape=Index(MMA_M, MMA_N, MMA_K),
         cluster_shape=Index(1, 1, 1),
-        num_pipeline_stages=num_pipeline_stages,
-        num_k_partitions=num_k_partitions,
-        k_group_size=k_group_size,
+        num_pipeline_stages=UInt(num_pipeline_stages),
+        num_k_partitions=UInt(num_k_partitions),
+        k_group_size=UInt(k_group_size),
         num_warp_k_partitions=1,
-        num_consumer=num_consumer,
+        num_consumer=UInt(num_consumer),
         partitioned_multicast=partitioned_multicast,
     )
 
@@ -498,11 +483,11 @@ fn test_matmul_sm90_swapAB_comparison_v2[
         warp_tile_shape=Index(MMA_M_SWAPAB, MMA_N_SWAPAB, BK_SWAPAB),
         mma_shape=Index(MMA_M_SWAPAB, MMA_N_SWAPAB, MMA_K_SWAPAB),
         cluster_shape=Index(1, 1, 1),
-        num_pipeline_stages=num_pipeline_stages_swapAB,
-        num_k_partitions=num_k_partitions_swapAB,
-        k_group_size=k_group_size_swapAB,
+        num_pipeline_stages=UInt(num_pipeline_stages_swapAB),
+        num_k_partitions=UInt(num_k_partitions_swapAB),
+        k_group_size=UInt(k_group_size_swapAB),
         num_warp_k_partitions=1,
-        num_consumer=num_consumer_swapAB,
+        num_consumer=UInt(num_consumer_swapAB),
         partitioned_multicast=partitioned_multicast_swapAB,
     )
 
@@ -513,9 +498,9 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     comptime CLUSTER_N_SWAPAB = 1
 
     # Static shapes - C shape is the same for both kernels
-    comptime static_a_shape = DimList(m.dim, k.dim)
-    comptime static_b_shape = DimList(n.dim, k.dim)
-    comptime static_c_shape = DimList(m.dim, n.dim)  # [M, N] for both
+    comptime static_a_shape = DimList[m.dim, k.dim]()
+    comptime static_b_shape = DimList[n.dim, k.dim]()
+    comptime static_c_shape = DimList[m.dim, n.dim]()  # [M, N] for both
 
     var dynamic_a_shape = IndexList[2](m.value, k.value)
     var dynamic_b_shape = IndexList[2](n.value, k.value)
@@ -527,21 +512,21 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     var c_size = M * N
 
     # Host allocations
-    var a_host_ptr = UnsafePointer[Scalar[a_type]].alloc(a_size)
-    var b_host_ptr = UnsafePointer[Scalar[b_type]].alloc(b_size)
-    var c_normal_host_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
-    var c_swapAB_host_ptr = UnsafePointer[Scalar[c_type]].alloc(c_size)
+    var a_host_ptr = alloc[Scalar[a_type]](a_size)
+    var b_host_ptr = alloc[Scalar[b_type]](b_size)
+    var c_normal_host_ptr = alloc[Scalar[c_type]](c_size)
+    var c_swapAB_host_ptr = alloc[Scalar[c_type]](c_size)
 
-    var a_host = NDBuffer[a_type, 2, _, static_a_shape](
+    var a_host = NDBuffer[rank=2, a_type, _, static_a_shape](
         a_host_ptr, dynamic_a_shape
     )
-    var b_host = NDBuffer[b_type, 2, _, static_b_shape](
+    var b_host = NDBuffer[rank=2, b_type, _, static_b_shape](
         b_host_ptr, dynamic_b_shape
     )
-    var c_normal_host = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_normal_host = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_normal_host_ptr, dynamic_c_shape
     )
-    var c_swapAB_host = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_swapAB_host = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_swapAB_host_ptr, dynamic_c_shape
     )
 
@@ -551,16 +536,16 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     var c_normal_dev_buffer = ctx.enqueue_create_buffer[c_type](c_size)
     var c_swapAB_dev_buffer = ctx.enqueue_create_buffer[c_type](c_size)
 
-    var a_device = NDBuffer[mut=False, a_type, 2, _, static_a_shape](
+    var a_device = NDBuffer[mut=False, rank=2, a_type, _, static_a_shape](
         a_dev_buffer.unsafe_ptr(), dynamic_a_shape
     )
-    var b_device = NDBuffer[mut=False, b_type, 2, _, static_b_shape](
+    var b_device = NDBuffer[mut=False, rank=2, b_type, _, static_b_shape](
         b_dev_buffer.unsafe_ptr(), dynamic_b_shape
     )
-    var c_normal_device = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_normal_device = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_normal_dev_buffer.unsafe_ptr(), dynamic_c_shape
     )
-    var c_swapAB_device = NDBuffer[c_type, 2, _, static_c_shape](
+    var c_swapAB_device = NDBuffer[rank=2, c_type, _, static_c_shape](
         c_swapAB_dev_buffer.unsafe_ptr(), dynamic_c_shape
     )
 
@@ -639,61 +624,49 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     )
 
     # Assertions for normal kernel
-    debug_assert(
-        (ceildiv(M, BM) % CLUSTER_M) == 0,
-        String(
-            (
-                "Normal: Number of blocks on M axis should be multiple of"
-                " cluster dim. M"
-            ),
-            "(M // BM=",
-            String(M // BM),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_M),
+    assert (ceildiv(M, BM) % CLUSTER_M) == 0, String(
+        (
+            "Normal: Number of blocks on M axis should be multiple of"
+            " cluster dim. M"
         ),
+        "(M // BM=",
+        String(M // BM),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_M),
     )
 
-    debug_assert(
-        (ceildiv(N, BN) % CLUSTER_N) == 0,
-        String(
-            (
-                "Normal: Number of blocks on N axis should be multiple of"
-                " cluster dim. N"
-            ),
-            "(N // BN=",
-            String(N // BN),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_N),
+    assert (ceildiv(N, BN) % CLUSTER_N) == 0, String(
+        (
+            "Normal: Number of blocks on N axis should be multiple of"
+            " cluster dim. N"
         ),
+        "(N // BN=",
+        String(N // BN),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_N),
     )
 
     # Assertions for swapAB kernel
-    debug_assert(
-        (ceildiv(M, BM_SWAPAB) % CLUSTER_M_SWAPAB) == 0,
-        String(
-            (
-                "SwapAB: Number of blocks on M axis should be multiple of"
-                " cluster dim. M"
-            ),
-            "(M // BM=",
-            String(M // BM_SWAPAB),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_M_SWAPAB),
+    assert (ceildiv(M, BM_SWAPAB) % CLUSTER_M_SWAPAB) == 0, String(
+        (
+            "SwapAB: Number of blocks on M axis should be multiple of"
+            " cluster dim. M"
         ),
+        "(M // BM=",
+        String(M // BM_SWAPAB),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_M_SWAPAB),
     )
 
-    debug_assert(
-        (ceildiv(N, BN_SWAPAB) % CLUSTER_N_SWAPAB) == 0,
-        String(
-            (
-                "SwapAB: Number of blocks on N axis should be multiple of"
-                " cluster dim. N"
-            ),
-            "(N // BN=",
-            String(N // BN_SWAPAB),
-            ") CLUSTER SIZE:",
-            String(CLUSTER_N_SWAPAB),
+    assert (ceildiv(N, BN_SWAPAB) % CLUSTER_N_SWAPAB) == 0, String(
+        (
+            "SwapAB: Number of blocks on N axis should be multiple of"
+            " cluster dim. N"
         ),
+        "(N // BN=",
+        String(N // BN_SWAPAB),
+        ") CLUSTER SIZE:",
+        String(CLUSTER_N_SWAPAB),
     )
 
     # =========================================================================
@@ -702,7 +675,7 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     @parameter
     @always_inline
     @__copy_capture(c_normal_device)
-    fn epilogue_fn_normal[
+    def epilogue_fn_normal[
         _dtype: DType,
         width: Int,
         *,
@@ -715,7 +688,7 @@ fn test_matmul_sm90_swapAB_comparison_v2[
     @parameter
     @always_inline
     @__copy_capture(c_swapAB_device)
-    fn epilogue_fn_swapAB[
+    def epilogue_fn_swapAB[
         _dtype: DType,
         width: Int,
         *,
@@ -763,9 +736,9 @@ fn test_matmul_sm90_swapAB_comparison_v2[
             elementwise_lambda_fn=elf_normal,
             elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
         ](
-            c_normal_device,
-            a_device,
-            b_device,
+            TileTensor(c_normal_device),
+            TileTensor(a_device),
+            TileTensor(b_device),
             ctx,
         )
 
@@ -787,9 +760,9 @@ fn test_matmul_sm90_swapAB_comparison_v2[
         elementwise_lambda_fn=elf_swapAB,
         elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
     ](
-        c_swapAB_device,
-        a_device,
-        b_device,
+        TileTensor(c_swapAB_device),
+        TileTensor(a_device),
+        TileTensor(b_device),
         ctx,
     )
 

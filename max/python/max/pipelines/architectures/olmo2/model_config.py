@@ -23,7 +23,7 @@ from max.graph import DeviceRef
 from max.graph.weights import WeightData
 from max.nn.kv_cache import KVCacheParams
 from max.nn.transformer import ReturnHiddenStates, ReturnLogits
-from max.pipelines.lib import KVCacheConfig, PipelineConfig
+from max.pipelines.lib import KVCacheConfig, MAXModelConfig, PipelineConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 from typing_extensions import Self, override
 
@@ -101,11 +101,16 @@ class Olmo2Config(Llama3Config):
 
     @override
     @classmethod
-    def initialize(cls, pipeline_config: PipelineConfig) -> Self:
-        huggingface_config = pipeline_config.model.huggingface_config
+    def initialize(
+        cls,
+        pipeline_config: PipelineConfig,
+        model_config: MAXModelConfig | None = None,
+    ) -> Self:
+        model_config = model_config or pipeline_config.model
+        huggingface_config = model_config.huggingface_config
         if huggingface_config is None:
             raise ValueError(
-                f"HuggingFace config is required for '{pipeline_config.model.model_path}', "
+                f"HuggingFace config is required for '{model_config.model_path}', "
                 "but config could not be loaded. "
                 "Please ensure the model repository contains a valid config.json file."
             )
@@ -113,13 +118,16 @@ class Olmo2Config(Llama3Config):
 
     @classmethod
     def initialize_from_config(
-        cls, pipeline_config: PipelineConfig, huggingface_config: AutoConfig
+        cls,
+        pipeline_config: PipelineConfig,
+        huggingface_config: AutoConfig,
+        model_config: MAXModelConfig | None = None,
     ) -> Self:
         """Initializes an Olmo2Config instance from pipeline and HuggingFace configuration.
 
         This method creates a config instance with all fields that can be determined
         from the pipeline and HuggingFace configuration, without needing the state_dict.
-        Fields that depend on the state_dict (like tie_word_embeddings, float8_config)
+        Fields that depend on the state_dict (like tie_word_embeddings, quant_config)
         should be set via the `finalize()` method.
 
         Overrides Llama3Config.initialize_from_config to use Olmo2-specific
@@ -128,13 +136,14 @@ class Olmo2Config(Llama3Config):
         Args:
             pipeline_config: The MAX Engine pipeline configuration.
             huggingface_config: The HuggingFace model configuration object.
+            model_config: The MAX Engine model configuration.
 
         Returns:
             An initialized Olmo2Config instance.
         """
         # Get the base config from Llama3Config
         base_config = Llama3Config.initialize_from_config(
-            pipeline_config, huggingface_config
+            pipeline_config, huggingface_config, model_config
         )
 
         kv_cache_config = pipeline_config.model.kv_cache

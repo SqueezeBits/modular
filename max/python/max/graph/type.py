@@ -45,7 +45,7 @@ class FilterLayout(enum.Enum):
     CFRS = "CFRS"
 
     def to_mlir(self) -> mo.LayoutAttr:
-        """Returns an mlir Attribute representing this Layout.
+        """Returns an MLIR attribute representing this layout.
 
         This attribute is used in tensor type metadata for certain ops.
 
@@ -77,7 +77,7 @@ class ConvInputLayout(enum.Enum):
     NCHW = "NCHW"
 
     def to_mlir(self) -> builtin.StringAttr:
-        """Returns an mlir Attribute representing this Layout.
+        """Returns an MLIR attribute representing this layout.
 
         This attribute is used for certain convolution ops.
 
@@ -124,7 +124,7 @@ class DeviceRef:
     """A symbolic device representation.
 
     DeviceRef type representation consists of a DeviceKind and an id. This is a direct
-    representation of the device attribute in mlir.
+    representation of the device attribute in MLIR.
 
     The following example demonstrates how to create and use device references:
 
@@ -144,12 +144,12 @@ class DeviceRef:
 
     @staticmethod
     def CPU(id: int = 0) -> DeviceRef:
-        """Static Method for creating a CPU device."""
+        """Creates a CPU device reference."""
         return DeviceRef(DeviceKind.CPU, id)
 
     @staticmethod
     def GPU(id: int = 0) -> DeviceRef:
-        """Static Method for creating a GPU device."""
+        """Creates a GPU device reference."""
         return DeviceRef(DeviceKind.GPU, id)
 
     def __init__(self, device_type: DeviceKind | str, id: int = 0) -> None:
@@ -168,7 +168,7 @@ class DeviceRef:
         return str(self)
 
     def __eq__(self, other: Any) -> bool:
-        """Returns true if devices are equal."""
+        """Returns ``True`` if devices are equal."""
         if not isinstance(other, DeviceRef):
             return False
         return self.device_type is other.device_type and self.id == other.id
@@ -178,11 +178,11 @@ class DeviceRef:
         return hash((self.device_type, self.id))
 
     def to_mlir(self) -> m.DeviceRefAttr:
-        """Returns a mlir attribute representing device."""
+        """Returns an MLIR attribute representing the device."""
         return m.DeviceRefAttr(str(self.device_type), self.id)
 
     def to_device(self) -> Device:
-        """Convert device reference to a concrete driver Device."""
+        """Converts a device reference to a concrete driver ``Device``."""
         if self.device_type is DeviceKind.CPU:
             return CPU(self.id)
         elif self.device_type is DeviceKind.GPU:
@@ -191,11 +191,11 @@ class DeviceRef:
             raise ValueError(f"Unsupported device type: {self.device_type}")
 
     def is_cpu(self) -> bool:
-        """Returns true if the device is a CPU device."""
+        """Returns ``True`` if the device is a CPU device."""
         return self.device_type is DeviceKind.CPU
 
     def is_gpu(self) -> bool:
-        """Returns true if the device is a GPU device."""
+        """Returns ``True`` if the device is a GPU device."""
         return self.device_type is DeviceKind.GPU
 
     @staticmethod
@@ -212,9 +212,9 @@ class DeviceRef:
 
 
 class Type(Generic[MlirType]):
-    """Represents any possible type for Graph values.
+    """The type of any value in a MAX graph.
 
-    Every Value in the Graph has a Type, and that type is represented by an Type.
+    Every value in the graph has a type, and that type is represented by a :class:`Type`.
     This type may be inspected to get finer-grained types and learn more
     about an individual Value.
 
@@ -273,14 +273,6 @@ class _TensorTypeBase(Type[MlirType]):
     def __init__(
         self, dtype: DType, shape: ShapeLike, device: DeviceRef
     ) -> None:
-        """Constructs a tensor type.
-
-        Args:
-            dtype: The element type of the tensor data.
-            shape: The shape dimensions of the tensor. The number of dims
-                is the rank of the tensor.
-            device: The device where the tensor resides.
-        """
         self.dtype = dtype
         self.shape = Shape(shape)
         self.device = device
@@ -296,7 +288,7 @@ class _TensorTypeBase(Type[MlirType]):
 
     @property
     def rank(self) -> int:
-        """Gets the rank of the tensor type.
+        """The rank of the tensor type.
 
         Returns:
             The tensor's static rank.
@@ -310,8 +302,8 @@ class _TensorTypeBase(Type[MlirType]):
             other: The other tensor to check equality against.
 
         Returns:
-            True if the tensors have identical element type and shape,
-            false otherwise.
+            ``True`` if the tensors have identical element type and shape,
+            ``False`` otherwise.
         """
         return (
             isinstance(other, type(self))
@@ -332,7 +324,7 @@ class _TensorTypeBase(Type[MlirType]):
 
         For a static tensor, returns the product of all static dimensions.
         This is the number of elements the tensor will hold **during execution**,
-        :obj:`TensorType` doesn't actually hold any element values at all.
+        :class:`TensorType` doesn't actually hold any element values at all.
 
         For any non-static tensor, in other words a tensor having any symbolic
         dimensions, the return value will be meaningless.
@@ -348,7 +340,7 @@ class _TensorTypeBase(Type[MlirType]):
         return math.prod(int(dim) for dim in self.shape)
 
     def cast(self, dtype: DType):  # noqa: ANN202
-        """Constructs a new tensor type of the same shape with the new `dtype`.
+        """Constructs a new tensor type of the same shape with the new ``dtype``.
 
         Args:
             dtype: The new element type for the tensor.
@@ -366,35 +358,41 @@ class _TensorTypeBase(Type[MlirType]):
 
 @dataclass
 class TensorType(_TensorTypeBase[mo.TensorType]):
-    """A symbolic :obj:`TensorType`.
+    """A symbolic tensor type.
 
-    This is not an eager tensor type! This contains no actual data, but
-    instead represents the type of a value at some point in time during model
-    execution.
+    Use ``TensorType`` to declare the expected ``dtype``, ``shape``, and target
+    ``device`` of tensor values that flow through a graph during model
+    execution. Unlike an eager tensor, a ``TensorType`` holds no data. It is a
+    purely symbolic description of a value's type at a specific point in the
+    computation. The graph compiler uses this information for shape inference
+    and optimization during graph construction.
 
-    Most internal values in a model will be tensors. This type represents
-    their element type (``dtype``) and dimensions (``dims``) at a specific point during
-    model computation. It allows us to do some optimistic optimizations and
-    shape inference during graph construction, and to provide more detailed
-    shape information to the compiler for further optimization passes.
-
-    The following example shows how to create a tensor type with static dimensions and access its properties:
+    The following example shows how to create a tensor type and access its
+    properties:
 
     .. code-block:: python
 
-        from max.graph import TensorType
+        from max.graph import TensorType, DeviceRef
         from max.dtype import DType
         # Create a tensor type with float32 elements and static dimensions 2x3
-        tensor_type = TensorType(DType.float32, (2, 3))
+        tensor_type = TensorType(DType.float32, (2, 3), device=DeviceRef.CPU())
         print(tensor_type.dtype)  # Outputs: DType.float32
         print(tensor_type.shape)  # Outputs: [2, 3]
 
-    It can also represent a fully dynamic rank tensor. The presence of dynamic
-    rank tensors in a graph will often degrade performance dramatically and
-    prevents many classes of optimizations.
+    A shape's dimensions can be static (integers), symbolic (strings), or
+    algebraic (expressions over symbolic dimensions). In each case the
+    rank is known at graph construction time. At the MLIR level, a tensor can
+    also have a fully dynamic rank where even the number of dimensions is
+    unknown. Dynamic rank tensors prevent many compiler optimizations and can
+    degrade performance significantly.
 
-    An optional device (``device``) can also be provided to indicate the explicit
-    device the tensor is associated with.
+    Args:
+        dtype: The data type of the tensor elements.
+        shape: The shape of the tensor expressed using dimensions
+            (:class:`~max.graph.Dim`).
+        device: The device the tensor is associated with. Use
+            :meth:`DeviceRef.CPU` or :meth:`DeviceRef.GPU` to create a device
+            reference.
     """
 
     _layout: FilterLayout | None = field(default=None, repr=False)
@@ -431,10 +429,10 @@ class TensorType(_TensorTypeBase[mo.TensorType]):
         return self
 
     def to_mlir(self) -> mo.TensorType:
-        """Converts to an ``mlir.Type`` instance.
+        """Converts to an :obj:`mlir.Type` instance.
 
         Returns:
-            An ``mlir.Type`` in the specified Context.
+            An :obj:`mlir.Type` in the specified context.
         """
         metadata = []
         if self._layout:
@@ -541,8 +539,6 @@ class _OpaqueType(Type[mo.OpaqueType]):
 
     Valid parameter types are ``bool``, ``int``, ``str``, and ``DType``.
 
-    Example:
-
     .. code-block:: python
 
         # Create an opaque type with parameters
@@ -602,10 +598,10 @@ class _ChainType(Type[mo.ChainType]):
     """
 
     def to_mlir(self) -> mo.ChainType:
-        """Converts to an mlir.Type instance.
+        """Converts to an ``mlir.Type`` instance.
 
         Returns:
-            An mlir.Type in the specified Context.
+            An ``mlir.Type`` in the specified Context.
         """
         return mo.ChainType()
 

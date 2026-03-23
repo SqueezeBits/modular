@@ -14,17 +14,18 @@
 from std.random import rand, randint
 
 from std.benchmark import *
-from buffer.dimlist import Dim
 from nn.gather_scatter import scatter_elements
 from tensor import DynamicTensor
 
 from std.utils.index import Index
 
 
-fn bench_scatter(mut m: Bench, spec: ScatterSpec) raises:
+def bench_scatter(mut m: Bench, spec: ScatterSpec) raises:
     @parameter
     @always_inline
-    fn bench_scatter_wrapper(mut b: Bencher, concrete_spec: ScatterSpec) raises:
+    def bench_scatter_wrapper(
+        mut b: Bencher, concrete_spec: ScatterSpec
+    ) raises:
         bench_scatter(b, concrete_spec)
 
     m.bench_with_input[ScatterSpec, bench_scatter_wrapper](
@@ -33,7 +34,7 @@ fn bench_scatter(mut m: Bench, spec: ScatterSpec) raises:
 
 
 @parameter
-fn bench_scatter(mut bencher: Bencher, spec: ScatterSpec):
+def bench_scatter(mut bencher: Bencher, spec: ScatterSpec):
     var index_rand_min = 0
     var index_rand_max = spec.m1 - 1
 
@@ -66,10 +67,10 @@ fn bench_scatter(mut bencher: Bencher, spec: ScatterSpec):
 
     @always_inline
     @parameter
-    fn bench_fn():
+    def bench_fn():
         @always_inline
         @parameter
-        fn reduce_fn[
+        def reduce_fn[
             _dtype: DType, width: Int
         ](
             input_val: SIMD[_dtype, width], update_val: SIMD[_dtype, width]
@@ -103,12 +104,7 @@ struct ScatterSpec(ImplicitlyCopyable, Writable):
     var n1: Int
     var n2: Int
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    @no_inline
-    fn __str__(self) -> String:
-        return String.write(self)
-
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes a string representation of the scatter spec.
 
         Args:

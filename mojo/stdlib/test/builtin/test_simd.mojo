@@ -314,7 +314,7 @@ def test_convert_simd_to_string() raises:
     )
 
 
-fn _test_repr(value: SIMD, expected: String) raises:
+def _test_repr(value: SIMD, expected: String) raises:
     # Test write_repr_to
     var string = String()
     value.write_repr_to(string)
@@ -431,7 +431,7 @@ def test_issue_30237() raises:
 
     @parameter
     @always_inline
-    fn eval1(x: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
+    def eval1(x: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
         var c_last = coefficients[coefficients_len - 1]
         var c_second_from_last = coefficients[coefficients_len - 2]
 
@@ -445,7 +445,7 @@ def test_issue_30237() raises:
 
     @parameter
     @always_inline
-    fn eval2(x: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
+    def eval2(x: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
         var c_last = coefficients[coefficients_len - 1]
         var c_second_from_last = coefficients[coefficients_len - 2]
 
@@ -494,7 +494,7 @@ def test_truthy() raises:
     )
 
     @parameter
-    fn test_dtype[dtype: DType]() raises:
+    def test_dtype[dtype: DType]() raises:
         # Scalars of 0-values are false-y, 1-values are truth-y
         assert_false(Scalar[dtype](0))
         assert_true(Scalar[dtype](1))
@@ -1347,7 +1347,7 @@ def test_extract() raises:
 
 def test_limits() raises:
     @parameter
-    fn test_integral_overflow[dtype: DType]() raises:
+    def test_integral_overflow[dtype: DType]() raises:
         var max_value = Scalar[dtype].MAX
         var min_value = Scalar[dtype].MIN
         assert_equal(max_value + 1, min_value)
@@ -1850,6 +1850,23 @@ def test_pow() raises:
     assert_equal(u8x4_val.__pow__(8), U8x4(0, 1, 0, 161))
     assert_equal(u8x4_val.__pow__(U8x4(3, 5, 7, 9)), U8x4(0, 1, 128, 227))
 
+    assert_equal(Int64(1), Int64.__pow__(Int64(3), Int64(0)))
+    assert_equal(Int64(27), Int64.__pow__(Int64(3), Int64(3)))
+    assert_equal(Int64(81), Int64.__pow__(Int64(3), Int64(4)))
+
+    # Negative exponents: 1 ** n == 1 for all n.
+    assert_equal(Int64(1), Int64.__pow__(Int64(1), Int64(-1)))
+    assert_equal(Int64(1), Int64.__pow__(Int64(1), Int64(-5)))
+
+    # Negative exponents: (-1) ** n depends on parity.
+    assert_equal(Int64(-1), Int64.__pow__(Int64(-1), Int64(-1)))
+    assert_equal(Int64(1), Int64.__pow__(Int64(-1), Int64(-2)))
+    assert_equal(Int64(-1), Int64.__pow__(Int64(-1), Int64(-3)))
+
+    # Negative exponents: |base| > 1 truncates to 0.
+    assert_equal(Int64(0), Int64.__pow__(Int64(2), Int64(-1)))
+    assert_equal(Int64(0), Int64.__pow__(Int64(3), Int64(-2)))
+
 
 def test_powf() raises:
     assert_almost_equal(Float32(2.0) ** Float32(0.5), 1.4142135)
@@ -1954,7 +1971,7 @@ def test_comparison() raises:
     )
 
     @parameter
-    fn test_dtype[dtype: DType]() raises:
+    def test_dtype[dtype: DType]() raises:
         comptime X4 = SIMD[dtype, 4]
 
         comptime if dtype.is_signed():
@@ -2300,7 +2317,7 @@ def test_vector_from_bytes_as_bytes() raises:
 
 
 def test_reversed() raises:
-    fn test[dtype: DType]() raises:
+    def test[dtype: DType]() raises:
         assert_equal(
             SIMD[dtype, 4](1, 2, 3, 4).reversed(), SIMD[dtype, 4](4, 3, 2, 1)
         )

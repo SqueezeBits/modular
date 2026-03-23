@@ -17,9 +17,6 @@ from std.itertools import product
 from layout import Layout, LayoutTensor, RuntimeLayout
 from layout.layout import blocked_product
 from layout._fillers import arange
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.testing import assert_equal
 
 from std.utils.index import IndexList
@@ -28,7 +25,7 @@ from std.utils.index import IndexList
 def test_runtime_and_compile_time_dim_and_stride(
     m: ValOrDim, k: ValOrDim
 ) raises:
-    comptime static_shape = DimList(k.dim, m.dim)
+    comptime static_shape = DimList[k.dim, m.dim]()
     var dynamic_shape = IndexList[2](k.value, m.value)
     comptime layout = Layout.row_major[dims=static_shape]()
 
@@ -36,7 +33,7 @@ def test_runtime_and_compile_time_dim_and_stride(
         DType.float32,
         layout,
     ](
-        UnsafePointer[Float32](),
+        UnsafePointer[Float32, MutAnyOrigin](),
         RuntimeLayout[layout].row_major(dynamic_shape),
     )
 
@@ -59,7 +56,7 @@ def test_nested_layout_shape() raises:
     comptime smem_layout = blocked_product(base_layout, tiler_layout)
 
     var tensor = LayoutTensor[DType.float32, smem_layout, MutAnyOrigin](
-        UnsafePointer[Float32]()
+        UnsafePointer[Float32, MutAnyOrigin]()
     )
 
     # Shape should be (64, 128) because:
@@ -88,7 +85,7 @@ def test_nested_layout_shape() raises:
     assert_equal(simple_shape1, 32, "Non-nested shape[1] should still work")
 
 
-fn _create_tensor_2x2[
+def _create_tensor_2x2[
     dtype: DType
 ]() -> LayoutTensor[dtype, Layout.row_major(2, 2), MutAnyOrigin]:
     """Helper to create a 2x2 row-major tensor on the stack."""
@@ -100,7 +97,7 @@ fn _create_tensor_2x2[
     ].stack_allocation()
 
 
-fn _copy_transpose[
+def _copy_transpose[
     dtype: DType
 ](
     src: LayoutTensor[dtype, Layout.row_major(2, 2), MutAnyOrigin],

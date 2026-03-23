@@ -15,7 +15,6 @@ from max.graph.weights import WeightsFormat
 from max.interfaces import PipelineTask
 from max.pipelines.core import TextAndVisionContext
 from max.pipelines.core.context_validators import (
-    validate_only_one_image,
     validate_requires_vision_context,
 )
 from max.pipelines.lib import (
@@ -48,7 +47,6 @@ pixtral_arch = SupportedArchitecture(
     },
     context_validators=[
         validate_requires_vision_context,
-        validate_only_one_image,
     ],
     config=PixtralConfig,
 )

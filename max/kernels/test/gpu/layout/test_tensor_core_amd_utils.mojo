@@ -19,9 +19,6 @@ from layout._fillers import arange
 from layout._utils import ManagedLayoutTensor
 from layout.tensor_core import TensorCore
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.utils.index import Index, IndexList
 
 comptime fp8_dtype = (
@@ -34,7 +31,7 @@ comptime bf8_dtype = (
 )
 
 
-fn test_load_a[
+def test_load_a[
     dst_dtype: DType,
     dtype: DType,
     layout: Layout,
@@ -49,7 +46,7 @@ fn test_load_a[
     a_lane[lane_id()] = a_reg_tile[0, 0]
 
 
-fn test_load_b[
+def test_load_b[
     dst_dtype: DType,
     dtype: DType,
     layout: Layout,
@@ -65,7 +62,7 @@ fn test_load_b[
     b_lane[lane_id()] = b_reg_tile[0, 0]
 
 
-fn test_load_c[
+def test_load_c[
     dst_dtype: DType,
     dtype: DType,
     layout: Layout,
@@ -81,7 +78,7 @@ fn test_load_c[
         c_lane[lane_id(), i] = c_reg_tile[0, i]
 
 
-fn test_store_d[
+def test_store_d[
     dst_dtype: DType,
     dtype: DType,
     layout: Layout,
@@ -96,7 +93,7 @@ fn test_store_d[
     mma.store_d(d, src)
 
 
-fn test_mma_op[
+def test_mma_op[
     dst_dtype: DType,
     dtype: DType,
     layout_a: Layout,
@@ -124,7 +121,7 @@ fn test_mma_op[
     mma.store_d(d, d_reg)
 
 
-fn _arange(tensor: LayoutTensor[mut=True, ...]):
+def _arange(tensor: LayoutTensor[mut=True, ...]):
     # use custom arange and the current arange does not work with fp8
     comptime if tensor.dtype in (DType.bfloat16, DType.float16, DType.float32):
         arange(tensor)

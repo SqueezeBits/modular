@@ -20,18 +20,15 @@ from std.gpu.compute.mma import mma
 from std.gpu.compute.mma_util import load_matrix_a_amd as load_matrix_a
 from std.gpu.compute.mma_util import load_matrix_b_amd as load_matrix_b
 from std.gpu.compute.mma_util import store_matrix_d
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.testing import assert_equal
 
 
-fn matmul_naive[
+def matmul_naive[
     a_type: DType, b_type: DType, c_type: DType, //, mma_n_blocks: Int = 1
 ](
-    a: UnsafePointer[Scalar[a_type]],
-    b: UnsafePointer[Scalar[b_type]],
-    c: UnsafePointer[Scalar[c_type]],
+    a: UnsafePointer[Scalar[a_type], _],
+    b: UnsafePointer[Scalar[b_type], _],
+    c: UnsafePointer[mut=True, Scalar[c_type], _],
     m: Int,
     n: Int,
     k: Int,
@@ -45,10 +42,10 @@ fn matmul_naive[
                     c[bl * m * n + n * i + j] += av * bv
 
 
-fn mma_kernel_fp32_fp32(
-    a_ptr: UnsafePointer[Float32],
-    b_ptr: UnsafePointer[Float32],
-    c_ptr: UnsafePointer[Float32],
+def mma_kernel_fp32_fp32(
+    a_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
+    b_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
+    c_ptr: UnsafePointer[Float32, MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -81,12 +78,12 @@ fn mma_kernel_fp32_fp32(
     store_matrix_d[mma_m, mma_n, mma_k](c_ptr, d_reg, c_tile_row, c_tile_col, n)
 
 
-fn mma_kernel_fp32_fp16[
+def mma_kernel_fp32_fp16[
     mma_n_blocks: Int
 ](
-    a_ptr: UnsafePointer[Float16],
-    b_ptr: UnsafePointer[Float16],
-    c_ptr: UnsafePointer[Float32],
+    a_ptr: UnsafePointer[Float16, ImmutAnyOrigin],
+    b_ptr: UnsafePointer[Float16, ImmutAnyOrigin],
+    c_ptr: UnsafePointer[Float32, MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -119,12 +116,12 @@ fn mma_kernel_fp32_fp16[
     )
 
 
-fn mma_kernel_fp32_bf16[
+def mma_kernel_fp32_bf16[
     mma_n_blocks: Int
 ](
-    a_ptr: UnsafePointer[BFloat16],
-    b_ptr: UnsafePointer[BFloat16],
-    c_ptr: UnsafePointer[Float32],
+    a_ptr: UnsafePointer[BFloat16, ImmutAnyOrigin],
+    b_ptr: UnsafePointer[BFloat16, ImmutAnyOrigin],
+    c_ptr: UnsafePointer[Float32, MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -157,7 +154,7 @@ fn mma_kernel_fp32_bf16[
     )
 
 
-fn run_mma_fp32_fp32(
+def run_mma_fp32_fp32(
     M: Int,
     N: Int,
     K: Int,
@@ -167,10 +164,10 @@ fn run_mma_fp32_fp32(
 ) raises:
     print("== run_matmul fp32.fp32 matrix core kernel")
 
-    var a_host = UnsafePointer[Float32].alloc(M * K)
-    var b_host = UnsafePointer[Float32].alloc(K * N)
-    var c_host = UnsafePointer[Float32].alloc(M * N)
-    var c_host_ref = UnsafePointer[Float32].alloc(M * N)
+    var a_host = alloc[Float32](M * K)
+    var b_host = alloc[Float32](K * N)
+    var c_host = alloc[Float32](M * N)
+    var c_host_ref = alloc[Float32](M * N)
 
     for i in range(M * K):
         var val = random_si64(rand_min, rand_max)
@@ -239,17 +236,17 @@ fn run_mma_fp32_fp32(
     assert_equal(errors, 0)
 
 
-fn run_mma_fp32_fp16[
+def run_mma_fp32_fp16[
     mma_n_blocks: Int = 1
 ](
     M: Int, N: Int, K: Int, rand_min: Int64, rand_max: Int64, ctx: DeviceContext
 ) raises:
     print("== run_matmul fp32.fp16 matrix core kernel")
 
-    var a_host = UnsafePointer[Float16].alloc(M * K * mma_n_blocks)
-    var b_host = UnsafePointer[Float16].alloc(K * N * mma_n_blocks)
-    var c_host = UnsafePointer[Float32].alloc(M * N * mma_n_blocks)
-    var c_host_ref = UnsafePointer[Float32].alloc(M * N * mma_n_blocks)
+    var a_host = alloc[Float16](M * K * mma_n_blocks)
+    var b_host = alloc[Float16](K * N * mma_n_blocks)
+    var c_host = alloc[Float32](M * N * mma_n_blocks)
+    var c_host_ref = alloc[Float32](M * N * mma_n_blocks)
 
     for b in range(mma_n_blocks):
         for i in range(M * K):
@@ -328,7 +325,7 @@ fn run_mma_fp32_fp16[
     assert_equal(errors, 0)
 
 
-fn run_mma_fp32_bf16[
+def run_mma_fp32_bf16[
     mma_n_blocks: Int = 1
 ](
     M: Int,
@@ -340,10 +337,10 @@ fn run_mma_fp32_bf16[
 ) raises:
     print("== run_matmul fp32.bf16 matrix core kernel")
 
-    var a_host = UnsafePointer[BFloat16].alloc(M * K * mma_n_blocks)
-    var b_host = UnsafePointer[BFloat16].alloc(K * N * mma_n_blocks)
-    var c_host = UnsafePointer[Float32].alloc(M * N * mma_n_blocks)
-    var c_host_ref = UnsafePointer[Float32].alloc(M * N * mma_n_blocks)
+    var a_host = alloc[BFloat16](M * K * mma_n_blocks)
+    var b_host = alloc[BFloat16](K * N * mma_n_blocks)
+    var c_host = alloc[Float32](M * N * mma_n_blocks)
+    var c_host_ref = alloc[Float32](M * N * mma_n_blocks)
 
     for b in range(mma_n_blocks):
         for i in range(M * K):

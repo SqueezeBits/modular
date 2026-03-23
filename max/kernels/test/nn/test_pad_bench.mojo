@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.os import abort
 
 import std.benchmark
@@ -26,7 +23,7 @@ from std.testing import assert_true
 from std.utils import IndexList, product
 
 
-fn pretty_print(
+def pretty_print(
     name: String,
     size: Int,
     rounds: Int,
@@ -45,8 +42,8 @@ fn pretty_print(
     )
 
 
-fn bench[
-    func: fn[rank: Int, size: Int, verify: Bool = False]() raises -> None,
+def bench[
+    func: def[rank: Int, size: Int, verify: Bool = False]() raises -> None,
     rank: Int,
     size: Int,
     name: String,
@@ -54,7 +51,7 @@ fn bench[
     comptime N = 100
 
     @parameter
-    fn runner():
+    def runner():
         try:
             for _ in range(N):
                 var result = func[rank, size]()
@@ -62,7 +59,7 @@ fn bench[
         except e:
             abort(String(e))
 
-    var ms = benchmark.run[runner](1, 10)
+    var ms = std.benchmark.run[runner](1, 10)
 
     pretty_print(
         name,
@@ -73,13 +70,13 @@ fn bench[
     )
 
 
-fn test_pad_constant_nd[rank: Int, n: Int, verify: Bool = False]() raises:
+def test_pad_constant_nd[rank: Int, n: Int, verify: Bool = False]() raises:
     comptime d_pre = 3
     comptime d_post = 7
     comptime d = d_pre + d_post
 
     @always_inline
-    fn get_in_out_shapes[rank: Int = 1]() -> InlineArray[IndexList[rank], 2]:
+    def get_in_out_shapes[rank: Int = 1]() -> InlineArray[IndexList[rank], 2]:
         var in_shape = IndexList[rank]()
         var out_shape = IndexList[rank]()
 
@@ -105,7 +102,7 @@ fn test_pad_constant_nd[rank: Int, n: Int, verify: Bool = False]() raises:
     comptime out_size = product(out_shape)
 
     # create a big input matrix and fill it with 1
-    var input_ptr = UnsafePointer[Scalar[DType.int]].alloc(in_size)
+    var input_ptr = alloc[Scalar[DType.int]](in_size)
     var input = TileTensor(
         input_ptr,
         row_major(Coord(in_shape)),
@@ -122,7 +119,7 @@ fn test_pad_constant_nd[rank: Int, n: Int, verify: Bool = False]() raises:
         paddings[2 * i + 1] = d_post
 
     # Create an output matrix and fill with 0
-    var output_ptr = UnsafePointer[Scalar[DType.int]].alloc(out_size)
+    var output_ptr = alloc[Scalar[DType.int]](out_size)
     var output = TileTensor(
         output_ptr,
         row_major(Coord(out_shape)),
@@ -145,13 +142,13 @@ fn test_pad_constant_nd[rank: Int, n: Int, verify: Bool = False]() raises:
     output_ptr.free()
 
 
-fn test_pad_reflect_nd[rank: Int, n: Int, verify: Bool = False]() raises:
+def test_pad_reflect_nd[rank: Int, n: Int, verify: Bool = False]() raises:
     comptime d_pre = 3
     comptime d_post = 7
     comptime d = d_pre + d_post
 
     @always_inline
-    fn get_in_out_shapes[rank: Int = 1]() -> InlineArray[IndexList[rank], 2]:
+    def get_in_out_shapes[rank: Int = 1]() -> InlineArray[IndexList[rank], 2]:
         var in_shape = IndexList[rank]()
         var out_shape = IndexList[rank]()
 
@@ -177,7 +174,7 @@ fn test_pad_reflect_nd[rank: Int, n: Int, verify: Bool = False]() raises:
     comptime out_size = product(out_shape)
 
     # create a big input matrix and fill it with 1
-    var input_ptr = UnsafePointer[Scalar[DType.int]].alloc(in_size)
+    var input_ptr = alloc[Scalar[DType.int]](in_size)
     var input = TileTensor(
         input_ptr,
         row_major(Coord(in_shape)),
@@ -194,7 +191,7 @@ fn test_pad_reflect_nd[rank: Int, n: Int, verify: Bool = False]() raises:
         paddings[2 * i + 1] = d_post
 
     # Create an output matrix and fill with 0
-    var output_ptr = UnsafePointer[Scalar[DType.int]].alloc(out_size)
+    var output_ptr = alloc[Scalar[DType.int]](out_size)
     var output = TileTensor(
         output_ptr,
         row_major(Coord(out_shape)),

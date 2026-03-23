@@ -16,7 +16,7 @@ This module provides the public API for launching the grouped 1D-1D matmul
 kernel for Mixture of Experts (MoE) layers.
 
 Usage:
-    grouped_matmul_1d1d_nvfp4[transpose_b=True, config=config](
+    grouped_matmul_nvfp4[transpose_b=True, config=config](
         c_tensor,  # Output: TileTensor (total_tokens, N)
         a_tensor,  # Input A: TileTensor (total_tokens, K)
         a_offsets,  # Per-expert offsets: TileTensor 1D
@@ -32,24 +32,16 @@ Usage:
 """
 
 from std.collections import Optional
-from std.math import ceildiv
+from std.math import align_up, ceildiv
 from std.sys import size_of
 
 from std.gpu.host import DeviceContext, Dim, FuncAttribute
 from std.gpu.host.info import B200
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
-from layout import (
-    Coord,
-    Idx,
-    Layout as LegacyLayout,
-    LayoutTensor,
-    RuntimeInt,
-    RuntimeLayout,
-    TileTensor,
-    row_major,
-)
+from layout import Coord, Idx, RuntimeInt, RuntimeLayout, TileTensor, row_major
 from layout.tile_layout import Layout as TileLayout
 from structured_kernels.tile_types import create_tma_tile
+from structured_kernels.kernel_common import WarpRole1D1D
 
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
@@ -67,7 +59,7 @@ from ..structured_kernels.config import BlockScaledMatmulConfig
 from .grouped_1d1d_matmul_kernel import Grouped1D1DMatmulKernel
 
 
-fn grouped_matmul_1d1d_nvfp4[
+def grouped_matmul_nvfp4[
     a_type: DType,
     b_type: DType,
     c_type: DType,
@@ -159,6 +151,7 @@ fn grouped_matmul_1d1d_nvfp4[
 
     comptime if config.cta_group == 2:
         comptime assert MMA_M == 256 and MMA_N in (
+            64,
             128,
             256,
         ), "Only support cta_group == 2 with MMA_M == 256"
@@ -166,9 +159,16 @@ fn grouped_matmul_1d1d_nvfp4[
             config.AB_swapped
         ), "cta_group == 2 requires AB_swapped for scheduler alignment"
     else:
-        comptime assert MMA_M == 128 and MMA_N in (128, 256), (
-            "Only support MMA_M == 128 and MMA_N in (128, 256) when"
-            " cta_group == 1"
+        comptime assert MMA_M == 128 and MMA_N in (
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+        ), (
+            "Only support MMA_M == 128 and MMA_N in (8, 16, 32, 64, 128,"
+            " 256) when cta_group == 1"
         )
 
     comptime cluster_shape = config.cluster_shape
@@ -212,7 +212,12 @@ fn grouped_matmul_1d1d_nvfp4[
         MMA_M == 256 or config.cta_group == 1
     ) else c_tma_tile_shape_mma128
 
-    comptime c_tma_tile_shape_1 = config.c_swizzle.bytes() // size_of[c_type]()
+    # When c_swizzle is SWIZZLE_NONE (MMA_N=8), c_swizzle.bytes() is 0.
+    # The TMA descriptor dim1 must equal the tile dim1 in that case.
+    comptime _c_swizzle_elems = config.c_swizzle.bytes() // size_of[c_type]()
+    comptime c_tma_tile_shape_1 = c_tma_tile_shape[
+        1
+    ] if _c_swizzle_elems == 0 else _c_swizzle_elems
 
     comptime sfa_tma_tile_shape = Index(
         BM // SF_MN_GROUP_SIZE,
@@ -221,10 +226,13 @@ fn grouped_matmul_1d1d_nvfp4[
         SF_ATOM_M[1] * SF_ATOM_K,
     )
 
+    # SFB TMA tile shape: for MMA_N < 64, reduced tile (1 k-atom, MMA_N rows)
+    # loaded by the dedicated SfbTMALoad warp; for MMA_N >= 64, full atom.
+    # Derive from kernel struct to keep a single source of truth.
     comptime sfb_tma_tile_shape = Index(
-        MMA_N // SF_MN_GROUP_SIZE,
-        config.num_sf_k_tiles,
-        SF_ATOM_M[0],
+        align_up(MMA_N, SF_MN_GROUP_SIZE) // SF_MN_GROUP_SIZE,
+        KernelType.SFB_TMA_K_ATOMS,
+        KernelType.SFB_TMA_ROWS,
         SF_ATOM_M[1] * SF_ATOM_K,
     )
 
@@ -269,10 +277,10 @@ fn grouped_matmul_1d1d_nvfp4[
         1,
     )
 
-    # Thread configuration: 3 warps for Load/MMA + 4 warps for Epilogue = 192 threads
-    comptime load_warps = 1
-    comptime mma_warps = 1
-    comptime epilogue_warps = 4
+    # Thread count from WarpRole1D1D (single source of truth):
+    # MMA_N >= 64: 192 threads (6 warps: 4 epilogue + 1 load + 1 MMA)
+    # MMA_N <  64: 352 threads (+ 1 SFB TMA load + 4 SFB TMEM load)
+    comptime block_threads = WarpRole1D1D.TOTAL_THREADS_WITH_SFB if MMA_N < 64 else WarpRole1D1D.TOTAL_THREADS
 
     # Re-wrap 1D TileTensors with GMEMLayout1D to match the kernel's
     # expected types. The caller's TileTensors may have a different symbolic
@@ -280,7 +288,7 @@ fn grouped_matmul_1d1d_nvfp4[
     from std.memory import UnsafePointer as Ptr
     from structured_kernels.tile_types import GMEMLayout1D
 
-    fn _to_1d[
+    def _to_1d[
         target_type: DType,
     ](t: TileTensor) -> TileTensor[target_type, GMEMLayout1D, MutAnyOrigin]:
         var shape = Coord(
@@ -300,14 +308,14 @@ fn grouped_matmul_1d1d_nvfp4[
     # and kernel launch. The @parameter if ensures compile-time branching.
     comptime if config.AB_swapped:
         var a_tma_op = create_tma_tile[
-            KernelType.ATmaTile.tile_layout,
-            KernelType.ATmaTile.desc_layout,
+            KernelType.ATileLayout,
+            KernelType.ADescLayout,
             Index(BM // cluster_shape[1], BK),
             swizzle_mode=config.a_swizzle,
         ](ctx, b_device)
         var b_tma_op = create_tma_tile[
-            KernelType.BTmaTile.tile_layout,
-            KernelType.BTmaTile.desc_layout,
+            KernelType.BTileLayout,
+            KernelType.BDescLayout,
             Index(
                 BN // (cluster_shape[0] // config.cta_group), BK
             ) if transpose_b else Index(
@@ -316,20 +324,20 @@ fn grouped_matmul_1d1d_nvfp4[
             swizzle_mode=config.b_swizzle,
         ](ctx, a_device)
         var c_tma_op = create_tma_tile[
-            KernelType.CTmaTile.tile_layout,
-            KernelType.CTmaTile.desc_layout,
+            KernelType.CTileLayout,
+            KernelType.CDescLayout,
             Index(c_tma_tile_shape[0], c_tma_tile_shape_1),
             swizzle_mode=config.c_swizzle,
         ](ctx, c_device)
         var sfa_tma_op = create_tma_tile[
-            KernelType.SFATmaTile.tile_layout,
-            KernelType.SFATmaTile.desc_layout,
+            KernelType.SFATileLayout,
+            KernelType.SFADescLayout,
             sfa_tma_tile_shape,
             swizzle_mode=TensorMapSwizzle.SWIZZLE_NONE,
         ](ctx, sfb_4d)
         var sfb_tma_op = create_tma_tile[
-            KernelType.SFBTmaTile.tile_layout,
-            KernelType.SFBTmaTile.desc_layout,
+            KernelType.SFBTileLayout,
+            KernelType.SFBDescLayout,
             sfb_tma_tile_shape,
             swizzle_mode=TensorMapSwizzle.SWIZZLE_NONE,
         ](ctx, sfa_4d)
@@ -347,7 +355,7 @@ fn grouped_matmul_1d1d_nvfp4[
             num_active_experts,
             UInt32(K),
             grid_dim=grid_dim,
-            block_dim=(32 * (load_warps + mma_warps + epilogue_warps)),
+            block_dim=block_threads,
             cluster_dim=Dim(
                 cluster_shape[0], cluster_shape[1], cluster_shape[2]
             ),
@@ -358,14 +366,14 @@ fn grouped_matmul_1d1d_nvfp4[
         )
     else:
         var a_tma_op = create_tma_tile[
-            KernelType.ATmaTile.tile_layout,
-            KernelType.ATmaTile.desc_layout,
+            KernelType.ATileLayout,
+            KernelType.ADescLayout,
             Index(BM // cluster_shape[1], BK),
             swizzle_mode=config.a_swizzle,
         ](ctx, a_device)
         var b_tma_op = create_tma_tile[
-            KernelType.BTmaTile.tile_layout,
-            KernelType.BTmaTile.desc_layout,
+            KernelType.BTileLayout,
+            KernelType.BDescLayout,
             Index(
                 BN // (cluster_shape[0] // config.cta_group), BK
             ) if transpose_b else Index(
@@ -374,20 +382,20 @@ fn grouped_matmul_1d1d_nvfp4[
             swizzle_mode=config.b_swizzle,
         ](ctx, b_device)
         var c_tma_op = create_tma_tile[
-            KernelType.CTmaTile.tile_layout,
-            KernelType.CTmaTile.desc_layout,
+            KernelType.CTileLayout,
+            KernelType.CDescLayout,
             c_tma_tile_shape,
             swizzle_mode=config.c_swizzle,
         ](ctx, c_device)
         var sfa_tma_op = create_tma_tile[
-            KernelType.SFATmaTile.tile_layout,
-            KernelType.SFATmaTile.desc_layout,
+            KernelType.SFATileLayout,
+            KernelType.SFADescLayout,
             sfa_tma_tile_shape,
             swizzle_mode=TensorMapSwizzle.SWIZZLE_NONE,
         ](ctx, sfa_4d)
         var sfb_tma_op = create_tma_tile[
-            KernelType.SFBTmaTile.tile_layout,
-            KernelType.SFBTmaTile.desc_layout,
+            KernelType.SFBTileLayout,
+            KernelType.SFBDescLayout,
             sfb_tma_tile_shape,
             swizzle_mode=TensorMapSwizzle.SWIZZLE_NONE,
         ](ctx, sfb_4d)
@@ -405,7 +413,7 @@ fn grouped_matmul_1d1d_nvfp4[
             num_active_experts,
             UInt32(K),
             grid_dim=grid_dim,
-            block_dim=(32 * (load_warps + mma_warps + epilogue_warps)),
+            block_dim=block_threads,
             cluster_dim=Dim(
                 cluster_shape[0], cluster_shape[1], cluster_shape[2]
             ),
@@ -414,86 +422,3 @@ fn grouped_matmul_1d1d_nvfp4[
                 UInt32(b200_smem)
             ),
         )
-
-
-fn grouped_matmul_dynamic_scaled_nvfp4[
-    transpose_b: Bool = True,
-    target: StaticString = "cpu",
-](
-    c: TileTensor,
-    a: TileTensor,
-    b: TileTensor,
-    a_scales: TileTensor,
-    b_scales: TileTensor,
-    a_offsets: TileTensor,
-    a_scale_offsets: TileTensor,
-    expert_ids: TileTensor,
-    expert_scales: TileTensor,
-    num_active_experts: Int,
-    ctx: DeviceContext,
-) raises:
-    """Performs grouped matrix multiplication with NVFP4 quantization.
-
-    This is a compatibility wrapper that creates the default config and calls
-    the structured kernel implementation.
-
-    Computes C = A @ B^T for multiple expert groups in a Mixture of Experts
-    (MoE) layer. Inputs A and B are NVFP4 quantized (4-bit floating point),
-    packed as uint8 (2 values per byte), with float8_e4m3fn scale factors.
-
-    Parameters:
-        transpose_b: Whether B is transposed (must be True).
-        target: Target device (ignored, always runs on GPU).
-
-    Args:
-        c: Output tensor (total_tokens, N).
-        a: Input A tensor (total_tokens, K).
-        b: Weight tensor B (num_experts, N, K).
-        a_scales: Scale factors for A.
-        b_scales: Scale factors for B.
-        a_offsets: Per-expert token offsets.
-        a_scale_offsets: Per-expert scale offsets.
-        expert_ids: Active expert IDs.
-        expert_scales: Per-expert output scaling.
-        num_active_experts: Number of active experts.
-        ctx: Device context.
-    """
-    # Extract dtypes from TileTensor arguments.
-    comptime a_type = a.dtype
-    comptime b_type = b.dtype
-    comptime c_type = c.dtype
-    comptime scales_type = a_scales.dtype
-
-    # Create the default config matching the old kernel
-    comptime MMA_K = 32
-    comptime bm = 128
-    comptime bn = 128
-    comptime mma_shape = Index(bm, bn, MMA_K)
-
-    comptime matmul_config = BlockScaledMatmulConfig[
-        a_type, b_type, c_type, scales_type, scales_type, transpose_b
-    ](
-        scaling_kind=UMMAKind.KIND_MXF4NVF4,
-        cluster_shape=Index(1, 1, 1),
-        mma_shape=mma_shape,
-        block_swizzle_size=8,
-        cta_group=1,
-        AB_swapped=False,
-        k_group_size=1,
-        num_accum_pipeline_stages=2,
-    )
-
-    # Call the new structured kernel
-    grouped_matmul_1d1d_nvfp4[transpose_b=transpose_b, config=matmul_config](
-        c,
-        a,
-        a_offsets,
-        a_scale_offsets,
-        b,
-        expert_ids,
-        a_scales,
-        b_scales,
-        expert_scales,
-        num_active_experts,
-        ctx,
-    )

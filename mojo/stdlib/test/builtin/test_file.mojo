@@ -285,17 +285,19 @@ def test_file_seek() raises:
         var pos = f.seek(6)
         assert_equal(pos, 6)
 
-        comptime expected_msg1 = "ipsum dolor sit amet, consectetur adipiscing elit."
+        comptime expected_msg1 = (
+            "ipsum dolor sit amet, consectetur adipiscing elit."
+        )
         assert_equal(f.read(len(expected_msg1)), expected_msg1)
 
         # Seek from the end of the file
-        pos = f.seek(-16, os.SEEK_END)
+        pos = f.seek(-16, std.os.SEEK_END)
         assert_equal(pos, 938)
 
         _ = f.read(6)
 
         # Seek from current position, skip the space
-        pos = f.seek(1, os.SEEK_CUR)
+        pos = f.seek(1, std.os.SEEK_CUR)
         assert_equal(pos, 945)
         assert_equal(f.read(7), "rhoncus")
 
@@ -303,7 +305,7 @@ def test_file_seek() raises:
             _ = f.seek(-12)
         except e:
             comptime expected_msg = "Failed to seek"
-            assert_equal(String(e)[: len(expected_msg)], expected_msg)
+            assert_equal(String(e)[byte = : len(expected_msg)], expected_msg)
 
 
 def test_file_open_nodir() raises:

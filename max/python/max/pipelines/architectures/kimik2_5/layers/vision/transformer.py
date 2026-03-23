@@ -18,108 +18,93 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from max.dtype import DType
-from max.graph import BufferValue, DeviceRef, ShardingStrategy, TensorValue
+from max.graph import BufferValue, DeviceRef, ShardingStrategy, TensorValue, ops
 from max.nn.comm import Allreduce
 from max.nn.kernels import tpool_patch_merger
-from max.nn.layer import LayerList, Module
+from max.nn.layer import Module
 
+from ...model_config import VisionConfig
 from .encoder import Encoder
 from .patch_embedding import PatchEmbedding
+from .patch_merger import PatchMergerMLP
 
 
 class Transformer(Module):
     """Full vision transformer.
 
-    Composes patch embedding, the encoder stack, and spatial-temporal
-    patch merging via ``tpool_patch_merger``.
+    Composes patch embedding, the encoder stack, spatial-temporal
+    patch merging via ``tpool_patch_merger``, and a learned
+    :obj:`PatchMergerMLP` projection.
 
     Auto-shards sub-layers with tensor-parallel strategy on construction.
 
     Args:
-        patch_size: Spatial patch size for the Conv2d projection.
-        in_channels: Number of input image channels (3 for RGB).
-        hidden_dim: Hidden dimension throughout the vision transformer.
-        num_heads: Number of attention heads.
-        mlp_dim: Inner dimension of the feed-forward MLP.
-        num_layers: Number of encoder layers.
-        init_pos_emb_height: Height of the learnable 2D position grid.
-        init_pos_emb_width: Width of the learnable 2D position grid.
-        init_pos_emb_time: Number of temporal steps for 1D sincos time
-            embedding.
-        rope_max_height: Maximum grid height for RoPE frequencies.
-        rope_max_width: Maximum grid width for RoPE frequencies.
-        rope_theta: Base for the RoPE inverse-frequency exponent.
-        merge_kernel_size: (kH, kW) spatial merge kernel for
-            ``tpool_patch_merger``.
-        dtype: Data type for all layer weights.
-        devices: Devices on which to allocate and shard weights.
-        has_bias: Whether linear projections include bias terms.
+        config: :obj:`VisionConfig` instance from which all architecture
+            parameters are derived.
     """
 
-    def __init__(
-        self,
-        patch_size: int,
-        in_channels: int,
-        hidden_dim: int,
-        num_heads: int,
-        mlp_dim: int,
-        num_layers: int,
-        init_pos_emb_height: int,
-        init_pos_emb_width: int,
-        init_pos_emb_time: int,
-        rope_max_height: int,
-        rope_max_width: int,
-        rope_theta: float,
-        merge_kernel_size: tuple[int, int],
-        dtype: DType,
-        devices: list[DeviceRef],
-        has_bias: bool = True,
-    ) -> None:
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.devices = devices
-        self.merge_kernel_size = merge_kernel_size
-
-        device = devices[0]
-        patch_embed = PatchEmbedding(
-            patch_size=patch_size,
-            in_channels=in_channels,
-            hidden_size=hidden_dim,
-            init_pos_emb_height=init_pos_emb_height,
-            init_pos_emb_width=init_pos_emb_width,
-            init_pos_emb_time=init_pos_emb_time,
-            dtype=dtype,
-            device=device,
-            has_bias=has_bias,
-        )
-        encoder = Encoder(
-            num_heads=num_heads,
-            hidden_dim=hidden_dim,
-            mlp_dim=mlp_dim,
-            num_layers=num_layers,
-            rope_max_height=rope_max_height,
-            rope_max_width=rope_max_width,
-            rope_theta=rope_theta,
-            dtype=dtype,
-            device=device,
-            has_bias=has_bias,
+        self.devices = config.devices
+        self.merge_kernel_size = (
+            config.merge_kernel_size[0],
+            config.merge_kernel_size[1],
         )
 
-        if len(devices) > 1:
-            patch_embed.sharding_strategy = ShardingStrategy.replicate(
-                len(devices)
+        device = config.devices[0]
+        self.patch_embed = PatchEmbedding(
+            patch_size=config.patch_size,
+            in_channels=config.in_channels,
+            hidden_size=config.vt_hidden_size,
+            init_pos_emb_height=config.init_pos_emb_height,
+            init_pos_emb_width=config.init_pos_emb_width,
+            init_pos_emb_time=config.init_pos_emb_time,
+            dtype=config.dtype,
+            device=device,
+            has_bias=config.has_bias,
+        )
+        self.encoder = Encoder(
+            num_heads=config.vt_num_attention_heads,
+            hidden_dim=config.vt_hidden_size,
+            mlp_dim=config.vt_intermediate_size,
+            num_layers=config.vt_num_hidden_layers,
+            rope_max_height=config.rope_max_height,
+            rope_max_width=config.rope_max_width,
+            rope_theta=config.rope_theta,
+            dtype=config.dtype,
+            device=device,
+            has_bias=config.has_bias,
+        )
+        self.patch_merger = PatchMergerMLP(
+            dtype=config.dtype,
+            device=device,
+            mm_hidden_size=config.mm_hidden_size,
+            hidden_size=config.text_hidden_size,
+            merge_kernel_size=self.merge_kernel_size,
+            eps=config.projector_ln_eps,
+        )
+
+        if len(config.devices) > 1:
+            self.patch_embed.sharding_strategy = ShardingStrategy.replicate(
+                len(config.devices)
             )
-            encoder.sharding_strategy = ShardingStrategy.tensor_parallel(
-                len(devices)
+            self.encoder.sharding_strategy = ShardingStrategy.replicate(
+                len(config.devices)
             )
-            self.patch_embed_shards = LayerList(patch_embed.shard(devices))
-            self.encoder_shards = LayerList(encoder.shard(devices))
+            self.patch_merger.sharding_strategy = (
+                ShardingStrategy.tensor_parallel(len(config.devices))
+            )
+            self.patch_embed_shards = self.patch_embed.shard(config.devices)
+            self.encoder_shards = self.encoder.shard(config.devices)
+            self.patch_merger_shards = self.patch_merger.shard(config.devices)
         else:
-            self.patch_embed_shards = LayerList([patch_embed])
-            self.encoder_shards = LayerList([encoder])
+            self.patch_embed_shards = [self.patch_embed]
+            self.encoder_shards = [self.encoder]
+            self.patch_merger_shards = [self.patch_merger]
 
         self.allreduce = (
-            Allreduce(num_accelerators=len(devices))
-            if len(devices) > 1
+            Allreduce(num_accelerators=len(config.devices))
+            if len(config.devices) > 1
             else None
         )
 
@@ -131,9 +116,6 @@ class Transformer(Module):
         max_seq_len: Sequence[TensorValue],
         position_ids: Sequence[TensorValue],
         signal_buffers: Sequence[BufferValue],
-        max_h: int,
-        max_w: int,
-        total_output_patches: int,
     ) -> list[TensorValue]:
         """Full vision transformer forward pass.
 
@@ -151,14 +133,9 @@ class Transformer(Module):
             signal_buffers: Per-device communication buffers for allreduce.
                 Only required when using multiple devices; ignored on
                 single device.
-            max_h: Maximum grid height across all videos in the batch.
-            max_w: Maximum grid width across all videos in the batch.
-            total_output_patches: Total number of output patches after
-                merging, i.e. ``sum(H_i * W_i)`` over all videos.
-
         Returns:
             Per-device allreduced merged patch tensors of shape
-            ``(total_output_patches, hidden_dim)``.
+            ``(sum_i(H_i * W_i), hidden_dim)``.
         """
         hs = [
             patch_embed(pv, grid)
@@ -178,17 +155,41 @@ class Transformer(Module):
             )
         ]
         kH, kW = self.merge_kernel_size
+        # Compute max_h and max_w at runtime from grid_thws (replicated across
+        # devices, so any shard gives the same values). ops.max keeps rank,
+        # returning shape (1,); reshape to () (rank-0 scalar) and move to CPU
+        # as the kernel requires scalar operands on the host.
+        grid0 = grid_thws[0]  # (n_videos, 3), int64, on GPU
+        max_h_tv = ops.reshape(
+            ops.max(grid0[:, 1], axis=0).cast(DType.int32), []
+        ).to(DeviceRef.CPU())
+        max_w_tv = ops.reshape(
+            ops.max(grid0[:, 2], axis=0).cast(DType.int32), []
+        ).to(DeviceRef.CPU())
         hs = [
             tpool_patch_merger(
                 h,
                 grid,
                 kH=kH,
                 kW=kW,
-                max_h=max_h,
-                max_w=max_w,
-                total_output_patches=total_output_patches,
+                max_h=max_h_tv,
+                max_w=max_w_tv,
             )
             for h, grid in zip(hs, grid_thws, strict=True)
+        ]
+        # PatchMergerMLP expects (n_spatial, kH*kW, D); kernel returns (n_merged, D).
+        # n_merged is a dynamic dim, so rebind first to assert it is
+        # divisible by kH*kW before reshaping (as suggested by the MAX error message).
+        merge_k = kH * kW
+        hs = [
+            h.rebind([(h.shape[0] // merge_k) * merge_k, h.shape[1]]).reshape(
+                [h.shape[0] // merge_k, merge_k, h.shape[1]]
+            )
+            for h in hs
+        ]
+        hs = [
+            merger(h)
+            for merger, h in zip(self.patch_merger_shards, hs, strict=True)
         ]
         if self.allreduce is not None:
             return self.allreduce(hs, signal_buffers)
