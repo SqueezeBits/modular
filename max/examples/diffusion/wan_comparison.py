@@ -465,6 +465,25 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
             )
             pipe_key = key
 
+        # Pre-generate noise with torch for reproducibility + parity with MAX
+        vae_t = getattr(pipe, "vae_scale_factor_temporal", 4)
+        vae_s = getattr(pipe, "vae_scale_factor_spatial", 8)
+        num_ch = pipe.transformer.config.in_channels
+        lat_f = (case["num_frames"] - 1) // vae_t + 1
+        lat_h = case["height"] // vae_s
+        lat_w = case["width"] // vae_s
+        noise = torch.randn(
+            (1, num_ch, lat_f, lat_h, lat_w),
+            generator=torch.Generator("cuda").manual_seed(0),
+            device="cuda", dtype=torch.bfloat16,
+        )
+        # Save noise for MAX parity
+        noise_dir = out_dir / "noise"
+        noise_dir.mkdir(parents=True, exist_ok=True)
+        fname_base = str(case["label"]).replace(" ", "_").lower()
+        noise_path = noise_dir / f"{fname_base}.npy"
+        np.save(noise_path, noise.float().cpu().numpy())
+
         gen_kwargs: dict[str, Any] = dict(
             prompt=case["prompt"],
             negative_prompt="low quality",
@@ -473,7 +492,7 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
             num_frames=case["num_frames"],
             guidance_scale=case["guidance_scale"],
             num_inference_steps=case["num_inference_steps"],
-            generator=torch.Generator("cuda").manual_seed(0),
+            latents=noise,
         )
         if case["guidance_scale_2"] is not None:
             gen_kwargs["guidance_scale_2"] = case["guidance_scale_2"]
@@ -592,6 +611,12 @@ def _run_max(args: argparse.Namespace) -> list[Result]:
             "--height", str(case["height"]),
             "--width", str(case["width"]),
         ])
+        # Use diffusers-generated noise for parity (if available)
+        noise_path = (
+            Path(args.output_dir) / "diffusers" / "noise" / f"{fname}.npy"
+        )
+        if noise_path.exists():
+            cmd.extend(["--initial-noise", str(noise_path.resolve())])
         if case["mode"] == "i2v":
             cmd.extend(["--input-image", os.path.abspath(args.input_image)])
         if case["lora"] and target.lora and case["mode"] in target.lora:

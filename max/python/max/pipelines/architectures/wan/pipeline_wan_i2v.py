@@ -21,8 +21,6 @@ latents at each denoising step to produce 36-channel transformer input.
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -171,39 +169,7 @@ class WanI2VPipeline(WanPipeline):
             [mask_expanded, latent_cond_np], axis=1
         ).astype(np.float32)
 
-        self._maybe_dump_i2v_debug_tensors(
-            video_condition=video_condition_np,
-            latent_condition=latent_cond_np,
-            mask=mask_expanded,
-            condition=condition,
-        )
-
         return _numpy_f32_to_buffer(condition, self.vae.config.dtype, device)
-
-    def _maybe_dump_i2v_debug_tensors(
-        self,
-        *,
-        video_condition: np.ndarray,
-        latent_condition: np.ndarray,
-        mask: np.ndarray,
-        condition: np.ndarray,
-    ) -> None:
-        debug_dir = os.environ.get("WAN_I2V_DEBUG_DIR")
-        if not debug_dir:
-            return
-
-        debug_path = Path(debug_dir)
-        debug_path.mkdir(parents=True, exist_ok=True)
-        artifacts = {
-            "video_condition.npy": video_condition,
-            "latent_condition.npy": latent_condition,
-            "mask.npy": mask,
-            "condition.npy": condition,
-        }
-        for name, value in artifacts.items():
-            out_path = debug_path / name
-            np.save(out_path, value)
-            logger.info("Saved Wan I2V debug tensor: %s", out_path)
 
     def _compile_i2v_concat(
         self, latent_model_input: Buffer, condition: Buffer

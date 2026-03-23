@@ -253,6 +253,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Path to input image for I2V (image-to-video) generation.",
     )
+    parser.add_argument(
+        "--initial-noise",
+        type=str,
+        default=None,
+        help="Path to .npy file with pre-generated initial noise (for parity testing).",
+    )
 
     args = parser.parse_args(argv)
     assert args.prompt, "Prompt must be a non-empty string."
@@ -557,6 +563,13 @@ async def generate_video(args: argparse.Namespace) -> None:
         input_image = PIL.Image.open(args.input_image).convert("RGB")
         print(f"Input image: {args.input_image} ({input_image.size[0]}x{input_image.size[1]})")
     context = await tokenizer.new_context(request, input_image=input_image)
+
+    # Override initial noise if provided (for parity testing)
+    if args.initial_noise:
+        noise = np.load(args.initial_noise).astype(np.float32)
+        context.latents = noise
+        print(f"Loaded initial noise from {args.initial_noise}: {noise.shape}")
+
     inputs = PixelGenerationInputs[PixelContext](
         batch={context.request_id: context}
     )
