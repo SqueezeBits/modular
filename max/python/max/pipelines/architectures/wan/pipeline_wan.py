@@ -138,7 +138,7 @@ class WanPipeline(DiffusionPipeline):
         lora_filenames = lora_config.get("filenames")
 
         lora_files: dict[str, Path] = {}
-        if lora_repo_id and lora_subfolder:
+        if lora_repo_id and lora_subfolder is not None:
             from .lora_utils import download_wan_lora
 
             lora_files = download_wan_lora(
@@ -193,7 +193,11 @@ class WanPipeline(DiffusionPipeline):
                 component_session = self.session
             elif component_cls is WanTransformerModel:
                 component_session = self.session
+                # A14B MoE: use "high_noise_model" key for primary transformer.
+                # Single-file LoRA: use the only available file.
                 component_lora_path = lora_files.get("high_noise_model")
+                if component_lora_path is None and lora_files:
+                    component_lora_path = next(iter(lora_files.values()))
             elif component_cls is AutoencoderKLWanModel:
                 component_eager_load = False
             models[name] = _load_component(
@@ -838,6 +842,7 @@ class WanPipeline(DiffusionPipeline):
         logger.info("Decoding Wan output")
         # _denormalize_vae_latents does f32→model_dtype cast internally
         denorm_latents = self._denormalize_vae_latents(latents)
+
         decoded_video = self.vae.decode_5d(denorm_latents)
         decoded_np = self._buffer_to_numpy_f32(
             decoded_video, dtype=decoded_video.dtype
@@ -868,10 +873,14 @@ class WanPipeline(DiffusionPipeline):
         model_inputs: WanModelInputs,
         **kwargs: object,
     ) -> WanPipelineOutput:
+        import time as _time
+
         del kwargs
         device = self.transformer.devices[0]
         if not self._moe_dual_loaded:
             self._activate_transformer_weights(use_secondary=False)
+
+        t_prep_start = _time.perf_counter()
         with Tracer("prepare_prompt_embeddings"):
             (
                 prompt_embeds,
@@ -902,6 +911,7 @@ class WanPipeline(DiffusionPipeline):
                 do_cfg,
                 device,
             )
+        t_denoise_start = _time.perf_counter()
         with Tracer("denoising_loop"):
             latents = self._run_denoising(
                 latents,
@@ -919,8 +929,18 @@ class WanPipeline(DiffusionPipeline):
                 guidance_scale_high,
                 guidance_scale_low,
             )
+        t_decode_start = _time.perf_counter()
         with Tracer("decode_outputs"):
             images = self._decode_output(latents, model_inputs)
+        t_end = _time.perf_counter()
+
+        logger.info(
+            "Phase timing: prep=%.1fs, denoise=%.1fs, decode=%.1fs, total=%.1fs",
+            t_denoise_start - t_prep_start,
+            t_decode_start - t_denoise_start,
+            t_end - t_decode_start,
+            t_end - t_prep_start,
+        )
         return WanPipelineOutput(images=images)
 
     def _run_denoising_phase(

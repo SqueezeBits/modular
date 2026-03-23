@@ -24,7 +24,7 @@ from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, TensorType
 from max.graph.buffer_utils import cast_dlpack_to
-from max.graph.weights import Weights
+from max.graph.weights import WeightData, Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
@@ -41,6 +41,9 @@ _KEY_REMAP = [
     (".attn2.to_out.0.", ".attn2.to_out."),
     (".ffn.net.0.proj.", ".ffn.proj."),
     (".ffn.net.2.", ".ffn.linear_out."),
+    # Image embedder GEGLU: numeric submodule names → underscore-prefixed
+    (".ff.net.0.", ".ff.net._0."),
+    (".ff.net.2.", ".ff.net._2."),
 ]
 
 # Keys to skip (non-persistent buffers computed at runtime)
@@ -54,8 +57,9 @@ def _remap_state_dict(
     """Remap diffusers weight keys to MAX module naming, permute Conv3d,
     and cast weights to target dtype.
 
-    The WAN safetensors store weights as float32. We cast to bfloat16
-    to match the module parameter declarations (which must also be bfloat16).
+    Some WAN checkpoints store weights as float32 (A14B), others as
+    bfloat16 (5B). We cast all to target_dtype to match the module
+    parameter declarations.
     """
     state_dict: dict[str, Any] = {}
 
@@ -75,8 +79,12 @@ def _remap_state_dict(
         # Diffusers: [F, C, D, H, W] (PyTorch FCDHW)
         # MAX Conv3d(permute=False): [D, H, W, C, F] (QRSCF)
         if new_key == "patch_embedding.weight" and len(tensor.shape) == 5:
+            # Cast to float32 first — numpy can't handle bfloat16 via
+            # dlpack, and some checkpoints (e.g. 5B) store in bfloat16.
+            buf = tensor.to_buffer() if hasattr(tensor, "to_buffer") else tensor
+            t_f32 = cast_dlpack_to(buf, tensor.dtype, DType.float32, CPU())
             tensor = np.ascontiguousarray(  # type: ignore[assignment]
-                np.from_dlpack(tensor).transpose(2, 3, 4, 1, 0)  # type: ignore[arg-type]
+                np.from_dlpack(t_f32).transpose(2, 3, 4, 1, 0)  # type: ignore[arg-type]
             )
 
         raw_dict[new_key] = tensor
@@ -89,8 +97,16 @@ def _remap_state_dict(
             v_key = key.replace(".attn2.to_k.", ".attn2.to_v.")
             kv_key = key.replace(".attn2.to_k.", ".attn2.to_kv.")
             if v_key in raw_dict:
-                k_np = np.from_dlpack(raw_dict[k_key])
-                v_np = np.from_dlpack(raw_dict[v_key])
+                k_data = raw_dict[k_key]
+                v_data = raw_dict[v_key]
+                # Cast to float32 for numpy — bfloat16 not supported
+                # via dlpack in numpy.
+                k_buf = k_data.to_buffer() if hasattr(k_data, "to_buffer") else k_data
+                v_buf = v_data.to_buffer() if hasattr(v_data, "to_buffer") else v_data
+                k_f32 = cast_dlpack_to(k_buf, k_data.dtype, DType.float32, CPU())
+                v_f32 = cast_dlpack_to(v_buf, v_data.dtype, DType.float32, CPU())
+                k_np = np.from_dlpack(k_f32)
+                v_np = np.from_dlpack(v_f32)
                 kv_np = np.ascontiguousarray(
                     np.concatenate([k_np, v_np], axis=0)
                 )
@@ -103,15 +119,23 @@ def _remap_state_dict(
         if key not in fused_keys:
             state_dict[key] = tensor
 
-    # Cast all weights to target dtype. The WAN safetensors are float32 but
-    # the module parameters must be bfloat16 (for flash_attention_gpu and to
-    # match the constant_external declarations in Module.compile).
-    if target_dtype != DType.float32:
-        cpu_device = CPU()
-        for key in state_dict:
-            state_dict[key] = cast_dlpack_to(
-                state_dict[key], DType.float32, target_dtype, cpu_device
-            )
+    # Cast all weights to target dtype. Some checkpoints store as float32
+    # (A14B), others as bfloat16 (5B).
+    # All values go through cast_dlpack_to → Buffer to maintain a uniform
+    # return type (Buffer has plain tuple[int] .shape, not Dim objects).
+    cpu_device = CPU()
+    for key in state_dict:
+        tensor = state_dict[key]
+        if isinstance(tensor, WeightData):
+            src_dtype = tensor.dtype
+            dlpack_obj = tensor.to_buffer()
+        else:
+            # numpy array (from permuted patch_embedding or fused KV)
+            src_dtype = DType.float32
+            dlpack_obj = tensor
+        state_dict[key] = cast_dlpack_to(
+            dlpack_obj, src_dtype, target_dtype, cpu_device
+        )
 
     return state_dict
 
@@ -265,6 +289,8 @@ class WanTransformerModel(ComponentModel):
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = WanConfig.generate(config, encoding, devices)
+        # Force bfloat16 — some repos (Wan 2.1) declare float32 in config.
+        self.config.dtype = DType.bfloat16
         self._state_dict: dict[str, Any] | None = None
         self._lora_path = lora_path
         self._lora_scale = lora_scale
@@ -289,7 +315,9 @@ class WanTransformerModel(ComponentModel):
                 )
             self._state_dict = _remap_state_dict(
                 self.weights,
-                target_dtype=self.config.dtype,
+                # Always use bfloat16 regardless of checkpoint dtype — some
+                # repos (Wan 2.1) declare float32 but run fine in bfloat16.
+                target_dtype=DType.bfloat16,
             )
             self.weights = None  # type: ignore[assignment]
 
@@ -361,6 +389,7 @@ class WanTransformerModel(ComponentModel):
             text_dim=dim,
             cross_attn_norm=self.config.cross_attn_norm,
             eps=self.config.eps,
+            added_kv_proj_dim=self.config.added_kv_proj_dim,
             dtype=dtype,
             device=dev_ref,
         )
@@ -507,6 +536,7 @@ class WanTransformerModel(ComponentModel):
                 text_dim=dim,
                 cross_attn_norm=self.config.cross_attn_norm,
                 eps=self.config.eps,
+                added_kv_proj_dim=self.config.added_kv_proj_dim,
                 dtype=dtype,
                 device=dev_ref,
             )

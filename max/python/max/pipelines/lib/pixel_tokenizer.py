@@ -280,10 +280,17 @@ class PixelGenerationTokenizer(
             .get("scheduler", {})
             .get("config_dict", {})
         )
-        base_flow_shift = float(scheduler_cfg.get("flow_shift", 1.0))
-        if height >= 720 or width >= 1280:
-            return 5.0
-        return max(3.0, base_flow_shift)
+        # Use explicit flow_shift from scheduler config if set (user override).
+        cfg_shift = scheduler_cfg.get("flow_shift")
+        if cfg_shift is not None and float(cfg_shift) != 1.0:
+            return float(cfg_shift)
+        # Default: interpolate based on pixel count.
+        # 480p (480*832=399360) → 3.0, 720p (720*1280=921600) → 5.0
+        pixels = height * width
+        lo_px, hi_px = 399_360, 921_600
+        lo_shift, hi_shift = 3.0, 5.0
+        t = max(0.0, min(1.0, (pixels - lo_px) / (hi_px - lo_px)))
+        return lo_shift + t * (hi_shift - lo_shift)
 
     def _randn_tensor(
         self,

@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 # Applied after stripping `diffusion_model.` prefix and before
 # appending `.weight`.
 _LORA_KEY_REMAP = [
+    # Norm keys (must come before generic attn remaps to avoid partial match)
+    (".self_attn.norm_q", ".attn1.norm_q"),
+    (".self_attn.norm_k", ".attn1.norm_k"),
+    (".cross_attn.norm_q", ".attn2.norm_q"),
+    (".cross_attn.norm_k", ".attn2.norm_k"),
     # Self-attention
     (".self_attn.q", ".attn1.to_q"),
     (".self_attn.k", ".attn1.to_k"),
@@ -161,9 +166,19 @@ def load_and_merge_lora(
     Returns:
         The modified state_dict.
     """
-    from safetensors.numpy import load_file
+    # safetensors.numpy can't read bfloat16; fall back to torch if needed.
+    try:
+        from safetensors.numpy import load_file
 
-    lora_weights = load_file(str(lora_path))
+        lora_weights = load_file(str(lora_path))
+    except TypeError:
+        import torch
+        from safetensors.torch import load_file as load_file_torch
+
+        torch_weights = load_file_torch(str(lora_path), device="cpu")
+        lora_weights = {
+            k: v.float().numpy() for k, v in torch_weights.items()
+        }
     logger.info(
         "Merging LoRA from %s (%d keys, scale=%.2f)",
         lora_path,
@@ -174,6 +189,9 @@ def load_and_merge_lora(
     # Group LoRA weights by base key
     # {base_key: {"down": ndarray, "up": ndarray, "alpha": float}}
     groups: dict[str, dict[str, Any]] = {}
+    # Collect bias deltas (.diff_b) and norm deltas (.diff) separately
+    bias_deltas: dict[str, np.ndarray] = {}
+    norm_deltas: dict[str, np.ndarray] = {}
     for key, tensor in lora_weights.items():
         if key.endswith(".lora_down.weight"):
             base = key[: -len(".lora_down.weight")]
@@ -184,6 +202,18 @@ def load_and_merge_lora(
         elif key.endswith(".alpha"):
             base = key[: -len(".alpha")]
             groups.setdefault(base, {})["alpha"] = float(tensor.flat[0])
+        elif key.endswith(".diff_b"):
+            # Bias delta (Wan 2.1 distill LoRA)
+            base = key[: -len(".diff_b")]
+            bias_deltas[base] = np.asarray(tensor, dtype=np.float32)
+        elif key.endswith(".diff"):
+            # Weight delta (e.g. norm_q.diff, norm_k.diff).
+            # Only merge 1D deltas (norms); skip multi-dim deltas
+            # (patch_embedding, head) which need permutation handling.
+            base = key[: -len(".diff")]
+            arr = np.asarray(tensor, dtype=np.float32)
+            if arr.ndim == 1:
+                norm_deltas[base] = arr
 
     # Collect cross-attn K/V deltas per block for fusion
     # key: "blocks.{i}.attn2" -> {"k_delta": ndarray, "v_delta": ndarray}
@@ -244,6 +274,26 @@ def load_and_merge_lora(
             continue
 
         _merge_delta_into(state_dict, sd_key, kv_delta)
+        merged_count += 1
+
+    # Merge bias deltas (.diff_b) — Wan 2.1 distill LoRA
+    for base_key, delta in bias_deltas.items():
+        remapped = _remap_lora_key(base_key)
+        sd_key = remapped + ".bias"
+        if sd_key not in state_dict:
+            skipped_keys.append(sd_key)
+            continue
+        _merge_delta_into(state_dict, sd_key, lora_scale * delta)
+        merged_count += 1
+
+    # Merge norm deltas (.diff) — e.g. norm_q.diff, norm_k.diff
+    for base_key, delta in norm_deltas.items():
+        remapped = _remap_lora_key(base_key)
+        sd_key = remapped + ".weight"
+        if sd_key not in state_dict:
+            skipped_keys.append(sd_key)
+            continue
+        _merge_delta_into(state_dict, sd_key, lora_scale * delta)
         merged_count += 1
 
     if skipped_keys:

@@ -48,8 +48,9 @@ class WanI2VPipeline(WanPipeline):
 
     def init_remaining_components(self) -> None:
         super().init_remaining_components()
-        # Pre-compile VAE encoder (dynamic H/W, single compilation).
-        self.vae.prewarm_encoder()
+        # Compiled GPU concat graph is lazily created on first use
+        # (needs concrete latent shape from first execution).
+        self._i2v_concat_model: Any = None
 
     def _prepare_i2v_condition(
         self,
@@ -204,21 +205,38 @@ class WanI2VPipeline(WanPipeline):
             np.save(out_path, value)
             logger.info("Saved Wan I2V debug tensor: %s", out_path)
 
-    @staticmethod
+    def _compile_i2v_concat(
+        self, latent_model_input: Buffer, condition: Buffer
+    ) -> Any:
+        """Compile a GPU graph that concatenates latents + condition along axis=1."""
+        from max.graph import Graph, TensorType, ops
+
+        device = self.transformer.devices[0]
+        dtype = latent_model_input.dtype
+        lat_shape = list(latent_model_input.shape)
+        cond_shape = list(condition.shape)
+
+        with Graph(
+            "wan_i2v_concat",
+            input_types=[
+                TensorType(dtype, lat_shape, device=device),
+                TensorType(dtype, cond_shape, device=device),
+            ],
+        ) as g:
+            lat = g.inputs[0].tensor
+            cond = g.inputs[1].tensor
+            g.output(ops.concat([lat, cond], axis=1))
+        return self.session.load(g)
+
     def _concat_i2v_condition(
-        latent_model_input: Buffer, condition: Buffer
+        self, latent_model_input: Buffer, condition: Buffer
     ) -> Buffer:
-        """Concat latents [B,16,T,H,W] with condition [B,20,T,H,W] -> [B,36,T,H,W]."""
-        cpu = CPU()
-        lat_np = _buffer_to_numpy_f32(latent_model_input, cpu)
-        cond_np = _buffer_to_numpy_f32(condition, cpu)
-        concat_np = np.concatenate([lat_np, cond_np], axis=1)
-        device = latent_model_input.device
-        if hasattr(device, "to_device"):
-            device = device.to_device()
-        return _numpy_f32_to_buffer(
-            concat_np, latent_model_input.dtype, device
-        )
+        """Concat latents [B,C_l,T,H,W] with condition [B,C_c,T,H,W] on GPU."""
+        if self._i2v_concat_model is None:
+            self._i2v_concat_model = self._compile_i2v_concat(
+                latent_model_input, condition
+            )
+        return self._i2v_concat_model.execute(latent_model_input, condition)[0]
 
     @traced(message="WanI2VPipeline.execute")
     def execute(  # type: ignore[override]
@@ -232,6 +250,11 @@ class WanI2VPipeline(WanPipeline):
         device = self.transformer.devices[0]
         if not self._moe_dual_loaded:
             self._activate_transformer_weights(use_secondary=False)
+
+        # Pre-compile VAE encoder for this resolution (one-time cost).
+        h = int(model_inputs.height)
+        w = int(model_inputs.width)
+        self.vae.prewarm_encoder(h, w)
 
         t_start = _time.perf_counter()
         with Tracer("prepare_prompt_embeddings"):
@@ -252,6 +275,15 @@ class WanI2VPipeline(WanPipeline):
                 model_inputs, tuple(int(d) for d in latents.shape), device
             )
         t_encode = _time.perf_counter()
+
+        # Pre-compile I2V concat graph (latent dtype, not f32)
+        if self._i2v_concat_model is None:
+            latent_model_input = (
+                self.compiled.cast_f32_to_model_dtype.execute(latents)[0]
+            )
+            self._i2v_concat_model = self._compile_i2v_concat(
+                latent_model_input, i2v_condition
+            )
 
         # Pre-compile VAE decoder
         self.vae.prewarm_for_latent_shape(
@@ -301,16 +333,16 @@ class WanI2VPipeline(WanPipeline):
             images = self._decode_output(latents, model_inputs)
         t_decode = _time.perf_counter()
 
+        prep_t = t_prewarm - t_start
+        denoise_t = t_denoise - t_prewarm
+        decode_t = t_decode - t_denoise
+        total_t = t_decode - t_start
         logger.info(
-            "I2V timing: prompt=%.1fs, vae_encode=%.1fs, "
-            "vae_prewarm=%.1fs, denoise=%.1fs, vae_decode=%.1fs, "
-            "total=%.1fs",
-            t_prompt - t_start,
-            t_encode - t_prompt,
-            t_prewarm - t_encode,
-            t_denoise - t_prewarm,
-            t_decode - t_denoise,
-            t_decode - t_start,
+            "Phase timing: prep=%.1fs, denoise=%.1fs, decode=%.1fs, total=%.1fs",
+            prep_t,
+            denoise_t,
+            decode_t,
+            total_t,
         )
         return WanPipelineOutput(images=images)
 

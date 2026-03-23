@@ -2305,6 +2305,8 @@ class AutoencoderKLWanModel(ComponentModel):
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = AutoencoderKLWanConfig.generate(config, encoding, devices)
+        # Force bfloat16 — some repos (Wan 2.1) declare float32.
+        self.config.dtype = DType.bfloat16
         self._framewise_decoder_cache: dict[
             _VAEFramewiseKey, _CachedFramewiseDecoder
         ] = {}
@@ -2361,14 +2363,18 @@ class AutoencoderKLWanModel(ComponentModel):
                     ):
                         use_native_layout = True
                     if use_native_layout:
+                        buf = weight_data.to_buffer() if hasattr(weight_data, "to_buffer") else weight_data
+                        t_f32 = cast_dlpack_to(buf, weight_data.dtype, DType.float32, CPU())
                         weight_data = np.ascontiguousarray(
-                            np.from_dlpack(weight_data).transpose(2, 3, 4, 1, 0)
+                            np.from_dlpack(t_f32).transpose(2, 3, 4, 1, 0)
                         )
                 if key.endswith(".weight") and len(weight_data.shape) == 4:
                     is_resample_conv = "resample" in key
                     if not is_resample_conv:
+                        buf = weight_data.to_buffer() if hasattr(weight_data, "to_buffer") else weight_data
+                        t_f32 = cast_dlpack_to(buf, weight_data.dtype, DType.float32, CPU())
                         weight_data = np.ascontiguousarray(
-                            np.from_dlpack(weight_data).transpose(2, 3, 1, 0)
+                            np.from_dlpack(t_f32).transpose(2, 3, 1, 0)
                         )
 
                 if is_decoder:
@@ -2377,23 +2383,23 @@ class AutoencoderKLWanModel(ComponentModel):
                     encoder_state_dict[key] = weight_data
                     has_encoder = True
 
-            # Cast all weights to target dtype using a compiled graph (cached
-            # per dtype pair, so the LLVM compilation only happens once).
-            if target_dtype != DType.float32:
-                cpu_device = CPU()
-                for key in decoder_state_dict:
-                    decoder_state_dict[key] = cast_dlpack_to(
-                        decoder_state_dict[key],
-                        DType.float32,
-                        target_dtype,
-                        cpu_device,
-                    )
-                for key in encoder_state_dict:
-                    encoder_state_dict[key] = cast_dlpack_to(
-                        encoder_state_dict[key],
-                        DType.float32,
-                        target_dtype,
-                        cpu_device,
+            # Cast all weights to target dtype.
+            cpu_device = CPU()
+            for sd in (decoder_state_dict, encoder_state_dict):
+                for key in sd:
+                    tensor = sd[key]
+                    if hasattr(tensor, "to_buffer") and hasattr(tensor, "dtype"):
+                        src_dtype = tensor.dtype
+                        if src_dtype == target_dtype:
+                            continue
+                        buf = tensor.to_buffer()
+                    else:
+                        src_dtype = DType.float32
+                        if src_dtype == target_dtype:
+                            continue
+                        buf = tensor
+                    sd[key] = cast_dlpack_to(
+                        buf, src_dtype, target_dtype, cpu_device,
                     )
 
             # Defer compilation to first decode_5d() call so we have concrete
@@ -2509,15 +2515,17 @@ class AutoencoderKLWanModel(ComponentModel):
                 (batch_size, z_dim, latent_h, latent_w)
             )
 
-    def prewarm_encoder(self) -> None:
-        """Pre-compile chunked encoder graphs (dynamic H/W, compile once)."""
+    def prewarm_encoder(self, height: int, width: int) -> None:
+        """Pre-compile chunked encoder graphs for given H/W."""
         self.load_model()
         if self._encoder_state_dict is None:
             return
         if self._chunked_encoder is None:
             with self._compile_lock:
                 if self._chunked_encoder is None:
-                    self._chunked_encoder = self._compile_chunked_encoder()
+                    self._chunked_encoder = self._compile_chunked_encoder(
+                        height, width
+                    )
 
     def decode_5d(self, latents_5d: Buffer) -> Buffer:
         """Decode 5D latents [B, C, T, H, W] with the cached framewise path."""
@@ -2564,16 +2572,18 @@ class AutoencoderKLWanModel(ComponentModel):
             return (self.decode_5d(latents),)
         return (self.decode_4d(latents),)
 
-    def _compile_chunked_encoder(self) -> _CachedChunkedEncoder:
-        """Compile chunked encoder graphs with dynamic H/W."""
+    def _compile_chunked_encoder(
+        self, height: int, width: int
+    ) -> _CachedChunkedEncoder:
+        """Compile chunked encoder graphs for concrete H/W."""
         cfg = self.config
         sd = self._encoder_state_dict
         assert sd is not None, "encoder state dict not initialized"
 
-        # First chunk: 1 frame, dynamic H/W
+        # First chunk: 1 frame, concrete H/W
         first_input_type = TensorType(
             cfg.dtype,
-            [1, 3, 1, None, None],
+            [1, 3, 1, height, width],
             device=cfg.device,
         )
         first_module = _WanVAEEncoderFirstChunk(cfg)
@@ -2589,13 +2599,15 @@ class AutoencoderKLWanModel(ComponentModel):
             first_graph, weights_registry=first_registry
         )
 
-        # Rest chunk: CHUNK_SIZE frames, dynamic H/W + cache inputs
+        # Rest chunk: CHUNK_SIZE frames, concrete H/W + cache inputs
         rest_input_type = TensorType(
             cfg.dtype,
-            [1, 3, WAN_ENCODER_CHUNK_SIZE, None, None],
+            [1, 3, WAN_ENCODER_CHUNK_SIZE, height, width],
             device=cfg.device,
         )
-        cache_shapes = first_module.encoder.cache_shapes(batch_size=1)
+        cache_shapes = first_module.encoder.cache_shapes(
+            batch_size=1, height=height, width=width
+        )
         rest_input_types = [
             rest_input_type,
             *[
@@ -2640,7 +2652,11 @@ class AutoencoderKLWanModel(ComponentModel):
         if self._chunked_encoder is None:
             with self._compile_lock:
                 if self._chunked_encoder is None:
-                    self._chunked_encoder = self._compile_chunked_encoder()
+                    h = int(video.shape[3])
+                    w = int(video.shape[4])
+                    self._chunked_encoder = (
+                        self._compile_chunked_encoder(h, w)
+                    )
 
         # Convert to numpy once for chunk slicing
         video_np = _buffer_to_numpy_f32(video, CPU())

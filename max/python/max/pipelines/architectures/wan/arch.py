@@ -50,9 +50,12 @@ wan_arch = SupportedArchitecture(
     name="WanPipeline",
     task=PipelineTask.PIXEL_GENERATION,
     default_encoding="bfloat16",
-    supported_encodings={"bfloat16"},
+    supported_encodings={"bfloat16", "float32"},
     example_repo_ids=[
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        "yetter-ai/Wan2.2-TI2V-5B-Turbo-Diffusers",
     ],
     pipeline_model=WanPipeline,  # type: ignore[arg-type]
     context_type=PixelContext,
@@ -65,9 +68,10 @@ wan_i2v_arch = SupportedArchitecture(
     name="WanImageToVideoPipeline",
     task=PipelineTask.PIXEL_GENERATION,
     default_encoding="bfloat16",
-    supported_encodings={"bfloat16"},
+    supported_encodings={"bfloat16", "float32"},
     example_repo_ids=[
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
     ],
     pipeline_model=WanI2VPipeline,  # type: ignore[arg-type]
     context_type=PixelContext,

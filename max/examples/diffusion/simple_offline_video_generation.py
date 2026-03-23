@@ -27,7 +27,7 @@ import asyncio
 import logging
 import os
 import subprocess
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 from max.driver import DeviceSpec
@@ -71,6 +71,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Generate videos with a diffusion model.",
     )
     parser.add_argument("--model", required=True, help="Model identifier.")
+    parser.add_argument(
+        "--quantization-encoding",
+        type=str,
+        default=None,
+        help="Override quantization encoding (e.g. 'bfloat16' for models that declare float32).",
+    )
     parser.add_argument(
         "--prompt", required=True, help="Text prompt for video generation."
     )
@@ -229,6 +235,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="LoRA strength multiplier for transformer_2 (low-noise). Defaults to --lora-scale.",
+    )
+    parser.add_argument(
+        "--lora-weight-name",
+        type=str,
+        default=None,
+        help=(
+            "Single LoRA safetensors filename (for non-MoE models). "
+            "When set, --lora-subfolder is treated as the HF subfolder "
+            "and this file is downloaded instead of high/low noise pairs."
+        ),
     )
 
     parser.add_argument(
@@ -423,11 +439,14 @@ def _video_frames_from_raw_output(images: np.ndarray) -> list[np.ndarray]:
 async def generate_video(args: argparse.Namespace) -> None:
     print(f"Loading model: {args.model}")
 
+    model_kwargs: dict[str, Any] = {
+        "model_path": args.model,
+        "device_specs": [DeviceSpec.accelerator()],
+    }
+    if args.quantization_encoding:
+        model_kwargs["quantization_encoding"] = args.quantization_encoding
     config = PipelineConfig(
-        model=MAXModelConfig(
-            model_path=args.model,
-            device_specs=[DeviceSpec.accelerator()],
-        ),
+        model=MAXModelConfig(**model_kwargs),
     )
     arch = PIPELINE_REGISTRY.retrieve_architecture(
         config.model.huggingface_weight_repo,
@@ -435,21 +454,33 @@ async def generate_video(args: argparse.Namespace) -> None:
     )
     assert arch is not None, "No matching diffusion architecture found."
 
+    # TI2V auto-routing: if resolved as WanPipeline but --input-image provided,
+    # switch to WanI2VPipeline for image conditioning support.
+    if arch.name == "WanPipeline" and args.input_image:
+        i2v_arch = PIPELINE_REGISTRY.architectures.get(
+            "WanImageToVideoPipeline"
+        )
+        if i2v_arch is not None:
+            print(
+                "TI2V auto-routing: WanPipeline → WanI2VPipeline"
+                " (--input-image provided)"
+            )
+            arch = i2v_arch
+
     # Inject LoRA config into diffusers_config if CLI args provided
     diffusers_config = config.model.diffusers_config
-    if (
-        args.lora_repo_id
-        and args.lora_subfolder
-        and diffusers_config is not None
-    ):
-        diffusers_config["lora"] = {
+    if args.lora_repo_id and diffusers_config is not None:
+        lora_cfg: dict[str, Any] = {
             "repo_id": args.lora_repo_id,
-            "subfolder": args.lora_subfolder,
+            "subfolder": args.lora_subfolder or "",
             "scale": args.lora_scale,
             "scale_2": args.lora_scale_2
             if args.lora_scale_2 is not None
             else args.lora_scale,
         }
+        if args.lora_weight_name:
+            lora_cfg["filenames"] = [args.lora_weight_name]
+        diffusers_config["lora"] = lora_cfg
 
     # Tokenizer setup
     max_length = args.max_length
@@ -667,10 +698,11 @@ async def generate_video(args: argparse.Namespace) -> None:
                 "Expected raw numpy video output from the diffusion pipeline."
             )
         print("Generation complete!")
+        total = t2 - t0
         print(
             f"Timing: prepare_inputs={t1 - t0:.2f}s, "
             f"execute={t2 - t1:.2f}s, "
-            f"total={t2 - t0:.2f}s"
+            f"total={total:.2f}s"
         )
         frames = _video_frames_from_raw_output(model_outputs.images)
 

@@ -27,16 +27,23 @@ from .umt5 import UMT5EncoderModel
 
 def _prepare_state_dict(
     weights: Weights,
+    target_dtype: DType | None = None,
 ) -> dict[str, WeightData]:
     """Convert Weights to a raw state dict, normalizing tied embedding keys.
 
     HF UMT5 ties ``shared.weight`` and ``encoder.embed_tokens.weight``.
     Our module owns the embedding as ``shared``, so we normalize to that key
     and drop the alias to avoid strict-mode validation failures.
+
+    If ``target_dtype`` is provided, all weights are cast to that dtype
+    (e.g. float32 → bfloat16 for Wan 2.1 checkpoints).
     """
     state_dict: dict[str, WeightData] = {}
     for key, value in weights.items():
-        state_dict[key] = value.data()
+        wd = value.data()
+        if target_dtype is not None and wd.dtype != target_dtype:
+            wd = wd.astype(target_dtype)
+        state_dict[key] = wd
 
     encoder_emb = state_dict.pop("encoder.embed_tokens.weight", None)
     if "shared.weight" not in state_dict and encoder_emb is not None:
@@ -65,9 +72,11 @@ class UMT5Model(ComponentModel):
 
     def load_model(self) -> Model:
         assert self.weights is not None, "Weights already freed"
-        state_dict = _prepare_state_dict(self.weights)
-
-        dtype = self.config.dtype
+        # Force bfloat16 — some repos (Wan 2.1) declare float32 but
+        # should run in bfloat16 on GPU. Override both config and weights.
+        dtype = DType.bfloat16
+        self.config.dtype = dtype
+        state_dict = _prepare_state_dict(self.weights, target_dtype=dtype)
         dev = self.devices[0]
         dev_ref = DeviceRef.from_device(dev)
 

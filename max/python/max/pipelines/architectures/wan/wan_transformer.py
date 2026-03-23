@@ -159,6 +159,132 @@ class WanTextProjection(Module):
         return hidden_states
 
 
+class _WanImageEmbedder(Module):
+    """Image embedding for Wan 2.1 I2V: LayerNorm → GEGLU FFN → LayerNorm.
+
+    Matches diffusers' FeedForward(image_dim, dim, mult=1, activation_fn="gelu")
+    with pre/post norms.  Weight keys::
+
+        image_embedder.norm1.{weight,bias}
+        image_embedder.ff.net.0.proj.{weight,bias}   (GEGLU gate+value)
+        image_embedder.ff.net.2.{weight,bias}         (output linear)
+        image_embedder.norm2.{weight,bias}
+    """
+
+    def __init__(
+        self,
+        image_dim: int,
+        out_dim: int,
+        *,
+        dtype: DType = DType.bfloat16,
+        device: DeviceRef = DeviceRef.CPU(),
+    ) -> None:
+        super().__init__()
+        # Matches diffusers FeedForward(image_dim, out_dim, mult=1, activation_fn="gelu"):
+        #   norm1(image_dim) → Linear(image_dim→image_dim) → GELU →
+        #   Linear(image_dim→out_dim) → norm2(out_dim)
+        self.norm1 = _LNWithBias(image_dim, dtype=dtype, device=device)
+        self.ff = _GELU_FF(
+            image_dim, image_dim, out_dim, dtype=dtype, device=device
+        )
+        self.norm2 = _LNWithBias(out_dim, dtype=dtype, device=device)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        x = self.norm1(x)
+        x = self.ff(x)
+        return self.norm2(x)
+
+
+class _LNWithBias(Module):
+    """LayerNorm with bias (matching diffusers nn.LayerNorm)."""
+
+    def __init__(
+        self, dim: int, *, dtype: DType, device: DeviceRef
+    ) -> None:
+        super().__init__()
+        self.weight = Weight("weight", dtype, [dim], device)
+        self.bias = Weight("bias", dtype, [dim], device)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return ops.layer_norm(x, self.weight, self.bias)
+
+
+class _GELU_FF(Module):
+    """GELU feed-forward matching diffusers' FeedForward `net` sub-module.
+
+    Structure: net.0.proj (Linear + GELU) → net.2 (Linear output).
+    Key paths: ff.net._0.proj.{weight,bias}, ff.net._2.{weight,bias}
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        inner_dim: int,
+        out_dim: int,
+        *,
+        dtype: DType,
+        device: DeviceRef,
+    ) -> None:
+        super().__init__()
+        self.net = _GELUNet(
+            in_dim, inner_dim, out_dim, dtype=dtype, device=device
+        )
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return self.net(x)
+
+
+class _GELUNet(Module):
+    """Container matching `net.0.proj` and `net.2` weight key paths."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        inner_dim: int,
+        out_dim: int,
+        *,
+        dtype: DType,
+        device: DeviceRef,
+    ) -> None:
+        super().__init__()
+        self._0 = _GELUProj(in_dim, inner_dim, dtype=dtype, device=device)
+        self._2 = Linear(
+            in_dim=inner_dim,
+            out_dim=out_dim,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        x = self._0(x)
+        return self._2(x)
+
+
+class _GELUProj(Module):
+    """Linear + GELU activation (net.0 sub-module with proj weight)."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        *,
+        dtype: DType,
+        device: DeviceRef,
+    ) -> None:
+        super().__init__()
+        self.proj = Linear(
+            in_dim=in_dim,
+            out_dim=out_dim,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
+        )
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return ops.gelu(self.proj(x))
+
+
 class WanTimeTextImageEmbedding(Module):
     def __init__(
         self,
@@ -167,6 +293,7 @@ class WanTimeTextImageEmbedding(Module):
         text_dim: int,
         num_layers: int,
         *,
+        image_dim: int | None = None,
         dtype: DType = DType.bfloat16,
         device: DeviceRef = DeviceRef.CPU(),
     ) -> None:
@@ -196,6 +323,15 @@ class WanTimeTextImageEmbedding(Module):
             dtype=dtype,
             device=device,
         )
+        # Optional image embedder (Wan 2.1 I2V)
+        self.image_embedder: _WanImageEmbedder | None = None
+        if image_dim is not None:
+            self.image_embedder = _WanImageEmbedder(
+                image_dim=image_dim,
+                out_dim=dim,
+                dtype=dtype,
+                device=device,
+            )
 
     def __call__(
         self, timestep: TensorValue, encoder_hidden_states: TensorValue
@@ -328,6 +464,7 @@ class WanCrossAttention(Module):
         head_dim: int,
         eps: float,
         *,
+        added_kv_proj_dim: int | None = None,
         dtype: DType = DType.bfloat16,
         device: DeviceRef = DeviceRef.CPU(),
     ) -> None:
@@ -335,6 +472,7 @@ class WanCrossAttention(Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.inner_dim = dim
+        self._has_added_kv = added_kv_proj_dim is not None
 
         self.to_q = Linear(
             in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
@@ -353,10 +491,34 @@ class WanCrossAttention(Module):
             in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
         )
 
+        # Optional added KV projections for image conditioning (Wan 2.1 I2V)
+        if added_kv_proj_dim is not None:
+            self.add_k_proj = Linear(
+                in_dim=added_kv_proj_dim,
+                out_dim=dim,
+                dtype=dtype,
+                device=device,
+                has_bias=True,
+            )
+            self.add_v_proj = Linear(
+                in_dim=added_kv_proj_dim,
+                out_dim=dim,
+                dtype=dtype,
+                device=device,
+                has_bias=True,
+            )
+            self.norm_added_q = WanRMSNorm(
+                dim, eps=eps, dtype=dtype, device=device
+            )
+            self.norm_added_k = WanRMSNorm(
+                dim, eps=eps, dtype=dtype, device=device
+            )
+
     def __call__(
         self,
         hidden_states: TensorValue,
         encoder_hidden_states: TensorValue,
+        image_embeds: TensorValue | None = None,
     ) -> TensorValue:
         query = self.to_q(hidden_states)
 
@@ -368,6 +530,14 @@ class WanCrossAttention(Module):
         # QK-norm across all heads (before reshape)
         query = self.norm_q(query)
         key = self.norm_k(key)
+
+        # Added image KV (Wan 2.1 I2V)
+        if self._has_added_kv and image_embeds is not None:
+            added_key = self.norm_added_k(self.add_k_proj(image_embeds))
+            added_value = self.add_v_proj(image_embeds)
+            # Concatenate image KV with text KV along sequence dim
+            key = ops.concat([key, added_key], axis=1)
+            value = ops.concat([value, added_value], axis=1)
 
         # Reshape to multi-head
         batch_size = query.shape[0]
@@ -448,6 +618,7 @@ class WanTransformerBlock(Module):
         cross_attn_norm: bool,
         eps: float,
         *,
+        added_kv_proj_dim: int | None = None,
         dtype: DType = DType.bfloat16,
         device: DeviceRef = DeviceRef.CPU(),
     ) -> None:
@@ -474,7 +645,14 @@ class WanTransformerBlock(Module):
             device=device,
         )
         self.attn2 = WanCrossAttention(
-            dim, text_dim, num_heads, head_dim, eps, dtype=dtype, device=device
+            dim,
+            text_dim,
+            num_heads,
+            head_dim,
+            eps,
+            added_kv_proj_dim=added_kv_proj_dim,
+            dtype=dtype,
+            device=device,
         )
         self.norm3 = WanLayerNorm(
             dim,
@@ -492,6 +670,7 @@ class WanTransformerBlock(Module):
         timestep_proj: TensorValue,
         rope_cos: TensorValue,
         rope_sin: TensorValue,
+        image_embeds: TensorValue | None = None,
     ) -> TensorValue:
         rotary_emb = (rope_cos, rope_sin)
 
@@ -512,9 +691,9 @@ class WanTransformerBlock(Module):
         x = self.attn1(x, rotary_emb)
         hidden_states = hidden_states + gate_sa * x
 
-        # Cross-attention
+        # Cross-attention (with optional image KV for 2.1 I2V)
         x = self.norm2(hidden_states)
-        x = self.attn2(x, encoder_hidden_states)
+        x = self.attn2(x, encoder_hidden_states, image_embeds=image_embeds)
         hidden_states = hidden_states + x
 
         # Feed-forward
@@ -553,6 +732,7 @@ class WanTransformerPreProcess(Module):
             freq_dim=config.freq_dim,
             text_dim=config.text_dim,
             num_layers=config.num_layers,
+            image_dim=getattr(config, "image_dim", None),
             dtype=dtype,
             device=device,
         )
@@ -685,6 +865,7 @@ class WanTransformer3DModel(Module):
             freq_dim=config.freq_dim,
             text_dim=config.text_dim,
             num_layers=config.num_layers,
+            image_dim=getattr(config, "image_dim", None),
             dtype=dtype,
             device=device,
         )

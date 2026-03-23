@@ -15,6 +15,7 @@ Usage:
     ./bazelw run //max/examples/diffusion:wan_comparison -- --skip-max --only-480p
     ./bazelw run //max/examples/diffusion:wan_comparison -- --skip-diffusers
     ./bazelw run //max/examples/diffusion:wan_comparison
+    ./bazelw run //max/examples/diffusion:wan_comparison -- --target wan2.2-ti2v-5b-turbo
 """
 
 from __future__ import annotations
@@ -59,26 +60,127 @@ I2V_PROMPT = (
     "with a relaxed expression."
 )
 
-LORA = {
-    "t2v": {
-        "repo": "lightx2v/Wan2.2-Lightning",
-        "subfolder": "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0",
-    },
-    "i2v": {
-        "repo": "lightx2v/Wan2.2-Lightning",
-        "subfolder": "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1",
-    },
+
+# ── Target configurations ────────────────────────────────────
+
+
+@dataclass
+class WanTarget:
+    name: str  # e.g. "wan2.2-ti2v-5b-turbo"
+    repo_id: str  # HuggingFace repo
+    modes: list[str]  # ["t2v"], ["i2v"], or ["t2v", "i2v"]
+    max_pixels: tuple[int, int]  # (max_width, max_height)
+    max_frames: int
+    default_steps: int
+    default_guidance: float
+    default_guidance_2: float | None  # None for non-MoE models
+    # mode -> {repo, subfolder, weight_name?} or {repo, filename?}
+    lora: dict[str, dict[str, str]] | None = None
+    lora_steps: int = 4
+    lora_guidance: float = 1.0
+    lora_guidance_2: float = 1.0
+    encoding: str | None = None  # override quantization encoding
+
+
+TARGETS: dict[str, WanTarget] = {
+    "wan2.2-t2v-a14b": WanTarget(
+        name="wan2.2-t2v-a14b",
+        repo_id="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        modes=["t2v"],
+        max_pixels=(1280, 720),
+        max_frames=81,
+        default_steps=40,
+        default_guidance=3.0,
+        default_guidance_2=4.0,
+        lora={
+            "t2v": {
+                "repo": "lightx2v/Wan2.2-Lightning",
+                "subfolder": "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0",
+            },
+        },
+    ),
+    "wan2.2-i2v-a14b": WanTarget(
+        name="wan2.2-i2v-a14b",
+        repo_id="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        modes=["i2v"],
+        max_pixels=(1280, 720),
+        max_frames=81,
+        default_steps=40,
+        default_guidance=3.0,
+        default_guidance_2=4.0,
+        lora={
+            "i2v": {
+                "repo": "lightx2v/Wan2.2-Lightning",
+                "subfolder": "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1",
+            },
+        },
+    ),
+    "wan2.2-ti2v-5b-turbo": WanTarget(
+        name="wan2.2-ti2v-5b-turbo",
+        repo_id="yetter-ai/Wan2.2-TI2V-5B-Turbo-Diffusers",
+        modes=["t2v", "i2v"],
+        max_pixels=(1280, 704),
+        max_frames=121,
+        default_steps=4,
+        default_guidance=1.0,
+        default_guidance_2=1.0,
+        lora=None,
+    ),
+    "wan2.2-ti2v-5b": WanTarget(
+        name="wan2.2-ti2v-5b",
+        repo_id="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        modes=["t2v", "i2v"],
+        max_pixels=(1280, 704),
+        max_frames=121,
+        default_steps=40,
+        default_guidance=3.0,
+        default_guidance_2=4.0,
+        lora=None,
+    ),
+    "wan2.1-t2v-14b": WanTarget(
+        name="wan2.1-t2v-14b",
+        repo_id="Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        modes=["t2v"],
+        max_pixels=(1280, 720),
+        max_frames=81,
+        default_steps=40,
+        default_guidance=5.0,
+        default_guidance_2=None,
+        lora={
+            "t2v": {
+                "repo": "lightx2v/Wan2.1-Distill-Loras",
+                "weight_name": "wan2.1_t2v_14b_lora_rank64_lightx2v_4step.safetensors",
+            },
+        },
+    ),
+    "wan2.1-i2v-14b": WanTarget(
+        name="wan2.1-i2v-14b",
+        repo_id="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        modes=["i2v"],
+        max_pixels=(1280, 720),
+        max_frames=81,
+        default_steps=40,
+        default_guidance=5.0,
+        default_guidance_2=None,
+        lora={
+            "i2v": {
+                "repo": "lightx2v/Wan2.1-Distill-Loras",
+                "weight_name": "wan2.1_i2v_lora_rank64_lightx2v_4step.safetensors",
+            },
+        },
+    ),
 }
 
-RESOLUTIONS = {
-    "t2v": {
-        "480p": {"height": 480, "width": 832},
-        "720p": {"height": 720, "width": 1280},
-    },
-    "i2v": {
-        "480p": {"height": 832, "width": 480},
-        "720p": {"height": 1280, "width": 720},
-    },
+DEFAULT_TARGETS = [
+    "wan2.2-t2v-a14b",
+    "wan2.2-i2v-a14b",
+    "wan2.1-t2v-14b",
+    "wan2.1-i2v-14b",
+]
+
+RESOLUTIONS_T2V = {
+    "480p": {"height": 480, "width": 832},
+    "720p": {"height": 720, "width": 1280},
 }
 
 
@@ -86,6 +188,7 @@ RESOLUTIONS = {
 class Result:
     label: str
     durations: list[float] = field(default_factory=list)
+    phase_timings: list[str] = field(default_factory=list)
 
     @property
     def mean(self) -> float:
@@ -100,6 +203,28 @@ class Result:
             return f"{m:.1f}s (std {statistics.stdev(self.durations):.1f}s)"
         return f"{m:.1f}s"
 
+    @property
+    def phase_summary(self) -> str:
+        """Return the last phase timing string if available."""
+        return self.phase_timings[-1] if self.phase_timings else ""
+
+
+def _compute_i2v_resolution(
+    image_path: str, max_area: int
+) -> tuple[int, int]:
+    """Compute aspect-preserving resolution from an input image.
+
+    Returns (height, width) aligned to 16px, capped by max_area.
+    """
+    from PIL import Image
+
+    img = Image.open(image_path)
+    aspect = img.height / img.width
+    mod = 16
+    h = round(np.sqrt(max_area * aspect)) // mod * mod
+    w = round(np.sqrt(max_area / aspect)) // mod * mod
+    return h, w
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Wan T2V/I2V: diffusers vs MAX")
@@ -112,12 +237,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--skip-t2v", action="store_true")
     p.add_argument("--skip-i2v", action="store_true")
     p.add_argument("--only-720p", action="store_true")
+    p.add_argument(
+        "--only-fast",
+        action="store_true",
+        help="Only run fast cases: LoRA targets and turbo/low-step models.",
+    )
     p.add_argument("--only-480p", action="store_true")
     p.add_argument(
         "--input-image",
         default=str(Path(__file__).resolve().parent / "cat.jpg"),
     )
     p.add_argument("--output-dir", default="wan_comparison_output")
+    p.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated target names "
+            f"(choices: {', '.join(TARGETS.keys())}). "
+            f"Default: {', '.join(DEFAULT_TARGETS)}."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -128,37 +268,81 @@ def _get_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.only_720p:
         res_keys = ["720p"]
 
+    # Resolve selected targets
+    if args.target:
+        target_names = [t.strip() for t in args.target.split(",")]
+        for tn in target_names:
+            if tn not in TARGETS:
+                raise ValueError(
+                    f"Unknown target '{tn}'. "
+                    f"Valid targets: {', '.join(TARGETS.keys())}"
+                )
+    else:
+        target_names = DEFAULT_TARGETS
+
     cases: list[dict[str, Any]] = []
-    for mode in ["t2v", "i2v"]:
-        if mode == "t2v" and args.skip_t2v:
-            continue
-        if mode == "i2v" and args.skip_i2v:
-            continue
-        prompt = T2V_PROMPT if mode == "t2v" else I2V_PROMPT
-        for res in res_keys:
-            r = RESOLUTIONS[mode][res]
-            if not args.skip_base:
-                cases.append({
-                    "label": f"{mode} {res} base",
-                    "mode": mode,
-                    "lora": False,
-                    "prompt": prompt,
-                    "num_inference_steps": 40,
-                    "guidance_scale": 3.0,
-                    "guidance_scale_2": 4.0,
-                    **r,
-                })
-            if not args.skip_lora:
-                cases.append({
-                    "label": f"{mode} {res} LoRA",
-                    "mode": mode,
-                    "lora": True,
-                    "prompt": prompt,
-                    "num_inference_steps": 4,
-                    "guidance_scale": 1.0,
-                    "guidance_scale_2": 1.0,
-                    **r,
-                })
+    for tname in target_names:
+        target = TARGETS[tname]
+        max_area = target.max_pixels[0] * target.max_pixels[1]
+        for mode in target.modes:
+            if mode == "t2v" and args.skip_t2v:
+                continue
+            if mode == "i2v" and args.skip_i2v:
+                continue
+            prompt = T2V_PROMPT if mode == "t2v" else I2V_PROMPT
+            for res in res_keys:
+                if mode == "t2v":
+                    r = RESOLUTIONS_T2V[res]
+                else:
+                    # I2V: compute resolution from input image
+                    if res == "480p":
+                        area = min(480 * 832, max_area)
+                    else:
+                        area = max_area
+                    h, w = _compute_i2v_resolution(args.input_image, area)
+                    r = {"height": h, "width": w}
+
+                has_lora = target.lora is not None and mode in target.lora
+                label_prefix = (
+                    f"{tname} {mode}"
+                    if len(target_names) > 1 or target_names != DEFAULT_TARGETS
+                    else mode
+                )
+
+                # --only-fast: skip base unless the target is inherently
+                # fast (e.g. turbo with <= 4 default steps).
+                is_fast_target = target.default_steps <= 4
+                skip_base = args.skip_base or (
+                    args.only_fast and not is_fast_target
+                )
+                if not skip_base:
+                    cases.append({
+                        "label": f"{label_prefix} {res} base",
+                        "mode": mode,
+                        "lora": False,
+                        "prompt": prompt,
+                        "num_inference_steps": target.default_steps,
+                        "guidance_scale": target.default_guidance,
+                        "guidance_scale_2": target.default_guidance_2,
+                        "num_frames": target.max_frames,
+                        "repo_id": target.repo_id,
+                        "target": target,
+                        **r,
+                    })
+                if not args.skip_lora and has_lora:
+                    cases.append({
+                        "label": f"{label_prefix} {res} LoRA",
+                        "mode": mode,
+                        "lora": True,
+                        "prompt": prompt,
+                        "num_inference_steps": target.lora_steps,
+                        "guidance_scale": target.lora_guidance,
+                        "guidance_scale_2": target.lora_guidance_2 if target.default_guidance_2 is not None else None,
+                        "num_frames": target.max_frames,
+                        "repo_id": target.repo_id,
+                        "target": target,
+                        **r,
+                    })
     return cases
 
 
@@ -169,7 +353,7 @@ def _save_video_ffmpeg(frames: list[Any], path: str, fps: int = 16) -> None:
 
     normalized: list[np.ndarray] = []
     for f in frames:
-        # Convert PIL → numpy uint8 RGB
+        # Convert PIL -> numpy uint8 RGB
         if isinstance(f, _PILImage.Image):
             arr = np.array(f.convert("RGB"), dtype=np.uint8)
         else:
@@ -190,37 +374,46 @@ def _save_video_ffmpeg(frames: list[Any], path: str, fps: int = 16) -> None:
     proc.communicate(input=raw)
 
 
-# ── Diffusers ────────────────────────────────────────────────
+# -- Diffusers ---------------------------------------------------------------
 
 
-def _load_diffusers_pipe(mode: str, lora: bool) -> Any:
+def _load_diffusers_pipe(
+    repo_id: str, mode: str, lora_info: dict[str, str] | None
+) -> Any:
     import torch
 
     if mode == "t2v":
         from diffusers import WanPipeline
         pipe = WanPipeline.from_pretrained(
-            "Wan-AI/Wan2.2-T2V-A14B-Diffusers", torch_dtype=torch.bfloat16
+            repo_id, torch_dtype=torch.bfloat16
         ).to("cuda")
     else:
         from diffusers import WanImageToVideoPipeline
         pipe = WanImageToVideoPipeline.from_pretrained(
-            "Wan-AI/Wan2.2-I2V-A14B-Diffusers", torch_dtype=torch.bfloat16
+            repo_id, torch_dtype=torch.bfloat16
         ).to("cuda")
 
-    if lora:
-        info = LORA[mode]
+    if lora_info is not None:
         print("  Fusing LoRA...")
-        pipe.load_lora_weights(
-            info["repo"],
-            weight_name=f"{info['subfolder']}/high_noise_model.safetensors",
-            adapter_name="high",
-        )
-        pipe.load_lora_weights(
-            info["repo"],
-            weight_name=f"{info['subfolder']}/low_noise_model.safetensors",
-            adapter_name="low",
-        )
-        pipe.set_adapters(["high", "low"], adapter_weights=[1.0, 1.0])
+        if "weight_name" in lora_info:
+            # Single-file LoRA (e.g. Wan2.1 distill)
+            pipe.load_lora_weights(
+                lora_info["repo"],
+                weight_name=lora_info["weight_name"],
+            )
+        else:
+            # A14B MoE: high/low noise expert LoRAs
+            pipe.load_lora_weights(
+                lora_info["repo"],
+                weight_name=f"{lora_info['subfolder']}/high_noise_model.safetensors",
+                adapter_name="high",
+            )
+            pipe.load_lora_weights(
+                lora_info["repo"],
+                weight_name=f"{lora_info['subfolder']}/low_noise_model.safetensors",
+                adapter_name="low",
+            )
+            pipe.set_adapters(["high", "low"], adapter_weights=[1.0, 1.0])
         pipe.fuse_lora()
         pipe.unload_lora_weights()
 
@@ -250,19 +443,26 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
     print("\n=== Diffusers (torch.compile) ===")
     results: list[Result] = []
     pipe: Any = None
-    pipe_key: tuple[str, bool] | None = None
+    pipe_key: tuple[str, str, bool] | None = None
     cat_img: Any = None
 
     for case in cases:
-        key = (str(case["mode"]), bool(case["lora"]))
+        target: WanTarget = case["target"]
+        lora_info: dict[str, str] | None = None
+        if case["lora"] and target.lora and case["mode"] in target.lora:
+            lora_info = target.lora[case["mode"]]
+
+        key = (str(case["repo_id"]), str(case["mode"]), bool(case["lora"]))
         if pipe is None or key != pipe_key:
             if pipe is not None:
                 del pipe
                 gc.collect()
                 torch.cuda.empty_cache()
             tag = f"{'LoRA' if case['lora'] else 'base'} {case['mode']}"
-            print(f"  Loading {tag} pipeline...")
-            pipe = _load_diffusers_pipe(str(case["mode"]), bool(case["lora"]))
+            print(f"  Loading {tag} pipeline ({case['repo_id']})...")
+            pipe = _load_diffusers_pipe(
+                str(case["repo_id"]), str(case["mode"]), lora_info
+            )
             pipe_key = key
 
         gen_kwargs: dict[str, Any] = dict(
@@ -270,11 +470,13 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
             negative_prompt="low quality",
             height=case["height"],
             width=case["width"],
-            num_frames=81,
+            num_frames=case["num_frames"],
             guidance_scale=case["guidance_scale"],
-            guidance_scale_2=case["guidance_scale_2"],
             num_inference_steps=case["num_inference_steps"],
+            generator=torch.Generator("cuda").manual_seed(0),
         )
+        if case["guidance_scale_2"] is not None:
+            gen_kwargs["guidance_scale_2"] = case["guidance_scale_2"]
         if case["mode"] == "i2v":
             if cat_img is None:
                 cat_img = Image.open(args.input_image).convert("RGB")
@@ -287,9 +489,10 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
             width=512,
             num_frames=9,
             guidance_scale=case["guidance_scale"],
-            guidance_scale_2=case["guidance_scale_2"],
             num_inference_steps=2,
         )
+        if case["guidance_scale_2"] is not None:
+            warmup_kwargs["guidance_scale_2"] = case["guidance_scale_2"]
         if case["mode"] == "i2v":
             warmup_kwargs["image"] = Image.new("RGB", (512, 288), (128, 128, 128))
 
@@ -332,11 +535,12 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
                 prep = t_denoise_start - t0
                 denoise = t_denoise_end - t_denoise_start
                 decode = t_end - t_denoise_end
-                print(
-                    f"  {case['label']} iter {i+1}: "
+                phase = (
                     f"prep={prep:.1f}s, denoise={denoise:.1f}s, "
                     f"decode={decode:.1f}s, total={dt:.1f}s"
                 )
+                result.phase_timings.append(phase)
+                print(f"  {case['label']} iter {i+1}: {phase}")
             else:
                 print(f"  {case['label']} iter {i+1}: {dt:.1f}s")
 
@@ -355,7 +559,7 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
     return results
 
 
-# ── MAX ──────────────────────────────────────────────────────
+# -- MAX ----------------------------------------------------------------------
 
 
 def _run_max(args: argparse.Namespace) -> list[Result]:
@@ -366,52 +570,68 @@ def _run_max(args: argparse.Namespace) -> list[Result]:
     results: list[Result] = []
 
     for case in cases:
+        target: WanTarget = case["target"]
         fname = str(case["label"]).replace(" ", "_").lower()
         output_file = str(out_dir / f"{fname}.mp4")
-        model = (
-            "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-            if case["mode"] == "t2v"
-            else "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
-        )
 
         cmd = [
             "./bazelw", "run",
             "//max/examples/diffusion:simple_offline_video_generation", "--",
-            "--model", model,
+            "--model", str(case["repo_id"]),
             "--prompt", str(case["prompt"]),
             "--negative-prompt", "low quality",
             "--num-inference-steps", str(case["num_inference_steps"]),
             "--guidance-scale", str(case["guidance_scale"]),
-            "--guidance-scale-2", str(case["guidance_scale_2"]),
             "--output", output_file,
-            "--num-frames", "81",
+            "--num-frames", str(case["num_frames"]),
+            "--seed", "0",
+        ]
+        if case["guidance_scale_2"] is not None:
+            cmd.extend(["--guidance-scale-2", str(case["guidance_scale_2"])])
+        cmd.extend([
             "--height", str(case["height"]),
             "--width", str(case["width"]),
-        ]
+        ])
         if case["mode"] == "i2v":
             cmd.extend(["--input-image", os.path.abspath(args.input_image)])
-        if case["lora"]:
-            info = LORA[str(case["mode"])]
-            cmd.extend([
-                "--lora-repo-id", info["repo"],
-                "--lora-subfolder", info["subfolder"],
-                "--lora-scale", "1.0",
-            ])
+        if case["lora"] and target.lora and case["mode"] in target.lora:
+            info = target.lora[case["mode"]]
+            cmd.extend(["--lora-repo-id", info["repo"]])
+            if "weight_name" in info:
+                # Single-file LoRA (e.g. Wan2.1 distill)
+                cmd.extend(["--lora-weight-name", info["weight_name"]])
+            else:
+                # A14B MoE: subfolder with high/low noise pairs
+                cmd.extend(["--lora-subfolder", info["subfolder"]])
+            cmd.extend(["--lora-scale", "1.0"])
+        if target.encoding:
+            cmd.extend(["--quantization-encoding", target.encoding])
 
         result = Result(label=str(case["label"]))
         for i in range(args.num_iterations):
             print(f"  {case['label']} iter {i+1}/{args.num_iterations}")
-            # Stream stderr (tqdm/logs) live, capture stdout for timing
+            # Capture both stdout (Timing:) and stderr (Phase timing:)
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=None,  # stderr → terminal
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
             )
-            assert proc.stdout is not None
-            stdout = proc.stdout.read()
-            proc.wait()
+            assert proc.stdout is not None and proc.stderr is not None
+            stdout, stderr = proc.communicate()
             if proc.returncode != 0:
                 print(f"    FAILED (exit {proc.returncode})")
+                # Show last few lines of stderr for debugging
+                for line in stderr.strip().split("\n")[-5:]:
+                    print(f"      {line}")
                 continue
+
+            # Parse phase timing from stderr (logger output)
+            phase_str = ""
+            for line in stderr.split("\n"):
+                if "Phase timing:" in line:
+                    # Extract "prep=Xs, denoise=Xs, decode=Xs, total=Xs"
+                    idx = line.index("Phase timing:")
+                    phase_str = line[idx + len("Phase timing:"):].strip()
+                    break
 
             for line in stdout.split("\n"):
                 if "Timing:" in line:
@@ -419,7 +639,11 @@ def _run_max(args: argparse.Namespace) -> list[Result]:
                         total_str = line.split("total=")[1].split("s")[0]
                         dt = float(total_str)
                         result.durations.append(dt)
-                        print(f"    {dt:.1f}s")
+                        if phase_str:
+                            result.phase_timings.append(phase_str)
+                            print(f"    {phase_str}")
+                        else:
+                            print(f"    {dt:.1f}s")
                     except (IndexError, ValueError):
                         pass
                     break
@@ -428,7 +652,7 @@ def _run_max(args: argparse.Namespace) -> list[Result]:
     return results
 
 
-# ── Summary ──────────────────────────────────────────────────
+# -- Summary ------------------------------------------------------------------
 
 
 def _gpu_name() -> str:
@@ -467,9 +691,9 @@ def main(argv: list[str] | None = None) -> int:
             traceback.print_exc()
 
     # Summary
-    w = 62
+    w = 72
     print(f"\n{'='*w}")
-    print(f"  Wan Comparison — {datetime.now():%Y-%m-%d}")
+    print(f"  Wan Comparison -- {datetime.now():%Y-%m-%d}")
     print(f"  GPU: {_gpu_name()}")
     print(f"  Output: {os.path.abspath(args.output_dir)}/")
     print(f"{'='*w}")
@@ -478,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     d_map = {r.label: r for r in diffusers}
     m_map = {r.label: r for r in max_results}
 
+    label_w = max((len(l) for l in labels), default=18) + 2
     cols = ""
     if diffusers:
         cols += f"  {'Diffusers':>12s}"
@@ -485,13 +710,13 @@ def main(argv: list[str] | None = None) -> int:
         cols += f"  {'MAX':>12s}"
     if diffusers and max_results:
         cols += f"  {'Speedup':>9s}"
-    print(f"  {'':18s}{cols}")
-    print(f"  {'-'*(18 + len(cols))}")
+    print(f"  {'':>{label_w}s}{cols}")
+    print(f"  {'-'*(label_w + len(cols))}")
 
     for label in labels:
         d = d_map.get(label)
         m = m_map.get(label)
-        row = f"  {label:18s}"
+        row = f"  {label:>{label_w}s}"
         if diffusers:
             row += f"  {d.summary if d else 'N/A':>12s}"
         if max_results:
@@ -499,6 +724,11 @@ def main(argv: list[str] | None = None) -> int:
         if diffusers and max_results and d and m and d.mean > 0 and m.mean > 0:
             row += f"  {d.mean / m.mean:>8.2f}x"
         print(row)
+        # Print phase breakdown for each runner below the summary row
+        if diffusers and d and d.phase_summary:
+            print(f"  {'':>{label_w}s}  D: {d.phase_summary}")
+        if max_results and m and m.phase_summary:
+            print(f"  {'':>{label_w}s}  M: {m.phase_summary}")
 
     print(f"{'='*w}")
 
