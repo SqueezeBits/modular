@@ -20,7 +20,13 @@ from kv_cache.types import (
     ContinuousBatchingKVCacheCollection,
     KVCacheStaticParams,
 )
-from layout import LayoutTensor, Layout, RuntimeLayout, UNKNOWN_VALUE
+from layout import (
+    Layout,
+    LayoutTensor,
+    RuntimeLayout,
+    TileTensor,
+    UNKNOWN_VALUE,
+)
 from layout._utils import ManagedLayoutTensor
 from layout._fillers import random
 from linalg.matmul.gpu import _matmul_gpu
@@ -98,7 +104,7 @@ def execute_fused_qkv_matmul[
     random(hidden_state_host)
 
     var hidden_state_device_2d = NDBuffer[
-        dtype, 2, MutAnyOrigin, DimList(Dim(), hidden_size)
+        rank=2, dtype, MutAnyOrigin, DimList[Dim(), hidden_size]()
     ](
         hidden_state.device_tensor().ptr,
         IndexList[2](batch_size * prompt_len, hidden_size),
@@ -201,22 +207,22 @@ def execute_fused_qkv_matmul[
     )
 
     var ref_output_device_ndbuffer = NDBuffer[
-        dtype, 2, MutAnyOrigin, DimList(Dim(), fused_hidden_size)
+        rank=2, dtype, MutAnyOrigin, DimList[Dim(), fused_hidden_size]()
     ](
         ref_output.device_tensor().ptr,
         ref_output_shape,
     )
     var weight_device_ndbuffer = NDBuffer[
-        dtype, 2, MutAnyOrigin, DimList(fused_hidden_size, hidden_size)
+        rank=2, dtype, MutAnyOrigin, DimList[fused_hidden_size, hidden_size]()
     ](
         weight_device.unsafe_ptr(),
         weight_shape,
     )
 
     _matmul_gpu[use_tensor_core=True, transpose_b=True](
-        ref_output_device_ndbuffer,
-        hidden_state_device_2d,
-        weight_device_ndbuffer,
+        TileTensor(ref_output_device_ndbuffer),
+        TileTensor(hidden_state_device_2d),
+        TileTensor(weight_device_ndbuffer),
         ctx,
     )
 
@@ -242,8 +248,7 @@ def execute_fused_qkv_matmul[
                 )
 
             for k_dim in range(kv_hidden_size):
-                head_idx = k_dim // kv_params.head_size
-                head_dim_idx = k_dim % kv_params.head_size
+                head_idx, head_dim_idx = divmod(k_dim, kv_params.head_size)
                 assert_almost_equal(
                     ref_output_host[
                         bs * prompt_len + s, hidden_size + Int(k_dim)
@@ -257,8 +262,7 @@ def execute_fused_qkv_matmul[
                 )
 
             for v_dim in range(kv_hidden_size):
-                head_idx = v_dim // kv_params.head_size
-                head_dim_idx = v_dim % kv_params.head_size
+                head_idx, head_dim_idx = divmod(v_dim, kv_params.head_size)
                 assert_almost_equal(
                     ref_output_host[
                         bs * prompt_len + s,

@@ -52,6 +52,7 @@ query interval data, particularly for finding overlaps.
 from std.builtin.string_literal import StaticString
 
 import std.format._utils as fmt
+from std.memory._nonnull import NonNullUnsafePointer
 
 from .deque import Deque
 
@@ -61,7 +62,7 @@ trait IntervalElement(Comparable, Copyable, Intable, Writable):
     `Writable`, `Intable`, and `Comparable` traits. Which is also subtractable.
     """
 
-    fn __sub__(self, rhs: Self) -> Self:
+    def __sub__(self, rhs: Self) -> Self:
         """Subtracts rhs from self, must be implemented in concrete types.
 
         Args:
@@ -94,7 +95,7 @@ struct Interval[T: IntervalElement](
     var end: Self.T
     """The exclusive end of the interval."""
 
-    fn __init__(out self, start: Self.T, end: Self.T):
+    def __init__(out self, start: Self.T, end: Self.T):
         """Initialize an interval with start and end values.
 
         Args:
@@ -108,7 +109,7 @@ struct Interval[T: IntervalElement](
         self.start = start.copy()
         self.end = end.copy()
 
-    fn __init__(out self, interval: Tuple[Self.T, Self.T], /):
+    def __init__(out self, interval: Tuple[Self.T, Self.T], /):
         """Initialize an interval with a tuple of start and end values.
 
         Args:
@@ -117,7 +118,7 @@ struct Interval[T: IntervalElement](
         self.start = interval[0].copy()
         self.end = interval[1].copy()
 
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Create a new instance of the interval by copying the values
         from an existing one.
 
@@ -127,7 +128,7 @@ struct Interval[T: IntervalElement](
         self.start = copy.start.copy()
         self.end = copy.end.copy()
 
-    fn overlaps(self, other: Self) -> Bool:
+    def overlaps(self, other: Self) -> Bool:
         """Returns whether this interval overlaps with another interval.
 
         Args:
@@ -138,7 +139,7 @@ struct Interval[T: IntervalElement](
         """
         return other.start < self.end and other.end > self.start
 
-    fn union(self, other: Self) -> Self:
+    def union(self, other: Self) -> Self:
         """Returns the union of this interval and another interval.
 
         Args:
@@ -162,7 +163,7 @@ struct Interval[T: IntervalElement](
         var end = self.end.copy() if self.end > other.end else other.end.copy()
         return Self(start, end)
 
-    fn intersection(self, other: Self) -> Self:
+    def intersection(self, other: Self) -> Self:
         """Returns the intersection of this interval and another interval.
 
         Args:
@@ -186,7 +187,7 @@ struct Interval[T: IntervalElement](
         var end = self.end.copy() if self.end < other.end else other.end.copy()
         return Self(start, end)
 
-    fn __contains__(self, other: Self.T) -> Bool:
+    def __contains__(self, other: Self.T) -> Bool:
         """Returns whether a value is contained within this interval.
 
         Args:
@@ -197,7 +198,7 @@ struct Interval[T: IntervalElement](
         """
         return self.start <= other.copy() < self.end.copy()
 
-    fn __contains__(self, other: Self) -> Bool:
+    def __contains__(self, other: Self) -> Bool:
         """Returns whether another interval is fully contained within this
         interval.
 
@@ -210,7 +211,7 @@ struct Interval[T: IntervalElement](
         """
         return self.start <= other.start and self.end >= other.end
 
-    fn __le__(self, other: Self) -> Bool:
+    def __le__(self, other: Self) -> Bool:
         """Returns whether this interval is less than or equal to another
         interval.
 
@@ -222,7 +223,7 @@ struct Interval[T: IntervalElement](
         """
         return self.start <= other.start
 
-    fn __ge__(self, other: Self) -> Bool:
+    def __ge__(self, other: Self) -> Bool:
         """Returns whether this interval is greater than or equal to another
         interval.
 
@@ -234,7 +235,7 @@ struct Interval[T: IntervalElement](
         """
         return self.end >= other.end
 
-    fn __lt__(self, other: Self) -> Bool:
+    def __lt__(self, other: Self) -> Bool:
         """Returns whether this interval is less than another interval.
 
         Args:
@@ -245,7 +246,7 @@ struct Interval[T: IntervalElement](
         """
         return self.start < other.start
 
-    fn __gt__(self, other: Self) -> Bool:
+    def __gt__(self, other: Self) -> Bool:
         """Returns whether this interval is greater than another interval.
 
         Args:
@@ -256,16 +257,16 @@ struct Interval[T: IntervalElement](
         """
         return self.end > other.end
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         """Returns the length of this interval.
 
         Returns:
             The difference between end and start values as an integer.
         """
-        debug_assert(Bool(self), "interval is empty")
+        assert Bool(self), "interval is empty"
         return Int(self.end - self.start)
 
-    fn __bool__(self) -> Bool:
+    def __bool__(self) -> Bool:
         """Returns whether this interval is empty.
 
         Returns:
@@ -274,7 +275,7 @@ struct Interval[T: IntervalElement](
         return self.start < self.end
 
     @no_inline
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes this interval to a writer in the format '(start, end)'.
 
         Args:
@@ -282,30 +283,11 @@ struct Interval[T: IntervalElement](
         """
         writer.write("(", self.start, ", ", self.end, ")")
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    fn __str__(self) -> String:
-        """Returns a string representation of this interval.
-
-        Returns:
-            A string in the format '(start, end)' representing this interval.
-        """
-        return String.write(self)
-
-    @deprecated("Representable is deprecated. Use Writable instead.")
-    fn __repr__(self) -> String:
-        """Returns a string representation of this interval suitable for
-        debugging.
-
-        Returns:
-            A string in the format '(start, end)' representing this interval.
-        """
-        return t"Interval{self}"
-
 
 struct _IntervalNode[
     T: IntervalElement,
     U: Copyable & Comparable & Writable,
-](ImplicitlyCopyable, Writable):
+](Copyable, Writable):
     """A node containing an interval and associated data.
 
     Parameters:
@@ -314,6 +296,10 @@ struct _IntervalNode[
         U: The type of the associated data, must support string conversion
           and collection operations.
     """
+
+    comptime _NodePointer = Optional[
+        NonNullUnsafePointer[Self, MutExternalOrigin]
+    ]
 
     var interval: Interval[Self.T]
     """The interval contained in this node."""
@@ -324,27 +310,27 @@ struct _IntervalNode[
     var max_end: Self.T
     """The maximum end value of this node."""
 
-    var left: UnsafePointer[Self, MutExternalOrigin]
+    var left: Self._NodePointer
     """The left child of this node."""
 
-    var right: UnsafePointer[Self, MutExternalOrigin]
+    var right: Self._NodePointer
     """The right child of this node."""
 
-    var parent: UnsafePointer[Self, MutExternalOrigin]
+    var parent: Self._NodePointer
     """The parent of this node."""
 
     var _is_red: Bool
     """Red-black node color."""
 
-    fn __init__(
+    def __init__(
         out self,
         start: Self.T,
         end: Self.T,
         data: Self.U,
         *,
-        left: Optional[UnsafePointer[Self, MutExternalOrigin]] = None,
-        right: Optional[UnsafePointer[Self, MutExternalOrigin]] = None,
-        parent: Optional[UnsafePointer[Self, MutExternalOrigin]] = None,
+        left: Self._NodePointer = {},
+        right: Self._NodePointer = {},
+        parent: Self._NodePointer = {},
         is_red: Bool = True,
     ):
         """Creates a new interval node.
@@ -367,14 +353,14 @@ struct _IntervalNode[
             is_red=is_red,
         )
 
-    fn __init__(
+    def __init__(
         out self,
         interval: Interval[Self.T],
         data: Self.U,
         *,
-        left: Optional[UnsafePointer[Self, MutExternalOrigin]] = None,
-        right: Optional[UnsafePointer[Self, MutExternalOrigin]] = None,
-        parent: Optional[UnsafePointer[Self, MutExternalOrigin]] = None,
+        left: Self._NodePointer = {},
+        right: Self._NodePointer = {},
+        parent: Self._NodePointer = {},
         is_red: Bool = True,
     ):
         """Creates a new interval node.
@@ -390,28 +376,13 @@ struct _IntervalNode[
         self.interval = interval
         self.max_end = interval.end.copy()
         self.data = data.copy()
-        self.left = left.or_else({})
-        self.right = right.or_else({})
-        self.parent = parent.or_else({})
+        self.left = left
+        self.right = right
+        self.parent = parent
         self._is_red = is_red
 
-    fn __init__(out self, *, copy: Self):
-        """Create a new instance of the interval node by copying the values
-        from an existing one.
-
-        Args:
-            copy: The interval node to copy values from.
-        """
-        self.interval = copy.interval
-        self.data = copy.data.copy()
-        self.max_end = copy.max_end.copy()
-        self.left = copy.left
-        self.right = copy.right
-        self.parent = copy.parent
-        self._is_red = copy._is_red
-
     @no_inline
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes this interval node to a writer in the format
         '(start, end): data'.
 
@@ -420,38 +391,17 @@ struct _IntervalNode[
         """
         writer.write(self.interval, "=", self.data)
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    fn __str__(self) -> String:
-        """Returns a string representation of this interval node.
-
-        Returns:
-            A string in the format '(start, end): data' representing this
-            interval node.
-        """
-        return String.write(self)
-
-    @deprecated("Representable is deprecated. Use Writable instead.")
-    fn __repr__(self) -> String:
-        """Returns a string representation of this interval node suitable for
-        debugging.
-
-        Returns:
-            A string in the format '(start, end): data' representing this
-            interval node.
-        """
-        return t"IntervalNode({self})"
-
-    fn depth(self) -> Int:
+    def depth(self) -> Int:
         """Returns the depth of this interval node.
 
         Returns:
             The depth of this interval node.
         """
-        var left_depth = self.left[].depth() if self.left else 0
-        var right_depth = self.right[].depth() if self.right else 0
+        var left_depth = self.left.value()[].depth() if self.left else 0
+        var right_depth = self.right.value()[].depth() if self.right else 0
         return 1 + max(left_depth, right_depth)
 
-    fn __bool__(self) -> Bool:
+    def __bool__(self) -> Bool:
         """Returns whether this interval node is empty.
 
         Returns:
@@ -459,7 +409,7 @@ struct _IntervalNode[
         """
         return Bool(self.interval)
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Returns whether this interval node is equal to another interval node.
 
         Args:
@@ -470,10 +420,10 @@ struct _IntervalNode[
         """
         return self.interval == other.interval and self.data == other.data
 
-    fn __lt__(self, other: Self) -> Bool:
+    def __lt__(self, other: Self) -> Bool:
         return self.interval < other.interval
 
-    fn __gt__(self, other: Self) -> Bool:
+    def __gt__(self, other: Self) -> Bool:
         return self.interval > other.interval
 
 
@@ -490,8 +440,8 @@ struct IntervalTree[
           and collection operations.
     """
 
-    comptime _IntervalNodePointer = UnsafePointer[
-        _IntervalNode[Self.T, Self.U], MutExternalOrigin
+    comptime _IntervalNodePointer = Optional[
+        NonNullUnsafePointer[_IntervalNode[Self.T, Self.U], MutExternalOrigin]
     ]
 
     var _root: Self._IntervalNodePointer
@@ -500,25 +450,30 @@ struct IntervalTree[
     var _len: Int
     """The number of elements in the interval tree."""
 
-    fn __init__(out self):
+    def __init__(out self):
         """Initializes an empty IntervalTree."""
-        self._root = {}
+        self._root = Self._IntervalNodePointer()
         self._len = 0
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Destructor that frees the interval tree's memory."""
-        Self._del_helper(self._root)
+        if self._root:
+            Self._del_helper(self._root.value())
 
     @staticmethod
-    fn _del_helper(node: Self._IntervalNodePointer):
+    def _del_helper(
+        node: NonNullUnsafePointer[
+            _IntervalNode[Self.T, Self.U], MutExternalOrigin
+        ],
+    ):
         if node[].left:
-            Self._del_helper(node[].left)
+            Self._del_helper(node[].left.value())
         if node[].right:
-            Self._del_helper(node[].right)
+            Self._del_helper(node[].right.value())
         node.destroy_pointee()
         node.free()
 
-    fn _left_rotate(mut self, rotation_node: Self._IntervalNodePointer):
+    def _left_rotate(mut self, rotation_node: Self._IntervalNodePointer):
         """Performs a left rotation around node x in the red-black tree.
 
         This method performs a left rotation around the given node x, which is a
@@ -539,53 +494,55 @@ struct IntervalTree[
             The rotation assumes that x has a right child. The method will assert if
             either the root or x's right child is not set.
         """
-        debug_assert(Bool(self._root), "node is not set")
-        var rotation_right_child = rotation_node[].right
-        debug_assert(Bool(rotation_right_child), "right child is not set")
-        rotation_node[].right = rotation_right_child[].left
+        assert Bool(self._root), "node is not set"
+        var rotation_node_nn = rotation_node.value()
+        var rotation_right_child = rotation_node_nn[].right
+        assert Bool(rotation_right_child), "right child is not set"
+        var rotation_right_child_nn = rotation_right_child.value()
+        rotation_node_nn[].right = rotation_right_child_nn[].left
 
-        if rotation_right_child[].left:
-            rotation_right_child[].left[].parent = rotation_node
+        if rotation_right_child_nn[].left:
+            rotation_right_child_nn[].left.value()[].parent = rotation_node
 
-        rotation_right_child[].parent = rotation_node[].parent
+        rotation_right_child_nn[].parent = rotation_node_nn[].parent
 
-        if not rotation_node[].parent:
+        if not rotation_node_nn[].parent:
             self._root = rotation_right_child
-        elif rotation_node == rotation_node[].parent[].left:
-            rotation_node[].parent[].left = rotation_right_child
+        elif rotation_node == rotation_node_nn[].parent.value()[].left:
+            rotation_node_nn[].parent.value()[].left = rotation_right_child
         else:
-            rotation_node[].parent[].right = rotation_right_child
+            rotation_node_nn[].parent.value()[].right = rotation_right_child
 
-        rotation_right_child[].left = rotation_node
-        rotation_node[].parent = rotation_right_child
+        rotation_right_child_nn[].left = rotation_node
+        rotation_node_nn[].parent = rotation_right_child
 
-        rotation_node[].max_end = rotation_node[].interval.end.copy()
-        if rotation_node[].left:
-            rotation_node[].max_end = max(
-                rotation_node[].max_end,
-                rotation_node[].left[].max_end,
+        rotation_node_nn[].max_end = rotation_node_nn[].interval.end.copy()
+        if rotation_node_nn[].left:
+            rotation_node_nn[].max_end = max(
+                rotation_node_nn[].max_end,
+                rotation_node_nn[].left.value()[].max_end,
             )
-        if rotation_node[].right:
-            rotation_node[].max_end = max(
-                rotation_node[].max_end,
-                rotation_node[].right[].max_end,
+        if rotation_node_nn[].right:
+            rotation_node_nn[].max_end = max(
+                rotation_node_nn[].max_end,
+                rotation_node_nn[].right.value()[].max_end,
             )
 
-        rotation_right_child[].max_end = (
-            rotation_right_child[].interval.end.copy()
+        rotation_right_child_nn[].max_end = (
+            rotation_right_child_nn[].interval.end.copy()
         )
-        if rotation_right_child[].left:
-            rotation_right_child[].max_end = max(
-                rotation_right_child[].max_end,
-                rotation_right_child[].left[].max_end,
+        if rotation_right_child_nn[].left:
+            rotation_right_child_nn[].max_end = max(
+                rotation_right_child_nn[].max_end,
+                rotation_right_child_nn[].left.value()[].max_end,
             )
-        if rotation_right_child[].right:
-            rotation_right_child[].max_end = max(
-                rotation_right_child[].max_end,
-                rotation_right_child[].right[].max_end,
+        if rotation_right_child_nn[].right:
+            rotation_right_child_nn[].max_end = max(
+                rotation_right_child_nn[].max_end,
+                rotation_right_child_nn[].right.value()[].max_end,
             )
 
-    fn _right_rotate(mut self, rotation_node: Self._IntervalNodePointer):
+    def _right_rotate(mut self, rotation_node: Self._IntervalNodePointer):
         """Performs a right rotation around node y in the red-black tree.
 
         This method performs a right rotation around the given node y, which is a
@@ -606,46 +563,50 @@ struct IntervalTree[
             The rotation assumes that y has a left child. The method will assert if
             either the root or y's left child is not set.
         """
-        debug_assert(Bool(self._root), "root node is not set")
-        var rotation_left_child = rotation_node[].left
-        debug_assert(Bool(rotation_left_child), "left child node is not set")
-        rotation_node[].left = rotation_left_child[].right
+        assert Bool(self._root), "root node is not set"
+        var rotation_node_nn = rotation_node.value()
+        var rotation_left_child = rotation_node_nn[].left
+        assert Bool(rotation_left_child), "left child node is not set"
+        var rotation_left_child_nn = rotation_left_child.value()
+        rotation_node_nn[].left = rotation_left_child_nn[].right
 
-        if rotation_left_child[].right:
-            rotation_left_child[].right[].parent = rotation_node
+        if rotation_left_child_nn[].right:
+            rotation_left_child_nn[].right.value()[].parent = rotation_node
 
-        rotation_left_child[].parent = rotation_node[].parent
+        rotation_left_child_nn[].parent = rotation_node_nn[].parent
 
-        if not rotation_node[].parent:
+        if not rotation_node_nn[].parent:
             self._root = rotation_left_child
-        elif rotation_node == rotation_node[].parent[].right:
-            rotation_node[].parent[].right = rotation_left_child
+        elif rotation_node == rotation_node_nn[].parent.value()[].right:
+            rotation_node_nn[].parent.value()[].right = rotation_left_child
         else:
-            rotation_node[].parent[].left = rotation_left_child
+            rotation_node_nn[].parent.value()[].left = rotation_left_child
 
-        rotation_left_child[].right = rotation_node
-        rotation_node[].parent = rotation_left_child
+        rotation_left_child_nn[].right = rotation_node
+        rotation_node_nn[].parent = rotation_left_child
 
-        rotation_node[].max_end = rotation_node[].interval.end.copy()
-        if rotation_node[].left:
-            rotation_node[].max_end = max(
-                rotation_node[].max_end, rotation_node[].left[].max_end
+        rotation_node_nn[].max_end = rotation_node_nn[].interval.end.copy()
+        if rotation_node_nn[].left:
+            rotation_node_nn[].max_end = max(
+                rotation_node_nn[].max_end,
+                rotation_node_nn[].left.value()[].max_end,
             )
-        if rotation_node[].right:
-            rotation_node[].max_end = max(
-                rotation_node[].max_end, rotation_node[].right[].max_end
+        if rotation_node_nn[].right:
+            rotation_node_nn[].max_end = max(
+                rotation_node_nn[].max_end,
+                rotation_node_nn[].right.value()[].max_end,
             )
 
-        rotation_left_child[].max_end = (
-            rotation_left_child[].interval.end.copy()
+        rotation_left_child_nn[].max_end = (
+            rotation_left_child_nn[].interval.end.copy()
         )
-        if rotation_left_child[].left:
-            rotation_left_child[].max_end = max(
-                rotation_left_child[].max_end,
-                rotation_left_child[].left[].max_end,
+        if rotation_left_child_nn[].left:
+            rotation_left_child_nn[].max_end = max(
+                rotation_left_child_nn[].max_end,
+                rotation_left_child_nn[].left.value()[].max_end,
             )
 
-    fn insert(mut self, interval: Tuple[Self.T, Self.T], data: Self.U):
+    def insert(mut self, interval: Tuple[Self.T, Self.T], data: Self.U):
         """Insert a new interval into the tree using a tuple representation.
 
         Args:
@@ -654,7 +615,7 @@ struct IntervalTree[
         """
         self.insert(Interval(interval[0], interval[1]), data)
 
-    fn insert(mut self, interval: Interval[Self.T], data: Self.U):
+    def insert(mut self, interval: Interval[Self.T], data: Self.U):
         """Insert a new interval into the tree.
 
         This method inserts a new interval and its associated data into the interval tree.
@@ -667,42 +628,44 @@ struct IntervalTree[
         """
         # Allocate memory for a new node and initialize it with the interval
         # and data
-        var new_node = alloc[_IntervalNode[Self.T, Self.U]](1)
+        var raw = alloc[_IntervalNode[Self.T, Self.U]](1)
+        var new_node = NonNullUnsafePointer(unsafe_from_nullable=raw)
         new_node.init_pointee_move(_IntervalNode(interval, data))
         self._len += 1
 
         # If the tree is empty, set the root to the new node and color it black.
         if not self._root:
             self._root = new_node
-            self._root[]._is_red = False
+            self._root.value()[]._is_red = False
             return
 
         # Find the insertion point by traversing down the tree
         # parent_node tracks the parent of the current node
-        var parent_node = type_of(self._root)()
+        var parent_node = Self._IntervalNodePointer()
         # current_node traverses down the tree until we find an empty spot
         var current_node = self._root
         while current_node:
             parent_node = current_node
-            if new_node[] < current_node[]:
-                current_node = current_node[].left
+            if new_node[] < current_node.value()[]:
+                current_node = current_node.value()[].left
             else:
-                current_node = current_node[].right
-            parent_node[].max_end = max(
-                parent_node[].max_end, new_node[].interval.end
+                current_node = current_node.value()[].right
+            parent_node.value()[].max_end = max(
+                parent_node.value()[].max_end,
+                new_node[].interval.end,
             )
 
         new_node[].parent = parent_node
         if not parent_node:
             self._root = new_node
-        elif new_node[] < parent_node[]:
-            parent_node[].left = new_node
+        elif new_node[] < parent_node.value()[]:
+            parent_node.value()[].left = new_node
         else:
-            parent_node[].right = new_node
+            parent_node.value()[].right = new_node
 
         self._insert_fixup(new_node)
 
-    fn _insert_fixup(mut self, current_node0: Self._IntervalNodePointer):
+    def _insert_fixup(mut self, current_node0: Self._IntervalNodePointer):
         """Fixes up the red-black tree properties after an insertion.
 
         This method restores the red-black tree properties that may have been violated
@@ -716,61 +679,60 @@ struct IntervalTree[
         var current_node = current_node0
 
         # While the parent of the current node is red, we need to fix violations
-        while current_node != self._root and current_node[].parent[]._is_red:
-            if current_node[].parent == current_node[].parent[].parent[].left:
+        while (
+            current_node != self._root
+            and current_node.value()[].parent.value()[]._is_red
+        ):
+            var node = current_node.value()
+            var parent = node[].parent.value()
+            var grandparent = parent[].parent.value()
+            if node[].parent == grandparent[].left:
                 # Get uncle node (parent's sibling)
-                var uncle_node = current_node[].parent[].parent[].right
-                if uncle_node and uncle_node[]._is_red:
+                var uncle_node = grandparent[].right
+                if uncle_node and uncle_node.value()[]._is_red:
                     # Case 1: Uncle is red - recolor parent, uncle and grandparent
-                    current_node[].parent[]._is_red = False
-                    uncle_node[]._is_red = False
-                    current_node[].parent[].parent[]._is_red = True
-                    current_node = current_node[].parent[].parent
+                    parent[]._is_red = False
+                    uncle_node.value()[]._is_red = False
+                    grandparent[]._is_red = True
+                    current_node = parent[].parent
                 else:
                     # Case 2: Uncle is black and node is a right child
-                    if current_node == current_node[].parent[].right:
-                        current_node = current_node[].parent
+                    if current_node == parent[].right:
+                        current_node = node[].parent
                         self._left_rotate(current_node)
+                        node = current_node.value()
+                        parent = node[].parent.value()
+                        grandparent = parent[].parent.value()
                     # Case 3: Uncle is black and node is a left child
-                    current_node[].parent[]._is_red = False
-                    current_node[].parent[].parent[]._is_red = True
-                    self._right_rotate(current_node[].parent[].parent)
+                    parent[]._is_red = False
+                    grandparent[]._is_red = True
+                    self._right_rotate(parent[].parent)
             else:
                 # Mirror case - parent is right child of grandparent
-                var uncle_node = current_node[].parent[].parent[].left
-                if uncle_node and uncle_node[]._is_red:
+                var uncle_node = grandparent[].left
+                if uncle_node and uncle_node.value()[]._is_red:
                     # Case 1: Uncle is red - recolor
-                    current_node[].parent[]._is_red = False
-                    uncle_node[]._is_red = False
-                    current_node[].parent[].parent[]._is_red = True
-                    current_node = current_node[].parent[].parent
+                    parent[]._is_red = False
+                    uncle_node.value()[]._is_red = False
+                    grandparent[]._is_red = True
+                    current_node = parent[].parent
                 else:
                     # Case 2: Uncle is black and node is a left child
-                    if current_node == current_node[].parent[].left:
-                        current_node = current_node[].parent
+                    if current_node == parent[].left:
+                        current_node = node[].parent
                         self._right_rotate(current_node)
+                        node = current_node.value()
+                        parent = node[].parent.value()
+                        grandparent = parent[].parent.value()
+                    # Case 3: Uncle is black and node is a right child
+                    parent[]._is_red = False
+                    grandparent[]._is_red = True
+                    self._left_rotate(parent[].parent)
 
         # Ensure root is black to maintain red-black tree properties
-        self._root[]._is_red = False
+        self._root.value()[]._is_red = False
 
-    fn __str__(self) -> String:
-        """Returns a string representation of the interval tree.
-
-        Returns:
-            A string representation of the interval tree.
-        """
-        return String.write(self)
-
-    fn __repr__(self) -> String:
-        """Returns a string representation of the interval tree suitable for
-        debugging.
-
-        Returns:
-            A string representation of the interval tree.
-        """
-        return String.write(self)
-
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes the interval tree to a writer.
 
         Args:
@@ -779,7 +741,7 @@ struct IntervalTree[
         self._draw(writer)
 
     @no_inline
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    def write_repr_to(self, mut writer: Some[Writer]):
         """Write the repr of this `IntervalTree` to a writer.
 
         Args:
@@ -787,7 +749,7 @@ struct IntervalTree[
         """
 
         @parameter
-        fn write_fields(mut w: Some[Writer]):
+        def write_fields(mut w: Some[Writer]):
             self._draw(w)
 
         fmt.FormatStruct(writer, "IntervalTree").params(
@@ -795,7 +757,7 @@ struct IntervalTree[
         ).fields[FieldsFn=write_fields]()
 
     @no_inline
-    fn _draw[w: Writer](self, mut writer: w):
+    def _draw[w: Writer](self, mut writer: w):
         """Draws the interval tree in a simple ASCII tree format.
 
         Creates a text representation of the tree using ASCII characters, with each node
@@ -811,7 +773,7 @@ struct IntervalTree[
         self._draw_helper(writer, self._root, "", True)
 
     @no_inline
-    fn _draw_helper[
+    def _draw_helper[
         w: Writer
     ](
         self,
@@ -846,13 +808,13 @@ struct IntervalTree[
         else:
             writer.write("└─")
             next_indent += "| "
-        writer.write(node[], "\n")
+        writer.write(node.value()[], "\n")
         # Recursively draw left and right subtrees
-        self._draw_helper(writer, node[].left, next_indent, False)
-        self._draw_helper(writer, node[].right, next_indent, True)
+        self._draw_helper(writer, node.value()[].left, next_indent, False)
+        self._draw_helper(writer, node.value()[].right, next_indent, True)
 
     @no_inline
-    fn _draw3[w: Writer](self, mut writer: w) raises:
+    def _draw3[w: Writer](self, mut writer: w) raises:
         """Draws the interval tree in a simple ASCII tree format.
 
         Creates a text representation of the tree using ASCII characters, with each node
@@ -883,12 +845,12 @@ struct IntervalTree[
             else:
                 writer.write("└─ ")
                 indent += "|  "
-            writer.write(node[], "\n")
-            work_list.append((node[].left, indent, False))
-            work_list.append((node[].right, indent, True))
+            writer.write(node.value()[], "\n")
+            work_list.append((node.value()[].left, indent, False))
+            work_list.append((node.value()[].right, indent, True))
 
     @no_inline
-    fn _draw2[w: Writer](self, mut writer: w) raises:
+    def _draw2[w: Writer](self, mut writer: w) raises:
         """Draws the interval tree in a visual ASCII art format.
 
         Creates a grid representation of the tree with nodes and connecting branches.
@@ -906,7 +868,7 @@ struct IntervalTree[
             return writer.write("Empty")
 
         # Calculate dimensions needed for the grid
-        var height = self._root[].depth()
+        var height = self._root.value()[].depth()
         var width = 2**height - 1
 
         # Create 2D grid of spaces to hold the tree visualization
@@ -933,7 +895,7 @@ struct IntervalTree[
             var pos_y = level * 3  # Scale y position for branch drawing
 
             # Draw the current node's value
-            var node_str = String(node[])
+            var node_str = String(node.value()[])
             var start_pos = max(
                 0, pos_x - len(node_str) // 2
             )  # Center the node text
@@ -943,16 +905,16 @@ struct IntervalTree[
                 i += 1
 
             # Add drawing left branch to the worklist.
-            if node[].left:
+            if node.value()[].left:
                 for y in range(1, 3):
                     grid[pos_y + y][pos_x - 2 * y + 1] = "/"  # Draw left branch
-                work_list.append((node[].left, level + 1, left, mid))
+                work_list.append((node.value()[].left, level + 1, left, mid))
 
             # Add drawing right branch to the worklist.
-            if node[].right:
+            if node.value()[].right:
                 for y in range(1, 3):
                     grid[pos_y + y][pos_x + 2 * y] = "\\"  # Draw right branch
-                work_list.append((node[].right, level + 1, mid, right))
+                work_list.append((node.value()[].right, level + 1, mid, right))
 
         # Output the completed grid row by row
         for row in grid:
@@ -960,7 +922,7 @@ struct IntervalTree[
             if row_str:
                 writer.write(row_str, "\n")
 
-    fn depth(self) -> Int:
+    def depth(self) -> Int:
         """Returns the depth of the interval tree.
 
         Returns:
@@ -969,9 +931,9 @@ struct IntervalTree[
         if not self._root:
             return 0
 
-        return self._root[].depth()
+        return self._root.value()[].depth()
 
-    fn transplant(
+    def transplant(
         mut self,
         mut u: Self._IntervalNodePointer,
         mut v: Self._IntervalNodePointer,
@@ -982,17 +944,17 @@ struct IntervalTree[
             u: The node to transplant.
             v: The node to transplant to.
         """
-        if not u[].parent:
+        if not u.value()[].parent:
             self._root = v
-        elif u == u[].parent[].left:
-            u[].parent[].left = v
+        elif u == u.value()[].parent.value()[].left:
+            u.value()[].parent.value()[].left = v
         else:
-            u[].parent[].right = v
+            u.value()[].parent.value()[].right = v
 
         if v:
-            v[].parent = u[].parent
+            v.value()[].parent = u.value()[].parent
 
-    fn search(self, interval: Tuple[Self.T, Self.T]) raises -> List[Self.U]:
+    def search(self, interval: Tuple[Self.T, Self.T]) raises -> List[Self.U]:
         """Searches for intervals overlapping with the given tuple.
 
         Args:
@@ -1006,7 +968,7 @@ struct IntervalTree[
         """
         return self.search(Interval(interval[0], interval[1]))
 
-    fn search(self, interval: Interval[Self.T]) raises -> List[Self.U]:
+    def search(self, interval: Interval[Self.T]) raises -> List[Self.U]:
         """Searches for intervals overlapping with the given interval.
 
         Args:
@@ -1020,7 +982,7 @@ struct IntervalTree[
         """
         return self._search_helper(self._root, interval)
 
-    fn _search_helper(
+    def _search_helper(
         self, node: Self._IntervalNodePointer, interval: Interval[Self.T]
     ) raises -> List[Self.U]:
         var result = List[Self.U]()
@@ -1031,17 +993,19 @@ struct IntervalTree[
             var current_node = work_list.pop()
             if not current_node:
                 continue
-            if current_node[].interval.overlaps(interval):
-                result.append(current_node[].data.copy())
+            if current_node.value()[].interval.overlaps(interval):
+                result.append(current_node.value()[].data.copy())
             if (
-                current_node[].left
-                and current_node[].left[].interval.start <= interval.end
+                current_node.value()[].left
+                and current_node.value()[].left.value()[].interval.start
+                <= interval.end
             ):
-                work_list.append(current_node[].left)
+                work_list.append(current_node.value()[].left)
             if (
-                current_node[].right
-                and current_node[].right[].max_end >= interval.start
+                current_node.value()[].right
+                and current_node.value()[].right.value()[].max_end
+                >= interval.start
             ):
-                work_list.append(current_node[].right)
+                work_list.append(current_node.value()[].right)
 
         return result^

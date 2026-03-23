@@ -44,9 +44,9 @@ from dataclasses import asdict, dataclass
 from functools import cache
 from pathlib import Path
 from pprint import pformat
-from subprocess import Popen, TimeoutExpired, check_call, check_output
+from subprocess import DEVNULL, Popen, TimeoutExpired, check_call, check_output
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, TypedDict
 
 import click
 import requests
@@ -75,9 +75,72 @@ EvalResults = dict[str, Any]
 EvalSamples = list[dict[str, Any]]
 
 
-def is_deepseek(model: str) -> bool:
-    """Temporary workaround for large DeepSeek models."""
-    return "deepseek" in model and "lite" not in model
+class ModelAlias(TypedDict):
+    hf_model_path: str
+    max_serve_args: str
+
+
+# Maps alias model names to their real HuggingFace model path and extra
+# MAX serve args. Aliases let the same weights be tested under different
+# configurations while keeping results separate in dashboards.
+# max_serve_args are only applied to MAX frameworks, not vllm/sglang.
+MODEL_ALIASES: dict[str, ModelAlias] = {
+    "meta-llama/llama-3.1-8b-instruct__modulev3": {
+        "hf_model_path": "meta-llama/llama-3.1-8b-instruct",
+        "max_serve_args": "--prefer-module-v3",
+    },
+    "meta-llama/llama-3.2-1b-instruct__modulev3": {
+        "hf_model_path": "meta-llama/llama-3.2-1b-instruct",
+        "max_serve_args": "--prefer-module-v3",
+    },
+    "unsloth/gpt-oss-20b-bf16__modulev3": {
+        "hf_model_path": "unsloth/gpt-oss-20b-bf16",
+        "max_serve_args": "--prefer-module-v3",
+    },
+    "microsoft/phi-3.5-mini-instruct__modulev3": {
+        "hf_model_path": "microsoft/phi-3.5-mini-instruct",
+        "max_serve_args": "--prefer-module-v3",
+    },
+    "microsoft/phi-4__modulev3": {
+        "hf_model_path": "microsoft/phi-4",
+        "max_serve_args": "--prefer-module-v3",
+    },
+    "nvidia/deepseek-v3.1-nvfp4__fp8kv": {
+        "hf_model_path": "nvidia/deepseek-v3.1-nvfp4",
+        "max_serve_args": "--kv-cache-format float8_e4m3fn",
+    },
+    "nvidia/deepseek-v3.1-nvfp4__tpep": {
+        "hf_model_path": "nvidia/deepseek-v3.1-nvfp4",
+        "max_serve_args": "--data-parallel-degree 1",
+    },
+    "nvidia/kimi-k2.5-nvfp4__with_vision": {  # MODELS-1066
+        "hf_model_path": "nvidia/kimi-k2.5-nvfp4",
+        "max_serve_args": "--ep-size 8 --data-parallel-degree 8 --max-batch-input-tokens 4096 --max-num-steps 1 --max-length 262144 --trust-remote-code --device-memory-utilization 0.80 --max-batch-size 1 --no-enable-chunked-prefill --no-enable-overlap-scheduler --no-enable-prefix-caching --force",
+    },
+    "nvidia/kimi-k2.5-nvfp4__no_vision": {
+        "hf_model_path": "nvidia/kimi-k2.5-nvfp4",
+        "max_serve_args": "--enable-prefix-caching --enable-chunked-prefill --max-num-steps 1",
+    },
+    "meta-llama/llama-3.2-3b-instruct__eagle": {
+        "hf_model_path": "meta-llama/llama-3.2-3b-instruct",
+        "max_serve_args": (
+            "--draft-model-path atomicapple0/EAGLE-Llama-3.2-3B-Instruct-bf16 "
+            "--speculative-method eagle "
+            "--num-speculative-tokens 3"
+        ),
+    },
+    "nvidia/kimi-k2.5-nvfp4__dgc-no-vision": {
+        "hf_model_path": "nvidia/kimi-k2.5-nvfp4",
+        "max_serve_args": "--no-enable-prefix-caching --device-graph-capture --max-batch-size 1 --no-enable-chunked-prefill",
+    },
+}
+
+
+def is_huge_moe(model: str) -> bool:
+    """Large MoE models that need expert parallelism instead of tensor parallelism."""
+    if "deepseek" in model and "lite" not in model:
+        return True
+    return any(x in model for x in ["minimax-m", "kimi-k"])
 
 
 def validate_hf_token() -> None:
@@ -130,55 +193,18 @@ def get_gpu_name_and_count() -> tuple[str, int]:
     amd = ["amd-smi", "static", "--json"]
     nv = ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
     try:
-        result = check_output(amd, text=True)
+        result = check_output(amd, text=True, stderr=DEVNULL)
         data = json.loads(result.strip())["gpu_data"]
         return data[0]["asic"]["market_name"], len(data)
     except:
         try:
-            lines = check_output(nv, text=True).strip().split("\n")
+            lines = (
+                check_output(nv, text=True, stderr=DEVNULL).strip().split("\n")
+            )
             return lines[0].strip(), len(lines)
         except:
             logger.warning("nvidia-smi and amd-smi both failed")
             return "N/A", 0
-
-
-VLLM_MAX_MODEL_LEN_CAP = 16384
-
-
-@cache
-def _get_hf_max_model_len(model: str) -> int | None:
-    """Fetch max_position_embeddings from the model's HuggingFace config.json."""
-    revision = _load_hf_repo_lock().get(model)
-    # Use pinned revision if available, otherwise default branch
-    ref = revision or "main"
-    url = f"https://huggingface.co/{model}/resolve/{ref}/config.json"
-    headers = {}
-    hf_token = os.getenv("HF_TOKEN")
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-    try:
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        config = r.json()
-        max_pos = config.get("max_position_embeddings")
-        if max_pos is not None:
-            return int(max_pos)
-        # Some models nest this under text_config (e.g. VLMs)
-        text_config = config.get("text_config", {})
-        max_pos = text_config.get("max_position_embeddings")
-        if max_pos is not None:
-            return int(max_pos)
-    except Exception as e:
-        logger.warning(f"Could not fetch config.json for {model}: {e}")
-    return None
-
-
-def _vllm_max_model_len(model: str) -> int:
-    """Return the --max-model-len value for vLLM, capped to the model's native limit."""
-    native = _get_hf_max_model_len(model)
-    if native is not None:
-        return min(VLLM_MAX_MODEL_LEN_CAP, native)
-    return VLLM_MAX_MODEL_LEN_CAP
 
 
 def server_is_ready() -> bool:
@@ -199,14 +225,26 @@ def get_server_cmd(
     sglang_backend = "triton" if "b200" in gpu_model.lower() else "fa3"
     SGLANG = f"sglang.launch_server --attention-backend {sglang_backend} --mem-fraction-static 0.8"
     # limit-mm-per-prompt.video is for InternVL3 on B200
-    max_model_len = _vllm_max_model_len(model)
-    VLLM = f"vllm.entrypoints.openai.api_server --max-model-len {max_model_len} --limit-mm-per-prompt.video 0"
+    VLLM = "vllm.entrypoints.openai.api_server --max-model-len auto --limit-mm-per-prompt.video 0"
     MAX = "max.entrypoints.pipelines serve"
 
-    is_huge_model = is_deepseek(model)
+    is_huge_model = is_huge_moe(model)
     if is_huge_model and framework != "sglang":
-        MAX += f" --device-memory-utilization 0.8 --devices gpu:{','.join(str(i) for i in range(gpu_count))} --ep-size {gpu_count} --data-parallel-degree {gpu_count} --max-batch-input-tokens 1024"
-        VLLM += f" --enable-chunked-prefill --gpu-memory-utilization 0.8 --data-parallel-size={gpu_count} --enable-expert-parallel"
+        MAX += f" --device-memory-utilization 0.8 --devices gpu:{','.join(str(i) for i in range(gpu_count))} --ep-size {gpu_count} --max-batch-input-tokens 1024"
+        VLLM += " --enable-chunked-prefill --gpu-memory-utilization 0.8 --enable-expert-parallel"
+        # resolve attention parallelism strategy
+        if "--data-parallel-degree 1" not in serve_extra_args:
+            # default to DP Attn + EP MoE strategy
+            MAX += f" --data-parallel-degree {gpu_count}"
+            VLLM += f" --data-parallel-size={gpu_count}"
+        else:
+            # TP Attn + EP MoE strategy
+            VLLM += f" --tensor-parallel-size={gpu_count}"
+
+        # Remove once vLLM >= 0.17 (which includes vllm-project/vllm#34673).
+        if "minimax-m2" in model:
+            os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "0"
+            VLLM += " --attention-backend FLASH_ATTN"
         # Have not been successful in getting SGLang to work with R1 yet
     elif gpu_count > 1:
         MAX += f" --devices gpu:{','.join(str(i) for i in range(gpu_count))}"
@@ -232,9 +270,6 @@ def get_server_cmd(
     # so we need to enable penalties on the server
     if "gpt-oss" in model and framework in ["max-ci", "max"]:
         cmd += ["--enable-penalties"]
-
-    if framework in ["max-ci", "max"] and "tbmod" in model:
-        cmd += ["--prefer-module-v3"]
 
     revision = _load_hf_repo_lock().get(model)
     if revision:
@@ -283,6 +318,7 @@ def call_eval(
             "gpt-oss",
             "internvl3_5",
             "qwen3",
+            "kimi-k2.5",
         )
     )
     # Reasoning models needs extra tokens for .. reasoning
@@ -293,6 +329,10 @@ def call_eval(
     # in CI, we add a repetition penalty which helps prevent the loop
     if "gpt-oss" in model:
         extra_gen_kwargs = extra_gen_kwargs + ",repetition_penalty=1.1"
+
+    if "kimi-k2.5" in model:  # MODELS-1066
+        max_concurrent = 1
+        num_questions = 30
 
     interpreter = sys.executable if _inside_bazel() else ".venv-eval/bin/python"
 
@@ -584,9 +624,16 @@ def smoke_test(
         output_path = Path(build_workspace) / output_path
 
     model = hf_model_path.lower().strip()
+    alias = MODEL_ALIASES.get(model)
+    hf_model_path = alias["hf_model_path"] if alias else model
+    if alias and framework in ["max-ci", "max"]:
+        serve_extra_args = (
+            f"{serve_extra_args} {alias['max_serve_args']}".strip()
+        )
+
     cmd = get_server_cmd(
         framework,
-        model,
+        hf_model_path,
         serve_extra_args=serve_extra_args,
     )
 
@@ -597,15 +644,19 @@ def smoke_test(
             "gemma-3",
             "idefics",
             "internvl",
+            "kimi-k2",
             "olmocr",
             "pixtral",
             "qwen2.5-vl",
             "qwen3-vl",
             "vision",
+            "kimi-vl",
         )
     )
     # 1b is non-vision
     if "gemma-3-1b" in model:
+        is_vision_model = False
+    if "no-vision" in model or model.endswith("__no_vision"):
         is_vision_model = False
 
     tasks = [TEXT_TASK]
@@ -617,7 +668,7 @@ def smoke_test(
     all_samples = []
     if disable_timeouts:
         timeout = sys.maxsize
-    elif is_deepseek(model):
+    elif is_huge_moe(model):
         timeout = 1800
     else:
         timeout = 900
@@ -628,9 +679,11 @@ def smoke_test(
         write_github_output("startup_time", f"{startup_time:.2f}")
 
         for task in tasks:
-            test_single_request(model, task, disable_timeouts=disable_timeouts)
+            test_single_request(
+                hf_model_path, task, disable_timeouts=disable_timeouts
+            )
             result, samples = call_eval(
-                model,
+                hf_model_path,
                 task,
                 max_concurrent=max_concurrent,
                 num_questions=num_questions,

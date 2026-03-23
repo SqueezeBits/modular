@@ -40,10 +40,17 @@ trait Equatable(ImplicitlyDestructible):
     Note: The default implementation performs memberwise equality comparison.
     This may not be appropriate for types containing floating-point fields
     (due to NaN semantics) or types requiring custom equality logic.
+
+    Note: The default reflection-based implementation iterates over all fields
+    at compile time. For mutually recursive types (e.g., struct `A` has a field
+    of type `List[B]` and struct `B` has a field of type `A`), this creates an
+    infinite monomorphization cycle that causes the compiler to hang. To fix
+    this, provide an explicit `__eq__()` implementation for at least one type
+    in the cycle.
     """
 
     @always_inline
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         """Define whether two instances of the object are equal to each other.
 
         The default implementation uses reflection to compare all fields for
@@ -76,7 +83,7 @@ trait Equatable(ImplicitlyDestructible):
         return True
 
     @always_inline
-    fn __ne__(self, other: Self) -> Bool:
+    def __ne__(self, other: Self) -> Bool:
         """Define whether two instances of the object are not equal to each
         other.
 
@@ -100,7 +107,7 @@ trait Comparable(Equatable):
     types, it is recommended to override all the default implementations.
     """
 
-    fn __lt__(self, rhs: Self) -> Bool:
+    def __lt__(self, rhs: Self) -> Bool:
         """Define whether `self` is less than `rhs`.
 
         Args:
@@ -112,7 +119,7 @@ trait Comparable(Equatable):
         ...
 
     @always_inline
-    fn __gt__(self, rhs: Self) -> Bool:
+    def __gt__(self, rhs: Self) -> Bool:
         """Define whether `self` is greater than `rhs`.
 
         Args:
@@ -124,7 +131,7 @@ trait Comparable(Equatable):
         return rhs < self
 
     @always_inline
-    fn __le__(self, rhs: Self) -> Bool:
+    def __le__(self, rhs: Self) -> Bool:
         """Define whether `self` is less than or equal to `rhs`.
 
         Args:
@@ -136,7 +143,7 @@ trait Comparable(Equatable):
         return not rhs < self
 
     @always_inline
-    fn __ge__(self, rhs: Self) -> Bool:
+    def __ge__(self, rhs: Self) -> Bool:
         """Define whether `self` is greater than or equal to `rhs`.
 
         Args:

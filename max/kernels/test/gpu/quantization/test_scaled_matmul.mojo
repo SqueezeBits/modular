@@ -17,9 +17,6 @@ from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
 from layout._fillers import random
 from linalg.fp8_quantization import matmul_dynamic_scaled_fp8
 from linalg.fp8_quantization import naive_blockwise_scaled_fp8_matmul
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.testing import assert_almost_equal
 from std.utils.index import Index, IndexList
 
@@ -27,7 +24,7 @@ from std.utils.index import Index, IndexList
 comptime to_dim[value: Optional[Int]] = value.value() if value else Dim()
 
 
-fn test_matmul_dynamic_scaled_fp8[
+def test_matmul_dynamic_scaled_fp8[
     in_dtype: DType,
     out_dtype: DType,
     scales_dtype: DType,
@@ -36,15 +33,17 @@ fn test_matmul_dynamic_scaled_fp8[
     N: Optional[Int],
     K: Optional[Int],
 ](ctx: DeviceContext, m: Int, n: Int, k: Int) raises:
-    comptime static_a_shape = DimList(to_dim[M], to_dim[K])
-    comptime static_b_shape = DimList(
-        to_dim[N], to_dim[K]
-    ) if transpose_b else DimList(to_dim[K], to_dim[N])
-    comptime static_c_shape = DimList(to_dim[M], to_dim[N])
-    comptime static_a_scales_shape = DimList(Dim(1), to_dim[M])
-    comptime static_b_scales_shape = DimList(
-        to_dim[N], Dim(1)
-    ) if transpose_b else DimList(Dim(1), to_dim[N])
+    comptime static_a_shape = DimList[to_dim[M], to_dim[K]]()
+    comptime static_b_shape = DimList[
+        to_dim[N] if transpose_b else to_dim[K],
+        to_dim[K] if transpose_b else to_dim[N],
+    ]()
+    comptime static_c_shape = DimList[to_dim[M], to_dim[N]]()
+    comptime static_a_scales_shape = DimList[Dim(1), to_dim[M]]()
+    comptime static_b_scales_shape = DimList[
+        to_dim[N] if transpose_b else Dim(1),
+        Dim(1) if transpose_b else to_dim[N],
+    ]()
 
     var dynamic_a_shape = IndexList[2](M.or_else(m), K.or_else(k))
     var dynamic_b_shape = IndexList[2](
@@ -79,16 +78,12 @@ fn test_matmul_dynamic_scaled_fp8[
     ) if transpose_b else Layout.row_major(1, N.or_else(UNKNOWN_VALUE))
 
     # Host allocations
-    var a_host_ptr = UnsafePointer[Scalar[in_dtype]].alloc(a_size)
-    var b_host_ptr = UnsafePointer[Scalar[in_dtype]].alloc(b_size)
-    var c_host_ptr = UnsafePointer[Scalar[out_dtype]].alloc(c_size)
-    var a_scales_host_ptr = UnsafePointer[Scalar[scales_dtype]].alloc(
-        a_scales_size
-    )
-    var b_scales_host_ptr = UnsafePointer[Scalar[scales_dtype]].alloc(
-        b_scales_size
-    )
-    var c_host_ref_ptr = UnsafePointer[Scalar[DType.float32]].alloc(c_size)
+    var a_host_ptr = alloc[Scalar[in_dtype]](a_size)
+    var b_host_ptr = alloc[Scalar[in_dtype]](b_size)
+    var c_host_ptr = alloc[Scalar[out_dtype]](c_size)
+    var a_scales_host_ptr = alloc[Scalar[scales_dtype]](a_scales_size)
+    var b_scales_host_ptr = alloc[Scalar[scales_dtype]](b_scales_size)
+    var c_host_ref_ptr = alloc[Scalar[DType.float32]](c_size)
 
     var a_host = LayoutTensor[in_dtype, a_layout](
         a_host_ptr,
@@ -135,58 +130,57 @@ fn test_matmul_dynamic_scaled_fp8[
     ctx.enqueue_copy(a_scales_device, a_scales_host_ptr)
     ctx.enqueue_copy(b_scales_device, b_scales_host_ptr)
 
-    @parameter
-    fn stride_from_shape[shape: DimList]() -> DimList:
-        comptime assert len(shape) == 2, "rank must be 2"
-        return DimList(shape.at[1](), 1)
-
     var a_ndbuffer = NDBuffer[
+        rank=2,
         in_dtype,
-        2,
         ImmutAnyOrigin,
         static_a_shape,
-        stride_from_shape[static_a_shape](),
+        static_a_shape.get_row_major_strides(),
     ](
         a_device.unsafe_ptr(),
         IndexList[2](m, k),
     )
     var b_ndbuffer = NDBuffer[
+        rank=2,
         in_dtype,
-        2,
         ImmutAnyOrigin,
         static_b_shape,
-        stride_from_shape[static_b_shape](),
+        static_b_shape.get_row_major_strides(),
     ](
         b_device.unsafe_ptr(),
         IndexList[2](n, k) if transpose_b else IndexList[2](k, n),
     )
     var c_ndbuffer = NDBuffer[
-        out_dtype, 2, _, static_c_shape, stride_from_shape[static_c_shape]()
+        rank=2,
+        out_dtype,
+        _,
+        static_c_shape,
+        static_c_shape.get_row_major_strides(),
     ](
         c_device.unsafe_ptr(),
         IndexList[2](m, n),
     )
     var a_scales_ndbuffer = NDBuffer[
+        rank=2,
         scales_dtype,
-        2,
         _,
         static_a_scales_shape,
-        stride_from_shape[static_a_scales_shape](),
+        static_a_scales_shape.get_row_major_strides(),
     ](
         a_scales_device.unsafe_ptr(),
         IndexList[2](1, m),
     )
     var b_scales_ndbuffer = NDBuffer[
+        rank=2,
         scales_dtype,
-        2,
         _,
         static_b_scales_shape,
-        stride_from_shape[static_b_scales_shape](),
+        static_b_scales_shape.get_row_major_strides(),
     ](
         b_scales_device.unsafe_ptr(),
         IndexList[2](n, 1) if transpose_b else IndexList[2](1, n),
     )
-    var c_ref_ndbuffer = NDBuffer[DType.float32, 2, _, static_c_shape](
+    var c_ref_ndbuffer = NDBuffer[rank=2, DType.float32, _, static_c_shape](
         c_device_ref.unsafe_ptr(),
         IndexList[2](m, n),
     )

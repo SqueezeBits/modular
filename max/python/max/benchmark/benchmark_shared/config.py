@@ -17,7 +17,7 @@ import argparse
 import enum
 import logging
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,7 +25,7 @@ from typing import Any
 import yaml
 from pydantic import Field
 
-from .datasets import DATASET_REGISTRY, DatasetMode
+from .datasets import DATASET_REGISTRY, DatasetMode, DistributionParameter
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +33,14 @@ from max.config import ConfigFileModel, MAXConfig, deep_merge_max_configs
 
 
 class Backend(str, enum.Enum):
-    vllm = "vllm"
-    vllm_chat = "vllm-chat"
     modular = "modular"
     modular_chat = "modular-chat"
     sglang = "sglang"
     sglang_chat = "sglang-chat"
     trtllm = "trtllm"
     trtllm_chat = "trtllm-chat"
+    vllm = "vllm"
+    vllm_chat = "vllm-chat"
 
 
 class Endpoint(str, enum.Enum):
@@ -48,6 +48,16 @@ class Endpoint(str, enum.Enum):
     chat_completions = "/v1/chat/completions"
     ensemble_generate_stream = "/v2/models/ensemble/generate_stream"
     responses = "/v1/responses"
+
+
+CACHE_RESET_ENDPOINT_MAP: Mapping[Backend, str] = {
+    Backend.modular: "/reset_prefix_cache",
+    Backend.modular_chat: "/reset_prefix_cache",
+    Backend.vllm: "/reset_prefix_cache",
+    Backend.vllm_chat: "/reset_prefix_cache",
+    Backend.sglang: "/flush_cache",
+    Backend.sglang_chat: "/flush_cache",
+}
 
 
 class BenchmarkTask(str, enum.Enum):
@@ -246,7 +256,6 @@ class BaseBenchmarkConfig(MAXConfig):
             "benchmark_task": [task.value for task in BenchmarkTask],
             "dataset_name": list(DATASET_REGISTRY.keys()),
             "dataset_mode": [mode.value for mode in DatasetMode],
-            "random_distribution_type": ["uniform", "normal", "gamma"],
         }
 
     @classmethod
@@ -277,7 +286,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
             "group_description": "Configuration for backend selection and API endpoints",
         },
     )
-    """Backend to use for benchmarking. Choices: vllm, vllm-chat, modular, modular-chat, sglang, sglang-chat"""
+    """Backend to use for benchmarking. Choices: modular, modular-chat, sglang, sglang-chat, trtllm, trtllm-chat, vllm, vllm-chat"""
 
     base_url: str | None = field(
         default=None, metadata={"group": "Backend and API Configuration"}
@@ -338,11 +347,13 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
     )
     """Number of multiturn chat sessions."""
 
-    delay_between_chat_turns: float | str | None = field(
+    delay_between_chat_turns: DistributionParameter | None = field(
         default=None, metadata={"group": "Workload Configuration"}
     )
-    """Delay between chat turns in ms. Accepts a float for a constant delay,
-    or a distribution string: 'N(mean,std)' for normal, 'U(lower,upper)' for uniform or 'G(shape,scale)' for gamma."""
+    """Delay between chat turns in milliseconds. Accepts a float or int for a constant delay,
+    or a distribution string: 'N(mean,std)' for normal, 'U(lower,upper)' for continuous uniform,
+    'DU(lower,upper)' for discrete uniform, 'G(shape,scale)' for gamma, or 'LN(mean,std)' for
+    log-normal."""
 
     # Output control (serving-specific extensions)
     output_lengths: str | None = field(
@@ -418,15 +429,23 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
     )
     """Burstiness factor (1.0 = Poisson process)."""
 
-    skip_first_n_requests: int = field(
-        default=0, metadata={"group": "Traffic Control"}
+    skip_first_n_requests: int | None = field(
+        default=None, metadata={"group": "Traffic Control"}
     )
-    """Skip first N requests for measurements."""
+    """Skip first N requests for measurements.
 
-    skip_last_n_requests: int = field(
-        default=0, metadata={"group": "Traffic Control"}
+    None = auto-set to max_concurrency when request_rate=inf.
+    0 = explicitly no skipping.
+    """
+
+    skip_last_n_requests: int | None = field(
+        default=None, metadata={"group": "Traffic Control"}
     )
-    """Skip last N requests for measurements."""
+    """Skip last N requests for measurements.
+
+    None = auto-set to max_concurrency when request_rate=inf.
+    0 = explicitly no skipping.
+    """
 
     chat_warmup_delay_ms: float = field(
         default=0.0, metadata={"group": "Traffic Control"}
@@ -458,32 +477,22 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
     obfuscated_conversations_shuffle: bool = field(
         default=False, metadata={"group": "Dataset-Specific Parameters"}
     )
-    random_coefficient_of_variation: str = field(
-        default="0.3,0.7", metadata={"group": "Dataset-Specific Parameters"}
-    )
-    random_distribution_type: str = field(
-        default="normal",  # choices: uniform, normal
-        metadata={"group": "Dataset-Specific Parameters"},
-    )
-    random_first_turn_ratio: float = field(
-        default=1.0, metadata={"group": "Dataset-Specific Parameters"}
-    )
     random_image_count: int = field(
         default=0, metadata={"group": "Dataset-Specific Parameters"}
     )
     random_image_size: str = field(
         default="", metadata={"group": "Dataset-Specific Parameters"}
     )
-    random_input_len: int = field(
+    random_input_len: DistributionParameter = field(
         default=1024, metadata={"group": "Dataset-Specific Parameters"}
     )
     random_max_num_unique_sys_prompt: int = field(
         default=1, metadata={"group": "Dataset-Specific Parameters"}
     )
-    random_num_turns: int = field(
+    random_num_turns: DistributionParameter = field(
         default=1, metadata={"group": "Dataset-Specific Parameters"}
     )
-    random_output_len: int = field(
+    random_output_len: DistributionParameter = field(
         default=128, metadata={"group": "Dataset-Specific Parameters"}
     )
     random_sys_prompt_ratio: float = field(
@@ -587,7 +596,7 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
         # Get base help and extend with serving-specific parameters
         base_help = BaseBenchmarkConfig.help()
         serving_help = {
-            "backend": "Backend to use for benchmarking. Choices: vllm, vllm-chat, modular, modular-chat, sglang, sglang-chat",
+            "backend": "Backend to use for benchmarking. Choices: modular, modular-chat, sglang, sglang-chat, trtllm, trtllm-chat, vllm, vllm-chat",
             "base_url": "Server or API base url if not using http host and port.",
             "host": "Server host.",
             "port": "Server port.",
@@ -610,8 +619,8 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
             "image_seed": "Optional deterministic seed for pixel generation.",
             "request_rate": "Requests per second (finite rate for realistic benchmarking).",
             "burstiness": "Burstiness factor (1.0 = Poisson process).",
-            "skip_first_n_requests": "Skip first N requests for measurements.",
-            "skip_last_n_requests": "Skip last N requests for measurements.",
+            "skip_first_n_requests": "Skip first N requests for measurements. Omit to auto-set to max_concurrency; pass 0 to disable.",
+            "skip_last_n_requests": "Skip last N requests for measurements. Omit to auto-set to max_concurrency; pass 0 to disable.",
             "chat_warmup_delay_ms": "Delay between starting chat sessions.",
             "sonnet_input_len": "Number of input tokens per request, used only for sonnet dataset.",
             "sonnet_prefix_len": "Number of prefix tokens per request, used only for sonnet dataset.",
@@ -620,14 +629,11 @@ class ServingBenchmarkConfig(BaseBenchmarkConfig):
             "obfuscated_conversations_average_output_len": "Average output length for obfuscated-conversations dataset when output_lengths is not provided.",
             "obfuscated_conversations_coefficient_of_variation": "Coefficient of variation for output length for obfuscated-conversations dataset when output_lengths is not provided.",
             "obfuscated_conversations_shuffle": "Shuffle the obfuscated-conversations dataset.",
-            "random_coefficient_of_variation": "Coefficient of variation for input/output length, used only for random sampling.",
-            "random_distribution_type": "Type of probability distribution for sampled input/output length. Choices: uniform, normal, gamma",
-            "random_first_turn_ratio": "Ratio of the length of the first turn to the length of subsequent turns.",
             "random_image_size": "Size of random images to generate.",
-            "random_input_len": "Number of input tokens per request, used only for random sampling.",
+            "random_input_len": "Number of input tokens per request, used only for random sampling. Use ';' to separate first-turn and remaining-turn distributions for multiturn.",
             "random_max_num_unique_sys_prompt": "Maximum number of unique system prompts, used only for random sampling.",
             "random_num_turns": "Number of turns per session, used only for random sampling and --num-chat-sessions.",
-            "random_output_len": "Number of output tokens per request, used only for random sampling.",
+            "random_output_len": "Number of output tokens per request, used only for random sampling. Use ';' to separate first-turn and remaining-turn distributions for multiturn.",
             "random_sys_prompt_ratio": "Ratio to determine the system prompt length, used only for random sampling.",
             "skip_test_prompt": "Skip the test prompt. Useful when doing external profiling.",
             "collect_gpu_stats": "Enable GPU stats collection for serving benchmarks.",

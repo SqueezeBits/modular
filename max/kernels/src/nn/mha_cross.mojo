@@ -18,8 +18,8 @@ from std.algorithm.functional import vectorize
 from std.gpu import block_idx, global_idx
 from std.gpu.host import DeviceContext, DeviceBuffer
 from kv_cache.types import KVCacheT
-from layout import Coord, Idx, TileTensor, row_major
-from layout.tile_layout import Layout, TensorLayout
+from layout import Coord, Idx, TensorLayout, TileTensor, row_major
+from layout.tile_layout import Layout
 from nn.mha import MHAConfig, _kernel_mask
 from nn.mha_mask import MHAMask
 from nn.softmax import _softmax_gpu
@@ -29,7 +29,7 @@ from std.utils.numerics import get_accum_type
 
 
 @always_inline
-fn _bmm0_bs[
+def _bmm0_bs[
     QLayoutType: TensorLayout,
     KVLayoutType: TensorLayout,
     //,
@@ -86,8 +86,8 @@ fn _bmm0_bs[
     # num_heads * kv_max_seq_len * batch * depth + depth * head
     num_keys = cur_kv_len + k_cache.cache_length(Int(batch))
 
-    debug_assert(cur_kv_len <= kv_max_seq_len, "Invalid cur_kv_len")
-    debug_assert(num_keys <= padded_num_keys, "Invalid max_cache_size")
+    assert cur_kv_len <= kv_max_seq_len, "Invalid cur_kv_len"
+    assert num_keys <= padded_num_keys, "Invalid max_cache_size"
 
     if x >= UInt(kv_max_seq_len + max_cache_size) or y >= UInt(q_max_seq_len):
         return
@@ -107,7 +107,7 @@ fn _bmm0_bs[
             Int(batch), Int(x), kv_head, 0
         )
 
-        fn accum_fn[width: Int](offset: Int) unified {mut}:
+        def accum_fn[width: Int](offset: Int) unified {mut}:
             comptime alignment = align_of[SIMD[p_type, width]]()
             var q_val = q.load[width=width, alignment=alignment](
                 y * UInt(num_heads) * UInt(depth) + UInt(offset)
@@ -137,7 +137,7 @@ fn _bmm0_bs[
 
 
 @always_inline
-fn _bmm1_bs[
+def _bmm1_bs[
     QLayoutType: TensorLayout,
     KVLayoutType: TensorLayout,
     //,
@@ -187,8 +187,8 @@ fn _bmm1_bs[
     kv_seq_end = Int(kv_input_row_offsets[batch + 1])
     cur_kv_len = kv_seq_end - kv_seq_start
 
-    debug_assert(cur_query_len <= q_max_seq_len, "Invalid cur_query_len")
-    debug_assert(cur_kv_len <= kv_max_seq_len, "Invalid cur_kv_len")
+    assert cur_query_len <= q_max_seq_len, "Invalid cur_query_len"
+    assert cur_kv_len <= kv_max_seq_len, "Invalid cur_kv_len"
 
     if x >= UInt(depth) or y >= UInt(cur_query_len):
         return
@@ -217,7 +217,7 @@ fn _bmm1_bs[
 # ===-----------------------------------------------------------------------===#
 
 
-fn mha_cross_gpu_naive[
+def mha_cross_gpu_naive[
     cache_t: KVCacheT,
     mask_t: MHAMask,
     dtype: DType,
@@ -298,7 +298,9 @@ fn mha_cross_gpu_naive[
             (Idx(batch_size * num_heads), Idx(q_max_seq_len), Idx(num_keys))
         ),
     )
-    var q_device = DeviceBuffer[q_type](ctx, q.ptr, q.numel(), owning=False)
+    var q_device = DeviceBuffer[q_type](
+        ctx, q.ptr, q.num_elements(), owning=False
+    )
 
     comptime kernel_0 = _bmm0_bs[
         QLayoutType=q.LayoutType,
@@ -333,11 +335,11 @@ fn mha_cross_gpu_naive[
 
     @parameter
     @__copy_capture(p_buffer)
-    fn input_fn_device[
+    def input_fn_device[
         _simd_width: Int, _rank: Int
     ](coords: IndexList[_rank]) -> SIMD[p_type, _simd_width]:
         var p_coord = Coord(coords)
-        comptime assert p_coord.flat_rank == p_buffer.flat_rank
+        comptime assert p_buffer.flat_rank >= p_coord.flat_rank
         return p_buffer.load[width=_simd_width](p_coord)
 
     _softmax_gpu[p_type, 1, 3, input_fn_device](
@@ -347,7 +349,7 @@ fn mha_cross_gpu_naive[
         ctx,
     )
     var output_device = DeviceBuffer[output.dtype](
-        ctx, output.ptr, output.numel(), owning=False
+        ctx, output.ptr, output.num_elements(), owning=False
     )
 
     comptime kernel_1 = _bmm1_bs[

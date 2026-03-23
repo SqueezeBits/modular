@@ -21,15 +21,17 @@ import pytest
 from max.dtype import DType
 from max.graph import BufferType, DeviceRef, Graph, TensorType, TensorValue
 from max.nn import (
-    Float8InputScaleSpec,
-    Float8ScaleGranularity,
-    Float8ScaleOrigin,
-    Float8WeightScaleSpec,
+    InputScaleSpec,
+    ScaleGranularity,
+    ScaleOrigin,
+    WeightScaleSpec,
+)
+from max.nn.kernels import (
+    _fused_qkv_ragged_matmul_scaled_float8 as fused_qkv_ragged_matmul_scaled_float8,
 )
 from max.nn.kernels import (
     batched_dynamic_scaled_fp8_matmul,
     dynamic_scaled_matmul,
-    fused_qkv_ragged_matmul_scaled_float8,
     grouped_dynamic_scaled_fp8_matmul,
     matmul_k_cache_ragged_scaled_float8,
 )
@@ -38,15 +40,15 @@ from max.nn.kv_cache import KVCacheParams, PagedCacheValues
 
 class DynamicScaledMatmul:
     return_type: DType
-    input_scale_spec: Float8InputScaleSpec
-    weight_scale_spec: Float8WeightScaleSpec
+    input_scale_spec: InputScaleSpec
+    weight_scale_spec: WeightScaleSpec
     """Return type of the `dynamic_scaled_matmul` custom op."""
 
     def __init__(
         self,
         return_type: DType,
-        input_scale_spec: Float8InputScaleSpec,
-        weight_scale_spec: Float8WeightScaleSpec,
+        input_scale_spec: InputScaleSpec,
+        weight_scale_spec: WeightScaleSpec,
     ) -> None:
         self.return_type = return_type
         self.input_scale_spec = input_scale_spec
@@ -94,13 +96,13 @@ def test_dynamic_scaled_matmul_rowwise() -> None:
             b,
             a_scales,
             b_scales,
-            input_scale_spec=Float8InputScaleSpec(
-                granularity=Float8ScaleGranularity.COLWISE,
-                origin=Float8ScaleOrigin.DYNAMIC,
+            input_scale_spec=InputScaleSpec(
+                granularity=ScaleGranularity.COLWISE,
+                origin=ScaleOrigin.DYNAMIC,
                 dtype=DType.bfloat16,
             ),
-            weight_scale_spec=Float8WeightScaleSpec(
-                granularity=Float8ScaleGranularity.ROWWISE,
+            weight_scale_spec=WeightScaleSpec(
+                granularity=ScaleGranularity.ROWWISE,
                 dtype=DType.bfloat16,
             ),
         )
@@ -159,13 +161,13 @@ def test_dynamic_scaled_matmul_dtype_mismatch(
             "dynamic_scaled_matmul",
             forward=DynamicScaledMatmul(
                 return_type=DType.bfloat16,
-                input_scale_spec=Float8InputScaleSpec(
-                    granularity=Float8ScaleGranularity.COLWISE,
-                    origin=Float8ScaleOrigin.DYNAMIC,
+                input_scale_spec=InputScaleSpec(
+                    granularity=ScaleGranularity.COLWISE,
+                    origin=ScaleOrigin.DYNAMIC,
                     dtype=a_scales_dtype,
                 ),
-                weight_scale_spec=Float8WeightScaleSpec(
-                    granularity=Float8ScaleGranularity.ROWWISE,
+                weight_scale_spec=WeightScaleSpec(
+                    granularity=ScaleGranularity.ROWWISE,
                     dtype=b_scales_dtype,
                 ),
             ),
@@ -695,14 +697,14 @@ def test_grouped_dynamic_scaled_fp8_matmul_valid() -> None:
             expert_start_indices.tensor,
             expert_ids.tensor,
             expert_usage_stats_host.tensor,
-            input_scale_spec=Float8InputScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
-                origin=Float8ScaleOrigin.DYNAMIC,
+            input_scale_spec=InputScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
+                origin=ScaleOrigin.DYNAMIC,
                 dtype=DType.float32,
                 block_size=(1, 128),
             ),
-            weight_scale_spec=Float8WeightScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
+            weight_scale_spec=WeightScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
                 dtype=DType.float32,
                 block_size=(128, 128),
             ),
@@ -757,14 +759,14 @@ def test_grouped_dynamic_scaled_fp8_matmul_invalid() -> None:
             expert_start_indices.tensor,
             expert_ids.tensor,
             expert_usage_stats_host.tensor,
-            input_scale_spec=Float8InputScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
-                origin=Float8ScaleOrigin.DYNAMIC,
+            input_scale_spec=InputScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
+                origin=ScaleOrigin.DYNAMIC,
                 dtype=DType.float32,
                 block_size=(1, 128),
             ),
-            weight_scale_spec=Float8WeightScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
+            weight_scale_spec=WeightScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
                 dtype=DType.float32,
                 block_size=(128, 128),
             ),
@@ -884,14 +886,14 @@ def test_batched_dynamic_scaled_fp8_matmul_valid() -> None:
             weight.tensor,
             a_scales.tensor,
             b_scales.tensor,
-            input_scale_spec=Float8InputScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
-                origin=Float8ScaleOrigin.DYNAMIC,
+            input_scale_spec=InputScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
+                origin=ScaleOrigin.DYNAMIC,
                 dtype=DType.float32,
                 block_size=(1, 128),
             ),
-            weight_scale_spec=Float8WeightScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
+            weight_scale_spec=WeightScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
                 dtype=DType.float32,
                 block_size=(128, 128),
             ),
@@ -934,14 +936,14 @@ def test_batched_dynamic_scaled_fp8_matmul_invalid() -> None:
             weight.tensor,
             a_scales.tensor,
             b_scales.tensor,
-            input_scale_spec=Float8InputScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
-                origin=Float8ScaleOrigin.DYNAMIC,
+            input_scale_spec=InputScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
+                origin=ScaleOrigin.DYNAMIC,
                 dtype=DType.float32,
                 block_size=(1, 128),
             ),
-            weight_scale_spec=Float8WeightScaleSpec(
-                granularity=Float8ScaleGranularity.BLOCK,
+            weight_scale_spec=WeightScaleSpec(
+                granularity=ScaleGranularity.BLOCK,
                 dtype=DType.float32,
                 block_size=(128, 128),
             ),

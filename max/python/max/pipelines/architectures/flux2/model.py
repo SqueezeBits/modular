@@ -14,9 +14,9 @@
 from collections.abc import Callable
 from typing import Any
 
-from max.driver import Device
-from max.experimental import functional as F
-from max.experimental.tensor import Tensor
+from max.driver import Buffer, Device
+from max.engine import InferenceSession, Model
+from max.graph import Graph
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
@@ -32,14 +32,11 @@ class Flux2TransformerModel(ComponentModel):
         encoding: SupportedEncoding,
         devices: list[Device],
         weights: Weights,
+        session: InferenceSession,
     ) -> None:
-        super().__init__(
-            config,
-            encoding,
-            devices,
-            weights,
-        )
-        self.config = Flux2Config.generate(
+        super().__init__(config, encoding, devices, weights)
+        self.session = session
+        self.config = Flux2Config.initialize_from_config(
             config,
             encoding,
             devices,
@@ -48,7 +45,7 @@ class Flux2TransformerModel(ComponentModel):
 
     def load_model(self) -> Callable[..., Any]:
         state_dict = {key: value.data() for key, value in self.weights.items()}
-        # Klein/distilled checkpoints can omit guidance embedder weights.
+
         has_guidance_embedder = any(
             "time_guidance_embed.guidance_embedder." in k for k in state_dict
         )
@@ -61,22 +58,37 @@ class Flux2TransformerModel(ComponentModel):
                 )
             else:
                 self.config.guidance_embeds = False
-        with F.lazy():
-            flux = Flux2Transformer2DModel(self.config)
-            flux.to(self.devices[0])
-        self.model = flux.compile(*flux.input_types(), weights=state_dict)
-        return self.model
+
+        nn_model = Flux2Transformer2DModel(self.config)
+        nn_model.load_state_dict(state_dict, weight_alignment=1, strict=True)
+        self.state_dict = nn_model.state_dict()
+
+        with Graph(
+            "flux2_transformer",
+            input_types=nn_model.input_types(),
+        ) as graph:
+            outputs = nn_model(*(value.tensor for value in graph.inputs))
+            if isinstance(outputs, tuple):
+                graph.output(*outputs)
+            else:
+                graph.output(outputs)
+
+        self.model: Model = self.session.load(
+            graph,
+            weights_registry=self.state_dict,
+        )
+        return self.model.execute
 
     def __call__(
         self,
-        hidden_states: Tensor,
-        encoder_hidden_states: Tensor,
-        timestep: Tensor,
-        img_ids: Tensor,
-        txt_ids: Tensor,
-        guidance: Tensor,
-    ) -> Any:
-        return self.model(
+        hidden_states: Buffer,
+        encoder_hidden_states: Buffer,
+        timestep: Buffer,
+        img_ids: Buffer,
+        txt_ids: Buffer,
+        guidance: Buffer,
+    ) -> list[Buffer]:
+        return self.model.execute(
             hidden_states,
             encoder_hidden_states,
             timestep,

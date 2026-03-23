@@ -25,10 +25,8 @@ from std.collections import OptionalReg
 
 from std.random import randint, randn, seed
 from std.sys import (
-    align_of,
     get_defined_int,
     get_defined_dtype,
-    simd_width_of,
     size_of,
 )
 
@@ -39,9 +37,9 @@ from std.benchmark import (
     BenchMetric,
     ThroughputMeasure,
 )
-from std.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
-from layout import UNKNOWN_VALUE, Layout, LayoutTensor
-from layout.runtime_layout import RuntimeLayout
+from std.gpu.host import DeviceBuffer, DeviceContext
+from layout import TileTensor, Idx
+from layout.tile_layout import row_major
 from std.memory import UnsafePointer
 from shmem import *
 from shmem.ep_comm import (
@@ -55,10 +53,8 @@ from shmem.ep_comm import (
 )
 from shmem._mpi import MPI_Finalize
 
-from std.utils import IndexList
 
-
-fn legalize_topk_ids[
+def legalize_topk_ids[
     n_experts: Int, top_k: Int
 ](topk_ids: UnsafePointer[mut=True, Int32, _], n_tokens: Int):
     for tok_id in range(n_tokens):
@@ -66,7 +62,7 @@ fn legalize_topk_ids[
 
         # The top-k ids for a token should be unique. If not, we will assign a
         # random id to the duplicate id.
-        fn is_duplicate() -> Int:
+        def is_duplicate() -> Int:
             for i in range(top_k):
                 for j in range(i + 1, top_k):
                     if topk_ids_for_token[i] == topk_ids_for_token[j]:
@@ -79,7 +75,7 @@ fn legalize_topk_ids[
             duplicate_idx = is_duplicate()
 
 
-fn bench_dispatch[
+def bench_dispatch[
     token_dtype: DType,
     scales_dtype: DType,
     hidden_size: Int,
@@ -90,14 +86,16 @@ fn bench_dispatch[
 ](ctx: DeviceContext, mut b: Bench, my_rank: Int) raises:
     comptime input_type = token_dtype
     comptime group_size = 128
-    comptime gpu_target = get_gpu_target()
-    comptime gpu_simd_width = simd_width_of[DType.uint8, target=gpu_target]()
-    comptime gpu_alignment = align_of[
-        SIMD[DType.uint8, gpu_simd_width], target=gpu_target
-    ]()
 
     comptime n_local_experts = n_experts // n_ranks
     comptime max_recv_tokens = n_experts * n_tokens_per_rank
+
+    comptime output_tt_layout = row_major(
+        (Idx[max_recv_tokens](), Idx[hidden_size]())
+    )
+    comptime output_scales_tt_layout = row_major(
+        (Idx[hidden_size // group_size](), Idx[max_recv_tokens]())
+    )
 
     var recv_count = shmem_malloc[DType.uint64](UInt(n_local_experts * n_ranks))
     var recv_count_buf = DeviceBuffer(
@@ -136,69 +134,30 @@ fn bench_dispatch[
         n_tokens_per_rank * n_ranks * n_local_experts * 2
     )
 
-    comptime topk_ids_layout = Layout.row_major(UNKNOWN_VALUE, top_k)
-    comptime input_tokens_layout = Layout.row_major(UNKNOWN_VALUE, hidden_size)
-    comptime output_layout = Layout.row_major(
-        n_tokens_per_rank * n_ranks * n_local_experts, hidden_size
+    var topk_ids_tensor = TileTensor[origin=ImmutAnyOrigin](
+        device_topk_buf, row_major((Idx(n_tokens_per_rank), Idx[top_k]()))
     )
-
-    comptime output_scales_layout = Layout.row_major(
-        hidden_size // group_size, max_recv_tokens
-    )
-
-    comptime row_offsets_layout = Layout.row_major(n_local_experts + 1)
-    comptime expert_ids_layout = Layout.row_major(n_local_experts)
-    comptime src_token_info_layout = Layout.row_major(
-        n_tokens_per_rank * n_ranks * n_local_experts, 2
-    )
-
-    var topk_ids_tensor = LayoutTensor[DType.int32, topk_ids_layout](
-        device_topk_buf,
-        RuntimeLayout[topk_ids_layout].row_major(
-            IndexList[2](n_tokens_per_rank, top_k)
-        ),
-    )
-    var input_tokens_tensor = LayoutTensor[input_type, input_tokens_layout](
+    var input_tokens_tensor = TileTensor[origin=ImmutAnyOrigin](
         device_input_buf,
-        RuntimeLayout[input_tokens_layout].row_major(
-            IndexList[2](n_tokens_per_rank, hidden_size)
-        ),
+        row_major((Idx(n_tokens_per_rank), Idx[hidden_size]())),
     )
-    var output_tensor = LayoutTensor[input_type, output_layout](
+    var output_tensor = TileTensor[origin=MutAnyOrigin](
         device_output_buf,
-        RuntimeLayout[output_layout].row_major(
-            IndexList[2](
-                n_tokens_per_rank * n_ranks * n_local_experts, hidden_size
-            )
-        ),
+        row_major((Idx[max_recv_tokens](), Idx[hidden_size]())),
     )
-
-    var output_scales_tensor = LayoutTensor[scales_dtype, output_scales_layout](
+    var output_scales_tensor = TileTensor[origin=MutAnyOrigin](
         device_output_scales_buf,
-        RuntimeLayout[output_scales_layout].row_major(
-            IndexList[2](hidden_size // group_size, max_recv_tokens)
-        ),
+        row_major((Idx[hidden_size // group_size](), Idx[max_recv_tokens]())),
     )
-
-    var row_offsets_tensor = LayoutTensor[DType.uint32, row_offsets_layout](
-        device_row_offsets_buf,
-        RuntimeLayout[row_offsets_layout].row_major(
-            IndexList[1](n_local_experts + 1)
-        ),
+    var row_offsets_tensor = TileTensor[origin=MutAnyOrigin](
+        device_row_offsets_buf, row_major[n_local_experts + 1]()
     )
-    var expert_ids_tensor = LayoutTensor[DType.int32, expert_ids_layout](
-        device_expert_ids_buf,
-        RuntimeLayout[expert_ids_layout].row_major(
-            IndexList[1](n_local_experts)
-        ),
+    var expert_ids_tensor = TileTensor[origin=MutAnyOrigin](
+        device_expert_ids_buf, row_major[n_local_experts]()
     )
-    var src_token_info_tensor = LayoutTensor[
-        DType.int32, src_token_info_layout
-    ](
+    var src_token_info_tensor = TileTensor[origin=MutAnyOrigin](
         device_src_token_info_buf,
-        RuntimeLayout[src_token_info_layout].row_major(
-            IndexList[2](n_tokens_per_rank * n_ranks * n_local_experts, 2)
-        ),
+        row_major((Idx[max_recv_tokens](), Idx[2]())),
     )
 
     comptime hw_info = ctx.default_device_info
@@ -222,12 +181,12 @@ fn bench_dispatch[
 
     @always_inline
     @parameter
-    fn clean_up(ctx: DeviceContext) raises:
+    def clean_up(ctx: DeviceContext) raises:
         ctx.enqueue_memset(atomic_counter, Int32(0))
 
     @always_inline
     @parameter
-    fn setup_and_run_benchmark[
+    def setup_and_run_benchmark[
         TokenFmtType: TokenFormat,
         FormatHandlerType: TokenFormat,
         ThroughputDtype: DType,
@@ -250,8 +209,8 @@ fn bench_dispatch[
         comptime dispatch_async = dispatch_async_kernel[
             input_type,
             hw_info.max_thread_block_size,
-            input_tokens_layout,
-            topk_ids_layout,
+            input_tokens_tensor.LayoutType,
+            topk_ids_tensor.LayoutType,
             hw_info.sm_count,
             n_experts,
             n_ranks,
@@ -265,9 +224,9 @@ fn bench_dispatch[
 
         comptime dispatch_wait = dispatch_wait_kernel[
             hw_info.max_thread_block_size,
-            row_offsets_layout,
-            expert_ids_layout,
-            src_token_info_layout,
+            row_offsets_tensor.LayoutType,
+            expert_ids_tensor.LayoutType,
+            src_token_info_tensor.LayoutType,
             hw_info.sm_count,
             n_experts,
             n_ranks,
@@ -279,7 +238,7 @@ fn bench_dispatch[
 
         @always_inline
         @parameter
-        fn run_dispatch_async(ctx: DeviceContext) raises:
+        def run_dispatch_async(ctx: DeviceContext) raises:
             # the recv_buf ptrs and recv_count ptrs need to be passed in a InlinedArray
             var recv_buf_ptrs = InlineArray[
                 UnsafePointer[UInt8, MutAnyOrigin], 1
@@ -305,7 +264,7 @@ fn bench_dispatch[
 
         @always_inline
         @parameter
-        fn run_dispatch_async_wait(ctx: DeviceContext) raises:
+        def run_dispatch_async_wait(ctx: DeviceContext) raises:
             ctx.enqueue_function(
                 func_wait,
                 format_handler,
@@ -317,8 +276,10 @@ fn bench_dispatch[
                 EPLocalSyncCounters[n_experts](atomic_counter.unsafe_ptr()),
                 Int32(my_rank),
                 OptionalReg[
-                    LayoutTensor[
-                        DType.bfloat16, Layout.row_major[2](), ImmutAnyOrigin
+                    TileTensor[
+                        DType.bfloat16,
+                        type_of(row_major((Idx(Int64(1)), Idx(Int64(1))))),
+                        ImmutAnyOrigin,
                     ]
                 ](),
                 grid_dim=hw_info.sm_count,
@@ -327,7 +288,7 @@ fn bench_dispatch[
 
         @always_inline
         @parameter
-        fn run_e2e(ctx: DeviceContext) raises:
+        def run_e2e(ctx: DeviceContext) raises:
             run_dispatch_async(ctx)
             run_dispatch_async_wait(ctx)
 
@@ -335,16 +296,16 @@ fn bench_dispatch[
 
         @always_inline
         @parameter
-        fn run_func() raises:
+        def run_func() raises:
             run_e2e(ctx)
             clean_up(ctx)
 
         @parameter
         @always_inline
-        fn bench_func(mut b: Bencher):
+        def bench_func(mut b: Bencher):
             @parameter
             @always_inline
-            fn kernel_launch(ctx: DeviceContext) raises:
+            def kernel_launch(ctx: DeviceContext) raises:
                 run_func()
 
             b.iter_custom[kernel_launch](ctx)
@@ -384,12 +345,16 @@ fn bench_dispatch[
 
     comptime if token_dtype == DType.bfloat16:
         comptime token_fmt_type = BF16TokenFormat[
-            output_layout=Layout(), hidden_size, top_k, gpu_alignment
+            output_layout=type_of(output_tt_layout), hidden_size, top_k
         ]
 
-        var format_handler = BF16TokenFormat[hidden_size, top_k, gpu_alignment](
-            output_tensor.bitcast[DType.bfloat16]().as_any_origin()
+        var bf16_output = TileTensor[
+            DType.bfloat16, output_tensor.LayoutType, MutAnyOrigin
+        ](
+            ptr=output_tensor.ptr.bitcast[Scalar[DType.bfloat16]](),
+            layout=output_tensor.layout,
         )
+        var format_handler = token_fmt_type(bf16_output)
 
         setup_and_run_benchmark[
             token_fmt_type,
@@ -407,19 +372,19 @@ fn bench_dispatch[
         comptime token_fmt_type = BlockwiseFP8TokenFormat[
             fp8_dtype=token_dtype,
             scales_dtype=scales_dtype,
-            output_layout=Layout(),
-            scales_layout=Layout(),
+            output_layout=type_of(output_tt_layout),
+            scales_layout=type_of(output_scales_tt_layout),
             hidden_size,
             top_k,
-            gpu_alignment,
         ]
 
-        var format_handler = BlockwiseFP8TokenFormat[
-            hidden_size, top_k, gpu_alignment
+        var fp8_output = TileTensor[
+            token_dtype, output_tensor.LayoutType, MutAnyOrigin
         ](
-            output_tensor.bitcast[DType.float8_e4m3fn]().as_any_origin(),
-            output_scales_tensor.as_any_origin(),
+            ptr=output_tensor.ptr.bitcast[Scalar[token_dtype]](),
+            layout=output_tensor.layout,
         )
+        var format_handler = token_fmt_type(fp8_output, output_scales_tensor)
 
         setup_and_run_benchmark[
             token_fmt_type,

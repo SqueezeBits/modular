@@ -32,25 +32,25 @@ from .buffers_rdna import RDNA_AB_FRAG_SIZE, RDNA_CD_FRAG_SIZE
 
 
 @parameter
-fn _noop_copy_fn[i: Int]():
+def _noop_copy_fn[i: Int]():
     """Default no-op function for A copy."""
     pass
 
 
 @always_inline
-fn mma_rdna[
+def mma_rdna[
     c_register_buffer_type: RegisterBuffer,
     a_register_buffer_type: RegisterMMABuffer,
     b_buffer_type: KVBuffer,
     //,
     tensor_core_mma: TiledTensorCore,
     BK: Int,
-    prefetch_function: OptionalReg[fn() capturing -> None],
+    prefetch_function: OptionalReg[def() capturing -> None],
     swap_a_b: Bool = False,
     beg_iter: Int = 0,
     num_iters: Int = 1,
     prefetched_b_tile: Bool = False,
-    a_copy_fn: fn[i: Int]() capturing -> None = _noop_copy_fn,
+    a_copy_fn: def[i: Int]() capturing -> None = _noop_copy_fn,
 ](
     c: c_register_buffer_type,
     mut a_tile: a_register_buffer_type,

@@ -109,6 +109,35 @@ _ConvertableToTensor: TypeAlias = (
 )
 
 
+def _reduce_all_axes(
+    x: TensorValue,
+    reduce_fn: Callable[..., TensorValue],
+) -> TensorValue:
+    """Reduces over all axes by iterating from the last axis to the first.
+
+    This avoids the ``reshape([-1]) → reduce(axis=0)`` pattern, which
+    collapses the tensor to a single 1-D reduction and destroys GPU parallelism.
+    Reducing last-to-first instead keeps ``num_rows`` (independent parallel
+    reductions) as large as possible at each step and limits total
+    element-touches to O(N) rather than O(N * ndim).
+
+    Args:
+        x: The input tensor.
+        reduce_fn: A single-axis reduction callable with signature
+            ``reduce_fn(x, axis=k) -> TensorValue``.
+
+    Returns:
+        A scalar tensor (all axes reduced).
+    """
+    ndim = len(x.shape)
+    result: TensorValue = x
+    for axis in reversed(range(ndim)):
+        result = reduce_fn(result, axis=axis)
+    # Collapse trailing size-1 dims so the output is shape [1], matching
+    # the old reshape([-1]) → reduce(axis=0) contract.
+    return result.reshape([1])
+
+
 def _to_tensor(value: _ConvertableToTensor) -> tensor.Tensor:
     """Converts a tensor-like value to a Tensor.
 
@@ -266,7 +295,7 @@ add = functional(ops.add)
 #: See :func:`max.graph.ops.allgather` for details.
 allgather = functional(ops.allgather)
 #: Sum values from multiple devices.
-#: See :func:`max.graph.ops.allreduce.sum` for details.
+#: See ``max.graph.ops.allreduce.sum`` for details.
 allreduce_sum = functional(ops.allreduce.sum)
 
 
@@ -337,11 +366,14 @@ cast = functional(ops.cast)
 #: See :func:`max.graph.ops.chunk` for details.
 chunk = functional(ops.chunk)
 #: Multiply two complex-valued tensors.
-#: See :func:`max.graph.ops.complex.mul` for details.
+#: See ``max.graph.ops.complex.mul`` for details.
 complex_mul = functional(ops.complex.mul)
 #: Concatenates a list of tensors along an axis.
 #: See :func:`max.graph.ops.concat` for details.
 concat = functional(ops.concat)
+#: Conditionally executes one of two branches based on a boolean predicate.
+#: See :func:`max.graph.ops.cond` for details.
+cond = functional(ops.cond)
 #: Creates a constant tensor.
 #: See :func:`max.graph.ops.constant` for details.
 constant = functional(ops.constant)
@@ -500,7 +532,7 @@ def inplace_custom(
         device: Device that the op is assigned to. This becomes a ``target``
             parameter to the kernel.
         values: The op function's arguments. At least one must be a
-            :obj:`BufferValue` or :obj:`_OpaqueValue`.
+            :class:`~max.graph.BufferValue` or :obj:`_OpaqueValue`.
         out_types: The list of op function's return types. Can be None if the
             operation has no outputs.
         parameters: Dictionary of extra parameters expected by the kernel.
@@ -629,8 +661,7 @@ def max(
         return ops.elementwise.max(x, y)
     # Reduction max
     if axis is None:
-        x = TensorValue(x).reshape([-1])
-        axis = 0
+        return _reduce_all_axes(TensorValue(x), ops.reduction.max)
     return ops.reduction.max(x, axis=axis)
 
 
@@ -652,8 +683,7 @@ def mean(x: TensorValueLike, axis: int | None = -1) -> TensorValue:
         A tensor containing the mean values.
     """
     if axis is None:
-        x = TensorValue(x).reshape([-1])
-        axis = 0
+        return _reduce_all_axes(TensorValue(x), ops.mean)
     return ops.mean(x, axis=axis)
 
 
@@ -680,10 +710,33 @@ def min(
         return ops.elementwise.min(x, y)
     # Reduction min
     if axis is None:
-        x = TensorValue(x).reshape([-1])
-        axis = 0
+        return _reduce_all_axes(TensorValue(x), ops.reduction.min)
     return ops.reduction.min(x, axis=axis)
 
+
+@functional
+def clamp(
+    x: TensorValueLike,
+    lower_bound: TensorValueLike,
+    upper_bound: TensorValueLike,
+) -> TensorValue:
+    """Clamps tensor values to a specified range.
+
+    Args:
+        x: The input tensor.
+        lower_bound: The minimum value. Elements less than this are set to
+            ``lower_bound``.
+        upper_bound: The maximum value. Elements greater than this are set to
+            ``upper_bound``.
+
+    Returns:
+        A tensor with values clamped to the specified range.
+    """
+    return max(min(x, upper_bound), lower_bound)
+
+
+#: Alias for :func:`clamp`.
+clip = clamp
 
 #: Computes the modulo operation element-wise.
 #: See :func:`max.graph.ops.mod` for details.
@@ -727,8 +780,7 @@ def prod(x: TensorValueLike, axis: int | None = -1) -> TensorValue:
         A tensor containing the product values.
     """
     if axis is None:
-        x = TensorValue(x).reshape([-1])
-        axis = 0
+        return _reduce_all_axes(TensorValue(x), ops.prod)
     return ops.prod(x, axis=axis)
 
 
@@ -856,8 +908,7 @@ def sum(x: TensorValueLike, axis: int | None = -1) -> TensorValue:
         A tensor containing the sum values.
     """
     if axis is None:
-        x = TensorValue(x).reshape([-1])
-        axis = 0
+        return _reduce_all_axes(TensorValue(x), ops.sum)
     return ops.sum(x, axis=axis)
 
 

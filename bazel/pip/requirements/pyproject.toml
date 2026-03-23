@@ -12,7 +12,9 @@ dependencies = [
   "asgiref",
   "async-asgi-testclient",
   "boto3",
+  "botocore",
   "click>=8.1",
+  "clickhouse-connect",
   "codeowners",
   "cyclopts",
   "datasets",
@@ -73,6 +75,7 @@ dependencies = [
   "pytest-xdist",
   "pytest>=7.2",
   "python-json-logger",
+  "PyGithub>=2.1.0",
   "PyYAML",
   "pyzmq",
   "plotext",
@@ -86,13 +89,14 @@ dependencies = [
   "slack-sdk",
   "tiktoken",
   "simpy",
-  "sphinx==7.4.7",
+  "sphinx==8.1.3",
   "sse-starlette",
   "sseclient-py",
   "starlette>=0.47.2", # transitively included by sse-starlette, >=0.47.2 is required for resolving CVE-2025-54121
   "taskgroup",
   "termcolor",
   "threadpoolctl",
+  "tiktoken",
   "tokenicer",
   "tomli",
   "tqdm",
@@ -169,7 +173,7 @@ amd = [
   "gptqmodel; sys_platform == 'linux' and platform_machine == 'x86_64'",
 
   "accelerate",
-  "lm-eval[api,ifeval,math]>=0.4.9.1",
+  "lm-eval[api,ifeval,math]>=0.4.11",
   "mteb",
   "optimum",
   "peft", # For LoRA adapter support
@@ -188,7 +192,7 @@ cpu = [
   "triton==3.5.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
 
   "accelerate",
-  "lm-eval[api,ifeval,math]>=0.4.9.1",
+  "lm-eval[api,ifeval,math]>=0.4.11",
   "mteb",
   "optimum",
   "peft", # For LoRA adapter support
@@ -206,12 +210,12 @@ nvidia = [
 
   "gptqmodel; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "compressed-tensors==0.13.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.14.1; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version >= '3.11'",
+  "vllm==0.16.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version >= '3.11'",
 
   "accelerate",
   "flashinfer-cubin",
   "flashinfer-python",
-  "lm-eval[api,ifeval,math]>=0.4.9.1",
+  "lm-eval[api,ifeval,math]>=0.4.11",
   "mteb",
   "optimum",
   "peft>=0.17.0", # For LoRA adapter support
@@ -244,8 +248,16 @@ override-dependencies = [
   "numba==0.63.1",
   # Override lmcache's numpy<=2.2.6 constraint to allow our numpy>=2.3.0
   "numpy>=2.2.0",
-  # Override vllm's `transformers` constraint (TODO: update to >=5)
-  "transformers==4.57.1",
+  # Override vllm's `transformers` constraint.
+  # Pin <5.3.0: v5.3.0 has a tokenizer regression where LlamaTokenizer
+  # overwrites the ByteLevel decoder from tokenizer.json with Metaspace,
+  # breaking decode for Llama/DeepSeek models (huggingface/transformers#44462).
+  "transformers>=5.0.0,<5.3.0",
+  # Pin packages to avoid duplicates after vllm 0.16.0 update
+  "aiohttp==3.13.3",
+  "apache-tvm-ffi==0.1.9",
+  "flashinfer-python==0.6.3",
+  "nvidia-cutlass-dsl==4.4.1",
 ]
 
 [tool.uv.sources]

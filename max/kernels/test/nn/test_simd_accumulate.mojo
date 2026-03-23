@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 
-from buffer import NDBuffer
+from layout import Layout, LayoutTensor
 from linalg.accumulate import _Accumulator, _simd_load_maybe_partial
 from std.testing import *
 
@@ -155,8 +155,8 @@ def test_accumulate_with_offsets[
             (b_ptr + j * simd_size).store(SIMD[type, simd_size](i))
 
     var a_base_stack = InlineArray[Int32, num_rows](uninitialized=True)
-    var a_base_offsets = NDBuffer[DType.int32, 1, _, num_rows](
-        a_base_stack.unsafe_ptr()
+    var a_base_offsets = LayoutTensor[DType.int32, Layout.row_major(num_rows)](
+        a_base_stack
     )
     a_base_offsets[0] = 0
     a_base_offsets[1] = Int32(length)
@@ -306,7 +306,7 @@ def test_load_store[
 
     # TODO: replace the following with simd.mojo:insert (after resolving its issue).
     @always_inline
-    fn simd_insert(mut x: SIMD[type, _], y: SIMD[type, _]):
+    def simd_insert(mut x: SIMD[type, _], y: SIMD[type, _]):
         comptime assert x.size >= y.size
 
         comptime for i in range(y.size):

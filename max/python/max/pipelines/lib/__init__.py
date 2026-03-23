@@ -21,9 +21,13 @@ from max.config import (
     resolve_max_config_inheritance,
 )
 
-from .bfloat16_utils import float32_to_bfloat16_as_uint16
+from .bfloat16_utils import (
+    float32_array_to_buffer,
+    float32_to_bfloat16_as_uint16,
+)
 from .config import (
     AudioGenerationConfig,
+    DenoisingCacheConfig,
     KVCacheConfig,
     LoRAConfig,
     MAXModelConfig,
@@ -43,7 +47,6 @@ from .config import (
     supported_encoding_supported_on,
 )
 from .embeddings_pipeline import EmbeddingsPipeline, EmbeddingsPipelineType
-from .float8 import parse_float8_config
 from .hf_utils import (
     HuggingFaceRepo,
     download_weight_files,
@@ -67,6 +70,7 @@ from .pipeline_variants.overlap_text_generation import (
     OverlapTextGenerationPipeline,
 )
 from .pixel_tokenizer import PixelGenerationTokenizer
+from .quant import parse_quant_config
 from .registry import PIPELINE_REGISTRY, SupportedArchitecture
 from .sampling import (
     SamplingConfig,
@@ -95,6 +99,7 @@ __all__ = [
     "AlwaysSignalBuffersMixin",
     "AudioGenerationConfig",
     "CompilationTimer",
+    "DenoisingCacheConfig",
     "EAGLESpeculativeDecodingPipeline",
     "EmbeddingsPipeline",
     "EmbeddingsPipelineType",
@@ -136,12 +141,13 @@ __all__ = [
     "convert_max_config_value",
     "deep_merge_max_configs",
     "download_weight_files",
+    "float32_array_to_buffer",
     "float32_to_bfloat16_as_uint16",
     "generate_local_model_path",
     "get_default_max_config_file_section_name",
     "is_float4_encoding",
     "max_tokens_to_generate",
-    "parse_float8_config",
+    "parse_quant_config",
     "parse_supported_encoding_from_file_name",
     "rejection_sampler",
     "rejection_sampler_with_residuals",

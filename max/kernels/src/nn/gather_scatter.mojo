@@ -39,12 +39,12 @@ from std.collections import OptionalReg
 
 
 @always_inline
-fn _unsafe_normalize_neg_index(idx: Int, dim_size: Int) -> Int:
+def _unsafe_normalize_neg_index(idx: Int, dim_size: Int) -> Int:
     return idx + dim_size if idx < 0 else idx
 
 
 @always_inline
-fn _unsafe_normalize_neg_index[
+def _unsafe_normalize_neg_index[
     dtype: DType, width: Int, out_type: DType = DType.int
 ](idx: SIMD[dtype, width], dim_size: Int) -> SIMD[out_type, width]:
     return idx.lt(0).select(
@@ -54,11 +54,14 @@ fn _unsafe_normalize_neg_index[
 
 
 @always_inline
-fn normalize_neg_index(idx: Int, dim_size: Int) raises -> Int:
+def normalize_neg_index(idx: Int, dim_size: Int) raises -> Int:
     """Indices passed to gather and scatter ops may be negative. This performs
     a normalization so that they can be used to index into a buffer.
 
     Returns val + dim if val < 0 else val
+
+    Raises:
+        If the index is out of range [-dim_size, dim_size).
     """
     if -dim_size <= idx < dim_size:
         return _unsafe_normalize_neg_index(idx, dim_size)
@@ -67,7 +70,7 @@ fn normalize_neg_index(idx: Int, dim_size: Int) raises -> Int:
 
 
 @always_inline
-fn normalize_neg_index[
+def normalize_neg_index[
     dtype: DType, width: Int, out_type: DType = DType.int
 ](idx: SIMD[dtype, width], dim_size: Int) raises -> SIMD[out_type, width]:
     """Indices passed to gather and scatter ops may be negative. This performs
@@ -91,19 +94,20 @@ struct Axis(Indexer, Intable, TrivialRegisterPassable):
     var axis: Int
 
     @always_inline
-    fn __init__(out self, axis: Int):
+    def __init__(out self, axis: Int):
         self.axis = axis
 
     @always_inline
-    fn __init__(out self, axis: Int, rank: Int) raises:
+    def __init__(out self, axis: Int, rank: Int) raises:
         self.axis = normalize_neg_index(axis, rank)
 
     @always_inline
-    fn __int__(self) -> Int:
+    def __int__(self) -> Int:
         return self.axis
 
+    @doc_hidden
     @always_inline("nodebug")
-    fn __mlir_index__(self) -> __mlir_type.index:
+    def __mlir_index__(self) -> __mlir_type.index:
         """Convert to index.
 
         Returns:
@@ -113,12 +117,12 @@ struct Axis(Indexer, Intable, TrivialRegisterPassable):
 
 
 @always_inline
-fn gather_reduce[
+def gather_reduce[
     dtype: DType,
     gather_axis: Int,
     reduce_axis: Int,
     simd_width: Int,
-    reduce_fn: fn[dtype: DType, width: Int](
+    reduce_fn: def[dtype: DType, width: Int](
         SIMD[dtype, width], SIMD[dtype, width]
     ) -> SIMD[dtype, width],
 ](
@@ -139,9 +143,12 @@ fn gather_reduce[
     comptime assert indices.flat_rank == 2
     comptime assert gather_axis == 0
     comptime assert reduce_axis == 1
+    # For the compiler to index below
+    comptime assert indices.flat_rank >= 2
+    comptime assert input.flat_rank >= 2
 
     # Short-circuit for trivial cases, and to avoid divide-by-zero
-    if input.numel() == 0 or indices.numel() == 0:
+    if input.num_elements() == 0 or indices.num_elements() == 0:
         return
 
     # TODO: find a heuristic to replace the magic number.
@@ -186,13 +193,14 @@ fn gather_reduce[
         gather_axis_size,
     )
     @parameter
-    fn task_func(task_id: Int):
+    def task_func(task_id: Int):
         comptime prefetch_offset = -1
 
         var output = output_bind
         var input = input_bind
         comptime assert output.flat_rank == 2
         comptime assert input.flat_rank == 2
+        comptime assert input.flat_rank >= 2
         var row_size = Int(output.dim[1]())
 
         # each thread gets a chunk of output embedding vectors to avoid inter-thread reduction
@@ -222,10 +230,10 @@ fn gather_reduce[
             @always_inline
             @__copy_capture(input, indices, output)
             @parameter
-            fn gather_k_tile[simd_width: Int](k: Int):
+            def gather_k_tile[simd_width: Int](k: Int):
                 @always_inline
                 @parameter
-                fn reduce_j_tile[
+                def reduce_j_tile[
                     unroll_factor: Int
                 ](
                     accums: StaticTuple[SIMD[dtype, simd_width], unroll_factor],
@@ -282,7 +290,7 @@ fn gather_reduce[
 
 
 # TODO: Delete / for testing purposes (test_gather.mojo)
-fn gather[
+def gather[
     dtype: DType,
     indices_type: DType,
     //,
@@ -304,12 +312,12 @@ fn gather[
 
     comptime prefetch_offset = 12  # TODO: search
 
-    var end_indices_ptr = indices.ptr + indices.numel()
+    var end_indices_ptr = indices.ptr + indices.num_elements()
 
     @parameter
     @__copy_capture(end_indices_ptr)
     @always_inline
-    fn prefetch_fn[
+    def prefetch_fn[
         _input_rank: Int, _indices_rank: Int
     ](
         _input_coords: IndexList[_input_rank],
@@ -344,29 +352,29 @@ fn gather[
 
     @parameter
     @always_inline
-    fn input_fn[
+    def input_fn[
         width: Int, _rank: Int
     ](index: IndexList[_rank]) -> SIMD[dtype, width]:
         var coords = Coord(index)
-        comptime assert coords.flat_rank == input.flat_rank
+        comptime assert input.flat_rank >= coords.flat_rank
         return input.load[width=width, alignment=1](coords)
 
     @parameter
     @always_inline
-    fn indices_fn[
+    def indices_fn[
         width: Int, _rank: Int
     ](index: IndexList[_rank]) -> SIMD[indices_type, width]:
         var coords = Coord(index)
-        comptime assert coords.flat_rank == indices.flat_rank
+        comptime assert indices.flat_rank >= coords.flat_rank
         return indices.load[width=width, alignment=1](coords)
 
     @parameter
     @always_inline
-    fn output_fn[
+    def output_fn[
         width: Int, _rank: Int
     ](index: IndexList[_rank], val: SIMD[dtype, width]):
         var coords = Coord(index)
-        comptime assert coords.flat_rank == output.flat_rank
+        comptime assert output.flat_rank >= coords.flat_rank
         output.store[width=width, alignment=1](
             coords, rebind[SIMD[dtype, width]](val)
         )
@@ -388,7 +396,7 @@ fn gather[
     )
 
 
-fn gather[
+def gather[
     dtype: DType,
     indices_type: DType,
     //,
@@ -410,12 +418,12 @@ fn gather[
 
     comptime prefetch_offset = 12  # TODO: search
 
-    var end_indices_ptr = indices.ptr + indices.numel()
+    var end_indices_ptr = indices.ptr + indices.num_elements()
 
     @parameter
     @__copy_capture(end_indices_ptr)
     @always_inline
-    fn prefetch_fn[
+    def prefetch_fn[
         _input_rank: Int, _indices_rank: Int
     ](
         _input_coords: IndexList[_input_rank],
@@ -450,29 +458,29 @@ fn gather[
 
     @parameter
     @always_inline
-    fn input_fn[
+    def input_fn[
         width: Int, _rank: Int
     ](index: IndexList[_rank]) -> SIMD[dtype, width]:
         var coords = Coord(index)
-        comptime assert coords.flat_rank == input.flat_rank
+        comptime assert input.flat_rank >= coords.flat_rank
         return input.load[width=width, alignment=1](coords)
 
     @parameter
     @always_inline
-    fn indices_fn[
+    def indices_fn[
         width: Int, _rank: Int
     ](index: IndexList[_rank]) -> SIMD[indices_type, width]:
         var coords = Coord(index)
-        comptime assert coords.flat_rank == indices.flat_rank
+        comptime assert indices.flat_rank >= coords.flat_rank
         return indices.load[width=width, alignment=1](coords)
 
     @parameter
     @always_inline
-    fn output_fn[
+    def output_fn[
         width: Int, _rank: Int
     ](index: IndexList[_rank], val: SIMD[dtype, width]):
         var coords = Coord(index)
-        comptime assert coords.flat_rank == output.flat_rank
+        comptime assert output.flat_rank >= coords.flat_rank
         output.store[width=width, alignment=1](
             coords, rebind[SIMD[dtype, width]](val)
         )
@@ -494,7 +502,7 @@ fn gather[
     )
 
 
-fn gather_guards(
+def gather_guards(
     axis: Axis,
     input_shape: IndexList,
     indices_shape: IndexList,
@@ -524,26 +532,27 @@ fn gather_guards(
         raise Error("gather: axis must be less than input rank")
 
 
-comptime error_index_fn_type = fn(Int) capturing -> None
+comptime error_index_fn_type = def(Int) capturing -> None
 
 
 @always_inline
-fn gather_elementwise_fn_wrapper[
-    *,
+def gather_elementwise_fn_wrapper[
     dtype: DType,
     indices_type: DType,
-    input_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+    //,
+    *,
+    input_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
         dtype, width
     ],
-    indices_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+    indices_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
         indices_type, width
     ],
-    output_fn: fn[width: Int, rank: Int](
+    output_fn: def[width: Int, rank: Int](
         IndexList[rank], SIMD[dtype, width]
     ) capturing -> None,
     simd_width: Int,
     prefetch_fn: OptionalReg[
-        fn[
+        def[
             input_rank: Int, indices_rank: Int
         ](IndexList[input_rank], IndexList[indices_rank]) capturing -> None
     ] = None,
@@ -557,7 +566,7 @@ fn gather_elementwise_fn_wrapper[
 ):
     @parameter
     @always_inline
-    fn gather_elementwise_fn[
+    def gather_elementwise_fn[
         simd_width: Int, rank: Int
     ](idx: IndexList[rank, ...]):
         # out_coords consists of 3 chunks:
@@ -629,26 +638,25 @@ fn gather_elementwise_fn_wrapper[
 
 # TODO: Delete / for testing purposes (test_gather.mojo)
 @always_inline
-fn gather[
+def gather[
     *,
     dtype: DType,
     indices_type: DType,
-    input_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+    input_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
         dtype, width
     ],
-    indices_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+    indices_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
         indices_type, width
     ],
-    output_fn: fn[width: Int, rank: Int](
+    output_fn: def[width: Int, rank: Int](
         IndexList[rank], SIMD[dtype, width]
     ) capturing -> None,
     prefetch_fn: OptionalReg[
-        fn[
+        def[
             input_rank: Int, indices_rank: Int
         ](IndexList[input_rank], IndexList[indices_rank]) capturing -> None
     ] = None,
     target: StaticString = "cpu",
-    single_thread_blocking_override: Bool = False,
 ](
     axis: Axis,
     input_shape: IndexList,
@@ -677,7 +685,7 @@ fn gather[
 
         @parameter
         @always_inline
-        fn error_index_fn(val: Int):
+        def error_index_fn(val: Int):
             error_index = val
 
         comptime error_fn = Optional[error_index_fn_type](
@@ -686,12 +694,10 @@ fn gather[
 
         @parameter
         @always_inline
-        fn gather_elementwise_fn[
+        def gather_elementwise_fn[
             simd_width: Int, rank: Int, alignment: Int = 1
         ](idx: IndexList[rank]):
             gather_elementwise_fn_wrapper[
-                dtype=dtype,
-                indices_type=indices_type,
                 input_fn=input_fn,
                 indices_fn=indices_fn,
                 output_fn=output_fn,
@@ -711,7 +717,6 @@ fn gather[
             elementwise[
                 gather_elementwise_fn,
                 simd_width=1,
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](
                 output_shape.canonicalize(),
@@ -721,7 +726,6 @@ fn gather[
             elementwise[
                 gather_elementwise_fn,
                 simd_width=simd_width_of[dtype](),
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](
                 output_shape.canonicalize(),
@@ -741,26 +745,25 @@ fn gather[
 
 
 @always_inline
-fn gather[
+def gather[
     *,
     dtype: DType,
     indices_type: DType,
-    input_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+    input_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
         dtype, width
     ],
-    indices_fn: fn[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
+    indices_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
         indices_type, width
     ],
-    output_fn: fn[width: Int, rank: Int](
+    output_fn: def[width: Int, rank: Int](
         IndexList[rank], SIMD[dtype, width]
     ) capturing -> None,
     prefetch_fn: OptionalReg[
-        fn[
+        def[
             input_rank: Int, indices_rank: Int
         ](IndexList[input_rank], IndexList[indices_rank]) capturing -> None
     ] = None,
     target: StaticString = "cpu",
-    single_thread_blocking_override: Bool = False,
 ](
     axis: Axis,
     input_shape: IndexList,
@@ -793,7 +796,7 @@ fn gather[
 
         @parameter
         @always_inline
-        fn error_index_fn(val: Int):
+        def error_index_fn(val: Int):
             error_index = val
 
         comptime error_fn = Optional[error_index_fn_type](
@@ -802,12 +805,10 @@ fn gather[
 
         @parameter
         @always_inline
-        fn gather_elementwise_fn[
+        def gather_elementwise_fn[
             simd_width: Int, rank: Int, alignment: Int = 1
         ](idx: IndexList[rank]):
             gather_elementwise_fn_wrapper[
-                dtype=dtype,
-                indices_type=indices_type,
                 input_fn=input_fn,
                 indices_fn=indices_fn,
                 output_fn=output_fn,
@@ -827,14 +828,12 @@ fn gather[
             elementwise[
                 gather_elementwise_fn,
                 simd_width=1,
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](output_shape, context)
         else:
             elementwise[
                 gather_elementwise_fn,
                 simd_width=simd_width_of[dtype, target=compile_target](),
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](output_shape, context)
 
@@ -876,14 +875,14 @@ struct ScatterOobIndexStrategy(Equatable, ImplicitlyCopyable, Writable):
 
 
 @always_inline
-fn scatter_nd_generator[
+def scatter_nd_generator[
     output_type: DType,
     indices_type: DType,
-    single_thread_blocking_override: Bool,
+    //,
     oob_index_strategy: ScatterOobIndexStrategy = ScatterOobIndexStrategy.UNDEFINED,
     target: StaticString = "cpu",
     reduce_fn: OptionalReg[
-        fn[
+        def[
             dtype: DType, width: Int
         ](SIMD[dtype, width], SIMD[dtype, width]) capturing -> SIMD[
             dtype, width
@@ -906,8 +905,6 @@ fn scatter_nd_generator[
     Parameters:
         output_type: Type of data, updates, and output tensors.
         indices_type: Type of the indices tensor.
-        single_thread_blocking_override: If True, then the operation is run
-          synchronously using a single thread.
         oob_index_strategy: Strategy to handle out of bounds indices.
         target: Target cpu or cuda.
         reduce_fn: Reduction function to apply: none (default), add, mul, max,
@@ -947,8 +944,12 @@ fn scatter_nd_generator[
                 " indices_shape[-1] - 1"
             )
 
-        var output_flat = TileTensor(output.ptr, row_major(Idx(output.numel())))
-        var data_flat = TileTensor(data.ptr, row_major(Idx(data.numel())))
+        var output_flat = TileTensor(
+            output.ptr, row_major(Idx(output.num_elements()))
+        )
+        var data_flat = TileTensor(
+            data.ptr, row_major(Idx(data.num_elements()))
+        )
 
         # Always copy input to output first.
         comptime if is_gpu[target]():
@@ -958,10 +959,12 @@ fn scatter_nd_generator[
             var outp = DeviceBuffer(
                 ctx,
                 output.ptr,
-                data.numel(),
+                data.num_elements(),
                 owning=False,
             )
-            var inp = DeviceBuffer(ctx, data.ptr, data.numel(), owning=False)
+            var inp = DeviceBuffer(
+                ctx, data.ptr, data.num_elements(), owning=False
+            )
             ctx.enqueue_copy(
                 outp,
                 inp,
@@ -971,15 +974,15 @@ fn scatter_nd_generator[
             memcpy(
                 dest=output_flat.ptr,
                 src=data_flat.ptr,
-                count=output_flat.numel(),
+                count=output_flat.num_elements(),
             )
 
-        if updates.numel() == 0:
+        if updates.num_elements() == 0:
             # Nothing to update.
             return
 
         var updates_flat = TileTensor(
-            updates.ptr, row_major(Idx(updates.numel()))
+            updates.ptr, row_major(Idx(updates.num_elements()))
         )
 
         var data_shape = coord_to_index_list(data.layout.shape_coord())
@@ -1002,7 +1005,7 @@ fn scatter_nd_generator[
             updates_flat,
         )
         @parameter
-        fn update_func[
+        def update_func[
             simd_width: Int,
             _rank: Int,
             alignment: Int = 1,
@@ -1042,7 +1045,7 @@ fn scatter_nd_generator[
                 indices_index[indices.rank - 1] = dim
 
                 var indices_coord = Coord(indices_index)
-                comptime assert indices_coord.flat_rank == indices.flat_rank
+                comptime assert indices.flat_rank >= indices_coord.flat_rank
                 var idx_on_axis = indices.load[width=1](indices_coord)
 
                 comptime if oob_index_strategy == ScatterOobIndexStrategy.SKIP:
@@ -1110,17 +1113,16 @@ fn scatter_nd_generator[
         elementwise[
             update_func,
             simd_width=1,
-            use_blocking_impl=single_thread_blocking_override,
             target=target,
             _trace_description=trace_description_str,
         ](iter_shape, context)
 
 
 @always_inline
-fn scatter_nd[
+def scatter_nd[
     output_type: DType,
     indices_type: DType,
-    single_thread_blocking_override: Bool,
+    //,
     target: StaticString = "cpu",
 ](
     data: TileTensor[output_type, address_space=AddressSpace.GENERIC, ...],
@@ -1132,21 +1134,13 @@ fn scatter_nd[
     context: DeviceContextPtr = DeviceContextPtr(),
 ) raises:
     """Scatter_nd operation without any reduction."""
-    scatter_nd_generator[
-        output_type,
-        indices_type,
-        single_thread_blocking_override,
-        oob_index_strategy=ScatterOobIndexStrategy.UNDEFINED,
-        target=target,
-        reduce_fn=None,
-    ](data, indices, updates, output, context)
+    scatter_nd_generator[target=target](data, indices, updates, output, context)
 
 
 @always_inline
-fn scatter_nd_shape[
+def scatter_nd_shape[
     input_type: DType,
     indices_type: DType,
-    single_thread_blocking_override: Bool,
 ](
     input: TileTensor[input_type, ...],
     updates: TileTensor[input_type, ...],
@@ -1159,8 +1153,6 @@ fn scatter_nd_shape[
     Parameters:
         input_type: Type of the input tensor.
         indices_type: Type of the indices tensor.
-        single_thread_blocking_override: If True, then the operation is run
-          synchronously using a single thread.
 
     Args:
         input: The input tensor.
@@ -1213,11 +1205,10 @@ fn scatter_nd_shape[
 
 
 @always_inline
-fn gather_shape[
+def gather_shape[
     output_rank: Int,
     input_type: DType,
     indices_type: DType,
-    single_thread_blocking_override: Bool = False,
 ](
     input_buf: TileTensor[input_type, ...],
     indices_buf: TileTensor[indices_type, ...],
@@ -1231,8 +1222,6 @@ fn gather_shape[
         output_rank: Rank of the output tensor.
         input_type: Type of the input tensor.
         indices_type: Type of the indices tensor.
-        single_thread_blocking_override: If True, then the operation is run
-          synchronously using a single thread.
 
     Args:
         input_buf: The input tensor.
@@ -1275,8 +1264,8 @@ fn gather_shape[
 
 
 @always_inline
-fn scatter_elements[
-    reduce_fn: fn[dtype: DType, width: Int](
+def scatter_elements[
+    reduce_fn: def[dtype: DType, width: Int](
         SIMD[dtype, width], SIMD[dtype, width]
     ) capturing -> SIMD[dtype, width],
     rank: Int,
@@ -1322,7 +1311,7 @@ fn scatter_elements[
 
     @__copy_capture(axis, input_ax_dim)
     @parameter
-    fn update_func[
+    def update_func[
         simd_width: Int, _rank: Int, alignment: Int = 1
     ](_indices_coords: IndexList[_rank]):
         var indices_coords = rebind[IndexList[rank]](_indices_coords)
@@ -1341,12 +1330,9 @@ fn scatter_elements[
 
 
 @always_inline
-fn scatter_elements_shape[
+def scatter_elements_shape[
     input_type: DType,
     indices_type: DType,
-    //,
-    *,
-    single_thread_blocking_override: Bool,
 ](
     input: TileTensor[input_type, ...],
     updates: TileTensor[input_type, ...],
@@ -1360,8 +1346,6 @@ fn scatter_elements_shape[
     Parameters:
         input_type: Type of the input tensor.
         indices_type: Type of the indices tensor.
-        single_thread_blocking_override: If True, then the operation is run
-          synchronously using a single thread.
 
     Args:
         input: The input tensor.
@@ -1402,7 +1386,7 @@ fn scatter_elements_shape[
 
 
 @always_inline
-fn gather_elements[
+def gather_elements[
     input_type: DType,
     indices_type: DType,
 ](
@@ -1438,19 +1422,19 @@ fn gather_elements[
 
     @__copy_capture(input_ax_dim, axis)
     @parameter
-    fn gather_func[
+    def gather_func[
         simd_width: Int, _rank: Int, alignment: Int = 1
     ](_output_coords: IndexList[_rank]):
         var output_coords = Coord(_output_coords)
-        comptime assert output_coords.flat_rank == indices.flat_rank
-        comptime assert output_coords.flat_rank == output.flat_rank
+        comptime assert indices.flat_rank >= output_coords.flat_rank
+        comptime assert output.flat_rank >= output_coords.flat_rank
         var idx_on_axis = indices.load[width=1](output_coords)
         var input_idx = _output_coords
         input_idx[axis] = Int(
             _unsafe_normalize_neg_index(idx_on_axis, input_ax_dim)
         )
         var input_coords = Coord(input_idx)
-        comptime assert input_coords.flat_rank == input.flat_rank
+        comptime assert input.flat_rank >= input_coords.flat_rank
         output.store(output_coords, input.load[width=1](input_coords))
 
     # cannot use simd_width > 1 here because consecutive updates are not contiguous
@@ -1465,12 +1449,11 @@ fn gather_elements[
 
 
 @always_inline
-fn gather_nd_shape[
+def gather_nd_shape[
     output_rank: Int,
     input_type: DType,
     indices_type: DType,
     batch_dims: Int,
-    single_thread_blocking_override: Bool = True,
 ](
     input_buf: TileTensor[input_type, ...],
     indices_buf: TileTensor[indices_type, ...],
@@ -1484,8 +1467,6 @@ fn gather_nd_shape[
         input_type: Type of the input tensor.
         indices_type: Type of the indices tensor.
         batch_dims: Batch dimensions.
-        single_thread_blocking_override: If True, then reduction is run
-          synchronously using a single thread.
 
     Args:
         input_buf: The input tensor.
@@ -1533,12 +1514,11 @@ fn gather_nd_shape[
 # ===-----------------------------------------------------------------------===#
 
 
-fn gather_nd[
+def gather_nd[
     dtype: DType,
     indices_type: DType,
     batch_dims: Int,
     target: StaticString = "cpu",
-    single_thread_blocking_override: Bool = False,
 ](
     data: TileTensor[dtype, ...],
     indices: TileTensor[indices_type, ...],
@@ -1555,8 +1535,6 @@ fn gather_nd[
         batch_dims: Number of batch dimensions. The gather of indexing
                     starts from dimension of data[batch_dims:].
         target: The target architecture to execute on.
-        single_thread_blocking_override: If True, then the operation is run
-          synchronously using a single thread.
 
     Args:
         data: Tensor of rank data_rank >= 1.
@@ -1572,23 +1550,20 @@ fn gather_nd[
         return _gather_nd_impl[
             batch_dims,
             target=target,
-            single_thread_blocking_override=single_thread_blocking_override,
         ](data, indices, output)
     else:
         return _gather_nd_impl[
             batch_dims,
             target=target,
-            single_thread_blocking_override=single_thread_blocking_override,
         ](data, indices, output, ctx.get_device_context())
 
 
-fn _gather_nd_impl[
+def _gather_nd_impl[
     dtype: DType,
     indices_type: DType,
     //,
     batch_dims: Int,
     target: StaticString = "cpu",
-    single_thread_blocking_override: Bool = False,
 ](
     data: TileTensor[dtype, ...],
     indices: TileTensor[indices_type, ...],
@@ -1600,15 +1575,14 @@ fn _gather_nd_impl[
     ), "Constraint: data_rank >= 1 and indices_rank >= 1"
 
     var indices_shape = coord_to_index_list(indices.layout.shape_coord())
-    debug_assert(
-        1 <= indices_shape[indices.rank - 1] <= data.rank - batch_dims,
-        "Constraint: 1 <= indices_shape[-1] <= data_rank - batch_dims",
-    )
+    assert (
+        1 <= indices_shape[indices.rank - 1] <= data.rank - batch_dims
+    ), "Constraint: 1 <= indices_shape[-1] <= data_rank - batch_dims"
 
     # This is modeled as an elementwise function mapping an index in the
     # output to an index in the input
     @parameter
-    fn gather_nd_elementwise_fn[
+    def gather_nd_elementwise_fn[
         simd_width: Int, rank: Int, alignment: Int = 1
     ](output_idx_arg: IndexList[rank]):
         var output_idx = rebind[IndexList[output.rank]](output_idx_arg)
@@ -1628,7 +1602,7 @@ fn _gather_nd_impl[
         for i in range(indices_last_dim):
             indices_idx[indices.rank - 1] = i
             var indices_coord = Coord(indices_idx)
-            comptime assert indices_coord.flat_rank == indices.flat_rank
+            comptime assert indices.flat_rank >= indices_coord.flat_rank
             data_idx[batch_dims + i] = Int(indices.load[width=1](indices_coord))
 
         # fill in the last slices in the input
@@ -1639,21 +1613,19 @@ fn _gather_nd_impl[
             data_idx[src_start + i] = output_idx[output_start + i]
 
         comptime for i in range(data.rank):
-            debug_assert(
-                data_idx[i] >= 0 and data_idx[i] < Int(data.dim[i]()),
-                "data index out of bounds",
-            )
+            assert data_idx[i] >= 0 and data_idx[i] < Int(
+                data.dim[i]()
+            ), "data index out of bounds"
 
         comptime for i in range(output.rank):
-            debug_assert(
-                output_idx[i] >= 0 and output_idx[i] < Int(output.dim[i]()),
-                "output index out of bounds",
-            )
+            assert output_idx[i] >= 0 and output_idx[i] < Int(
+                output.dim[i]()
+            ), "output index out of bounds"
 
         var data_coord = Coord(data_idx)
         var output_coord = Coord(output_idx)
-        comptime assert data_coord.flat_rank == data.flat_rank
-        comptime assert output_coord.flat_rank == output.flat_rank
+        comptime assert data.flat_rank >= data_coord.flat_rank
+        comptime assert output.flat_rank >= output_coord.flat_rank
         output.store[width=simd_width, alignment=1](
             output_coord, data.load[width=simd_width, alignment=1](data_coord)
         )
@@ -1685,33 +1657,27 @@ fn _gather_nd_impl[
             elementwise[
                 gather_nd_elementwise_fn,
                 target_simd_width,
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](coord_to_index_list(output.layout.shape_coord()))
         else:
             elementwise[
                 gather_nd_elementwise_fn,
                 1,
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](coord_to_index_list(output.layout.shape_coord()))
     else:
-        debug_assert(
-            Bool(ctx), "Must provide DeviceContext if executing on GPU."
-        )
+        assert Bool(ctx), "Must provide DeviceContext if executing on GPU."
         var cuda_ctx = ctx.value()
         if use_simd:
             elementwise[
                 gather_nd_elementwise_fn,
                 target_simd_width,
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](coord_to_index_list(output.layout.shape_coord()), cuda_ctx)
         else:
             elementwise[
                 gather_nd_elementwise_fn,
                 1,
-                use_blocking_impl=single_thread_blocking_override,
                 target=target,
             ](coord_to_index_list(output.layout.shape_coord()), cuda_ctx)
 
@@ -1721,12 +1687,11 @@ fn _gather_nd_impl[
 # ===-----------------------------------------------------------------------===#
 
 
-fn scatter_set_constant[
+def scatter_set_constant[
     data_type: DType,
     index_type: DType,
     //,
     target: StaticString,
-    single_thread_blocking_override: Bool = False,
 ](
     data: TileTensor[mut=True, data_type, ...],
     indices: TileTensor[index_type, ...],
@@ -1767,14 +1732,13 @@ fn scatter_set_constant[
     comptime assert (
         indices.flat_rank == 2
     ), "scatter_set: indices must have rank 2"
-    debug_assert(
-        Int(indices.dim[1]()) == 2,
-        "scatter_set: indices must have shape [total_seq_len, 2]",
-    )
+    assert (
+        Int(indices.dim[1]()) == 2
+    ), "scatter_set: indices must have shape [total_seq_len, 2]"
 
     @always_inline
     @parameter
-    fn scatter_set_constant_fn[
+    def scatter_set_constant_fn[
         width: Int, rank_: Int, alignment: Int = 1
     ](idx: IndexList[rank_]):
         comptime assert rank_ == 1, "scatter_set_constant_fn: rank must be 1"
@@ -1786,6 +1750,5 @@ fn scatter_set_constant[
         func=scatter_set_constant_fn,
         simd_width=1,
         target=target,
-        use_blocking_impl=single_thread_blocking_override,
         _trace_description="scatter_set_constant",
     ](dispatch_shape, ctx)

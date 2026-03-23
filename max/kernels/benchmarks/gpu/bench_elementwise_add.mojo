@@ -22,16 +22,14 @@ from std.benchmark import (
     BenchMetric,
     ThroughputMeasure,
 )
-from buffer import NDBuffer
 from std.gpu.host import DeviceContext
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.utils import IndexList
 
+from layout import TileTensor, Coord, row_major
 
-fn bench_add[
+
+def bench_add[
     unroll_by: Int, rank: Int
 ](mut b: Bench, shape: IndexList[rank], ctx: DeviceContext) raises:
     comptime type = DType.float32
@@ -39,9 +37,9 @@ fn bench_add[
     var input0_ptr = ctx.enqueue_create_buffer[type](size)
     var input1_ptr = ctx.enqueue_create_buffer[type](size)
     var output_ptr = ctx.enqueue_create_buffer[type](size)
-    var input0_ptr_host = UnsafePointer[Scalar[type]].alloc(size)
-    var input1_ptr_host = UnsafePointer[Scalar[type]].alloc(size)
-    var output_ptr_host = UnsafePointer[Scalar[type]].alloc(size)
+    var input0_ptr_host = alloc[Scalar[type]](size)
+    var input1_ptr_host = alloc[Scalar[type]](size)
+    var output_ptr_host = alloc[Scalar[type]](size)
     randn(input0_ptr_host, size)
     randn(input1_ptr_host, size)
     randn(output_ptr_host, size)
@@ -49,17 +47,18 @@ fn bench_add[
     ctx.enqueue_copy(input1_ptr, input1_ptr_host)
     ctx.enqueue_copy(output_ptr, output_ptr_host)
 
-    var input0 = NDBuffer[type, rank](input0_ptr.unsafe_ptr(), shape)
-    var input1 = NDBuffer[type, rank](input1_ptr.unsafe_ptr(), shape)
-    var output = NDBuffer[type, rank](output_ptr.unsafe_ptr(), shape)
+    var input0 = TileTensor(input0_ptr, row_major(Coord(shape)))
+    var input1 = TileTensor(input1_ptr, row_major(Coord(shape)))
+    var output = TileTensor(output_ptr, row_major(Coord(shape)))
 
     @parameter
     @always_inline
     @__copy_capture(input0, input1, output)
-    fn add[
+    def add[
         simd_width: Int, _rank: Int, alignment: Int = 1
     ](out_index: IndexList[_rank]):
-        var idx = rebind[IndexList[rank]](out_index)
+        var idx = Coord(out_index)
+        comptime assert input0.flat_rank >= idx.flat_rank
         var val = input0.load[width=simd_width](idx) + input1.load[
             width=simd_width
         ](idx)
@@ -67,10 +66,10 @@ fn bench_add[
 
     @parameter
     @always_inline
-    fn bench_func(mut b: Bencher, shape: IndexList[rank]) raises:
+    def bench_func(mut b: Bencher, shape: IndexList[rank]) raises:
         @parameter
         @always_inline
-        fn kernel_launch(ctx: DeviceContext) raises:
+        def kernel_launch(ctx: DeviceContext) raises:
             elementwise[add, simd_width=unroll_by, target="gpu"](shape, ctx)
 
         b.iter_custom[kernel_launch](ctx)
@@ -93,10 +92,6 @@ fn bench_add[
             )
         ).reduce_and():
             raise Error(t"mismatch at flattened idx {i}")
-
-    _ = input0_ptr
-    _ = input1_ptr
-    _ = output_ptr
 
 
 def main() raises:

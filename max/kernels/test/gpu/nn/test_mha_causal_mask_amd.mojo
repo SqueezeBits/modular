@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.math import isclose
 from std.random import rand
 from std.sys import argv, get_defined_bool
@@ -30,14 +27,14 @@ from std.utils.index import Index
 from std.utils.numerics import min_or_neg_inf
 
 
-fn is_benchmark() -> Bool:
+def is_benchmark() -> Bool:
     for arg in argv():
         if arg == "--benchmark" or arg == "-benchmark":
             return True
     return False
 
 
-fn test[
+def test[
     qkv_type: DType,
     mask_type: DType,
     depth: Int,
@@ -79,12 +76,12 @@ fn test[
     var mask_size = num_heads * seq_len * num_keys
 
     # Allocate memory for all variables.
-    var q_ptr = UnsafePointer[Scalar[qkv_type]].alloc(q_size)
-    var k_ptr = UnsafePointer[Scalar[qkv_type]].alloc(k_size)
-    var v_ptr = UnsafePointer[Scalar[qkv_type]].alloc(v_size)
-    var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(mask_size)
-    var output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
+    var q_ptr = alloc[Scalar[qkv_type]](q_size)
+    var k_ptr = alloc[Scalar[qkv_type]](k_size)
+    var v_ptr = alloc[Scalar[qkv_type]](v_size)
+    var mask_ptr = alloc[Scalar[mask_type]](mask_size)
+    var output_ptr = alloc[Scalar[qkv_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[qkv_type]](o_size)
 
     # Construct buffers.
     comptime layout_4d = Layout.row_major[4]()
@@ -195,7 +192,7 @@ fn test[
     @parameter
     @always_inline
     @__copy_capture(q_device, k_device, v_device, mask4d, output_device)
-    fn kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(ctx: DeviceContext) raises:
         flash_attention(
             output_device,
             q_device,
@@ -287,7 +284,7 @@ fn test[
     flash_output_ptr.free()
 
 
-fn test_helper[depth: Int](ctx: DeviceContext) raises:
+def test_helper[depth: Int](ctx: DeviceContext) raises:
     test[
         DType.bfloat16,
         DType.bfloat16,

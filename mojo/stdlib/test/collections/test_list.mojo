@@ -18,6 +18,7 @@ from test_utils import (
     CopyCounter,
     DelCounter,
     MoveCounter,
+    Observable,
     TriviallyCopyableMoveCounter,
     check_write_to,
 )
@@ -79,7 +80,7 @@ def test_list() raises:
 
 
 struct WeirdList[T: AnyType]:
-    fn __init__(out self, var *values: Self.T, __list_literal__: ()):
+    def __init__(out self, var *values: Self.T, __list_literal__: ()):
         pass
 
 
@@ -655,7 +656,7 @@ def test_list_iter() raises:
     vs.append(3)
 
     # Borrow immutably
-    fn sum(vs: List[Int]) -> Int:
+    def sum(vs: List[Int]) -> Int:
         var sum = 0
         for v in vs:
             sum += v
@@ -675,6 +676,97 @@ def test_list_iter_mutable() raises:
         sum += v
 
     assert_equal(9, sum)
+
+
+# We use `MutAnyOrigin` to bypass exclusivity checking
+# otherwise we cannot construct a list of Observables where
+# all point to the same copy/move/del counter.
+comptime ObservableElement = Observable[
+    CopyOrigin=MutAnyOrigin,
+    MoveOrigin=MutAnyOrigin,
+    DelOrigin=MutAnyOrigin,
+]
+
+
+def make_observable_list(
+    *, mut copies: Int, mut moves: Int, mut dels: Int, length: Int
+) -> List[ObservableElement]:
+    var list = List[ObservableElement](capacity=length)
+    for _i in range(length):
+        list.append(
+            ObservableElement(
+                copies=Pointer[Int, MutAnyOrigin](to=copies),
+                moves=Pointer[Int, MutAnyOrigin](to=moves),
+                dels=Pointer[Int, MutAnyOrigin](to=dels),
+            )
+        )
+    return list^
+
+
+def test_list_iter_owned() raises:
+    var copies = 0
+    var moves = 0
+    var dels = 0
+
+    var list = make_observable_list(
+        copies=copies, moves=moves, dels=dels, length=2
+    )
+    assert_equal(copies, 0)
+    assert_equal(moves, 2)
+    assert_equal(dels, 0)
+
+    for _elem in list^:
+        pass
+
+    assert_equal(copies, 0)
+    assert_equal(moves, 4)
+    assert_equal(dels, 2)
+
+
+def test_list_iter_owned_destroys_elements_if_not_consumed() raises:
+    var copies = 0
+    var moves = 0
+    var dels = 0
+
+    var list = make_observable_list(
+        copies=copies, moves=moves, dels=dels, length=2
+    )
+    var _ = list^.__iter__()
+    assert_equal(copies, 0)
+    assert_equal(moves, 2)
+    assert_equal(dels, 2)
+
+
+def test_list_iter_owned_destroys_elements_if_partially_consumed() raises:
+    var copies = 0
+    var moves = 0
+    var dels = 0
+
+    var list = make_observable_list(
+        copies=copies, moves=moves, dels=dels, length=2
+    )
+
+    var iter = list^.__iter__()
+    assert_equal(copies, 0)
+    assert_equal(moves, 2)
+    assert_equal(dels, 0)
+
+    var _ = iter.__next__()
+    assert_equal(copies, 0)
+    assert_equal(moves, 3)
+    assert_equal(dels, 1)
+
+    _ = iter^
+    assert_equal(copies, 0)
+    assert_equal(moves, 3)
+    assert_equal(dels, 2)
+
+
+def test_list_iter_owned_bounds() raises:
+    var iter = iter([1, 2, 3])
+    for i in range(3, 0, -1):
+        assert_equal((i, Optional(i)), iter.bounds())
+        _ = iter.__next__()
 
 
 def _test_list_iter_bounds[I: Iterator](var list_iter: I, list_len: Int) raises:
@@ -916,11 +1008,10 @@ struct NonEquatable(Copyable):
 
 def test_list_conditional_conformances() raises:
     assert_true(conforms_to(List[Int], Equatable))
-    # TODO(MSTDL-2077):
-    #   This should pass, but does not due to Unconditional Conformances
-    # assert_false(conforms_to(List[NonEquatable], Equatable))
+    assert_false(conforms_to(List[NonEquatable], Equatable))
 
     assert_true(conforms_to(List[Int], Writable))
+    assert_false(conforms_to(List[NonEquatable], Writable))
 
 
 def test_list_init_span() raises:
@@ -1076,6 +1167,22 @@ def test_list_can_infer_iterable_element_type() raises:
             Codepoint.ord("🔥"),
         ],
     )
+
+
+def test_list_hash() raises:
+    # Equal lists should produce the same hash.
+    assert_equal(hash([1, 2, 3]), hash([1, 2, 3]))
+
+    # Empty list hashing.
+    assert_equal(hash(List[Int]()), hash(List[Int]()))
+
+    # Different lists should (likely) produce different hashes.
+    assert_not_equal(hash([1, 2, 3]), hash([1, 2, 4]))
+    assert_not_equal(hash([1, 2]), hash([2, 1]))
+
+    # Hashable conformance is conditional.
+    assert_true(conforms_to(List[Int], Hashable))
+    assert_true(conforms_to(List[String], Hashable))
 
 
 # ===-------------------------------------------------------------------===#

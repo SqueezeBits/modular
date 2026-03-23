@@ -21,18 +21,18 @@ from std.testing import assert_equal
 from std.utils.index import IndexList
 
 
-fn linear_filler(i: Int, n: Int) -> Float32:
+def linear_filler(i: Int, n: Int) -> Float32:
     return Float32(i)
 
 
-fn reverse_filler(i: Int, n: Int) -> Float32:
+def reverse_filler(i: Int, n: Int) -> Float32:
     return Float32(n - i)
 
 
-fn test_argsort[
+def test_argsort[
     dtype: DType = DType.float32,
     *,
-    filler: fn(Int, Int) -> Float32,
+    filler: def(Int, Int) -> Float32,
     ascending: Bool = True,
 ](ctx: DeviceContext, N: Int) raises:
     # Allocate host memory
@@ -81,7 +81,7 @@ fn test_argsort[
         assert_equal(
             indices_host_ptr[i],
             expected_indices_ptr[i],
-            msg=(
+            msg=String(
                 t"indices[{i}] = {indices_host_ptr[i]} expected_indices[{i}] ="
                 t" {expected_indices_ptr[i]} N = {N} ascending = {ascending} at"
                 t" position {i}"
@@ -98,10 +98,10 @@ fn test_argsort[
     _ = device_input^
 
 
-fn test_argsort_helper[
+def test_argsort_helper[
     *,
     dtype: DType,
-    filler: fn(Int, Int) -> Float32,
+    filler: def(Int, Int) -> Float32,
     ascending: Bool,
 ](ctx: DeviceContext) raises:
     test_argsort[dtype, filler=filler, ascending=ascending](ctx, N=3731)

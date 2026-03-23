@@ -35,11 +35,11 @@ from std.utils.numerics import max_finite
 comptime BATCH_SIZE = 2048
 
 
-fn _filler_impl[
+def _filler_impl[
     dtype: DType,
     layout: Layout,
     //,
-    filler: fn(i: Int) capturing[_] -> Scalar[dtype],
+    filler: def(i: Int) capturing[_] -> Scalar[dtype],
     use_runtime_layout: Bool = (
         not layout.all_dims_known() or layout.size() > BATCH_SIZE
     ),
@@ -83,7 +83,7 @@ fn _filler_impl[
             tensor.ptr[i] = val.cast[tensor.dtype]()
 
 
-fn arange[
+def arange[
     dtype: DType,
     layout: Layout,
     /,
@@ -130,7 +130,7 @@ fn arange[
     """
 
     @parameter
-    fn filler(i: Int) -> Scalar[tensor.dtype]:
+    def filler(i: Int) -> Scalar[tensor.dtype]:
         return (Scalar[dtype](i) * step + start) % end
 
     # Use layout info for 2D tensors with simple (non-nested) shapes
@@ -147,7 +147,7 @@ fn arange[
             tensor[m, n] = (Scalar[dtype](m * cols + n) * step + start) % end
 
 
-fn random[
+def random[
     dtype: DType,
     layout: Layout,
     /,
@@ -195,7 +195,7 @@ fn random[
     comptime assert not is_nvidia_gpu(), "Cannot run random on the gpu"
 
     @parameter
-    fn filler(i: Int) -> Scalar[tensor.dtype]:
+    def filler(i: Int) -> Scalar[tensor.dtype]:
         return random_float64(
             min.cast[DType.float64](), max.cast[DType.float64]()
         ).cast[tensor.dtype]()
@@ -203,11 +203,11 @@ fn random[
     _filler_impl[filler, use_runtime_layout](tensor)
 
 
-fn _filler_impl[
+def _filler_impl[
     dtype: DType,
     LayoutType: TensorLayout,
     //,
-    filler: fn(i: Int) capturing[_] -> Scalar[dtype],
+    filler: def(i: Int) capturing[_] -> Scalar[dtype],
     use_runtime_layout: Bool = (
         not LayoutType.all_dims_known
         or Coord[*LayoutType._shape_types].static_product > BATCH_SIZE
@@ -254,7 +254,7 @@ fn _filler_impl[
             tensor.ptr[i] = val.cast[tensor.dtype]()
 
 
-fn arange[
+def arange[
     dtype: DType,
     LayoutType: TensorLayout,
     /,
@@ -302,7 +302,7 @@ fn arange[
     """
 
     @parameter
-    fn filler(i: Int) -> Scalar[tensor.dtype]:
+    def filler(i: Int) -> Scalar[tensor.dtype]:
         return (Scalar[dtype](i) * step + start) % end
 
     # Use layout info for 2D tensors with simple (non-nested) shapes
@@ -315,13 +315,13 @@ fn arange[
     else:
         # Provide evidence that flat_rank == 2 for the constraint system
         comptime assert tensor.flat_rank == 2
-        var rows = Int(tensor.layout.shape[0]().value())
-        var cols = Int(tensor.layout.shape[1]().value())
+        var rows = tensor.layout.shape[0]().value()
+        var cols = tensor.layout.shape[1]().value()
         for m, n in product(range(rows), range(cols)):
             tensor[m, n] = (Scalar[dtype](m * cols + n) * step + start) % end
 
 
-fn random[
+def random[
     dtype: DType,
     LayoutType: TensorLayout,
     /,
@@ -370,7 +370,7 @@ fn random[
     comptime assert not is_nvidia_gpu(), "Cannot run random on the gpu"
 
     @parameter
-    fn filler(i: Int) -> Scalar[tensor.dtype]:
+    def filler(i: Int) -> Scalar[tensor.dtype]:
         return random_float64(
             min.cast[DType.float64](), max.cast[DType.float64]()
         ).cast[tensor.dtype]()

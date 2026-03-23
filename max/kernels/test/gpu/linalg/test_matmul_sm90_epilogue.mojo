@@ -15,7 +15,6 @@ from std.collections import Optional
 from std.sys import align_of, size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
-from buffer.dimlist import DimList
 from std.gpu.host import DeviceContext
 from internal_utils._utils import dynamic, static
 from linalg.matmul.gpu.sm90.testbed import test_matmul_sm90
@@ -169,7 +168,7 @@ def main() raises:
 
         @parameter
         @always_inline
-        fn test_lambda_fn_square[
+        def test_lambda_fn_square[
             _dtype: DType,
             width: Int,
             *,
@@ -195,7 +194,7 @@ def main() raises:
 
         @parameter
         @always_inline
-        fn test_lambda_add_coords[
+        def test_lambda_add_coords[
             _dtype: DType,
             width: Int,
             *,

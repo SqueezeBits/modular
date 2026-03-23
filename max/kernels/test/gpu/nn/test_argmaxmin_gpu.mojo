@@ -21,10 +21,10 @@ from std.testing import assert_equal
 from std.utils.index import IndexList
 
 
-fn test_argmaxmin_gpu[
+def test_argmaxmin_gpu[
     dtype: DType,
     output_type: DType,
-    fill_fn: fn[rank: Int, dtype: DType](
+    fill_fn: def[rank: Int, dtype: DType](
         TileTensor[mut=True, dtype, ...]
     ) capturing[_] -> None,
     largest: Bool = True,
@@ -138,9 +138,9 @@ fn test_argmaxmin_gpu[
     _ = device_out_idxs^
 
 
-fn _test_argmaxmin_gpu_helper_2[
+def _test_argmaxmin_gpu_helper_2[
     idx_type: DType,
-    fill_fn: fn[rank: Int, dtype: DType](
+    fill_fn: def[rank: Int, dtype: DType](
         TileTensor[mut=True, dtype, ...]
     ) capturing[_] -> None,
     largest: Bool,
@@ -156,9 +156,9 @@ fn _test_argmaxmin_gpu_helper_2[
     ](ctx, N=1024, batch_size=12, num_batches=10)
 
 
-fn test_argmaxmin_gpu_helper[
+def test_argmaxmin_gpu_helper[
     idx_type: DType,
-    fill_fn: fn[rank: Int, dtype: DType](
+    fill_fn: def[rank: Int, dtype: DType](
         TileTensor[mut=True, dtype, ...]
     ) capturing[_] -> None,
 ](ctx: DeviceContext) raises:
@@ -171,12 +171,12 @@ fn test_argmaxmin_gpu_helper[
 
 def main() raises:
     @parameter
-    fn fill_random[
+    def fill_random[
         rank: Int, dtype: DType
     ](buffer: TileTensor[mut=True, dtype, ...]):
         comptime min_val = -1e9
         comptime max_val = 1e9
-        var total_elements = buffer.numel()
+        var total_elements = buffer.num_elements()
         for i in range(total_elements):
             var random_value = random_float64(min_val, max_val)
             buffer.ptr[i] = random_value.cast[dtype]()

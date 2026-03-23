@@ -228,17 +228,10 @@ def test_tuple_concat_copy_count() raises:
 
 # This test doesn't need to run, it just needs to compile
 def test_tuple_size_parse_time() raises:
-    fn func_with_where_clause(t: Tuple) where type_of(t).__len__() < 4:
+    def func_with_where_clause(t: Tuple) where type_of(t).__len__() < 4:
         pass
 
     func_with_where_clause((1, 3, 2))
-
-
-def test_tuple_conforms_copyable() raises:
-    assert_true(conforms_to(Tuple[], Copyable))
-    assert_true(conforms_to(Tuple[Int], Copyable))
-    assert_true(conforms_to(Tuple[Int, String], Copyable))
-    assert_true(conforms_to(Tuple[Int, Tuple[Int, Float32]], Copyable))
 
 
 def test_tuple_works_with_non_copyable_types() raises:
@@ -309,8 +302,55 @@ def test_tuple_assert_not_equal() raises:
     assert_not_equal((1, 2, 3), (1, 2))
 
 
+def test_tuple_conditional_conformances() raises:
+    # Copyable conformance is conditional on all element types being Copyable.
+    assert_true(conforms_to(Tuple[], Copyable))
+    assert_true(conforms_to(Tuple[Int], Copyable))
+    assert_true(conforms_to(Tuple[Int, String], Copyable))
+    assert_true(conforms_to(Tuple[Int, Tuple[Int, Float32]], Copyable))
+
+    # ImplicitlyCopyable conformance is conditional on all element types being
+    # ImplicitlyCopyable (and Copyable).
+    assert_true(conforms_to(Tuple[], ImplicitlyCopyable))
+    assert_true(conforms_to(Tuple[Int], ImplicitlyCopyable))
+    assert_true(conforms_to(Tuple[Int, String], ImplicitlyCopyable))
+
+    # Writable conformance is conditional on all element types being Writable.
+    assert_true(conforms_to(Tuple[Int], Writable))
+    assert_true(conforms_to(Tuple[Int, String], Writable))
+    assert_true(conforms_to(Tuple[], Writable))
+
+    # Equatable conformance is conditional on all element types being Equatable.
+    assert_true(conforms_to(Tuple[], Equatable))
+    assert_true(conforms_to(Tuple[Int], Equatable))
+    assert_true(conforms_to(Tuple[Int, String], Equatable))
+
+    # Hashable conformance is conditional on all element types being Hashable.
+    assert_true(conforms_to(Tuple[], Hashable))
+    assert_true(conforms_to(Tuple[Int], Hashable))
+    assert_true(conforms_to(Tuple[Int, String], Hashable))
+
+    # conforms_to correctly returns False for non-conforming element types.
+    assert_false(conforms_to(Tuple[MoveOnly[Int]], Copyable))
+    assert_false(conforms_to(Tuple[MoveOnly[Int]], ImplicitlyCopyable))
+    assert_false(conforms_to(Tuple[MoveOnly[Int]], Writable))
+
+
+def test_tuple_hash() raises:
+    # Equal tuples should produce the same hash.
+    assert_equal(hash((1, 2, 3)), hash((1, 2, 3)))
+    assert_equal(hash(("a", "b")), hash(("a", "b")))
+
+    # Empty tuple hashing.
+    assert_equal(hash(Tuple[]()), hash(Tuple[]()))
+
+    # Different tuples should (likely) produce different hashes.
+    assert_not_equal(hash((1, 2, 3)), hash((1, 2, 4)))
+    assert_not_equal(hash((1, 2)), hash((2, 1)))
+
+
 def test_tuple_assert_equal_failure_message() raises:
-    with assert_raises(contains="Tuple[Int, Int](Int(1), Int(2))"):
+    with assert_raises(contains="left: (1, 2)"):
         assert_equal((1, 2), (1, 3))
 
 

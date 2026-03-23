@@ -21,9 +21,10 @@ from max.graph import DeviceRef
 from max.nn.kv_cache import (
     KVCacheParamInterface,
 )
-from max.pipelines.lib import KVCacheConfig, PipelineConfig
+from max.pipelines.lib import KVCacheConfig, MAXModelConfig, PipelineConfig
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from max.pipelines.lib.interfaces.arch_config import ArchConfigWithKVCache
+from max.pipelines.lib.pipeline_variants.utils import get_rope_theta
 from max.pipelines.lib.utils import upper_bounded_default
 from transformers import AutoConfig
 from typing_extensions import Self, override
@@ -35,12 +36,16 @@ from ..deepseekV3.model_config import DeepseekV3Config
 class KimiK2_5TextConfig(DeepseekV3Config):
     @override
     @classmethod
-    def initialize(cls, pipeline_config: PipelineConfig) -> Self:
+    def initialize(
+        cls,
+        pipeline_config: PipelineConfig,
+        model_config: MAXModelConfig | None = None,
+    ) -> Self:
         """Initializes a DeepseekV3Config instance from pipeline configuration.
 
         This method creates a config instance with all fields that can be determined
         from the pipeline configuration, without needing the state_dict.
-        Fields that depend on the state_dict (like norm_dtype, float8_config, etc.)
+        Fields that depend on the state_dict (like norm_dtype, quant_config, etc.)
         should be set via the `finalize()` method.
 
         Args:
@@ -49,24 +54,25 @@ class KimiK2_5TextConfig(DeepseekV3Config):
         Returns:
             An initialized DeepseekV3Config instance.
         """
-        assert pipeline_config.model.huggingface_config is not None
-        config = pipeline_config.model.huggingface_config.text_config
+        model_config = model_config or pipeline_config.model
+        assert model_config.huggingface_config is not None
+        config = model_config.huggingface_config.text_config
         if config is None:
             raise ValueError(
-                f"HuggingFace config is required for '{pipeline_config.model.model_path}', "
+                f"HuggingFace config is required for '{model_config.model_path}', "
                 "but config could not be loaded. "
                 "Please ensure the model repository contains a valid config.json file."
             )
-        kv_cache_config = pipeline_config.model.kv_cache
-        quantization_encoding = pipeline_config.model.quantization_encoding
+        kv_cache_config = model_config.kv_cache
+        quantization_encoding = model_config.quantization_encoding
         if quantization_encoding is None:
             raise ValueError("quantization_encoding must not be None")
         dtype = supported_encoding_dtype(quantization_encoding)
-        cache_dtype = pipeline_config.model.kv_cache.cache_dtype
+        cache_dtype = model_config.kv_cache.cache_dtype
 
         device_refs = [
             DeviceRef(spec.device_type, spec.id)
-            for spec in pipeline_config.model.device_specs
+            for spec in model_config.device_specs
         ]
 
         kv_params = cls.construct_kv_params(
@@ -79,15 +85,15 @@ class KimiK2_5TextConfig(DeepseekV3Config):
 
         max_seq_len = upper_bounded_default(
             upper_bound=config.max_position_embeddings,
-            default=pipeline_config.model.max_length,
+            default=model_config.max_length,
         )
 
         return cls(
             dtype=dtype,
             kv_params=kv_params,
             devices=device_refs,
-            data_parallel_degree=pipeline_config.model.data_parallel_degree,
-            use_subgraphs=pipeline_config.model.use_subgraphs,
+            data_parallel_degree=model_config.data_parallel_degree,
+            use_subgraphs=model_config.use_subgraphs,
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -115,7 +121,7 @@ class KimiK2_5TextConfig(DeepseekV3Config):
             max_seq_len=max_seq_len,
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=config.tie_word_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=get_rope_theta(config),
             rope_scaling=config.rope_scaling,
             rope_interleave=getattr(config, "rope_interleave", True),
             scoring_func=config.scoring_func,
@@ -148,10 +154,9 @@ class KimiK2_5TextConfig(DeepseekV3Config):
 class VisionConfig:
     """Vision configuration for Kimi-K2.5 models with required fields."""
 
+    # Required fields (no defaults); order must precede any field with a default.
     dtype: DType
     """DType of the Kimi-K2.5 vision model weights."""
-    llm_dtype: DType
-    """DType of the Kimi-K2.5 language model weights."""
     devices: list[DeviceRef]
     """Devices that the Kimi-K2.5 vision encoder model is parallelized over."""
 
@@ -163,26 +168,14 @@ class VisionConfig:
     """Width of the initial position embedding."""
     merge_kernel_size: list[int]
     """Kernel size for the merge operation."""
-    merge_type: str
-    """Type of the merge operation."""
     mm_hidden_size: int
     """Hidden size of the multi-modal hidden layer."""
-    mm_projector_type: str
-    """Type of the multi-modal projector."""
-    model_type: str
-    """Type of the model."""
     patch_size: int
     """Size of the patch."""
-    pos_emb_type: str
-    """Type of the position embedding."""
-    projector_hidden_act: str
-    """Activation function for the projector."""
     projector_ln_eps: float
     """Epsilon for the layer normalization."""
     text_hidden_size: int
     """Hidden size of the text hidden layer."""
-    video_attn_type: str
-    """Type of the video attention."""
     vt_hidden_size: int
     """Hidden size of the video hidden layer."""
     vt_intermediate_size: int
@@ -192,54 +185,111 @@ class VisionConfig:
     vt_num_hidden_layers: int
     """Number of hidden layers of the video hidden layer."""
 
+    # Optional fields (from HF config or defaults).
+    merge_type: str | None = None
+    """Type of the merge operation."""
+    mm_projector_type: str | None = None
+    """Type of the multi-modal projector."""
+    model_type: str = ""
+    """Type of the model."""
+    pos_emb_type: str | None = None
+    """Type of the position embedding."""
+    projector_hidden_act: str | None = None
+    """Activation function for the projector."""
+    video_attn_type: str | None = None
+    """Type of the video attention."""
+
+    # Fields with hardcoded defaults (not present in HF config.json).
+    has_bias: bool = True
+    """Whether linear projections in the vision transformer include bias terms."""
+    in_channels: int = 3
+    """Number of input image channels (3 for RGB).
+    """
+    rope_max_height: int = 512
+    """Maximum grid height for RoPE frequency precomputation.
+    """
+    rope_max_width: int = 512
+    """Maximum grid width for RoPE frequency precomputation.
+    """
+    rope_theta: float = 10000.0
+    """Base for the RoPE inverse-frequency exponent.
+    """
+
     @classmethod
     def initialize_from_config(
         cls,
         pipeline_config: PipelineConfig,
         hf_vision_config: AutoConfig,
+        huggingface_config: AutoConfig | None = None,
     ) -> VisionConfig:
         """Initialize VisionConfig from HuggingFace vision config.
+
+        Args:
+            pipeline_config: MAX Engine pipeline configuration.
+            hf_vision_config: HuggingFace vision sub-config.
+            huggingface_config: Full HuggingFace model config, used to derive
+                ``text_hidden_size`` from ``text_config.hidden_size`` when
+                ``hf_vision_config`` does not carry the attribute directly
+                (e.g. moonshotai/Kimi-VL-A3B-Instruct vs nvidia/Kimi-K2.5-NVFP4).
 
         Note: dtype fields will be set to defaults and should be updated
         via finalize() once state_dict is available.
         """
-        from max.dtype import DType as MaxDType
+        # text_hidden_size is the patch-merger output dim, which must match the
+        # LLM hidden size.  Prefer the explicit attribute on the vision config;
+        # fall back to the LLM text_config hidden_size; then a last-resort default.
+        text_hidden_size = getattr(hf_vision_config, "text_hidden_size", None)
+        if text_hidden_size is None and huggingface_config is not None:
+            llm_cfg = getattr(
+                huggingface_config, "text_config", huggingface_config
+            )
+            text_hidden_size = llm_cfg.hidden_size
+        if text_hidden_size is None:
+            text_hidden_size = 7168  # last-resort default (Kimi-K2.5 value)
 
         return cls(
-            dtype=MaxDType.bfloat16,
-            llm_dtype=MaxDType.bfloat16,
+            dtype=DType.bfloat16,
             devices=[
                 DeviceRef(spec.device_type, spec.id)
                 for spec in pipeline_config.model.device_specs
             ],
             init_pos_emb_height=hf_vision_config.init_pos_emb_height,
-            init_pos_emb_time=hf_vision_config.init_pos_emb_time,
+            init_pos_emb_time=getattr(hf_vision_config, "init_pos_emb_time", 4),
             init_pos_emb_width=hf_vision_config.init_pos_emb_width,
             merge_kernel_size=hf_vision_config.merge_kernel_size,
-            merge_type=hf_vision_config.merge_type,
-            mm_hidden_size=hf_vision_config.mm_hidden_size,
-            mm_projector_type=hf_vision_config.mm_projector_type,
+            merge_type=getattr(hf_vision_config, "merge_type", None),
+            mm_hidden_size=getattr(hf_vision_config, "mm_hidden_size", 1152),
+            mm_projector_type=getattr(
+                hf_vision_config, "mm_projector_type", None
+            ),
             model_type=hf_vision_config.model_type,
             patch_size=hf_vision_config.patch_size,
-            pos_emb_type=hf_vision_config.pos_emb_type,
-            projector_hidden_act=hf_vision_config.projector_hidden_act,
-            projector_ln_eps=hf_vision_config.projector_ln_eps,
-            text_hidden_size=hf_vision_config.text_hidden_size,
-            video_attn_type=hf_vision_config.video_attn_type,
-            vt_hidden_size=hf_vision_config.vt_hidden_size,
-            vt_intermediate_size=hf_vision_config.vt_intermediate_size,
-            vt_num_attention_heads=hf_vision_config.vt_num_attention_heads,
-            vt_num_hidden_layers=hf_vision_config.vt_num_hidden_layers,
+            pos_emb_type=getattr(hf_vision_config, "pos_emb_type", None),
+            projector_hidden_act=getattr(
+                hf_vision_config, "projector_hidden_act", None
+            ),
+            projector_ln_eps=getattr(
+                hf_vision_config, "projector_ln_eps", 1e-05
+            ),
+            text_hidden_size=text_hidden_size,
+            video_attn_type=getattr(hf_vision_config, "video_attn_type", None),
+            vt_hidden_size=hf_vision_config.vt_hidden_size
+            if hasattr(hf_vision_config, "vt_hidden_size")
+            else hf_vision_config.hidden_size,
+            vt_intermediate_size=hf_vision_config.vt_intermediate_size
+            if hasattr(hf_vision_config, "vt_intermediate_size")
+            else hf_vision_config.intermediate_size,
+            vt_num_attention_heads=hf_vision_config.vt_num_attention_heads
+            if hasattr(hf_vision_config, "vt_num_attention_heads")
+            else hf_vision_config.num_attention_heads,
+            vt_num_hidden_layers=hf_vision_config.vt_num_hidden_layers
+            if hasattr(hf_vision_config, "vt_num_hidden_layers")
+            else hf_vision_config.num_hidden_layers,
         )
 
-    def finalize(
-        self,
-        vision_dtype: DType,
-        llm_dtype: DType,
-    ) -> None:
+    def finalize(self, vision_dtype: DType) -> None:
         """Finalize VisionConfig with state_dict dependent fields."""
         self.dtype = vision_dtype
-        self.llm_dtype = llm_dtype
 
 
 @dataclass(kw_only=True)
@@ -270,10 +320,10 @@ class KimiK2_5Config(ArchConfigWithKVCache):
     tie_word_embeddings: bool
     """Whether to share (tie) the input and output word embeddings in the language model."""
 
-    use_unified_vision_chunk: bool
+    use_unified_vision_chunk: bool | None
     """Whether to use a unified chunk for vision inputs."""
 
-    video_placeholder: str
+    video_placeholder: str | None
     """Placeholder string used to represent video segments in input text."""
 
     # Vision encoder configuration.
@@ -334,7 +384,11 @@ class KimiK2_5Config(ArchConfigWithKVCache):
 
     @override
     @classmethod
-    def initialize(cls, pipeline_config: PipelineConfig) -> Self:
+    def initialize(
+        cls,
+        pipeline_config: PipelineConfig,
+        model_config: MAXModelConfig | None = None,
+    ) -> Self:
         """Initializes a Qwen3VLConfig instance from pipeline configuration.
 
         Args:
@@ -343,10 +397,11 @@ class KimiK2_5Config(ArchConfigWithKVCache):
         Returns:
             A Qwen3VLConfig instance with fields initialized from config.
         """
-        huggingface_config = pipeline_config.model.huggingface_config
+        model_config = model_config or pipeline_config.model
+        huggingface_config = model_config.huggingface_config
         if huggingface_config is None:
             raise ValueError(
-                f"HuggingFace config is required for '{pipeline_config.model.model_path}', "
+                f"HuggingFace config is required for '{model_config.model_path}', "
                 "but config could not be loaded. "
                 "Please ensure the model repository contains a valid config.json file."
             )
@@ -378,8 +433,6 @@ class KimiK2_5Config(ArchConfigWithKVCache):
         if hf_vision_config is None:
             raise ValueError("vision_config not found in huggingface_config")
 
-        text_config = huggingface_config.text_config
-
         # Get quantization encoding for dtype
         quantization_encoding = pipeline_config.model.quantization_encoding
         if quantization_encoding is None:
@@ -398,7 +451,9 @@ class KimiK2_5Config(ArchConfigWithKVCache):
             )
 
         vision_config = VisionConfig.initialize_from_config(
-            pipeline_config, hf_vision_config
+            pipeline_config,
+            hf_vision_config,
+            huggingface_config=huggingface_config,
         )
 
         # Create KimiK2_5TextConfig for the language model
@@ -437,8 +492,12 @@ class KimiK2_5Config(ArchConfigWithKVCache):
             media_placeholder_token_id=huggingface_config.media_placeholder_token_id,
             pad_token_id=huggingface_config.pad_token_id,
             tie_word_embeddings=huggingface_config.tie_word_embeddings,
-            use_unified_vision_chunk=huggingface_config.use_unified_vision_chunk,
-            video_placeholder=huggingface_config.video_placeholder,
+            use_unified_vision_chunk=getattr(
+                huggingface_config, "use_unified_vision_chunk", None
+            ),
+            video_placeholder=getattr(
+                huggingface_config, "video_placeholder", None
+            ),
             # Vision configuration
             vision_config=vision_config,
             # Composed language model configuration

@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +30,7 @@ from max.interfaces import (
     PixelGenerationContext,
     RequestID,
     SamplingParams,
+    SpecDecodingState,
     TextGenerationContext,
     TextGenerationOutput,
     TokenBuffer,
@@ -68,6 +67,7 @@ class TextContext:
         _log_probabilities_data: Token log probabilities data
         _is_initial_prompt: Whether this is the initial prompt encoding
         _draft_offset: Offset for draft decoding
+        _spec_decoding_state: Optional per-request speculative decoding state
     """
 
     max_length: int
@@ -89,6 +89,7 @@ class TextContext:
 
     _is_initial_prompt: bool = field(default=True)
     _draft_offset: int = field(default=0)
+    _spec_decoding_state: SpecDecodingState | None = field(default=None)
 
     target_endpoint: str | None = field(default=None)
 
@@ -124,6 +125,18 @@ class TextContext:
     def min_tokens(self) -> int:
         """The minimum number of new tokens to generate."""
         return self.sampling_params.min_new_tokens
+
+    @property
+    def spec_decoding_state(self) -> SpecDecodingState:
+        """Gets or creates the per-request speculative decoding state."""
+        if self._spec_decoding_state is None:
+            self._spec_decoding_state = SpecDecodingState()
+        return self._spec_decoding_state
+
+    @property
+    def num_draft_tokens(self) -> int:
+        """Returns the total sequence length including speculative tokens."""
+        return len(self.spec_decoding_state.saved_draft_tokens)
 
     def apply_processing_offset(self, offset: int) -> None:
         """Applies a processing offset to the token buffer."""
@@ -350,8 +363,12 @@ class TextContext:
 
     def reset(self) -> None:
         """Resets the context's state by combining all tokens into a new prompt."""
-        self.tokens.reset_as_new_prompt()
+        delete_last_generated_token = self.tokens.all[-1] == FUTURE_TOKEN
+        self.tokens.reset_as_new_prompt(
+            delete_last_generated_token=delete_last_generated_token
+        )
         self._is_initial_prompt = True
+        self._spec_decoding_state = None
 
     def compute_num_available_steps(
         self,
@@ -676,6 +693,9 @@ class PixelContext:
     negative_tokens: TokenBuffer | None = field(default=None)
     """Negative tokens for primary encoder."""
 
+    negative_mask: npt.NDArray[np.bool_] | None = field(default=None)
+    """Mask for the negative text encoder path."""
+
     negative_tokens_2: TokenBuffer | None = field(default=None)
     """Negative tokens for secondary encoder. None for single-encoder models."""
 
@@ -709,6 +729,10 @@ class PixelContext:
     num_images_per_prompt: int = field(default=1)
     input_image: npt.NDArray[np.uint8] | None = field(default=None)
     """Input image as numpy array (H, W, C) in uint8 format for image-to-image generation."""
+    image: npt.NDArray[np.uint8] | None = field(default=None)
+    """Decoded output image (H, W, C) uint8 [0, 255]. Set after generation completes."""
+    output_format: str = field(default="jpeg")
+    """Image encoding format for the output (e.g., 'jpeg', 'png', 'webp')."""
     status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
 
     @property
@@ -727,16 +751,24 @@ class PixelContext:
         """Resets the context's state."""
         self.status = GenerationStatus.ACTIVE
 
-    def update(self, latents: npt.NDArray[Any]) -> None:
-        """Update the context with newly generated latents/image data."""
-        self.latents = latents
+    def update(self, image: npt.NDArray[np.uint8]) -> None:
+        """Update the context with the decoded uint8 image output."""
+        self.image = image
 
     def to_generation_output(self) -> GenerationOutput:
         """Convert this context to a GenerationOutput object."""
+        if self.image is None:
+            raise ValueError(
+                "No decoded image available; generation may not have completed."
+            )
         return GenerationOutput(
             request_id=self.request_id,
             final_status=self.status,
-            output=[OutputImageContent.from_numpy(self.latents, format="png")],
+            output=[
+                OutputImageContent.from_numpy(
+                    self.image, format=self.output_format
+                )
+            ],
         )
 
 
@@ -765,50 +797,3 @@ if TYPE_CHECKING:
             request_id=RequestID(),
             tokens=TokenBuffer(np.array([0], dtype=np.int64)),
         )
-
-
-@contextmanager
-def reserve_token_space_for_batch(
-    batch: list[TextContext],
-    num_tokens: int,
-) -> Iterator[None]:
-    """Reserves token space for each context in a batch for the duration of the context.
-
-    Increments each context's token buffer processing range end and current length
-    by ``num_tokens``; restores them on exit.
-
-    Args:
-        batch: List of TextContext objects to reserve space for.
-        num_tokens: Number of tokens to reserve for each context.
-
-    Yields:
-        None
-    """
-    if num_tokens == 0:
-        yield
-
-    saved_state: dict[RequestID, tuple[int, int]] = {
-        ctx.request_id: (
-            ctx.tokens._processing_range.end,
-            ctx.tokens._current_length,
-        )
-        for ctx in batch
-    }
-
-    try:
-        for ctx in batch:
-            ctx.tokens._processing_range.bump_end(num_tokens)
-
-            new_length = ctx.tokens._current_length + num_tokens
-            if new_length < 0:
-                raise ValueError(
-                    f"Logical length {ctx.tokens._current_length} + num_tokens {num_tokens} must be >= 0"
-                )
-            ctx.tokens._expand_capacity(min_capacity=new_length)
-            ctx.tokens._current_length = new_length
-        yield
-    finally:
-        for ctx in batch:
-            proc_end, cur_len = saved_state[ctx.request_id]
-            ctx.tokens._processing_range.end = proc_end
-            ctx.tokens._current_length = cur_len

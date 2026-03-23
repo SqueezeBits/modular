@@ -48,7 +48,7 @@ struct Point(Writable):
     var x: Float64
     var y: Float64
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write("(", self.x, ", ", self.y, ")")
 
 var p = Point(1.5, 2.7)
@@ -65,7 +65,7 @@ struct Point(Writable):
     var x: Float64
     var y: Float64
 
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    def write_repr_to(self, mut writer: Some[Writer]):
         writer.write("Point: x=", self.x, ", y=", self.y)
 
 var p = Point(1.5, 2.7)
@@ -83,6 +83,7 @@ from std.reflection import (
 )
 from std.reflection.type_info import _unqualified_type_name
 
+from .repr import repr
 
 # ===-----------------------------------------------------------------------===#
 # Writer
@@ -106,7 +107,7 @@ trait Writer(ImplicitlyDestructible):
     struct StringBuilder(Writer):
         var s: String
 
-        fn write_string(mut self, string: StringSlice):
+        def write_string(mut self, string: StringSlice):
             self.s += string
 
     var builder = StringBuilder("")
@@ -115,7 +116,7 @@ trait Writer(ImplicitlyDestructible):
     ```
     """
 
-    fn write_string(mut self, string: StringSlice):
+    def write_string(mut self, string: StringSlice):
         """
         Write a `StringSlice` to this `Writer`.
 
@@ -124,7 +125,7 @@ trait Writer(ImplicitlyDestructible):
         """
         ...
 
-    fn write[*Ts: Writable](mut self, *args: *Ts):
+    def write[*Ts: Writable](mut self, *args: *Ts):
         """Write a sequence of Writable arguments to the provided Writer.
 
         Parameters:
@@ -173,19 +174,26 @@ trait Writable(ImplicitlyDestructible):
         var x: Float64
         var y: Float64
 
-        fn write_to(self, mut writer: Some[Writer]):
+        def write_to(self, mut writer: Some[Writer]):
             writer.write("(", self.x, ", ", self.y, ")")
 
-        fn write_repr_to(self, mut writer: Some[Writer]):
+        def write_repr_to(self, mut writer: Some[Writer]):
             writer.write("Point: x=", self.x, ", y=", self.y)
 
     var p = Point(1.5, 2.7)
     print(p)       # (1.5, 2.7)
     print(repr(p)) # Point: x=1.5, y=2.7
     ```
+
+    Note: The default reflection-based implementations iterate over all fields
+    at compile time. For mutually recursive types (e.g., struct `A` has a field
+    of type `List[B]` and struct `B` has a field of type `A`), this creates an
+    infinite monomorphization cycle that causes the compiler to hang. To fix
+    this, provide explicit `write_to()` and `write_repr_to()` implementations
+    for at least one type in the cycle.
     """
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Write this value's text representation to a writer.
 
         This method is called by `print()`, `String()`, and format strings to
@@ -202,20 +210,20 @@ trait Writable(ImplicitlyDestructible):
         ## Example
 
         ```mojo
-        fn write_to(self, mut writer: Some[Writer]):
+        def write_to(self, mut writer: Some[Writer]):
             writer.write("(", self.x, ", ", self.y, ")")
         ```
         """
 
         @always_inline
-        fn call_write_to[
+        def call_write_to[
             FieldType: Writable
         ](field: FieldType, mut writer: type_of(writer)):
             field.write_to(writer)
 
         _reflection_write_to[f=call_write_to](self, writer)
 
-    fn write_repr_to(self, mut writer: Some[Writer]):
+    def write_repr_to(self, mut writer: Some[Writer]):
         """Write this value's debug representation to a writer.
 
         This method is called by `repr(value)` or the `"{!r}"` format specifier
@@ -232,7 +240,7 @@ trait Writable(ImplicitlyDestructible):
         ## Example
 
         ```mojo
-        fn write_repr_to(self, mut writer: Some[Writer]):
+        def write_repr_to(self, mut writer: Some[Writer]):
             writer.write("Point: x=", self.x, ", y=", self.y)
         ```
 
@@ -243,7 +251,7 @@ trait Writable(ImplicitlyDestructible):
         """
 
         @always_inline
-        fn call_write_repr_to[
+        def call_write_repr_to[
             FieldType: Writable
         ](field: FieldType, mut writer: type_of(writer)):
             field.write_repr_to(writer)
@@ -252,11 +260,11 @@ trait Writable(ImplicitlyDestructible):
 
 
 @always_inline
-fn _reflection_write_to[
+def _reflection_write_to[
     T: Writable,
     W: Writer,
     //,
-    f: fn[FieldType: Writable](field: FieldType, mut writer: W),
+    f: def[FieldType: Writable](field: FieldType, mut writer: W),
 ](this: T, mut writer: W,):
     comptime names = struct_field_names[T]()
     comptime types = struct_field_types[T]()

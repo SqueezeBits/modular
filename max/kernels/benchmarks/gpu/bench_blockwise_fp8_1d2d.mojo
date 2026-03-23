@@ -51,28 +51,23 @@ from layout import (
     RuntimeLayout,
     TileTensor,
     UNKNOWN_VALUE,
+    row_major as new_row_major,
 )
 from layout._fillers import random
-from layout._ndbuffer_stub import from_ndbuffer_row_major
 from linalg.grouped_matmul_sm100_blockwise_fp8 import (
     grouped_matmul_sm100_blockwise_scaled_fp8_persistent,
 )
 from linalg.matmul.gpu.sm100.config import MatmulConfig
-from layout.tile_layout import row_major as new_row_major
 from structured_kernels.tile_types import (
     GMEMLayout1D,
 )
 from linalg.matmul.gpu.sm100_structured.blockwise_fp8_1d2d import (
     grouped_matmul_dynamic_scaled_fp8_1d2d,
 )
-from buffer import Dim, DimList, NDBuffer
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from std.utils.index import Index, IndexList
 
 
-fn bench_blockwise_fp8_1d2d[
+def bench_blockwise_fp8_1d2d[
     num_experts: Int,
     expert_shape: IndexList[2],  # (N, K)
 ](
@@ -124,15 +119,9 @@ fn bench_blockwise_fp8_1d2d[
     )
 
     # Host allocations
-    var a_offsets_host_ptr = UnsafePointer[Scalar[DType.uint32]].alloc(
-        num_active_experts + 1
-    )
-    var expert_ids_host_ptr = UnsafePointer[Scalar[DType.int32]].alloc(
-        num_active_experts
-    )
-    var expert_scales_host_ptr = UnsafePointer[Scalar[DType.float32]].alloc(
-        num_experts
-    )
+    var a_offsets_host_ptr = alloc[Scalar[DType.uint32]](num_active_experts + 1)
+    var expert_ids_host_ptr = alloc[Scalar[DType.int32]](num_active_experts)
+    var expert_scales_host_ptr = alloc[Scalar[DType.float32]](num_experts)
 
     # Setup offsets, expert ids, scales
     a_offsets_host_ptr[0] = 0
@@ -168,47 +157,6 @@ fn bench_blockwise_fp8_1d2d[
     ctx.enqueue_copy(a_offsets_dev_buf, a_offsets_host_ptr)
     ctx.enqueue_copy(expert_ids_dev_buf, expert_ids_host_ptr)
     ctx.enqueue_copy(expert_scales_dev_buf, expert_scales_host_ptr)
-
-    # Create NDBuffer views for legacy kernel
-    comptime static_a_shape = DimList(Dim(), K)
-    comptime static_b_shape = DimList(num_experts, N, K)
-    comptime static_c_shape = DimList(Dim(), N)
-    comptime static_a_scales_shape = DimList(K // BLOCK_SCALE_K, Dim())
-    comptime static_b_scales_shape = DimList(
-        num_experts, N // BLOCK_SCALE_K, K // BLOCK_SCALE_K
-    )
-
-    var a_ndb = NDBuffer[a_type, 2, _, static_a_shape](
-        a_dev_buf.unsafe_ptr(), IndexList[2](total_num_tokens, K)
-    )
-    var b_ndb = NDBuffer[b_type, 3, _, static_b_shape](
-        b_dev_buf.unsafe_ptr(), IndexList[3](num_experts, N, K)
-    )
-    var c_ndb = NDBuffer[c_type, 2, _, static_c_shape](
-        c_dev_buf.unsafe_ptr(), IndexList[2](total_num_tokens, N)
-    )
-    var a_offsets_ndb = NDBuffer[DType.uint32, 1](
-        a_offsets_dev_buf.unsafe_ptr(), IndexList[1](num_active_experts + 1)
-    )
-    var expert_ids_ndb = NDBuffer[DType.int32, 1](
-        expert_ids_dev_buf.unsafe_ptr(), IndexList[1](num_active_experts)
-    )
-    var a_scales_ndb = NDBuffer[DType.float32, 2, _, static_a_scales_shape](
-        a_scales_dev_buf.unsafe_ptr(),
-        IndexList[2](K // BLOCK_SCALE_K, total_num_tokens),
-    )
-    var b_scales_ndb = NDBuffer[DType.float32, 3, _, static_b_scales_shape](
-        b_scales_dev_buf.unsafe_ptr(),
-        IndexList[3](num_experts, N // BLOCK_SCALE_K, K // BLOCK_SCALE_K),
-    )
-
-    var a_lt = from_ndbuffer_row_major(a_ndb)
-    var b_lt = from_ndbuffer_row_major(b_ndb)
-    var c_lt = from_ndbuffer_row_major(c_ndb)
-    var a_offsets_lt = from_ndbuffer_row_major(a_offsets_ndb)
-    var expert_ids_lt = from_ndbuffer_row_major(expert_ids_ndb)
-    var a_scales_lt = from_ndbuffer_row_major(a_scales_ndb)
-    var b_scales_lt = from_ndbuffer_row_major(b_scales_ndb)
 
     # LayoutTensor views for structured kernel
     var dynamic_a_shape = IndexList[2](total_num_tokens, K)
@@ -348,29 +296,29 @@ fn bench_blockwise_fp8_1d2d[
 
     @parameter
     @__copy_capture(
-        a_lt,
-        b_lt,
-        c_lt,
-        a_scales_lt,
-        b_scales_lt,
-        a_offsets_lt,
-        expert_ids_lt,
+        a_tt,
+        b_tt,
+        c_tt,
+        a_scales_tt,
+        b_scales_tt,
+        a_offsets_tt,
+        expert_ids_tt,
     )
     @always_inline
-    fn bench_legacy(mut bencher: Bencher):
+    def bench_legacy(mut bencher: Bencher):
         @parameter
         @always_inline
-        fn kernel_launch(ctx: DeviceContext, iteration: Int) raises:
+        def kernel_launch(ctx: DeviceContext, iteration: Int) raises:
             grouped_matmul_sm100_blockwise_scaled_fp8_persistent[
                 config=config,
             ](
-                c_lt,
-                a_lt,
-                b_lt,
-                a_scales_lt,
-                b_scales_lt,
-                a_offsets_lt,
-                expert_ids_lt,
+                c_tt,
+                a_tt,
+                b_tt,
+                a_scales_tt,
+                b_scales_tt,
+                a_offsets_tt,
+                expert_ids_tt,
                 max_num_tokens_by_expert,
                 num_active_experts,
                 ctx,
@@ -396,10 +344,10 @@ fn bench_blockwise_fp8_1d2d[
         expert_scales_struct,
     )
     @always_inline
-    fn bench_structured(mut bencher: Bencher):
+    def bench_structured(mut bencher: Bencher):
         @parameter
         @always_inline
-        fn kernel_launch(ctx: DeviceContext, iteration: Int) raises:
+        def kernel_launch(ctx: DeviceContext, iteration: Int) raises:
             grouped_matmul_dynamic_scaled_fp8_1d2d[
                 a_scales_type=DType.float32,
                 b_scales_type=DType.float32,

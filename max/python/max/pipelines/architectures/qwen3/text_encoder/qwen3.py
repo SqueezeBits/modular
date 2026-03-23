@@ -32,7 +32,7 @@ from max.graph import TensorType
 from .layers import EncoderAttention, RotaryEmbedding
 
 if TYPE_CHECKING:
-    from .model_config import Qwen3TextEncoderConfigBase
+    from .model_config import Qwen3TextEncoderConfig
 
 
 class Qwen3MLP(Module[[Tensor], Tensor]):
@@ -76,19 +76,27 @@ class EncoderTransformerBlock(Module[..., Tensor]):
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def forward(self, x: Tensor, rope: RotaryEmbedding) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        rope: RotaryEmbedding,
+        attention_bias: Tensor,
+    ) -> Tensor:
         """Forward pass without KV cache.
 
         Args:
             x: Input hidden states [seq_len, hidden_dim]
             rope: RoPE embedding module
-
         Returns:
             Output hidden states [seq_len, hidden_dim]
         """
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, rope)
+        x = self.self_attn(
+            x,
+            rope,
+            attention_bias=attention_bias,
+        )
         x = residual + x
 
         residual = x
@@ -102,15 +110,25 @@ class EncoderTransformerBlock(Module[..., Tensor]):
 class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
     """Qwen3 text encoder transformer without KV cache dependency.
 
-    Returns hidden states from all layers for use in diffusion pipelines.
+    Returns fused prompt embeddings by stacking configured hidden states and
+    merging the layer/hidden dimensions.
     """
 
-    def __init__(self, config: Qwen3TextEncoderConfigBase) -> None:
+    def __init__(self, config: Qwen3TextEncoderConfig) -> None:
         super().__init__()
 
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
         self.device = config.device
+        if config.hidden_state_layers:
+            self._sorted_hidden_state_layers = sorted(
+                config.hidden_state_layers
+            )
+        else:
+            self._sorted_hidden_state_layers = list(
+                range(config.num_hidden_layers)
+            )
+        self._hidden_state_layers = set(self._sorted_hidden_state_layers)
 
         self.rope = RotaryEmbedding(
             dim=config.hidden_size,
@@ -119,6 +137,7 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
             max_seq_len=config.max_seq_len,
             device=config.device.to_device(),
             head_dim=config.head_dim,
+            interleaved=False,
         )
 
         self.layers = ModuleList(
@@ -146,22 +165,56 @@ class Qwen3TextEncoderTransformer(Module[..., tuple[Tensor, ...]]):
                 shape=["total_seq_len"],
                 device=self.device,
             ),
+            TensorType(
+                DType.float32,
+                shape=[1, 1, "total_seq_len", "total_seq_len"],
+                device=self.device,
+            ),
         )
 
-    def forward(self, tokens: Tensor) -> tuple[Tensor, ...]:
-        """Forward pass returning hidden states from all layers.
+    def forward(
+        self,
+        tokens: Tensor,
+        attention_bias: Tensor,
+    ) -> tuple[Tensor, ...]:
+        """Forward pass returning fused prompt embeddings.
 
         Args:
             tokens: Input token IDs [total_seq_len]
+            attention_bias: Additive causal+padding mask bias with shape
+                [1, 1, seq_len, seq_len].
 
         Returns:
-            Tuple of hidden states from all layers, each with shape [seq_len, hidden_dim]
+            Tuple containing one tensor shaped [1, seq_len, num_layers * hidden_dim].
         """
         h = self.embed_tokens(tokens)
 
-        all_hidden_states: list[Tensor] = []
-        for layer in self.layers:
-            h = layer(h, self.rope)
-            all_hidden_states.append(h)
+        # Match Hugging Face `output.hidden_states` indexing:
+        #   hidden_states[0] = token embeddings
+        #   hidden_states[i + 1] = output after transformer block i
+        # Flux2-Klein layer indices are specified against that HF contract.
+        selected: dict[int, Tensor] = {}
+        if 0 in self._hidden_state_layers:
+            selected[0] = h
 
-        return tuple(all_hidden_states)
+        max_layer = self._sorted_hidden_state_layers[-1]
+        if max_layer > 0:
+            for i, layer in enumerate(self.layers):
+                h = layer(h, self.rope, attention_bias)
+                hf_hidden_state_index = i + 1
+                if hf_hidden_state_index in self._hidden_state_layers:
+                    selected[hf_hidden_state_index] = h
+                if hf_hidden_state_index == max_layer:
+                    break
+
+        hidden_states = [selected[i] for i in self._sorted_hidden_state_layers]
+
+        stacked = F.stack(hidden_states, axis=0)  # [L, S, D]
+        stacked = F.unsqueeze(stacked, axis=0)  # [1, L, S, D]
+        stacked = F.permute(stacked, [0, 2, 1, 3])  # [1, S, L, D]
+        seq_len = stacked.shape[1]
+        return (
+            F.reshape(
+                stacked, [1, seq_len, stacked.shape[2] * stacked.shape[3]]
+            ),
+        )

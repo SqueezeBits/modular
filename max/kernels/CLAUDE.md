@@ -95,7 +95,7 @@ bd //KGEN/tools/mojo -- /path/to/file.mojo
 
 ```mojo
 from linalg.matmul import matmul
-from layout import Layout, LayoutTensor
+from layout import TileTensor, row_major
 from gpu.host import DeviceContext
 ```
 
@@ -120,6 +120,19 @@ from gpu.host import DeviceContext
 ```
 
 ### Benchmarking
+
+Before running benchmarks on remote GPU nodes, check for hardware throttling
+that can silently produce unreliable results (10x+ slowdowns):
+
+```bash
+# Check for GPU thermal/power throttling (exits non-zero if throttled)
+utils/check-gpu-throttle.sh
+
+# Quick manual check (NVIDIA) — look for "Active" on HW Slowdown lines
+nvidia-smi -q -d PERFORMANCE | grep -E 'HW (Slowdown|Thermal|Power Brake)'
+```
+
+If throttling is detected, switch to a different node before benchmarking.
 
 ```bash
 # Run benchmarks using the benchmarking framework

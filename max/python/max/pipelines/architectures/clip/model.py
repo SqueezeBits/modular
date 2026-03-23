@@ -31,14 +31,16 @@ class ClipModel(ComponentModel):
         encoding: SupportedEncoding,
         devices: list[Device],
         weights: Weights,
+        **kwargs: Any,
     ) -> None:
         super().__init__(
             config,
             encoding,
             devices,
             weights,
+            **kwargs,
         )
-        self.config = ClipConfig.generate(
+        self.config = ClipConfig.initialize_from_config(
             config,
             encoding,
             devices,

@@ -1,0 +1,44 @@
+# Nightly: v0.26.3
+
+This version is still a work in progress.
+
+## ✨ Highlights
+
+## Documentation
+
+## Language enhancements
+
+- String literals now support `\uXXXX` and `\UXXXXXXXX` unicode escape
+  sequences, matching Python. The resulting code point is stored as UTF-8.
+  Invalid code points and surrogates are rejected at parse time.
+
+## Language changes
+
+- Mojo now warns on uses of the legacy `fn` keyword. Please move to `def` as
+  this will upgrade to an error in the future.
+
+## Library changes
+
+- Standard library types now use conditional conformances, replacing previous
+  `_constrained_conforms_to` checks:
+  - `Span`: `Writable`
+
+- Added `IterableOwned` trait to the iteration module. Types conforming to
+  `IterableOwned` implement `__iter__(var self)`, which consumes the collection
+  and returns an iterator that owns the underlying elements.
+  - `List` now conforms to `IterableOwned`.
+
+- `CStringSlice` can no longer represent a null pointer. To represent nullability
+  use `Optional[CStringSlice]` which is guaranteed to have the same size and layout
+  as `const char*`, where `NULL` is the empty `Optional`.
+
+- `external_call`'s `return_type`'s requirements has been relaxed from
+  `TrivialRegisterPassable` to `RegisterPassable`.
+
+- `alloc[T](count, alignment)` will now `abort` if the underlying allocation failed.
+
+## Tooling changes
+
+## ❌ Removed
+
+## 🛠️ Fixed

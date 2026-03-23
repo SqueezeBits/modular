@@ -113,12 +113,12 @@ comptime _ConstCharPtr = UnsafePointer[UInt8, ImmutAnyOrigin]
 comptime _IntPtr = UnsafePointer[Int32, MutAnyOrigin]
 comptime _SizeT = UInt
 
-comptime _DumpPath = Variant[Bool, Path, StaticString, fn() capturing -> Path]
+comptime _DumpPath = Variant[Bool, Path, StaticString, def() capturing -> Path]
 
 # Define helper methods to call AsyncRT bindings.
 
 
-fn _string_from_owned_charptr(c_str: _ConstCharPtr) -> String:
+def _string_from_owned_charptr(c_str: _ConstCharPtr) -> String:
     var result = String(unsafe_from_utf8_ptr=c_str)
     # void AsyncRT_DeviceContext_strfree(const char* ptr)
     external_call["AsyncRT_DeviceContext_strfree", NoneType, _ConstCharPtr](
@@ -128,7 +128,7 @@ fn _string_from_owned_charptr(c_str: _ConstCharPtr) -> String:
 
 
 @always_inline
-fn _checked(
+def _checked(
     err: _ConstCharPtr,
     *,
     msg: String = "",
@@ -139,8 +139,8 @@ fn _checked(
 
 
 @always_inline
-fn _checked_call[
-    func: Some[__TypeOfAllTypes]
+def _checked_call[
+    func: Some[TrivialRegisterPassable]
 ](
     err: _ConstCharPtr,
     *,
@@ -169,7 +169,7 @@ fn _checked_call[
 
 
 @no_inline
-fn _raise_checked_impl(
+def _raise_checked_impl(
     err_msg: _ConstCharPtr, msg: String, location: SourceLocation
 ) raises:
     var err = _string_from_owned_charptr(err_msg)
@@ -177,7 +177,7 @@ fn _raise_checked_impl(
 
 
 # Checks that the given `dim` has only positive integers in them.
-fn _check_dim[
+def _check_dim[
     func_name_for_msg: StringLiteral, dim_name_for_msg: StringLiteral
 ](dim: Dim, *, location: SourceLocation) raises:
     if dim.x() <= 0:
@@ -209,10 +209,10 @@ fn _check_dim[
 struct _DeviceTimer:
     var _handle: _DeviceTimerPtr
 
-    fn __init__(out self, ptr: _DeviceTimerPtr):
+    def __init__(out self, ptr: _DeviceTimerPtr):
         self._handle = ptr
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         # void AsyncRT_DeviceTimer_release(const DviceTimer *timer)
         external_call["AsyncRT_DeviceTimer_release", NoneType, _DeviceTimerPtr](
             self._handle
@@ -233,18 +233,8 @@ struct StreamPriorityRange(TrivialRegisterPassable, Writable):
     var greatest: Int
     """The highest (numerically largest) priority value."""
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    @no_inline
-    fn __str__(self) -> String:
-        """Returns a string representation of the stream priority range.
-
-        Returns:
-            A string in the format "StreamPriorityRange(least=X, greatest=Y)".
-        """
-        return String.write(self)
-
     @always_inline
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes the stream priority range to the given writer.
 
         Args:
@@ -266,7 +256,7 @@ struct _DeviceBufferMode(TrivialRegisterPassable):
     comptime _SYNC = _DeviceBufferMode(0)
     comptime _ASYNC = _DeviceBufferMode(1)
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         return self._mode == other._mode
 
 
@@ -288,8 +278,8 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
     var _host_ptr: Self._HostPtr
     var _handle: _DeviceBufferPtr
 
-    @doc_private
-    fn __init__(
+    @doc_hidden
+    def __init__(
         out self,
         ctx: DeviceContext,
         size: Int,
@@ -324,14 +314,14 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         self._host_ptr = host_ptr
         self._handle = cpp_handle
 
-    @doc_private
-    fn __init__(out self, handle: _DeviceBufferPtr, host_ptr: Self._HostPtr):
+    @doc_hidden
+    def __init__(out self, handle: _DeviceBufferPtr, host_ptr: Self._HostPtr):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         self._host_ptr = host_ptr
         self._handle = handle
 
-    @doc_private
-    fn __init__(
+    @doc_hidden
+    def __init__(
         out self,
         ctx: DeviceContext,
         host_ptr: Self._HostPtr,
@@ -366,7 +356,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         self._host_ptr = host_ptr
         self._handle = cpp_handle
 
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Creates a copy of an existing host buffer by incrementing its reference count.
 
         This copy constructor creates a new reference to the same underlying host buffer
@@ -388,7 +378,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         self._host_ptr = copy._host_ptr
         self._handle = copy._handle
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Releases resources associated with this host buffer.
 
         This function schedules an owned buffer free using the stream in the
@@ -403,7 +393,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
             self._handle,
         )
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         """Returns the number of elements in this buffer.
 
         This method calculates the number of elements by dividing the total byte size
@@ -421,7 +411,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
             // size_of[Self.dtype]()
         )
 
-    fn create_sub_buffer[
+    def create_sub_buffer[
         view_type: DType
     ](self, offset: Int, size: Int) raises -> HostBuffer[view_type]:
         """Creates a sub-buffer view of this buffer with a different element dtype.
@@ -474,7 +464,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         )
         return HostBuffer[view_type](new_handle, new_host_ptr)
 
-    fn enqueue_copy_to(self, dst: HostBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_to(self, dst: HostBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy from this buffer to another host buffer.
 
         This method schedules a memory copy operation from this buffer to the destination
@@ -489,7 +479,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         """
         dst.context().enqueue_copy(dst, self)
 
-    fn enqueue_copy_to(self, dst: DeviceBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_to(self, dst: DeviceBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy from this buffer to a device buffer.
 
         This method schedules a memory copy operation from this buffer to the destination
@@ -505,7 +495,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         dst.context().enqueue_copy(dst, self)
 
-    fn enqueue_copy_to(
+    def enqueue_copy_to(
         self, dst_ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
     ) raises:
         """Enqueues an asynchronous copy from this buffer to host memory.
@@ -523,7 +513,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         self.context().enqueue_copy(dst_ptr, self)
 
-    fn enqueue_copy_from(self, src: HostBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_from(self, src: HostBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy to this buffer from another host buffer.
 
         This method schedules a memory copy operation to this buffer from the source
@@ -539,7 +529,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         self.context().enqueue_copy(self, src)
 
-    fn enqueue_copy_from(self, src: DeviceBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_from(self, src: DeviceBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy to this buffer from a device buffer.
 
         This method schedules a memory copy operation to this buffer from the source
@@ -555,7 +545,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         self.context().enqueue_copy(self, src)
 
-    fn enqueue_copy_from(
+    def enqueue_copy_from(
         self, src_ptr: UnsafePointer[Scalar[Self.dtype], _]
     ) raises:
         """Enqueues an asynchronous copy to this buffer from host memory.
@@ -573,7 +563,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         self.context().enqueue_copy(self, src_ptr)
 
-    fn enqueue_fill(self, val: Scalar[Self.dtype]) raises:
+    def enqueue_fill(self, val: Scalar[Self.dtype]) raises:
         """Enqueues an operation to fill this buffer with a specified value.
 
         This method schedules a memory set operation that fills the entire buffer
@@ -589,7 +579,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         self.context().enqueue_memset(self, val)
 
-    fn reassign_ownership_to(self, ctx: DeviceContext) raises:
+    def reassign_ownership_to(self, ctx: DeviceContext) raises:
         """Transfers ownership of this buffer to another device context.
 
         This method changes the device context that owns this buffer. This can be
@@ -613,7 +603,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
             ](self._handle, ctx._handle)
         )
 
-    fn take_ptr(
+    def take_ptr(
         var self,
     ) -> Self._HostPtr:
         """Takes ownership of the device pointer from this buffer.
@@ -635,7 +625,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         return result
 
     @always_inline
-    fn unsafe_ptr(
+    def unsafe_ptr(
         self,
     ) -> Self._HostPtr:
         """Returns the raw device pointer without transferring ownership.
@@ -649,7 +639,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         return self._host_ptr
 
-    fn context(self) raises -> DeviceContext:
+    def context(self) raises -> DeviceContext:
         """Returns the device context associated with this buffer.
 
         This method retrieves the device context that owns this buffer and is
@@ -668,7 +658,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         ](self._handle)
         return DeviceContext(ctx_ptr)
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes a string representation of this buffer to the provided writer.
 
         This method formats the buffer's contents as a string and writes it to
@@ -682,7 +672,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         writer.write("(")
 
         @parameter
-        fn serialize[T: Writable](val: T):
+        def serialize[T: Writable](val: T):
             writer.write(val)
 
         var size = len(self)
@@ -699,20 +689,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
             )
         writer.write(")")
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    fn __str__(self) -> String:
-        """Returns a string representation of the `HostBuffer`.
-
-        This method creates a human-readable string representation of the buffer's contents
-        by mapping the device memory to host memory and formatting the elements.
-
-        Returns:
-            A string containing the formatted buffer contents.
-        """
-        comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
-        return String.write(self)
-
-    fn __getitem__(self, idx: Int) -> Scalar[Self.dtype]:
+    def __getitem__(self, idx: Int) -> Scalar[Self.dtype]:
         """Retrieves the element at the specified index from the host buffer.
 
         This operator allows direct access to individual elements in the host buffer
@@ -727,7 +704,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         return self._host_ptr[idx]
 
-    fn __setitem__(
+    def __setitem__(
         self: HostBuffer[Self.dtype], idx: Int, val: Scalar[Self.dtype]
     ):
         """Sets the element at the specified index in the host buffer.
@@ -742,7 +719,7 @@ struct HostBuffer[dtype: DType](ImplicitlyCopyable, Sized, Writable):
         comptime assert not is_gpu(), "HostBuffer is not supported on GPUs"
         self._host_ptr[idx] = val
 
-    fn as_span[
+    def as_span[
         mut: Bool, origin: Origin[mut=mut], //
     ](ref[origin] self) -> Span[Scalar[Self.dtype], origin]:
         """Returns a `Span` pointing to the underlying memory of the `HostBuffer`.
@@ -779,12 +756,12 @@ struct DeviceBuffer[dtype: DType](
     """
 
     # Implementation of `DevicePassable`
-    comptime device_type: AnyType = LegacyUnsafePointer[
-        mut=True, Scalar[Self.dtype]
+    comptime device_type: AnyType = UnsafePointer[
+        mut=True, Scalar[Self.dtype], AnyOrigin[mut=True]
     ]
     """DeviceBuffer dtypes are remapped to UnsafePointer when passed to accelerator devices."""
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
+    def _to_device_type(self, target: MutOpaquePointer[_]):
         """Device dtype mapping from DeviceBuffer to the device's UnsafePointer.
         """
         # TODO: Allow the low-level DeviceContext implementation to intercept
@@ -792,7 +769,7 @@ struct DeviceBuffer[dtype: DType](
         target.bitcast[Self.device_type]()[] = self._device_ptr
 
     @staticmethod
-    fn get_type_name() -> String:
+    def get_type_name() -> String:
         """
         Gets this dtype's name, for use in error messages when handing arguments
         to kernels.
@@ -802,7 +779,7 @@ struct DeviceBuffer[dtype: DType](
         Returns:
             This dtype's name.
         """
-        return t"DeviceBuffer[{Self.dtype}]"
+        return String(t"DeviceBuffer[{Self.dtype}]")
 
     comptime _DevicePtr = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
     # _device_ptr must be the first word in the struct to enable passing of
@@ -811,9 +788,9 @@ struct DeviceBuffer[dtype: DType](
     var _device_ptr: Self._DevicePtr
     var _handle: _DeviceBufferPtr
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         ctx: DeviceContext,
         size: Int,
@@ -861,16 +838,16 @@ struct DeviceBuffer[dtype: DType](
         self._device_ptr = device_ptr
         self._handle = cpp_handle
 
-    @doc_private
-    fn __init__(
+    @doc_hidden
+    def __init__(
         out self, handle: _DeviceBufferPtr, device_ptr: Self._DevicePtr
     ):
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         self._device_ptr = device_ptr
         self._handle = handle
 
-    @doc_private
-    fn __init__(
+    @doc_hidden
+    def __init__(
         out self,
         ctx: DeviceContext,
         ptr: Self._DevicePtr,
@@ -905,8 +882,8 @@ struct DeviceBuffer[dtype: DType](
         self._device_ptr = ptr
         self._handle = cpp_handle
 
-    @doc_private
-    fn __init__[
+    @doc_hidden
+    def __init__[
         _dtype: DType,
     ](
         out self: DeviceBuffer[_dtype],
@@ -959,7 +936,7 @@ struct DeviceBuffer[dtype: DType](
         self._device_ptr = device_ptr
         self._handle = cpp_handle
 
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Creates a copy of an existing device buffer by incrementing its reference count.
 
         This copy constructor creates a new reference to the same underlying device buffer
@@ -982,7 +959,7 @@ struct DeviceBuffer[dtype: DType](
         self._handle = copy._handle
 
     @always_inline
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Releases resources associated with this device buffer.
 
         This function schedules an owned buffer free using the stream in the
@@ -997,7 +974,7 @@ struct DeviceBuffer[dtype: DType](
             self._handle,
         )
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         """Returns the number of elements in this buffer.
 
         This method calculates the number of elements by dividing the total byte size
@@ -1016,7 +993,7 @@ struct DeviceBuffer[dtype: DType](
         )
 
     @always_inline
-    fn create_sub_buffer[
+    def create_sub_buffer[
         view_type: DType
     ](self, offset: Int, size: Int) raises -> DeviceBuffer[view_type]:
         """Creates a sub-buffer view of this buffer with a different element dtype.
@@ -1070,7 +1047,7 @@ struct DeviceBuffer[dtype: DType](
         )
         return DeviceBuffer[view_type](new_handle, new_device_ptr)
 
-    fn enqueue_copy_to(self, dst: DeviceBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_to(self, dst: DeviceBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy from this buffer to another device buffer.
 
         This method schedules a memory copy operation from this buffer to the destination
@@ -1086,7 +1063,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         dst.context().enqueue_copy(dst, self)
 
-    fn enqueue_copy_to(self, dst: HostBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_to(self, dst: HostBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy from this buffer to a host buffer.
 
         This method schedules a memory copy operation from this buffer to the destination
@@ -1102,7 +1079,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         dst.context().enqueue_copy(dst, self)
 
-    fn enqueue_copy_to(
+    def enqueue_copy_to(
         self, dst_ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
     ) raises:
         """Enqueues an asynchronous copy from this buffer to host memory.
@@ -1120,7 +1097,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         self.context().enqueue_copy(dst_ptr, self)
 
-    fn enqueue_copy_from(self, src: DeviceBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_from(self, src: DeviceBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy to this buffer from another device buffer.
 
         This method schedules a memory copy operation to this buffer from the source
@@ -1136,7 +1113,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         self.context().enqueue_copy(self, src)
 
-    fn enqueue_copy_from(self, src: HostBuffer[Self.dtype, ...]) raises:
+    def enqueue_copy_from(self, src: HostBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy to this buffer from a host buffer.
 
         This method schedules a memory copy operation to this buffer from the source
@@ -1152,7 +1129,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         self.context().enqueue_copy(self, src)
 
-    fn enqueue_copy_from(
+    def enqueue_copy_from(
         self, src_ptr: UnsafePointer[Scalar[Self.dtype], _]
     ) raises:
         """Enqueues an asynchronous copy to this buffer from host memory.
@@ -1170,7 +1147,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         self.context().enqueue_copy(self, src_ptr)
 
-    fn enqueue_fill(self, val: Scalar[Self.dtype]) raises:
+    def enqueue_fill(self, val: Scalar[Self.dtype]) raises:
         """Enqueues an operation to fill this buffer with a specified value.
 
         This method schedules a memory set operation that fills the entire buffer
@@ -1186,7 +1163,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         self.context().enqueue_memset(self, val)
 
-    fn reassign_ownership_to(self, ctx: DeviceContext) raises:
+    def reassign_ownership_to(self, ctx: DeviceContext) raises:
         """Transfers ownership of this buffer to another device context.
 
         This method changes the device context that owns this buffer. This can be
@@ -1211,7 +1188,7 @@ struct DeviceBuffer[dtype: DType](
         )
 
     @always_inline
-    fn take_ptr(
+    def take_ptr(
         var self,
     ) -> Self._DevicePtr:
         """Takes ownership of the device pointer from this buffer.
@@ -1233,7 +1210,7 @@ struct DeviceBuffer[dtype: DType](
         return result
 
     @always_inline
-    fn unsafe_ptr(
+    def unsafe_ptr(
         self,
     ) -> Self._DevicePtr:
         """Returns the raw device pointer without transferring ownership.
@@ -1247,7 +1224,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         return self._device_ptr
 
-    fn context(self) raises -> DeviceContext:
+    def context(self) raises -> DeviceContext:
         """Returns the device context associated with this buffer.
 
         This method retrieves the device context that owns this buffer and is
@@ -1266,7 +1243,7 @@ struct DeviceBuffer[dtype: DType](
         ](self._handle)
         return DeviceContext(ctx_ptr)
 
-    fn map_to_host(
+    def map_to_host(
         self,
         out mapped_buffer: _HostMappedBuffer[Self.dtype],
     ) raises:
@@ -1307,7 +1284,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         mapped_buffer = _HostMappedBuffer[Self.dtype](self.context(), self)
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """Writes a string representation of this buffer to the provided writer.
 
         This method formats the buffer's contents as a string and writes it to
@@ -1323,7 +1300,7 @@ struct DeviceBuffer[dtype: DType](
                 writer.write("(")
 
                 @parameter
-                fn serialize[T: Writable](val: T):
+                def serialize[T: Writable](val: T):
                     writer.write(val)
 
                 var size = len(self)
@@ -1342,21 +1319,8 @@ struct DeviceBuffer[dtype: DType](
         except e:
             abort(t"failed to write DeviceBuffer:{e}")
 
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    fn __str__(self) -> String:
-        """Returns a string representation of the `DeviceBuffer`.
 
-        This method creates a human-readable string representation of the buffer's contents
-        by mapping the device memory to host memory and formatting the elements.
-
-        Returns:
-            A string containing the formatted buffer contents.
-        """
-        comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
-        return String.write(self)
-
-
-# @doc_private does not work on structs - see MOTO-992.
+# @doc_hidden does not work on structs - see MOTO-992.
 struct DeviceStream(ImplicitlyCopyable):
     """Represents a CUDA/HIP stream for asynchronous GPU operations.
 
@@ -1386,9 +1350,9 @@ struct DeviceStream(ImplicitlyCopyable):
     var _handle: _DeviceStreamPtr
     """Internal handle to the native stream object."""
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(out self, handle: _DeviceStreamPtr):
+    def __init__(out self, handle: _DeviceStreamPtr):
         """Initializes a new DeviceStream with the given stream handle.
 
         Args:
@@ -1396,9 +1360,9 @@ struct DeviceStream(ImplicitlyCopyable):
         """
         self._handle = handle
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(out self, ctx: DeviceContext) raises:
+    def __init__(out self, ctx: DeviceContext) raises:
         """Retrieves the stream associated with the given device context.
 
         Args:
@@ -1419,8 +1383,8 @@ struct DeviceStream(ImplicitlyCopyable):
         )
         self._handle = result
 
-    @doc_private
-    fn __init__(out self, *, copy: Self):
+    @doc_hidden
+    def __init__(out self, *, copy: Self):
         """Creates a copy of an existing stream by incrementing its reference count.
 
         Args:
@@ -1434,9 +1398,9 @@ struct DeviceStream(ImplicitlyCopyable):
         ](copy._handle)
         self._handle = copy._handle
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Releases resources associated with this stream."""
         # void AsyncRT_DeviceStream_release(const DeviceStream *stream)
         external_call[
@@ -1446,7 +1410,7 @@ struct DeviceStream(ImplicitlyCopyable):
         )
 
     @always_inline
-    fn synchronize(self) raises:
+    def synchronize(self) raises:
         """Blocks the calling CPU thread until all operations in this stream complete.
 
         This function waits until all previously issued commands in this stream
@@ -1478,7 +1442,7 @@ struct DeviceStream(ImplicitlyCopyable):
         )
 
     @always_inline
-    fn enqueue_wait_for(self, event: DeviceEvent) raises:
+    def enqueue_wait_for(self, event: DeviceEvent) raises:
         """Makes this stream wait for the specified event.
 
         This function inserts a wait operation into this stream that will
@@ -1502,7 +1466,7 @@ struct DeviceStream(ImplicitlyCopyable):
         )
 
     @always_inline
-    fn record_event(self, event: DeviceEvent) raises:
+    def record_event(self, event: DeviceEvent) raises:
         """Records an event in this stream.
 
         This function records the given event at the current point in this stream.
@@ -1546,7 +1510,7 @@ struct DeviceStream(ImplicitlyCopyable):
         )
 
     @always_inline
-    fn enqueue_function[
+    def enqueue_function[
         *Ts: DevicePassable
     ](
         self,
@@ -1598,7 +1562,7 @@ struct DeviceStream(ImplicitlyCopyable):
 
     @parameter
     @always_inline
-    fn _enqueue_function_unchecked[
+    def _enqueue_function_unchecked[
         *Ts: AnyType
     ](
         self,
@@ -1626,7 +1590,7 @@ struct DeviceStream(ImplicitlyCopyable):
 
     @parameter
     @always_inline
-    fn _enqueue_function[
+    def _enqueue_function[
         *Ts: DevicePassable
     ](
         self,
@@ -1671,7 +1635,7 @@ struct EventFlags(TrivialRegisterPassable):
     comptime interprocess = Self(0x04)
     """Enable interprocess synchronization, currently unimplemented."""
 
-    fn __init__(out self, flags: c_uint):
+    def __init__(out self, flags: c_uint):
         """Initializes a new EventFlags.
 
         Args:
@@ -1679,7 +1643,7 @@ struct EventFlags(TrivialRegisterPassable):
         """
         self._flags = flags
 
-    fn __ior__(mut self, other: Self):
+    def __ior__(mut self, other: Self):
         """Combines the current flags with another flag in-place.
 
         Args:
@@ -1687,7 +1651,7 @@ struct EventFlags(TrivialRegisterPassable):
         """
         self._flags |= other._flags
 
-    fn __or__(self, other: Self) -> Self:
+    def __or__(self, other: Self) -> Self:
         """Returns the current flags combined with another flag.
 
         Args:
@@ -1730,9 +1694,9 @@ struct DeviceEvent(ImplicitlyCopyable):
     var _handle: _DeviceEventPtr
     """Internal handle to the native event object."""
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(out self, ctx: DeviceContext) raises:
+    def __init__(out self, ctx: DeviceContext) raises:
         """Creates a new event recorded on the given context's default stream.
 
         Args:
@@ -1753,9 +1717,9 @@ struct DeviceEvent(ImplicitlyCopyable):
         )
         self._handle = result
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(out self, existing: _DeviceEventPtr):
+    def __init__(out self, existing: _DeviceEventPtr):
         """Creates a DeviceEvent from an existing pointer.
 
         Args:
@@ -1767,8 +1731,8 @@ struct DeviceEvent(ImplicitlyCopyable):
         )
         self._handle = existing
 
-    @doc_private
-    fn __init__(out self, *, copy: Self):
+    @doc_hidden
+    def __init__(out self, *, copy: Self):
         """Creates a copy of an existing event by incrementing its reference count.
 
         Args:
@@ -1780,7 +1744,7 @@ struct DeviceEvent(ImplicitlyCopyable):
         )
         self._handle = copy._handle
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Releases resources associated with this event."""
         # void AsyncRT_DeviceEvent_release(const DeviceEvent *event)
         external_call["AsyncRT_DeviceEvent_release", NoneType, _DeviceEventPtr](
@@ -1788,7 +1752,7 @@ struct DeviceEvent(ImplicitlyCopyable):
         )
 
     @always_inline
-    fn synchronize(self) raises:
+    def synchronize(self) raises:
         """Blocks the calling CPU thread until this event completes.
 
         This function waits until the event has been recorded and all
@@ -1807,16 +1771,16 @@ struct DeviceEvent(ImplicitlyCopyable):
         )
 
 
-fn _is_nvidia_gpu[target: _TargetType]() -> Bool:
+def _is_nvidia_gpu[target: _TargetType]() -> Bool:
     return is_triple["nvptx64-nvidia-cuda", target]()
 
 
-fn _is_path_like(ss: StringSlice) -> Bool:
+def _is_path_like(ss: StringSlice) -> Bool:
     return ss.startswith("/") or ss.startswith("~") or ss.startswith("./")
 
 
 struct DeviceFunction[
-    func_type: __TypeOfAllTypes,
+    func_type: TrivialRegisterPassable,
     //,
     func: func_type,
     declared_arg_types: Optional[Variadic.TypesOfTrait[AnyType]],
@@ -1845,7 +1809,7 @@ struct DeviceFunction[
     ```mojo
     from std.gpu.host import DeviceContext, DeviceFunction
 
-    fn my_kernel(x: Int, y: Int):
+    def my_kernel(x: Int, y: Int):
         # Kernel implementation
         pass
 
@@ -1868,7 +1832,7 @@ struct DeviceFunction[
     var _context: DeviceContext
     """The device context backing the function."""
 
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Creates a copy of an existing DeviceFunction.
 
         This increases the reference count of the underlying device function handle.
@@ -1888,7 +1852,7 @@ struct DeviceFunction[
         self._func_impl = copy._func_impl
         self._context = copy._context
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Releases resources associated with this DeviceFunction.
 
         This decrements the reference count of the underlying device function handle.
@@ -1902,9 +1866,9 @@ struct DeviceFunction[
             _DeviceFunctionPtr,
         ](self._handle)
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         ctx: DeviceContext,
         *,
@@ -1975,7 +1939,7 @@ struct DeviceFunction[
         )
         self._handle = result
 
-    fn _copy_to_constant_memory(
+    def _copy_to_constant_memory(
         read self, mapping: ConstantMemoryMapping
     ) raises:
         # const char *AsyncRT_DeviceFunction_copyToConstantMemory(
@@ -2001,7 +1965,7 @@ struct DeviceFunction[
         )
 
     @staticmethod
-    fn _dump_q[name: String, val: _DumpPath]() -> Tuple[Bool, _DumpPath]:
+    def _dump_q[name: String, val: _DumpPath]() -> Tuple[Bool, _DumpPath]:
         comptime env_var = "DUMP_GPU_" + name.upper()
 
         comptime if is_defined[env_var]():
@@ -2034,10 +1998,10 @@ struct DeviceFunction[
             return val.unsafe_get[StaticString]() != "", val
 
         else:
-            return val.isa[fn() capturing -> Path](), val
+            return val.isa[def() capturing -> Path](), val
 
     @staticmethod
-    fn _cleanup_asm(s: StringSlice) -> String:
+    def _cleanup_asm(s: StringSlice) -> String:
         return (
             String(s)
             .replace("\t// begin inline asm\n", "")
@@ -2046,14 +2010,14 @@ struct DeviceFunction[
             .replace("\t;;#ASMEND\n", "")
         )
 
-    fn _expand_path(read self, path: Path) -> Path:
+    def _expand_path(read self, path: Path) -> Path:
         """If the path contains a `%` character, it is replaced with the module
         name. This allows one to dump multiple kernels which are disambiguated
         by the module name.
         """
         return String(path).replace("%", self._func_impl.module_name)
 
-    fn _expand_path(read self, path: StaticString) -> Path:
+    def _expand_path(read self, path: StaticString) -> Path:
         """If the path contains a `%` character, it is replaced with the module
         name. This allows one to dump multiple kernels which are disambiguated
         by the module name.
@@ -2061,7 +2025,7 @@ struct DeviceFunction[
         return String(path).replace("%", self._func_impl.module_name)
 
     @no_inline
-    fn dump_rep[
+    def dump_rep[
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
         _dump_sass: _DumpPath = False,
@@ -2091,7 +2055,7 @@ struct DeviceFunction[
 
         # Get ASM - either from the pre-compiled func_impl or by compiling now
         @parameter
-        fn get_asm() -> StaticString:
+        def get_asm() -> StaticString:
             comptime if Self._emission_kind == "asm":
                 return self._func_impl.asm
             return _compile_code[
@@ -2111,9 +2075,9 @@ struct DeviceFunction[
         comptime if do_dump_asm:
             var asm = self._cleanup_asm(get_asm())
 
-            comptime if dump_asm_val.isa[fn() capturing -> Path]():
+            comptime if dump_asm_val.isa[def() capturing -> Path]():
                 comptime dump_asm_fn = dump_asm_val.unsafe_get[
-                    fn() capturing -> Path
+                    def() capturing -> Path
                 ]()
                 dump_asm_fn().write_text(asm)
             elif dump_asm_val.isa[Path]():
@@ -2135,9 +2099,9 @@ struct DeviceFunction[
             var ptx = Self._cleanup_asm(get_asm())
             var sass = _to_sass[Self.target](ptx)
 
-            comptime if dump_sass_val.isa[fn() capturing -> Path]():
+            comptime if dump_sass_val.isa[def() capturing -> Path]():
                 comptime _dump_sass_fn = dump_sass_val.unsafe_get[
-                    fn() capturing -> Path
+                    def() capturing -> Path
                 ]()
                 _dump_sass_fn().write_text(sass)
             elif dump_sass_val.isa[Path]():
@@ -2163,9 +2127,9 @@ struct DeviceFunction[
                 compile_options=Self.compile_options,
             ]().asm
 
-            comptime if dump_llvm_val.isa[fn() capturing -> Path]():
+            comptime if dump_llvm_val.isa[def() capturing -> Path]():
                 comptime dump_llvm_fn = dump_llvm_val.unsafe_get[
-                    fn() capturing -> Path
+                    def() capturing -> Path
                 ]()
                 dump_llvm_fn().write_text(llvm)
             elif dump_llvm_val.isa[Path]():
@@ -2181,7 +2145,7 @@ struct DeviceFunction[
 
     @always_inline
     @parameter
-    fn _call_with_pack[
+    def _call_with_pack[
         *Ts: AnyType
     ](
         read self,
@@ -2234,7 +2198,7 @@ struct DeviceFunction[
             )
 
         @parameter
-        fn _populate_arg_sizes[i: Int]():
+        def _populate_arg_sizes[i: Int]():
             dense_args_sizes[i] = UInt64(size_of[Ts[i]]())
 
         comptime for i in range(num_args):
@@ -2286,6 +2250,7 @@ struct DeviceFunction[
                     UnsafePointer[LaunchAttribute, MutAnyOrigin],
                     UInt32,
                     UnsafePointer[OpaquePointer[MutAnyOrigin], MutAnyOrigin],
+                    UInt32,
                     UnsafePointer[UInt64, MutAnyOrigin],
                 ](
                     ctx._handle,
@@ -2300,6 +2265,7 @@ struct DeviceFunction[
                     attributes.unsafe_ptr(),
                     UInt32(len(attributes)),
                     dense_args_addrs,
+                    UInt32(num_args + num_captures),
                     dense_args_sizes,
                 ),
                 device_context=self._context,
@@ -2322,6 +2288,7 @@ struct DeviceFunction[
                     UnsafePointer[LaunchAttribute, MutAnyOrigin],
                     UInt32,
                     UnsafePointer[OpaquePointer[MutAnyOrigin], MutAnyOrigin],
+                    UInt32,
                     UnsafePointer[UInt64, MutAnyOrigin],
                 ](
                     ctx._handle,
@@ -2336,6 +2303,7 @@ struct DeviceFunction[
                     attributes.unsafe_ptr(),
                     UInt32(len(attributes)),
                     dense_args_addrs,
+                    UInt32(num_args),
                     dense_args_sizes,
                 ),
                 device_context=self._context,
@@ -2349,7 +2317,7 @@ struct DeviceFunction[
     # Enqueue function on a stream
     @always_inline
     @parameter
-    fn _call_with_pack[
+    def _call_with_pack[
         *Ts: AnyType
     ](
         read self,
@@ -2466,7 +2434,7 @@ struct DeviceFunction[
 
     @always_inline
     @staticmethod
-    fn _validate_arguments[
+    def _validate_arguments[
         *Ts: DevicePassable,
         num_args: Int,
     ]() -> Tuple[Int, InlineArray[Int, num_args]]:
@@ -2491,7 +2459,7 @@ struct DeviceFunction[
             comptime declared_arg_type = Self.declared_arg_types.value()[i]
             comptime actual_arg_type = Ts[i]
 
-            fn declared_arg_type_name() -> String:
+            def declared_arg_type_name() -> String:
                 comptime if conforms_to(declared_arg_type, DevicePassable):
                     return downcast[
                         declared_arg_type, DevicePassable
@@ -2549,7 +2517,7 @@ struct DeviceFunction[
 
     @always_inline
     @parameter
-    fn _call_with_pack_checked[
+    def _call_with_pack_checked[
         *Ts: DevicePassable
     ](
         read self,
@@ -2669,7 +2637,7 @@ struct DeviceFunction[
 
     @always_inline
     @parameter
-    fn _call_with_pack_checked[
+    def _call_with_pack_checked[
         *Ts: DevicePassable
     ](
         read self,
@@ -2709,7 +2677,7 @@ struct DeviceFunction[
         # so we break out the calculation into a function executed at compile
         # time.
         @parameter
-        fn calculate_args_size() -> Int:
+        def calculate_args_size() -> Int:
             var tmp_args_size = 8  # always reserve 8 extra bytes for alignment.
 
             comptime for i in range(num_passed_args):
@@ -2821,6 +2789,7 @@ struct DeviceFunction[
                 UnsafePointer[LaunchAttribute, MutAnyOrigin],
                 UInt32,
                 UnsafePointer[OpaquePointer[MutAnyOrigin], MutAnyOrigin],
+                UInt32,
                 UnsafePointer[UInt64, MutAnyOrigin],
             ](
                 ctx._handle,
@@ -2835,6 +2804,7 @@ struct DeviceFunction[
                 attributes.unsafe_ptr(),
                 UInt32(len(attributes)),
                 dense_args_addrs,
+                UInt32(num_translated_args + num_captures),
                 dense_args_sizes,
             ),
             device_context=self._context,
@@ -2846,7 +2816,7 @@ struct DeviceFunction[
             dense_args_sizes.free()
 
     @always_inline
-    fn get_attribute(self, attr: Attribute) raises -> Int:
+    def get_attribute(self, attr: Attribute) raises -> Int:
         """Retrieves a specific attribute value from the compiled device function.
 
         This method queries the device function for information about its resource
@@ -2891,7 +2861,7 @@ struct DeviceFunction[
         return Int(result)
 
     @always_inline
-    fn occupancy_max_active_blocks_per_multiprocessor(
+    def occupancy_max_active_blocks_per_multiprocessor(
         self, block_size: Int, dynamic_shared_mem_size: Int
     ) raises -> Int:
         """Returns the maximum number of active blocks per multiprocessor for the given function.
@@ -2942,7 +2912,7 @@ struct DeviceExternalFunction:
     var _handle: _DeviceFunctionPtr
     """Internal handle to the native device function object."""
 
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Creates a copy of an existing device function by incrementing its reference count.
 
         Args:
@@ -2958,7 +2928,7 @@ struct DeviceExternalFunction:
         ](copy._handle)
         self._handle = copy._handle
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Releases resources associated with this device function."""
         # Decrement the reference count held by this struct.
         #
@@ -2969,9 +2939,9 @@ struct DeviceExternalFunction:
             _DeviceFunctionPtr,
         ](self._handle)
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         ctx: DeviceContext,
         info: CompiledFunctionInfo,
@@ -2999,9 +2969,9 @@ struct DeviceExternalFunction:
             func_attribute = func_attribute,
         }
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         ctx: DeviceContext,
         *,
@@ -3070,7 +3040,7 @@ struct DeviceExternalFunction:
         self._handle = result
 
     @always_inline
-    fn _copy_to_constant_memory(
+    def _copy_to_constant_memory(
         read self, mapping: ConstantMemoryMapping
     ) raises:
         """Copies data to constant memory for use by the device function.
@@ -3105,7 +3075,7 @@ struct DeviceExternalFunction:
 
     @always_inline
     @parameter
-    fn _call_with_pack[
+    def _call_with_pack[
         *Ts: AnyType
     ](
         read self,
@@ -3165,7 +3135,7 @@ struct DeviceExternalFunction:
         #                                                         uint32_t gridX, uint32_t gridY, uint32_t gridZ,
         #                                                         uint32_t blockX, uint32_t blockY, uint32_t blockZ,
         #                                                         uint32_t sharedMemBytes, void *attrs, uint32_t num_attrs,
-        #                                                         void **args)
+        #                                                         void **args, uint32_t argCount, const size_t *argSizes)
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_enqueueFunctionDirect",
@@ -3182,6 +3152,8 @@ struct DeviceExternalFunction:
                 UnsafePointer[LaunchAttribute, MutAnyOrigin],
                 UInt32,
                 UnsafePointer[OpaquePointer[MutAnyOrigin], MutAnyOrigin],
+                UInt32,
+                UnsafePointer[UInt64, MutAnyOrigin],
             ](
                 ctx._handle,
                 self._handle,
@@ -3195,11 +3167,13 @@ struct DeviceExternalFunction:
                 attributes.unsafe_ptr(),
                 UInt32(len(attributes)),
                 dense_args_addrs.unsafe_ptr(),
+                UInt32(num_args),
+                UnsafePointer[UInt64, MutAnyOrigin](),
             )
         )
 
     @always_inline
-    fn get_attribute(self, attr: Attribute) raises -> Int:
+    def get_attribute(self, attr: Attribute) raises -> Int:
         """Retrieves a specific attribute of this device function.
 
         Args:
@@ -3246,7 +3220,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
     from std.gpu.host import DeviceContext
     from std.gpu import thread_idx
 
-    fn kernel():
+    def kernel():
         # `print()` does not work on Apple Silicon from GPU kernels
         print("hello from thread:", thread_idx.x, thread_idx.y, thread_idx.z)
 
@@ -3264,7 +3238,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
     @register("custom_op")
     struct CustomOp:
         @staticmethod
-        fn execute(ctx_ptr: DeviceContextPtr) raises:
+        def execute(ctx_ptr: DeviceContextPtr) raises:
             var ctx = ctx_ptr.get_device_context()
             ctx.enqueue_function[kernel, kernel](grid_dim=1, block_dim=(2, 2, 2))
             ctx.synchronize()
@@ -3278,7 +3252,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
     var _owning: Bool
 
     @always_inline
-    fn __init__(
+    def __init__(
         out self,
         device_id: Int = 0,
         *,
@@ -3329,7 +3303,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         self._handle = result
         self._owning = True
 
-    fn _retain(self):
+    def _retain(self):
         # Increment the reference count.
         #
         # void AsyncRT_DeviceContext_retain(const DeviceContext *ctx)
@@ -3339,21 +3313,21 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _DeviceContextPtr,
         ](self._handle)
 
-    @doc_private
-    fn __init__(out self, handle: OpaquePointer[mut=True, _]):
+    @doc_hidden
+    def __init__(out self, handle: OpaquePointer[mut=True, _]):
         """Create a Mojo DeviceContext from a pointer to an existing C++ object.
         """
         self._handle = handle.bitcast[_DeviceContextCpp]()
         self._owning = False
 
-    @doc_private
-    fn __init__(out self, ctx_ptr: _DeviceContextPtr):
+    @doc_hidden
+    def __init__(out self, ctx_ptr: _DeviceContextPtr):
         """Create a Mojo DeviceContext from a pointer to an existing C++ object.
         """
         self._handle = ctx_ptr
         self._owning = False
 
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         """Creates a copy of an existing device context by incrementing its reference count.
 
         This copy constructor creates a new reference to the same underlying device context
@@ -3369,7 +3343,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         self._handle = copy._handle
         self._owning = copy._owning
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         """Releases resources associated with this device context.
 
         This destructor decrements the reference count of the native device context.
@@ -3387,7 +3361,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _DeviceContextPtr,
         ](self._handle)
 
-    fn __enter__(var self) -> Self:
+    def __enter__(var self) -> Self:
         """Enables the use of DeviceContext in a 'with' statement context manager.
 
         This method allows DeviceContext to be used with Python-style context managers,
@@ -3409,7 +3383,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         """
         return self^
 
-    fn name(self) -> String:
+    def name(self) -> String:
         """Returns the device name, an ASCII string identifying this device,
         defined by the native device API.
 
@@ -3439,7 +3413,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
         return _string_from_owned_charptr(name_ptr)
 
-    fn api(self) -> String:
+    def api(self) -> String:
         """Returns the name of the API used to program the device.
 
         This method queries the underlying device context to determine which GPU programming
@@ -3479,7 +3453,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
         return String(api_ptr)
 
-    fn _get_max_dynamic_shared_memory_bytes(
+    def _get_max_dynamic_shared_memory_bytes(
         self, requested_bytes: Int
     ) -> UInt32:
         """Gets the maximum dynamic shared memory bytes for this device.
@@ -3533,7 +3507,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             # set func_attribute.
             return 0
 
-    fn enqueue_create_buffer[
+    def enqueue_create_buffer[
         dtype: DType
     ](self, size: Int) raises -> DeviceBuffer[dtype]:
         """Enqueues a buffer creation using the `DeviceBuffer` constructor.
@@ -3554,7 +3528,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         """
         return DeviceBuffer[dtype](self, size, _DeviceBufferMode._ASYNC)
 
-    fn create_buffer_sync[
+    def create_buffer_sync[
         dtype: DType
     ](self, size: Int) raises -> DeviceBuffer[dtype]:
         """Creates a buffer synchronously using the `DeviceBuffer` constructor.
@@ -3575,7 +3549,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         self.synchronize()
         return result
 
-    fn enqueue_create_host_buffer[
+    def enqueue_create_host_buffer[
         dtype: DType
     ](self, size: Int) raises -> HostBuffer[dtype]:
         """Enqueues the creation of a HostBuffer.
@@ -3624,8 +3598,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return HostBuffer[dtype](self, size)
 
     @always_inline
-    fn compile_function_unchecked[
-        func_type: __TypeOfAllTypes,
+    def compile_function_unchecked[
+        func_type: TrivialRegisterPassable,
         //,
         func: func_type,
         *,
@@ -3684,14 +3658,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         - This method will be deprecated and eventually removed.
           Use `compile_function()` instead for type-checked kernel compilation.
         """
-        debug_assert(
+        assert (
             not func_attribute
             or func_attribute.value().attribute
             != Attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES
             or func_attribute.value().value
-            <= Int32(self.default_device_info.shared_memory_per_multiprocessor),
-            "Requested more than available shared memory.",
-        )
+            <= Int32(self.default_device_info.shared_memory_per_multiprocessor)
+        ), "Requested more than available shared memory."
         comptime result_type = type_of(result)
         result = result_type(
             self,
@@ -3705,12 +3678,12 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ]()
 
     @always_inline
-    fn compile_function[
-        func_type: __TypeOfAllTypes,
+    def compile_function[
+        func_type: TrivialRegisterPassable,
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
         func: func_type,
-        signature_func: fn(* args: * declared_arg_types) -> None,
+        signature_func: def(* args: * declared_arg_types) -> None,
         *,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -3762,14 +3735,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         Raises:
             If the operation fails.
         """
-        debug_assert(
+        assert (
             not func_attribute
             or func_attribute.value().attribute
             != Attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES
             or func_attribute.value().value
-            <= Int32(self.default_device_info.shared_memory_per_multiprocessor),
-            "Requested more than available shared memory.",
-        )
+            <= Int32(self.default_device_info.shared_memory_per_multiprocessor)
+        ), "Requested more than available shared memory."
         comptime result_type = type_of(result)
         result = result_type(
             self,
@@ -3783,10 +3755,10 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ]()
 
     @always_inline
-    fn compile_function_experimental[
+    def compile_function_experimental[
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
-        func: fn(* args: * declared_arg_types) -> None,
+        func: def(* args: * declared_arg_types) -> None,
         *,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -3835,14 +3807,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         Raises:
             If the operation fails.
         """
-        debug_assert(
+        assert (
             not func_attribute
             or func_attribute.value().attribute
             != Attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES
             or func_attribute.value().value
-            <= Int32(self.default_device_info.shared_memory_per_multiprocessor),
-            "Requested more than available shared memory.",
-        )
+            <= Int32(self.default_device_info.shared_memory_per_multiprocessor)
+        ), "Requested more than available shared memory."
         comptime result_type = type_of(result)
         result = result_type(
             self,
@@ -3856,12 +3827,12 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ]()
 
     @always_inline
-    fn compile_function[
-        func_type: __TypeOfAllTypes,
+    def compile_function[
+        func_type: TrivialRegisterPassable,
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
         func: func_type,
-        signature_func: fn(* args: * declared_arg_types) capturing -> None,
+        signature_func: def(* args: * declared_arg_types) capturing -> None,
         *,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -3914,14 +3885,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         Raises:
             If the operation fails.
         """
-        debug_assert(
+        assert (
             not func_attribute
             or func_attribute.value().attribute
             != Attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES
             or func_attribute.value().value
-            <= Int32(self.default_device_info.shared_memory_per_multiprocessor),
-            "Requested more than available shared memory.",
-        )
+            <= Int32(self.default_device_info.shared_memory_per_multiprocessor)
+        ), "Requested more than available shared memory."
         comptime result_type = type_of(result)
         result = result_type(
             self,
@@ -3935,10 +3905,10 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ]()
 
     @always_inline
-    fn compile_function_experimental[
+    def compile_function_experimental[
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
-        func: fn(* args: * declared_arg_types) capturing -> None,
+        func: def(* args: * declared_arg_types) capturing -> None,
         *,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -3987,14 +3957,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         Raises:
             If the operation fails.
         """
-        debug_assert(
+        assert (
             not func_attribute
             or func_attribute.value().attribute
             != Attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES
             or func_attribute.value().value
-            <= Int32(self.default_device_info.shared_memory_per_multiprocessor),
-            "Requested more than available shared memory.",
-        )
+            <= Int32(self.default_device_info.shared_memory_per_multiprocessor)
+        ), "Requested more than available shared memory."
         comptime result_type = type_of(result)
         result = result_type(
             self,
@@ -4007,8 +3976,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _dump_sass=_dump_sass,
         ]()
 
-    fn load_function[
-        func_type: __TypeOfAllTypes,
+    def load_function[
+        func_type: TrivialRegisterPassable,
         //,
         func: func_type,
     ](
@@ -4047,7 +4016,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         from std.gpu.host import DeviceContext
         from std.gpu.host.device_context import DeviceExternalFunction
 
-        fn func_signature(
+        def func_signature(
             # Arguments being passed to the assembly code
             # e.g. two pointers and a length
             input: UnsafePointer[Float32],
@@ -4075,8 +4044,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn enqueue_function_unchecked[
-        func_type: __TypeOfAllTypes,
+    def enqueue_function_unchecked[
+        func_type: TrivialRegisterPassable,
         //,
         func: func_type,
         *Ts: AnyType,
@@ -4130,7 +4099,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn kernel():
+        def kernel():
             # `print()` does not work on Apple Silicon from GPU kernels
             print("hello from the GPU")
 
@@ -4191,7 +4160,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn enqueue_function_unchecked[
+    def enqueue_function_unchecked[
         *Ts: AnyType
     ](
         self,
@@ -4229,7 +4198,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn kernel():
+        def kernel():
             # `print()` does not work on Apple Silicon from GPU kernels
             print("hello from the GPU")
 
@@ -4287,7 +4256,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn enqueue_function[
+    def enqueue_function[
         *Ts: DevicePassable
     ](
         self,
@@ -4327,7 +4296,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn kernel(x: Int):
+        def kernel(x: Int):
             # `print()` does not work on Apple Silicon from GPU kernels
             print("Value:", x)
 
@@ -4363,7 +4332,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_function[
+    def enqueue_function[
         *Ts: AnyType
     ](
         self,
@@ -4403,7 +4372,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn vec_add_sig(
+        def vec_add_sig(
             in0: UnsafePointer[Float32],
             in1: UnsafePointer[Float32],
             out: UnsafePointer[Float32],
@@ -4452,12 +4421,12 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn enqueue_function[
-        func_type: __TypeOfAllTypes,
+    def enqueue_function[
+        func_type: TrivialRegisterPassable,
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
         func: func_type,
-        signature_func: fn(* args: * declared_arg_types) -> None,
+        signature_func: def(* args: * declared_arg_types) -> None,
         *actual_arg_types: DevicePassable,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -4519,7 +4488,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         from std.gpu.host import DeviceContext
         from layout import Layout, LayoutTensor
 
-        fn vector_add(
+        def vector_add(
             a: LayoutTensor[DType.float32, Layout.row_major(1000), MutAnyOrigin],
             b: LayoutTensor[DType.float32, Layout.row_major(1000), MutAnyOrigin],
             c: LayoutTensor[DType.float32, Layout.row_major(1000), MutAnyOrigin],
@@ -4583,10 +4552,10 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn enqueue_function_experimental[
+    def enqueue_function_experimental[
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
-        func: fn(* args: * declared_arg_types) -> None,
+        func: def(* args: * declared_arg_types) -> None,
         *actual_arg_types: DevicePassable,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -4638,7 +4607,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn kernel():
+        def kernel():
             # `print()` does not work on Apple Silicon from GPU kernels
             print("hello from the GPU")
 
@@ -4703,12 +4672,12 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn enqueue_function[
-        func_type: __TypeOfAllTypes,
+    def enqueue_function[
+        func_type: TrivialRegisterPassable,
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
         func: func_type,
-        signature_func: fn(* args: * declared_arg_types) capturing -> None,
+        signature_func: def(* args: * declared_arg_types) capturing -> None,
         *actual_arg_types: DevicePassable,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -4770,12 +4739,12 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         from std.gpu.host import DeviceContext
         from layout import Layout, LayoutTensor
 
-        fn main():
+        def main():
             with DeviceContext() as ctx:
                 var scale_factor = 2.0
 
                 # This kernel captures 'scale_factor' from the enclosing scope
-                fn scale_kernel(data: LayoutTensor[DType.float32, Layout.row_major(100), MutAnyOrigin]):
+                def scale_kernel(data: LayoutTensor[DType.float32, Layout.row_major(100), MutAnyOrigin]):
                     # Uses captured scale_factor variable
                     pass
 
@@ -4832,12 +4801,122 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             location=location.or_else(call_location()),
         )
 
+    @always_inline
+    def enqueue_function[
+        FuncType: def() unified register_passable -> None,
+        //,
+        dump_asm: _DumpPath = False,
+        dump_llvm: _DumpPath = False,
+        _dump_sass: _DumpPath = False,
+        _ptxas_info_verbose: Bool = False,
+    ](
+        self,
+        func: FuncType,
+        grid_dim: Dim,
+        block_dim: Dim,
+        cluster_dim: OptionalReg[Dim] = None,
+        shared_mem_bytes: OptionalReg[Int] = None,
+        var attributes: List[LaunchAttribute] = [],
+        var constant_memory: List[ConstantMemoryMapping] = [],
+        func_attribute: OptionalReg[FuncAttribute] = None,
+        location: OptionalReg[SourceLocation] = None,
+    ) raises:
+        """Compiles and enqueues a capturing kernel for execution on this device with type checking.
+
+        This overload is for kernels that capture variables from their enclosing scope.
+        The `capturing` annotation on the signature function indicates that the kernel
+        can access variables from the surrounding context. Like the non-capturing overload,
+        both `func` and `signature_func` should typically be the same kernel function.
+
+        Parameters:
+            FuncType: The type of the function to launch (usually inferred).
+            dump_asm: To dump the compiled assembly, pass `True`, or a file
+                path to dump to, or a function returning a file path.
+            dump_llvm: To dump the generated LLVM code, pass `True`, or a file
+                path to dump to, or a function returning a file path.
+            _dump_sass: Only runs on NVIDIA targets, and requires CUDA Toolkit
+                to be installed. Pass `True`, or a file path to dump to, or a
+                function returning a file path.
+            _ptxas_info_verbose: Only runs on NVIDIA targets, and requires CUDA
+                Toolkit to be installed. Changes `dump_asm` to output verbose
+                PTX assembly (default `False`).
+
+        Args:
+            func: The capturing kernel function to compile and launch.
+            grid_dim: The grid dimensions.
+            block_dim: The block dimensions.
+            cluster_dim: The cluster dimensions.
+            shared_mem_bytes: Per-block memory shared between blocks.
+            attributes: A `List` of launch attributes.
+            constant_memory: A `List` of constant memory mappings.
+            func_attribute: `CUfunction_attribute` enum.
+            location: Source location for the function call.
+
+        Most parameters are inferred automatically. This overload is selected when
+        your kernel captures variables from its surrounding scope:
+
+        ```mojo
+        from std.gpu import DeviceContext, global_idx
+        from layout import TileTensor, row_major
+
+
+        def main() raises:
+            with DeviceContext() as ctx:
+                var scale_factor: Float32 = 2.0
+
+                var data_buffer = ctx.enqueue_create_buffer[DType.float32](100)
+                var data = TileTensor(data_buffer, row_major[100]())
+                with data_buffer.map_to_host() as h:
+                    for i in range(data.num_elements()):
+                        h[i] = Float32(i)
+
+                # This kernel captures 'scale_factor' from the enclosing scope
+                def scale_kernel() unified {var}:
+                    var i = global_idx.x
+                    if i >= UInt(100):
+                        return
+                    data[i] = data[i] * scale_factor
+
+                ctx.enqueue_function(scale_kernel, grid_dim=1, block_dim=256)
+                ctx.synchronize()
+                with data_buffer.map_to_host() as h:
+                    for i in range(data.num_elements()):
+                        print(h[i])
+        ```
+
+        Raises:
+            If the operation fails.
+        """
+        _check_dim["DeviceContext.enqueue_function", "grid_dim"](
+            grid_dim, location=call_location()
+        )
+        _check_dim["DeviceContext.enqueue_function", "block_dim"](
+            block_dim, location=call_location()
+        )
+
+        self.enqueue_function_unchecked[
+            FuncType.__call__,
+            dump_asm=dump_asm,
+            dump_llvm=dump_llvm,
+            _dump_sass=_dump_sass,
+            _ptxas_info_verbose=_ptxas_info_verbose,
+        ](
+            func,
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            cluster_dim=cluster_dim,
+            shared_mem_bytes=shared_mem_bytes,
+            attributes=attributes^,
+            constant_memory=constant_memory^,
+            location=location.or_else(call_location()),
+        )
+
     @parameter
     @always_inline
-    fn enqueue_function_experimental[
+    def enqueue_function_experimental[
         declared_arg_types: Variadic.TypesOfTrait[AnyType],
         //,
-        func: fn(* args: * declared_arg_types) capturing -> None,
+        func: def(* args: * declared_arg_types) capturing -> None,
         *actual_arg_types: DevicePassable,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -4890,7 +4969,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn kernel():
+        def kernel():
             # `print()` does not work on Apple Silicon from GPU kernels
             print("hello from the GPU")
 
@@ -4955,8 +5034,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn enqueue_function_experimental[
-        func_type: __TypeOfAllTypes,
+    def enqueue_function_experimental[
+        func_type: TrivialRegisterPassable,
         //,
         func: func_type,
         declared_arg_types: Optional[Variadic.TypesOfTrait[AnyType]],
@@ -5000,7 +5079,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn kernel():
+        def kernel():
             # `print()` does not work on Apple Silicon from GPU kernels
             print("hello from the GPU")
 
@@ -5050,7 +5129,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn _enqueue_function_unchecked[
+    def _enqueue_function_unchecked[
         *Ts: AnyType
     ](
         self,
@@ -5078,7 +5157,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn _enqueue_function[
+    def _enqueue_function[
         *Ts: DevicePassable
     ](
         self,
@@ -5106,7 +5185,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    fn _enqueue_external_function[
+    def _enqueue_external_function[
         *Ts: AnyType
     ](
         self,
@@ -5133,8 +5212,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn execution_time[
-        func: fn(Self) raises capturing[_] -> None
+    def execution_time[
+        func: def(Self) raises capturing[_] -> None
     ](self, num_iters: Int) raises -> Int:
         """Measures the execution time of a function that takes a DeviceContext parameter.
 
@@ -5159,7 +5238,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn gpu_operation(ctx: DeviceContext) raises capturing [_] -> None:
+        def gpu_operation(ctx: DeviceContext) raises capturing [_] -> None:
             # Perform some GPU operation using ctx
             pass
 
@@ -5202,7 +5281,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
         return elapsed_nanos
 
-    fn push_context(self) raises -> _DeviceContextScope:
+    def push_context(self) raises -> _DeviceContextScope:
         """Returns a context manager that ensures this device's driver context is active.
 
         This method returns a context manager that pushes this device's driver
@@ -5230,7 +5309,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         comptime assert not is_gpu(), "DeviceContext is not supported on GPUs"
         return _DeviceContextScope(self)
 
-    fn set_as_current(self) raises:
+    def set_as_current(self) raises:
         """For use with libraries that require a specific GPU context to be
         active. Sets the current device to the one associated with this
         DeviceContext.
@@ -5254,8 +5333,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn execution_time[
-        func: fn() raises capturing[_] -> None
+    def execution_time[
+        func: def() raises capturing[_] -> None
     ](self, num_iters: Int) raises -> Int:
         """Measures the execution time of a function over multiple iterations.
 
@@ -5280,7 +5359,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         ```mojo
         from std.gpu.host import DeviceContext
 
-        fn some_gpu_operation() raises capturing [_] -> None:
+        def some_gpu_operation() raises capturing [_] -> None:
             # Perform some GPU operation
             pass
 
@@ -5324,8 +5403,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return elapsed_nanos
 
     @always_inline
-    fn execution_time_iter[
-        func: fn(Self, Int) raises capturing[_] -> None
+    def execution_time_iter[
+        func: def(Self, Int) raises capturing[_] -> None
     ](self, num_iters: Int) raises -> Int:
         """Measures the execution time of a function that takes iteration index as input.
 
@@ -5353,7 +5432,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
         var my_kernel = DeviceFunction(...)
 
-        fn benchmark_kernel(ctx: DeviceContext, i: Int) raises capturing [_] -> None:
+        def benchmark_kernel(ctx: DeviceContext, i: Int) raises capturing [_] -> None:
             # Run kernel with different parameters based on iteration
             ctx.enqueue_function[my_kernel, my_kernel](grid_dim=Dim(i), block_dim=Dim(256))
 
@@ -5397,7 +5476,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return elapsed_nanos
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self,
@@ -5434,7 +5513,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self,
@@ -5471,7 +5550,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self,
@@ -5507,7 +5586,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self,
@@ -5543,7 +5622,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self,
@@ -5583,7 +5662,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         self.enqueue_copy(dst_buf, src_buf)
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self,
@@ -5620,7 +5699,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self, dst_buf: DeviceBuffer[dtype, ...], src_buf: HostBuffer[dtype, ...]
@@ -5655,7 +5734,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self, dst_buf: HostBuffer[dtype, ...], src_buf: DeviceBuffer[dtype, ...]
@@ -5690,7 +5769,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_copy[
+    def enqueue_copy[
         dtype: DType
     ](
         self, dst_buf: HostBuffer[dtype, ...], src_buf: HostBuffer[dtype, ...]
@@ -5725,7 +5804,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn enqueue_memset[
+    def enqueue_memset[
         dtype: DType
     ](self, dst: DeviceBuffer[dtype, ...], val: Scalar[dtype]) raises:
         """Enqueues an async memset operation, setting all of the elements in
@@ -5773,7 +5852,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             )
         )
 
-    fn enqueue_memset[
+    def enqueue_memset[
         dtype: DType
     ](self, dst: HostBuffer[dtype, ...], val: Scalar[dtype]) raises:
         """Enqueues an async memset operation, setting all of the elements in
@@ -5821,13 +5900,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             )
         )
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn stream(self) raises -> DeviceStream:
+    def stream(self) raises -> DeviceStream:
         return DeviceStream(self)
 
     @always_inline
-    fn create_event[
+    def create_event[
         *,
         blocking_sync: Bool = False,
         disable_timing: Bool = True,
@@ -5899,7 +5978,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
         return DeviceEvent(result)
 
-    fn stream_priority_range(self) raises -> StreamPriorityRange:
+    def stream_priority_range(self) raises -> StreamPriorityRange:
         """Returns the range of stream priorities supported by this device context.
 
         Returns:
@@ -5923,7 +6002,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
         return StreamPriorityRange(Int(least_priority), Int(greatest_priority))
 
-    fn create_stream(self, *, priority: Int = 0) raises -> DeviceStream:
+    def create_stream(self, *, priority: Int = 0) raises -> DeviceStream:
         """Creates a new stream associated with the given device context.
 
         To create a stream with the highest priority, use:
@@ -5955,8 +6034,40 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
         return DeviceStream(result)
 
+    def create_external_stream(
+        self, external_stream: OpaquePointer[MutAnyOrigin]
+    ) raises -> DeviceStream:
+        """Creates a non-owning stream wrapper around an externally managed GPU stream.
+
+        The returned `DeviceStream` does not
+        take ownership of the underlying stream. The caller is responsible for
+        ensuring the external stream remains valid for the lifetime of the
+        returned wrapper.
+
+        Args:
+            external_stream: An opaque pointer to the external GPU stream handle
+                (e.g., a `CUstream` or `hipStream_t` cast to `void*`).
+
+        Returns:
+            A `DeviceStream` wrapping the external stream without taking
+            ownership of it.
+
+        Raises:
+            If wrapping the external stream fails.
+        """
+        var result = _DeviceStreamPtr()
+
+        # const char *AsyncRT_DeviceContext_createExternalStream(const DeviceStream **stream, void *externalStream, const DeviceContext *ctx)
+        _checked(
+            external_call[
+                "AsyncRT_DeviceContext_createExternalStream",
+                _ConstCharPtr,
+            ](UnsafePointer(to=result), external_stream, self._handle)
+        )
+        return DeviceStream(result)
+
     @always_inline
-    fn synchronize(self) raises:
+    def synchronize(self) raises:
         """Blocks until all asynchronous calls on the stream associated with
         this device context have completed.
 
@@ -5977,7 +6088,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             location=call_location(),
         )
 
-    fn enqueue_wait_for(self, other: DeviceContext) raises:
+    def enqueue_wait_for(self, other: DeviceContext) raises:
         """Enqueues a wait operation for another device context to complete its work.
 
         This method creates a dependency between two device contexts, ensuring that operations
@@ -6022,7 +6133,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn get_api_version(self) raises -> Int:
+    def get_api_version(self) raises -> Int:
         """Returns the API version associated with this device.
 
         This method retrieves the version number of the GPU driver currently installed
@@ -6064,7 +6175,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return Int(value)
 
     @always_inline
-    fn get_attribute(self, attr: DeviceAttribute) raises -> Int:
+    def get_attribute(self, attr: DeviceAttribute) raises -> Int:
         """Returns the specified attribute for this device.
 
         Use the aliases defined by
@@ -6109,7 +6220,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return Int(value)
 
     @always_inline
-    fn is_compatible(self) -> Bool:
+    def is_compatible(self) -> Bool:
         """Returns True if this device is compatible with MAX.
 
         This method checks whether the current device is compatible with the
@@ -6145,7 +6256,31 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             return False
 
     @always_inline
-    fn id(self) raises -> Int64:
+    def run_healthcheck(self) raises:
+        """Runs lightweight GPU health validation.
+
+        Checks for hardware throttling, uncorrectable ECC errors, and stuck
+        VRAM. Raises an error if the GPU is unhealthy. The healthcheck runs
+        automatically during device initialization; this method allows
+        re-running it explicitly.
+
+        Disable with `MODULAR_DEVICE_CONTEXT_DISABLE_HEALTHCHECK=true`.
+
+        Raises:
+            Error: If the GPU is in an unhealthy state.
+        """
+        # const char *AsyncRT_DeviceContext_runHealthcheck(DeviceContext *ctx)
+        _checked(
+            external_call[
+                "AsyncRT_DeviceContext_runHealthcheck",
+                _ConstCharPtr,
+                _DeviceContextPtr,
+            ](self._handle),
+            location=call_location(),
+        )
+
+    @always_inline
+    def id(self) raises -> Int64:
         """Returns the ID associated with this device.
 
         This method retrieves the unique identifier for the current device.
@@ -6174,9 +6309,9 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             "AsyncRT_DeviceContext_id", Int64, _DeviceContextPtr
         ](self._handle)
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn compute_capability(self) raises -> Int:
+    def compute_capability(self) raises -> Int:
         """Returns the compute capability of this NVIDIA GPU device.
 
         This internal method retrieves the compute capability version of the current
@@ -6206,9 +6341,9 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
         return Int(compute_capability)
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn arch_name(self) raises -> String:
+    def arch_name(self) raises -> String:
         """Returns the architecture name of this device.
 
         This internal method retrieves the architecture name of AMD GPUs.
@@ -6231,7 +6366,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return String(arch_name)
 
     @always_inline
-    fn get_memory_info(self) raises -> Tuple[_SizeT, _SizeT]:
+    def get_memory_info(self) raises -> Tuple[_SizeT, _SizeT]:
         """Returns the free and total memory size for this device.
 
         This method queries the current state of device memory, providing information
@@ -6280,7 +6415,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return (free, total)
 
     @always_inline
-    fn can_access(self, peer: DeviceContext) raises -> Bool:
+    def can_access(self, peer: DeviceContext) raises -> Bool:
         """Returns True if this device can access the identified peer device.
 
         This method checks whether the current device can directly access memory on
@@ -6333,7 +6468,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         return result
 
     @always_inline
-    fn enable_peer_access(self, peer: DeviceContext) raises:
+    def enable_peer_access(self, peer: DeviceContext) raises:
         """Enables direct memory access to the peer device.
 
         This method establishes peer-to-peer access from the current device to the
@@ -6391,7 +6526,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @always_inline
-    fn supports_multicast(self) raises -> Bool:
+    def supports_multicast(self) raises -> Bool:
         """Returns True if this device supports multicast memory mappings.
 
         Returns:
@@ -6418,7 +6553,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @staticmethod
     @always_inline
-    fn number_of_devices(
+    def number_of_devices(
         *, api: String = String(Self.default_device_info.api)
     ) -> Int:
         """Returns the number of devices available that support the specified API.
@@ -6458,7 +6593,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         )
 
     @staticmethod
-    fn enable_all_peer_access() raises:
+    def enable_all_peer_access() raises:
         """Enable peer-to-peer memory access between all available accelerators.
 
         This function detects all available accelerators in the system and enables
@@ -6499,7 +6634,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @staticmethod
     @always_inline
-    fn all_peer_access_enabled() raises -> Bool:
+    def all_peer_access_enabled() raises -> Bool:
         """Check whether peer-to-peer memory access is enabled between all GPU pairs.
 
         This function queries whether P2P access has been successfully enabled
@@ -6550,8 +6685,8 @@ struct DeviceMulticastBuffer[dtype: DType]:
 
     var _handle: _DeviceMulticastBufferPtr
 
-    @doc_private
-    fn __init__(
+    @doc_hidden
+    def __init__(
         out self,
         var contexts: List[DeviceContext],
         size: Int,
@@ -6585,8 +6720,8 @@ struct DeviceMulticastBuffer[dtype: DType]:
 
         self._handle = handle
 
-    @doc_private
-    fn unicast_buffer_for(
+    @doc_hidden
+    def unicast_buffer_for(
         self, ctx: DeviceContext
     ) raises -> DeviceBuffer[Self.dtype]:
         # const char* AsyncRT_DeviceMulticastBuffer_unicastBufferFor(const DeviceBuffer **result, void **devicePtr, const DeviceMulticastBuffer *multiBuffer, const DeviceContext* ctx)
@@ -6612,8 +6747,8 @@ struct DeviceMulticastBuffer[dtype: DType]:
 
         return DeviceBuffer[Self.dtype](buf_handle, buf_ptr)
 
-    @doc_private
-    fn multicast_buffer_for(
+    @doc_hidden
+    def multicast_buffer_for(
         self, ctx: DeviceContext
     ) raises -> DeviceBuffer[Self.dtype]:
         # const char* AsyncRT_DeviceMulticastBuffer_multicastBufferFor(const DeviceBuffer **result, void **devicePtr, const DeviceMulticastBuffer *multiBuffer, const DeviceContext* ctx)
@@ -6645,7 +6780,7 @@ struct _HostMappedBuffer[dtype: DType]:
     var _dev_buf: DeviceBuffer[Self.dtype]
     var _cpu_buf: HostBuffer[Self.dtype]
 
-    fn __init__(
+    def __init__(
         out self, ctx: DeviceContext, buf: DeviceBuffer[Self.dtype]
     ) raises:
         var cpu_buf = ctx.enqueue_create_host_buffer[Self.dtype](len(buf))
@@ -6653,15 +6788,15 @@ struct _HostMappedBuffer[dtype: DType]:
         self._dev_buf = buf
         self._cpu_buf = cpu_buf
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         pass
 
-    fn __enter__(mut self) raises -> HostBuffer[Self.dtype]:
+    def __enter__(mut self) raises -> HostBuffer[Self.dtype]:
         self._dev_buf.enqueue_copy_to(self._cpu_buf)
         self._ctx.synchronize()
         return self._cpu_buf
 
-    fn __exit__(mut self) raises:
+    def __exit__(mut self) raises:
         self._ctx.synchronize()
         self._cpu_buf.enqueue_copy_to(self._dev_buf)
         self._ctx.synchronize()
@@ -6671,16 +6806,16 @@ struct _DeviceContextScope:
     var _ctx: DeviceContext
     var _handle: _DeviceContextScopePtr
 
-    fn __init__(out self, ctx: DeviceContext):
+    def __init__(out self, ctx: DeviceContext):
         self._ctx = ctx
         self._handle = _DeviceContextScopePtr()
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         # Ensure that the C++ scope is removed in all cases.
         if self._handle:
             self._release()
 
-    fn __enter__(mut self) raises -> DeviceContext:
+    def __enter__(mut self) raises -> DeviceContext:
         # Create a C++ DeviceContextScope
         var cpp_handle = _DeviceContextScopePtr()
 
@@ -6700,12 +6835,12 @@ struct _DeviceContextScope:
 
         return self._ctx
 
-    fn __exit__(mut self) raises:
+    def __exit__(mut self) raises:
         # Release the C++ DeviceContextScope
         self._release()
         self._handle = _DeviceContextScopePtr()
 
-    fn _release(mut self):
+    def _release(mut self):
         # void AsyncRT_DeviceContextScope_release(const DeviceContextScope *scope)
         external_call[
             "AsyncRT_DeviceContextScope_release",

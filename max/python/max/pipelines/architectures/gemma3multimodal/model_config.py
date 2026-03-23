@@ -18,14 +18,15 @@ from dataclasses import dataclass
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.graph.weights import WeightData, WeightsFormat, weights_format
-from max.nn.float8_config import Float8Config
 from max.nn.kv_cache import KVCacheParams
+from max.nn.quant_config import QuantConfig
 from max.nn.transformer import ReturnLogits
 from max.pipelines.architectures.gemma3.model_config import Gemma3Config
 from max.pipelines.lib import (
     KVCacheConfig,
+    MAXModelConfig,
     PipelineConfig,
-    parse_float8_config,
+    parse_quant_config,
 )
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from max.pipelines.lib.interfaces.arch_config import ArchConfigWithKVCache
@@ -156,8 +157,8 @@ class Gemma3ForConditionalGenerationConfig(ArchConfigWithKVCache):
     attention_bias: bool = False
     """Whether to use a bias in the query, key, value and output projection layers during self-attention."""
 
-    float8_config: Float8Config | None = None
-    """Float8 quantization configuration."""
+    quant_config: QuantConfig | None = None
+    """Scaled quantization configuration."""
 
     head_dim: int = 256
     """The attention head dimension."""
@@ -212,7 +213,11 @@ class Gemma3ForConditionalGenerationConfig(ArchConfigWithKVCache):
 
     @override
     @classmethod
-    def initialize(cls, pipeline_config: PipelineConfig) -> Self:
+    def initialize(
+        cls,
+        pipeline_config: PipelineConfig,
+        model_config: MAXModelConfig | None = None,
+    ) -> Self:
         """Initializes a Gemma3ForConditionalGenerationConfig instance from pipeline configuration.
 
         Args:
@@ -221,10 +226,11 @@ class Gemma3ForConditionalGenerationConfig(ArchConfigWithKVCache):
         Returns:
             A Gemma3ForConditionalGenerationConfig instance with fields initialized from config.
         """
-        huggingface_config = pipeline_config.model.huggingface_config
+        model_config = model_config or pipeline_config.model
+        huggingface_config = model_config.huggingface_config
         if huggingface_config is None:
             raise ValueError(
-                f"HuggingFace config is required for '{pipeline_config.model.model_path}', "
+                f"HuggingFace config is required for '{model_config.model_path}', "
                 "but config could not be loaded. "
                 "Please ensure the model repository contains a valid config.json file."
             )
@@ -328,7 +334,7 @@ class Gemma3ForConditionalGenerationConfig(ArchConfigWithKVCache):
         """
         # Parse the float8 config from compressed-tensors
         layer_name_prefix = "language_model.model."
-        float8_config = parse_float8_config(
+        quant_config = parse_quant_config(
             huggingface_config,
             state_dict,
             self.dtype,
@@ -336,7 +342,7 @@ class Gemma3ForConditionalGenerationConfig(ArchConfigWithKVCache):
             ignored_modules_prefix=layer_name_prefix,
         )
 
-        self.float8_config = float8_config
+        self.quant_config = quant_config
         self.return_logits = return_logits
 
         # Finalize text config
@@ -347,5 +353,5 @@ class Gemma3ForConditionalGenerationConfig(ArchConfigWithKVCache):
             huggingface_config=hf_text_config,
             state_dict=state_dict,
             return_logits=return_logits,
-            float8_config=float8_config,
+            quant_config=quant_config,
         )

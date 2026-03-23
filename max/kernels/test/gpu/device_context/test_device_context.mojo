@@ -16,23 +16,14 @@ from std.math import iota
 from std.builtin.device_passable import DevicePassable
 from std.gpu import *
 from std.gpu.host import DeviceBuffer, DeviceContext
-from std.memory import (
-    UnsafePointer as UnsafePointerV2,
-)
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-comptime OpaquePointer = LegacyUnsafePointer[
-    mut=True, NoneType, origin=MutAnyOrigin
-]
 from std.testing import assert_equal
 
 
 # A Simple Kernel performing the sum of two arrays
-fn vec_func(
-    in0: UnsafePointer[Float32],
-    in1: UnsafePointer[Float32],
-    output: UnsafePointer[Float32],
+def vec_func(
+    in0: UnsafePointer[Float32, ImmutAnyOrigin],
+    in1: UnsafePointer[Float32, ImmutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
     len: Int,
     supplement: Int,
 ):
@@ -46,13 +37,13 @@ def test_is_compatible(ctx: DeviceContext) raises:
     assert_equal(ctx.is_compatible(), True)
 
 
-fn test_basic(ctx: DeviceContext) raises:
+def test_basic(ctx: DeviceContext) raises:
     comptime length = 1024
 
     # Host memory buffers for input and output data
-    var in0_host = UnsafePointer[Float32].alloc(length)
-    var in1_host = UnsafePointer[Float32].alloc(length)
-    var out_host = UnsafePointer[Float32].alloc(length)
+    var in0_host = alloc[Float32](length)
+    var in1_host = alloc[Float32](length)
+    var out_host = alloc[Float32](length)
 
     # Initialize inputs
     for i in range(length):
@@ -156,54 +147,77 @@ def test_print(ctx: DeviceContext) raises:
     assert_equal(String(large_buffer), expected_large)
 
 
-@fieldwise_init
-struct ToLegacyUnsafePointer(Copyable, DevicePassable):
-    comptime device_type: AnyType = LegacyUnsafePointer[mut=True, Float32]
+def test_enqueue_unified(ctx: DeviceContext) raises:
+    comptime length = 1024
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
-        target.bitcast[Self.device_type]()[] = Self.device_type()
+    # Host memory buffers for input and output data
+    var in0_host = alloc[Float32](length)
+    var in1_host = alloc[Float32](length)
+    var out_host = alloc[Float32](length)
 
-    @staticmethod
-    fn get_type_name() -> String:
-        return ""
+    # Initialize inputs
+    for i in range(length):
+        in0_host[i] = Float32(i)
+        in1_host[i] = 2
 
+    # Device memory buffers for the kernel input and output
+    var in0_device = ctx.enqueue_create_buffer[DType.float32](length)
+    var in1_device = ctx.enqueue_create_buffer[DType.float32](length)
+    var out_device = ctx.enqueue_create_buffer[DType.float32](length)
 
-@fieldwise_init
-struct ToUnsafePointer(Copyable, DevicePassable):
-    comptime device_type: AnyType = UnsafePointerV2[Float32, MutAnyOrigin]
+    # Copy the input data from the Host to the Device memory
+    ctx.enqueue_copy(in0_device, in0_host)
+    ctx.enqueue_copy(in1_device, in1_host)
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
-        target.bitcast[Self.device_type]()[] = Self.device_type()
+    var block_dim = 32
+    var supplement = 5
 
-    @staticmethod
-    fn get_type_name() -> String:
-        return ""
+    var output = Span(ptr=out_device.unsafe_ptr(), length=length)
+    var in0 = Span(ptr=in0_device.unsafe_ptr(), length=length)
+    var in1 = Span(ptr=in1_device.unsafe_ptr(), length=length)
 
+    def vec_closure() unified register_passable {
+        var supplement, var in0, var in1, var output
+    }:
+        var tid = global_idx.x
+        if tid >= UInt(length):
+            return
+        output[tid] = in0[tid] + in1[tid] + Float32(supplement)
 
-def test_kernel_pointer_conversions(ctx: DeviceContext) raises:
-    fn kernel(
-        legacy: LegacyUnsafePointer[mut=True, Float32],
-        unsafe_pointer: UnsafePointerV2[Float32, MutAnyOrigin],
-    ):
-        pass
-
-    # No conversion needed
-    ctx.enqueue_function_experimental[kernel](
-        ToLegacyUnsafePointer(),
-        ToUnsafePointer(),
-        grid_dim=1,
-        block_dim=1,
+    # Execute the kernel on the device.
+    #  - notice the simple function call like invocation
+    ctx.enqueue_function(
+        vec_closure,
+        grid_dim=(length // block_dim),
+        block_dim=block_dim,
     )
 
-    # Converts from UnsafePointer <-> LegacyUnsafePointer
-    ctx.enqueue_function_experimental[kernel](
-        ToUnsafePointer(),
-        ToLegacyUnsafePointer(),
-        grid_dim=1,
-        block_dim=1,
-    )
+    # Copy the results back from the device to the host
+    ctx.enqueue_copy(out_host, out_device)
 
+    # Wait for the computation to be completed
     ctx.synchronize()
+
+    var expected: List[Float32] = [
+        7.0,
+        8.0,
+        9.0,
+        10.0,
+        11.0,
+        12.0,
+        13.0,
+        14.0,
+        15.0,
+        16.0,
+    ]
+    for i in range(10):
+        print("at index", i, "the value is", out_host[i])
+        assert_equal(out_host[i], expected[i])
+
+    # Release the Host buffers
+    in0_host.free()
+    in1_host.free()
+    out_host.free()
 
 
 def main() raises:
@@ -215,4 +229,4 @@ def main() raises:
         test_move(ctx)
         test_id(ctx)
         test_print(ctx)
-        test_kernel_pointer_conversions(ctx)
+        test_enqueue_unified(ctx)

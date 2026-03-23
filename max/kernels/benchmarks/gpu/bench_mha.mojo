@@ -26,9 +26,6 @@ from std.gpu.host import DeviceContext
 from internal_utils import CacheBustingBuffer, arg_parse
 from internal_utils._utils import InitializationType
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
 from nn.mha import flash_attention, mha_gpu_naive
 from nn.mha_mask import CausalMask
 from std.testing import assert_almost_equal
@@ -37,7 +34,7 @@ from std.utils.index import Index
 from std.utils.numerics import min_or_neg_inf
 
 
-fn run_mha[
+def run_mha[
     qkv_type: DType,
     mask_type: DType,
     depth: Int,
@@ -80,10 +77,8 @@ fn run_mha[
     )
 
     # Allocate host memory for verification.
-    var output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(o_size)
-    var flash_output_ptr = UnsafePointer[Scalar[qkv_type]].alloc(
-        cb_o.alloc_size()
-    )
+    var output_ptr = alloc[Scalar[qkv_type]](o_size)
+    var flash_output_ptr = alloc[Scalar[qkv_type]](cb_o.alloc_size())
 
     # Initialize data on the device.
     comptime random_distribution = InitializationType.uniform_distribution
@@ -97,10 +92,10 @@ fn run_mha[
         @parameter
         @always_inline
         @__copy_capture(cb_q, cb_k, cb_v, cb_o)
-        fn bench_func(mut b: Bencher):
+        def bench_func(mut b: Bencher):
             @parameter
             @always_inline
-            fn _kernel_launch(ctx: DeviceContext, iteration: Int) raises:
+            def _kernel_launch(ctx: DeviceContext, iteration: Int) raises:
                 # Construct device buffers with offsets.
                 comptime q_layout = Layout.row_major(
                     UNKNOWN_VALUE, UNKNOWN_VALUE, num_heads, depth
@@ -152,7 +147,7 @@ fn run_mha[
 
             b.iter_custom[_kernel_launch](ctx)
 
-        fn compute_flops() -> Int:
+        def compute_flops() -> Int:
             # Using causal mask, skip half of tiles.
             return 2 * batch_size * num_heads * seq_len * num_keys * depth
 
@@ -232,7 +227,7 @@ fn run_mha[
         ctx.enqueue_copy(flash_output_ptr, cb_o.device_buffer())
         # Allocate and initialize mask for verification
         var mask_size = batch_size * num_heads * seq_len * num_keys
-        var mask_ptr = UnsafePointer[Scalar[mask_type]].alloc(mask_size)
+        var mask_ptr = alloc[Scalar[mask_type]](mask_size)
 
         comptime layout_4d = Layout.row_major[4]()
         var mask = LayoutTensor[mask_type, layout_4d](
@@ -319,7 +314,7 @@ fn run_mha[
 
 
 @fieldwise_init
-struct MHA_cfg(ImplicitlyCopyable):
+struct MHA_cfg(ImplicitlyCopyable, Writable):
     # params
     var qkv_type: DType
     var mask_type: DType
@@ -327,19 +322,6 @@ struct MHA_cfg(ImplicitlyCopyable):
     var num_heads: Int
     var group: Int
     var cache_busting: Bool
-
-    @no_inline
-    fn __str__(self) -> String:
-        # fmt: off
-        return String(
-            "qkv_type=", self.qkv_type,
-            "/mask_type=", self.mask_type,
-            "/depth=", self.depth,
-            "/num_heads=", self.num_heads,
-            "/group=", self.group,
-            "/cache_busting=", self.cache_busting,
-        )
-        # fmt: on
 
 
 def main() raises:

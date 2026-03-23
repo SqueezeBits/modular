@@ -27,7 +27,12 @@ from std.gpu.memory import AddressSpace
 
 from ..block_scaled.block_scaled_smem import BlockScaledTileCore
 from ..structured_kernels.config import BlockScaledMatmulConfig
-from structured_kernels.pipeline_storage import SmemPipelineBundleNoClc
+from structured_kernels.pipeline_storage import (
+    BarrierPair,
+    RawBarrierStorage,
+    SmemPipelineBundleNoClc,
+    MbarPtr,
+)
 
 
 struct Grouped1D1DSmem[
@@ -70,53 +75,78 @@ struct Grouped1D1DSmem[
     ]
     var pipelines: Self.Pipelines
 
+    # ========== SFB Load Barriers (MMA_N < 64) ==========
+    # SFB TMEM load warps arrive after writing SFB to TMEM via tcgen05_st.
+    # MMA warp waits before issuing UMMA.
+    var sfb_load_barriers: RawBarrierStorage[
+        Int(Self.Core.num_group_pipeline_stages)
+    ]
+
+    # ========== SFB TMA Pipeline Barriers (MMA_N < 64) ==========
+    # Producer-consumer pipeline between SfbTMALoad warp and SfbTMEMLoad/MMA.
+    # Producer (SfbTMALoad): signals FULL after TMA copy, waits EMPTY from MMA.
+    # Consumer (SfbTMEMLoad): waits FULL, signals sfb_load_barriers after TMEM write.
+    # Consumer (MMA): signals EMPTY after consuming TMEM data.
+    var sfb_tma_barriers: BarrierPair[Int(Self.Core.num_group_pipeline_stages)]
+
+    # ========== SFB Barrier Accessors ==========
+    @always_inline
+    def sfb_load_mbars_ptr(ref[AddressSpace.SHARED] self) -> MbarPtr:
+        """Get pointer to SFB-load mbarrier array (SFB Load→MMA)."""
+        return self.sfb_load_barriers.ptr()
+
+    @always_inline
+    def sfb_tma_mbars_ptr(ref[AddressSpace.SHARED] self) -> MbarPtr:
+        """Get pointer to SFB TMA pipeline mbarrier array (SfbTMALoad↔MMA)."""
+        return self.sfb_tma_barriers.ptr()
+
     # ========== Tile Accessors (forwarding) ==========
     @always_inline
-    fn a_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.ATileArray:
+    def a_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.ATileArray:
         """Get A tile array accessor."""
         return self.core.a_tiles()
 
     @always_inline
-    fn b_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.BTileArray:
+    def b_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.BTileArray:
         """Get B tile array accessor."""
         return self.core.b_tiles()
 
     @always_inline
-    fn c_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.CTileArray:
+    def c_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.CTileArray:
         """Get C tile array accessor."""
         return self.core.c_tiles()
 
     @always_inline
-    fn sfa_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.SFATileArray:
+    def sfa_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.SFATileArray:
         """Get SFA tile array accessor."""
         return self.core.sfa_tiles()
 
     @always_inline
-    fn sfb_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.SFBTileArray:
+    def sfb_tiles(ref[AddressSpace.SHARED] self) -> Self.Core.SFBTileArray:
         """Get SFB tile array accessor."""
         return self.core.sfb_tiles()
 
     # ========== Size Utilities (forwarding) ==========
     @staticmethod
     @always_inline
-    fn ab_pipeline_size() -> Int:
+    def ab_pipeline_size() -> Int:
         """Total size of A+B tiles for all pipeline stages (in elements)."""
         return Self.Core.ab_pipeline_size()
 
     @staticmethod
     @always_inline
-    fn sf_pipeline_size() -> Int:
+    def sf_pipeline_size() -> Int:
         """Total size of SFA+SFB tiles for all pipeline stages (in elements)."""
         return Self.Core.sf_pipeline_size()
 
     @staticmethod
     @always_inline
-    fn c_output_size() -> Int:
+    def c_output_size() -> Int:
         """Size of C tiles for all output stages (in elements)."""
         return Self.Core.c_output_size()
 
     @staticmethod
     @always_inline
-    fn total_tile_size() -> Int:
+    def total_tile_size() -> Int:
         """Total tile storage size (A+B+SFA+SFB+C) in elements."""
         return Self.Core.total_tile_size()

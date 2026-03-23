@@ -53,8 +53,12 @@ from layout.tma_async import create_tensor_tile_im2col
 from structured_kernels.tile_types import (
     create_tma_tile,
 )
-from layout import Layout as LegacyLayout, LayoutTensor, RuntimeLayout
-from linalg.utils import elementwise_compute_lambda_type
+from layout import TileTensor
+from layout.tile_layout import Coord, row_major
+from linalg.utils import (
+    elementwise_compute_lambda_type,
+    elementwise_epilogue_type,
+)
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
@@ -67,7 +71,7 @@ from .conv2d_fprop_kernel import Conv2dFpropKernel
 # =============================================================================
 
 
-fn conv2d_fprop[
+def conv2d_fprop[
     act_type: DType,
     filter_type: DType,
     out_type: DType,
@@ -75,14 +79,15 @@ fn conv2d_fprop[
     config: Conv2dConfig[act_type, filter_type, out_type] = Conv2dConfig[
         act_type, filter_type, out_type
     ].default_bf16(),
+    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     elementwise_compute_lambda_fn: Optional[
         elementwise_compute_lambda_type
     ] = None,
     register_based_epilogue: Bool = True,
 ](
-    output: NDBuffer[out_type, 4, _],  # NHWC
-    activation: NDBuffer[act_type, 4, _],  # NHWC
-    filter: NDBuffer[filter_type, 4, _],  # KRSC (out_ch, R, S, in_ch)
+    output: NDBuffer[rank=4, out_type, _],  # NHWC
+    activation: NDBuffer[rank=4, act_type, _],  # NHWC
+    filter: NDBuffer[rank=4, filter_type, _],  # KRSC (out_ch, R, S, in_ch)
     problem: Conv2dProblemShape,
     ctx: DeviceContext,
 ) raises:
@@ -110,9 +115,11 @@ fn conv2d_fprop[
         filter_type: Data type of the filter weights tensor.
         out_type: Data type of the output tensor.
         config: Kernel configuration (tile sizes, pipeline stages, etc.).
+        elementwise_lambda_fn: Optional void epilogue lambda applied after
+            output write. Signature: `def(IndexList[2], SIMD) -> None`.
         elementwise_compute_lambda_fn: Optional element-wise lambda function
             for epilogue fusion (bias add, activation, residual connection).
-            Signature: `fn(coords: IndexList[2], val: SIMD) -> SIMD`.
+            Signature: `def(coords: IndexList[2], val: SIMD) -> SIMD`.
         register_based_epilogue: If True, apply lambda in registers (faster).
             If False, apply lambda after SMEM write (more flexible).
 
@@ -168,51 +175,40 @@ fn conv2d_fprop[
     comptime corner_limit = 128  # signed 8-bit range
     comptime offset_limit = 255  # unsigned 8-bit max
 
-    debug_assert(
-        lower_corner_h >= -corner_limit and lower_corner_h < corner_limit,
-        "lower_corner_h out of TMA im2col range [-128, 127]",
-    )
-    debug_assert(
-        lower_corner_w >= -corner_limit and lower_corner_w < corner_limit,
-        "lower_corner_w out of TMA im2col range [-128, 127]",
-    )
-    debug_assert(
-        upper_corner_h >= -corner_limit and upper_corner_h < corner_limit,
-        "upper_corner_h out of TMA im2col range [-128, 127]",
-    )
-    debug_assert(
-        upper_corner_w >= -corner_limit and upper_corner_w < corner_limit,
-        "upper_corner_w out of TMA im2col range [-128, 127]",
-    )
+    assert (
+        lower_corner_h >= -corner_limit and lower_corner_h < corner_limit
+    ), "lower_corner_h out of TMA im2col range [-128, 127]"
+    assert (
+        lower_corner_w >= -corner_limit and lower_corner_w < corner_limit
+    ), "lower_corner_w out of TMA im2col range [-128, 127]"
+    assert (
+        upper_corner_h >= -corner_limit and upper_corner_h < corner_limit
+    ), "upper_corner_h out of TMA im2col range [-128, 127]"
+    assert (
+        upper_corner_w >= -corner_limit and upper_corner_w < corner_limit
+    ), "upper_corner_w out of TMA im2col range [-128, 127]"
 
     # Filter offsets range from 0 to (filter_size - 1), multiplied by dilation
     # For now we assume dilation=1
-    debug_assert(
-        problem.filter_h - 1 <= offset_limit,
-        "filter_h offset exceeds TMA im2col limit [0, 255]",
-    )
-    debug_assert(
-        problem.filter_w - 1 <= offset_limit,
-        "filter_w offset exceeds TMA im2col limit [0, 255]",
-    )
+    assert (
+        problem.filter_h - 1 <= offset_limit
+    ), "filter_h offset exceeds TMA im2col limit [0, 255]"
+    assert (
+        problem.filter_w - 1 <= offset_limit
+    ), "filter_w offset exceeds TMA im2col limit [0, 255]"
 
-    # Create activation LayoutTensor view (4D NHWC)
-    comptime act_4d_layout = LegacyLayout.row_major(1, 1, 1, 1)  # Dynamic
-    var act_tensor = LayoutTensor[act_type, act_4d_layout](
+    # Create activation TileTensor view (4D NHWC row-major)
+    var act_tensor = TileTensor(
         activation.data,
-        RuntimeLayout[act_4d_layout](
-            Index(
-                activation.dim[0](),
-                activation.dim[1](),
-                activation.dim[2](),
-                activation.dim[3](),
-            ),
-            Index(
-                activation.stride[0](),
-                activation.stride[1](),
-                activation.stride[2](),
-                activation.stride[3](),
-            ),
+        row_major(
+            Coord(
+                IndexList[4](
+                    activation.dim[0](),
+                    activation.dim[1](),
+                    activation.dim[2](),
+                    activation.dim[3](),
+                )
+            )
         ),
     )
 
@@ -234,6 +230,7 @@ fn conv2d_fprop[
             Int32(config.cluster_shape[1]),
             Int32(config.cluster_shape[2]),
         ),
+        elementwise_lambda_fn=elementwise_lambda_fn,
         elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
         register_based_epilogue=register_based_epilogue,
     ]
@@ -259,31 +256,21 @@ fn conv2d_fprop[
         problem.filter_w,
     )
 
-    # Create filter 2D view: [N, K] transposed (K-major)
-    comptime filter_2d_layout = LegacyLayout.row_major(1, 1)  # Dynamic
-    var filter_tensor = LayoutTensor[filter_type, filter_2d_layout](
-        filter.data,
-        RuntimeLayout[filter_2d_layout](
-            Index(N, K),
-            Index(K, 1),  # K-major (transposed)
-        ),
+    # Create filter 2D view: [N, K] row-major (K-contiguous)
+    var filter_tensor = TileTensor(
+        filter.data, row_major(Coord(IndexList[2](N, K)))
     )
 
     filter_tma_op = create_tma_tile[
-        KernelType.FilterTmaTile.tile_layout,
-        KernelType.FilterTmaTile.desc_layout,
+        KernelType.FilterTileLayout,
+        KernelType.FilterDescLayout,
         Index(BN // (cluster_shape[0] // config.cta_group), BK),
         swizzle_mode=config.b_swizzle,
     ](ctx, filter_tensor)
 
     # Create output 2D view: [M, N] row-major
-    comptime out_2d_layout = LegacyLayout.row_major(1, 1)  # Dynamic
-    var out_tensor = LayoutTensor[out_type, out_2d_layout](
-        output.data,
-        RuntimeLayout[out_2d_layout](
-            Index(M, N),
-            Index(N, 1),  # Row-major
-        ),
+    var out_tensor = TileTensor(
+        output.data, row_major(Coord(IndexList[2](M, N)))
     )
 
     comptime c_tma_tile_shape_mma128 = Index(64, config.output_tile_shape[1])
@@ -292,8 +279,8 @@ fn conv2d_fprop[
     ) else c_tma_tile_shape_mma128
 
     out_tma_op = create_tma_tile[
-        KernelType.OutTmaTile.tile_layout,
-        KernelType.OutTmaTile.desc_layout,
+        KernelType.OutTileLayout,
+        KernelType.OutDescLayout,
         c_tma_tile_shape,
         swizzle_mode=config.c_swizzle,
     ](ctx, out_tensor)
@@ -337,7 +324,7 @@ fn conv2d_fprop[
 # =============================================================================
 
 
-fn conv2d_fprop_with_residual[
+def conv2d_fprop_with_residual[
     act_type: DType,
     filter_type: DType,
     out_type: DType,
@@ -345,16 +332,17 @@ fn conv2d_fprop_with_residual[
     config: Conv2dConfig[act_type, filter_type, out_type] = Conv2dConfig[
         act_type, filter_type, out_type
     ].default_bf16(),
+    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     elementwise_compute_lambda_fn: Optional[
         elementwise_compute_lambda_type
     ] = None,
     register_based_epilogue: Bool = True,
     has_residual: Bool = False,
 ](
-    output: NDBuffer[out_type, 4, _],  # NHWC - D = Conv(A,B) + beta*C
-    activation: NDBuffer[act_type, 4, _],  # NHWC - A
-    filter: NDBuffer[filter_type, 4, _],  # KRSC - B
-    source: NDBuffer[out_type, 4, _],  # NHWC - C (residual input)
+    output: NDBuffer[rank=4, out_type, _],  # NHWC - D = Conv(A,B) + beta*C
+    activation: NDBuffer[rank=4, act_type, _],  # NHWC - A
+    filter: NDBuffer[rank=4, filter_type, _],  # KRSC - B
+    source: NDBuffer[rank=4, out_type, _],  # NHWC - C (residual input)
     beta: Float32,  # Residual scale factor
     problem: Conv2dProblemShape,
     ctx: DeviceContext,
@@ -378,6 +366,8 @@ fn conv2d_fprop_with_residual[
         filter_type: Data type of the filter weights tensor.
         out_type: Data type of the output tensor.
         config: Kernel configuration (tile sizes, pipeline stages, etc.).
+        elementwise_lambda_fn: Optional void epilogue lambda applied after
+            output write. Signature: `def(IndexList[2], SIMD) -> None`.
         elementwise_compute_lambda_fn: Optional element-wise lambda function
             for epilogue fusion (bias add, activation). Applied before residual.
         register_based_epilogue: If True, apply lambda in registers (faster).
@@ -447,23 +437,18 @@ fn conv2d_fprop_with_residual[
     var upper_corner_w = problem.pad_w - (problem.filter_w - 1)
 
     # ========== Create TMA descriptors ==========
-    # Activation TMA with im2col (4D NHWC)
-    comptime act_4d_layout = LegacyLayout.row_major(1, 1, 1, 1)
-    var act_tensor = LayoutTensor[act_type, act_4d_layout](
+    # Activation TMA with im2col (4D NHWC row-major)
+    var act_tensor = TileTensor(
         activation.data,
-        RuntimeLayout[act_4d_layout](
-            Index(
-                activation.dim[0](),
-                activation.dim[1](),
-                activation.dim[2](),
-                activation.dim[3](),
-            ),
-            Index(
-                activation.stride[0](),
-                activation.stride[1](),
-                activation.stride[2](),
-                activation.stride[3](),
-            ),
+        row_major(
+            Coord(
+                IndexList[4](
+                    activation.dim[0](),
+                    activation.dim[1](),
+                    activation.dim[2](),
+                    activation.dim[3](),
+                )
+            )
         ),
     )
 
@@ -485,6 +470,7 @@ fn conv2d_fprop_with_residual[
             Int32(config.cluster_shape[1]),
             Int32(config.cluster_shape[2]),
         ),
+        elementwise_lambda_fn=elementwise_lambda_fn,
         elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
         register_based_epilogue=register_based_epilogue,
     ]
@@ -510,30 +496,20 @@ fn conv2d_fprop_with_residual[
         problem.filter_w,
     )
 
-    # Filter TMA (2D K-major)
-    comptime filter_2d_layout = LegacyLayout.row_major(1, 1)
-    var filter_tensor = LayoutTensor[filter_type, filter_2d_layout](
-        filter.data,
-        RuntimeLayout[filter_2d_layout](
-            Index(N, K),
-            Index(K, 1),
-        ),
+    # Filter TMA (2D row-major, K-contiguous)
+    var filter_tensor = TileTensor(
+        filter.data, row_major(Coord(IndexList[2](N, K)))
     )
     filter_tma_op = create_tma_tile[
-        KernelType.FilterTmaTile.tile_layout,
-        KernelType.FilterTmaTile.desc_layout,
+        KernelType.FilterTileLayout,
+        KernelType.FilterDescLayout,
         Index(BN // (cluster_shape[0] // config.cta_group), BK),
         swizzle_mode=config.b_swizzle,
     ](ctx, filter_tensor)
 
     # Output TMA (D) - 2D row-major
-    comptime out_2d_layout = LegacyLayout.row_major(1, 1)
-    var out_tensor = LayoutTensor[out_type, out_2d_layout](
-        output.data,
-        RuntimeLayout[out_2d_layout](
-            Index(M, N),
-            Index(N, 1),
-        ),
+    var out_tensor = TileTensor(
+        output.data, row_major(Coord(IndexList[2](M, N)))
     )
     comptime c_tma_tile_shape_mma128 = Index(64, config.output_tile_shape[1])
     comptime c_tma_tile_shape = config.output_tile_shape if (
@@ -541,23 +517,19 @@ fn conv2d_fprop_with_residual[
     ) else c_tma_tile_shape_mma128
 
     out_tma_op = create_tma_tile[
-        KernelType.OutTmaTile.tile_layout,
-        KernelType.OutTmaTile.desc_layout,
+        KernelType.OutTileLayout,
+        KernelType.OutDescLayout,
         c_tma_tile_shape,
         swizzle_mode=config.c_swizzle,
     ](ctx, out_tensor)
 
     # Source TMA (C) - same shape and layout as output
-    var src_tensor = LayoutTensor[out_type, out_2d_layout](
-        source.data,
-        RuntimeLayout[out_2d_layout](
-            Index(M, N),
-            Index(N, 1),
-        ),
+    var src_tensor = TileTensor(
+        source.data, row_major(Coord(IndexList[2](M, N)))
     )
     src_tma_op = create_tma_tile[
-        KernelType.SrcTmaTile.tile_layout,
-        KernelType.SrcTmaTile.desc_layout,
+        KernelType.SrcTileLayout,
+        KernelType.SrcDescLayout,
         c_tma_tile_shape,
         swizzle_mode=config.c_swizzle,
     ](ctx, src_tensor)
@@ -602,11 +574,11 @@ fn conv2d_fprop_with_residual[
 # =============================================================================
 
 
-fn im2col[
+def im2col[
     dtype: DType,
 ](
-    output: NDBuffer[mut=True, dtype, 2, ...],  # [M, K] output
-    activation: NDBuffer[dtype, 4, ...],  # [N, H, W, C] input
+    output: NDBuffer[mut=True, rank=2, dtype, ...],  # [M, K] output
+    activation: NDBuffer[rank=4, dtype, ...],  # [N, H, W, C] input
     problem: Conv2dProblemShape,
 ):
     """Explicit im2col transformation for convolution.

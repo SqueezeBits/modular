@@ -65,6 +65,8 @@ async def run_with_default_executor(
 
 
 class PipelineClassName(str, Enum):
+    """Known pipeline class names for image generation models."""
+
     FLUX = "FluxPipeline"
     FLUX2 = "Flux2Pipeline"
     FLUX2_KLEIN = "Flux2KleinPipeline"
@@ -107,7 +109,6 @@ class PixelGenerationTokenizer(
         max_length: Maximum sequence length for the primary tokenizer.
         secondary_max_length: Maximum sequence length for the secondary tokenizer, if used.
         trust_remote_code: Whether to trust remote code from the model.
-        context_validators: Optional list of validators to run on PixelContext.
     """
 
     def __init__(
@@ -121,10 +122,11 @@ class PixelGenerationTokenizer(
         max_length: int | None = None,
         secondary_max_length: int | None = None,
         trust_remote_code: bool = False,
-        context_validators: list[Callable[[PixelContext], None]] | None = None,
+        default_num_inference_steps: int = 50,
         **unused_kwargs,
     ) -> None:
         self.model_path = model_path
+        self._default_num_inference_steps = default_num_inference_steps
 
         if max_length is None:
             raise ValueError(
@@ -169,10 +171,6 @@ class PixelGenerationTokenizer(
                 "- '--trust-remote-code' is needed but not set\n"
             ) from e
 
-        self._context_validators = (
-            context_validators if context_validators else []
-        )
-
         # Extract diffusers_config
         if not pipeline_config or not hasattr(
             pipeline_config.model, "diffusers_config"
@@ -192,6 +190,9 @@ class PixelGenerationTokenizer(
         self._pipeline_class_name = PipelineClassName.from_diffusers_config(
             self.diffusers_config
         )
+
+        # Preserve tokenizer attention masks so downstream text encoders can
+        # derive additive attention bias directly from tokenizer semantics.
 
         # Extract static config values once during initialization
         components = self.diffusers_config.get("components", {})
@@ -477,7 +478,7 @@ class PixelGenerationTokenizer(
             assert delegate is not None
 
             if self._pipeline_class_name == PipelineClassName.FLUX2:
-                from max.pipelines.architectures.flux2.system_messages import (
+                from max.pipelines.architectures.flux2_modulev3.system_messages import (
                     SYSTEM_MESSAGE,
                     format_input,
                 )
@@ -487,6 +488,30 @@ class PixelGenerationTokenizer(
                     system_message=SYSTEM_MESSAGE,
                     images=None,
                 )
+
+                # Validate prompt length before truncation.
+                # apply_chat_template with truncation=True silently
+                # drops tokens; error early instead.
+                precheck = delegate.apply_chat_template(
+                    messages_batch[0],
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    return_dict=True,
+                    truncation=False,
+                )
+                precheck_ids = precheck["input_ids"]
+                precheck_len = (
+                    len(precheck_ids[0])
+                    if precheck_ids and isinstance(precheck_ids[0], list)
+                    else len(precheck_ids)
+                )
+                if max_sequence_length and precheck_len > max_sequence_length:
+                    raise ValueError(
+                        f"Prompt is too long for this model's text"
+                        f" encoder: {precheck_len} tokens exceeds"
+                        f" the maximum of {max_sequence_length}"
+                        " tokens. Please shorten your prompt."
+                    )
 
                 return delegate.apply_chat_template(
                     messages_batch[0],
@@ -500,7 +525,7 @@ class PixelGenerationTokenizer(
                     return_overflowing_tokens=False,
                 )
             elif self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
-                from max.pipelines.architectures.flux2.system_messages import (
+                from max.pipelines.architectures.flux2_modulev3.system_messages import (
                     format_input_klein,
                 )
 
@@ -523,6 +548,19 @@ class PixelGenerationTokenizer(
                         messages_batch[0],
                         **kwargs,
                     )
+                # Validate prompt length before truncation.
+                raw_ids = delegate.encode(
+                    prompt_text,
+                    add_special_tokens=add_special_tokens,
+                )
+                if max_sequence_length and len(raw_ids) > max_sequence_length:
+                    raise ValueError(
+                        f"Prompt is too long for this model's text"
+                        f" encoder: {len(raw_ids)} tokens exceeds"
+                        f" the maximum of {max_sequence_length}"
+                        " tokens. Please shorten your prompt."
+                    )
+
                 return delegate(
                     prompt_text,
                     padding="max_length",
@@ -532,6 +570,22 @@ class PixelGenerationTokenizer(
                     return_attention_mask=True,
                 )
             else:
+                # Validate prompt length before truncation.
+                # The tokenizer's truncation=True silently drops
+                # tokens beyond max_sequence_length; error early
+                # instead.
+                raw_ids = delegate.encode(
+                    prompt_str,
+                    add_special_tokens=add_special_tokens,
+                )
+                if max_sequence_length and len(raw_ids) > max_sequence_length:
+                    raise ValueError(
+                        f"Prompt is too long for this model's text"
+                        f" encoder: {len(raw_ids)} tokens exceeds"
+                        f" the maximum of {max_sequence_length}"
+                        " tokens. Please shorten your prompt."
+                    )
+
                 return delegate(
                     prompt_str,
                     padding="max_length",
@@ -870,7 +924,11 @@ class PixelGenerationTokenizer(
         latent_width = 2 * (int(width) // (self._vae_scale_factor * 2))
         image_seq_len = (latent_height // 2) * (latent_width // 2)
 
-        num_inference_steps = image_options.steps
+        num_inference_steps = (
+            image_options.steps
+            if "steps" in image_options.model_fields_set
+            else self._default_num_inference_steps
+        )
         timesteps, sigmas = self._scheduler.retrieve_timesteps_and_sigmas(
             image_seq_len, num_inference_steps
         )
@@ -894,6 +952,7 @@ class PixelGenerationTokenizer(
             mask=attn_mask,
             tokens_2=token_buffer_2,
             negative_tokens=negative_token_buffer,
+            negative_mask=_negative_attn_mask,
             negative_tokens_2=negative_token_buffer_2,
             timesteps=timesteps,
             sigmas=sigmas,
@@ -908,9 +967,7 @@ class PixelGenerationTokenizer(
             num_warmup_steps=num_warmup_steps,
             model_name=request.body.model,
             input_image=preprocessed_image_array,  # Pass numpy array instead of PIL.Image
+            output_format=image_options.output_format,
         )
-
-        for validator in self._context_validators:
-            validator(context)
 
         return context

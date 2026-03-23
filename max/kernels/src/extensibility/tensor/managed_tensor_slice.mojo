@@ -18,24 +18,30 @@ from std.collections import Optional
 from std.math import ceil, fma
 from std.sys import align_of, simd_width_of, size_of
 from std.sys.info import CompilationTarget, is_gpu
-from std.sys.intrinsics import strided_load, strided_store
+from std.sys.intrinsics import _type_is_eq, strided_load, strided_store
 
 import std.algorithm
 from buffer.dimlist import DimList, Dim, _make_partially_static_index_list
 from std.builtin.device_passable import DevicePassable
-from compiler_internal.directives import StaticTensorSpec, __mogg_intrinsic_attr
+from compiler_internal.directives import (
+    StaticTensorSpec,
+    __mogg_intrinsic_attr,
+    StaticTensorSpecInternal,
+    get_row_major_tensor_spec,
+    InputFusion,
+    OutputFusion,
+    ComputeOutputFusion,
+    ElementwiseFusion,
+    _NoFusionIn,
+    _NoFusionOut,
+    _NoComputeFusion,
+)
 from std.gpu.host import get_gpu_target
 from std.gpu.host.info import is_cpu
 from std.gpu.host.info import is_gpu as _is_gpu
-from layout import LayoutTensor, TileTensor
-from layout.coord import Coord, _DimsToCoordLike
+from layout import Coord, LayoutTensor, TileTensor
+from layout.coord import _DimsToCoordLike
 from layout.tile_layout import Layout as TileLayout
-from std.memory import LegacyUnsafePointer
-
-comptime UnsafePointer = LegacyUnsafePointer[mut=True, ...]
-comptime OpaquePointer = LegacyUnsafePointer[
-    mut=True, NoneType, origin=MutAnyOrigin
-]
 from register import register_internal
 from std.runtime.asyncrt import DeviceContextPtr
 from std.runtime.tracing import trace_arg
@@ -44,7 +50,7 @@ from tensor import RuntimeTensorSpec
 from std.utils import IndexList, StaticTuple
 from std.utils._serialize import _serialize
 
-from ._indexing import _dot_prod, _row_major_strides, _slice_to_tuple
+from ._indexing import _dot_prod, _slice_to_tuple
 from .io_spec import IO, IOSpec
 
 # ===----------------------------------------------------------------------=== #
@@ -54,7 +60,7 @@ from .io_spec import IO, IOSpec
 
 @parameter
 @always_inline
-fn _gcd_pow2[a: Int, b: Int]() -> Int:
+def _gcd_pow2[a: Int, b: Int]() -> Int:
     # alignments should always be powers of 2
     comptime assert (
         a.is_power_of_two() and b.is_power_of_two()
@@ -72,14 +78,15 @@ fn _gcd_pow2[a: Int, b: Int]() -> Int:
 # predictably introspect and manipulate these particular functions.
 #
 # They are set to be inlined further down graph compiler stack.
-@doc_private
+@doc_hidden
 @register_internal("simd_store_into_managed_tensor_slice")
 @always_inline
-fn simd_store_into_managed_tensor_slice[
+def simd_store_into_managed_tensor_slice[
     dtype: DType,
     rank: Int,
     simd_width: Int,
-    static_spec: StaticTensorSpec[dtype, rank],
+    //,
+    static_spec: StaticTensorSpec[dtype, rank, ...],
     element_alignment: Int = 1,
 ](
     tensor: ManagedTensorSlice[static_spec=static_spec, ...],
@@ -98,7 +105,7 @@ fn simd_store_into_managed_tensor_slice[
     # Stride = 1
     @parameter
     @always_inline
-    fn store_stride1():
+    def store_stride1():
         comptime if dtype == DType.bool:
             var v = value.cast[DType.uint8]()
             tensor._ptr.bitcast[UInt8]().store(flat_index, v)
@@ -108,7 +115,7 @@ fn simd_store_into_managed_tensor_slice[
     # Stride > 1
     @parameter
     @always_inline
-    fn store_strided(stride: Int):
+    def store_strided(stride: Int):
         comptime if dtype == DType.bool:
             var v = value.cast[DType.uint8]()
             strided_store(
@@ -138,17 +145,18 @@ fn simd_store_into_managed_tensor_slice[
             store_strided(static_stride.get())
 
 
-@doc_private
+@doc_hidden
 @register_internal("simd_store_into_tensor_pointer")
 @always_inline
-fn simd_store_into_tensor_pointer[
+def simd_store_into_tensor_pointer[
     dtype: DType,
     rank: Int,
-    static_spec: StaticTensorSpec[dtype, rank],
+    //,
+    static_spec: StaticTensorSpec[dtype, rank, ...],
     simd_width: Int,
     element_alignment: Int = 1,
 ](
-    ptr: UnsafePointer[Scalar[dtype]],
+    ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     shape: IndexList[rank],
     strides: IndexList[rank],
     indices: IndexList[rank],
@@ -165,8 +173,8 @@ fn simd_store_into_tensor_pointer[
         dtype: The data type of tensor elements.
         rank: The rank (number of dimensions) of the tensor.
         static_spec: The static specs of the tensor.
-        simd_width: The SIMD width for the load operation.
-        element_alignment: The element alignment for the load.
+        simd_width: The SIMD width for the store operation.
+        element_alignment: The element alignment for the store.
 
     Args:
         ptr: The raw pointer to tensor data.
@@ -186,17 +194,18 @@ fn simd_store_into_tensor_pointer[
 # GPU-safe load function that takes raw components (pointer, strides) instead of
 # ManagedTensorSlice. This avoids capturing ManagedTensorSlice in GPU kernels,
 # which doesn't work correctly due to closure capture limitations.
-@doc_private
+@doc_hidden
 @register_internal("simd_load_from_tensor_pointer")
 @always_inline
-fn simd_load_from_tensor_pointer[
+def simd_load_from_tensor_pointer[
     dtype: DType,
     rank: Int,
-    static_spec: StaticTensorSpec[dtype, rank],
+    //,
+    static_spec: StaticTensorSpec[dtype, rank, ...],
     simd_width: Int,
     element_alignment: Int = 1,
 ](
-    ptr: UnsafePointer[Scalar[dtype]],
+    ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     shape: IndexList[rank],
     strides: IndexList[rank],
     indices: IndexList[rank],
@@ -232,14 +241,15 @@ fn simd_load_from_tensor_pointer[
     ](tensor, indices)
 
 
-@doc_private
+@doc_hidden
 @register_internal("simd_load_from_managed_tensor_slice")
 @always_inline
-fn simd_load_from_managed_tensor_slice[
+def simd_load_from_managed_tensor_slice[
     dtype: DType,
     rank: Int,
     simd_width: Int,
-    static_spec: StaticTensorSpec[dtype, rank],
+    //,
+    static_spec: StaticTensorSpec[dtype, rank, ...],
     element_alignment: Int = 1,
 ](
     tensor: ManagedTensorSlice[static_spec=static_spec, ...],
@@ -257,7 +267,7 @@ fn simd_load_from_managed_tensor_slice[
     # Stride = 1
     @parameter
     @always_inline
-    fn load_stride1() -> SIMD[dtype, simd_width]:
+    def load_stride1() -> SIMD[dtype, simd_width]:
         comptime if dtype == DType.bool:
             var v = tensor._ptr.bitcast[UInt8]().load[
                 width=simd_width,
@@ -272,7 +282,7 @@ fn simd_load_from_managed_tensor_slice[
     # Stride > 1
     @parameter
     @always_inline
-    fn load_strided(stride: Int) -> SIMD[dtype, simd_width]:
+    def load_strided(stride: Int) -> SIMD[dtype, simd_width]:
         comptime if dtype == DType.bool:
             var v = strided_load[simd_width, invariant=invariant](
                 tensor._ptr.bitcast[UInt8]() + flat_index,
@@ -304,79 +314,6 @@ fn simd_load_from_managed_tensor_slice[
 
 
 # ===----------------------------------------------------------------------=== #
-# Input / output fusion primitives
-# ===----------------------------------------------------------------------=== #
-
-
-@no_inline
-fn rebuild_static_tensor_specs_with_input_lambda[
-    func_type: __TypeOfAllTypes,
-    //,
-    dtype: DType,
-    rank: Int,
-](
-    spec: StaticTensorSpec[dtype, rank],
-    in_lambda: func_type,
-) -> StaticTensorSpec[dtype, rank]:
-    return StaticTensorSpec[dtype, rank](
-        shape=spec.shape,
-        strides=spec.strides,
-        alignment=spec.alignment,
-        address_space=spec.address_space,
-        exclusive=spec.exclusive,
-        in_lambda=rebind[spec.in_lambda_t](in_lambda),
-        out_lambda=None,
-        out_compute_lambda=None,
-    )
-
-
-@no_inline
-fn rebuild_static_tensor_specs_with_output_lambda[
-    func_type: __TypeOfAllTypes,
-    //,
-    dtype: DType,
-    rank: Int,
-](
-    spec: StaticTensorSpec[dtype, rank],
-    out_lambda: func_type,
-) -> StaticTensorSpec[dtype, rank]:
-    return StaticTensorSpec[dtype, rank](
-        shape=spec.shape,
-        strides=spec.strides,
-        alignment=spec.alignment,
-        address_space=spec.address_space,
-        exclusive=spec.exclusive,
-        in_lambda=None,
-        out_lambda=rebind[spec.out_lambda_t](out_lambda),
-        out_compute_lambda=None,
-    )
-
-
-@no_inline
-fn rebuild_static_tensor_specs_with_compute_output_lambda[
-    func_type: __TypeOfAllTypes,
-    //,
-    dtype: DType,
-    rank: Int,
-](
-    spec: StaticTensorSpec[dtype, rank],
-    out_compute_lambda: func_type,
-) -> StaticTensorSpec[dtype, rank]:
-    return StaticTensorSpec[dtype, rank](
-        shape=spec.shape,
-        strides=spec.strides,
-        alignment=spec.alignment,
-        address_space=spec.address_space,
-        exclusive=spec.exclusive,
-        in_lambda=None,
-        out_lambda=None,
-        out_compute_lambda=rebind[spec.out_compute_lambda_t](
-            out_compute_lambda
-        ),
-    )
-
-
-# ===----------------------------------------------------------------------=== #
 # ManagedTensorSlice class
 # ===----------------------------------------------------------------------=== #
 
@@ -393,7 +330,7 @@ comptime _FusedComputeOutputTensor = ManagedTensorSlice[
 
 comptime DynamicTensor[dtype: DType, rank: Int] = ManagedTensorSlice[
     io_spec=IOUnknown,
-    static_spec=StaticTensorSpec[dtype, rank].create_unknown(),
+    static_spec=StaticTensorSpec[dtype, rank, ...].get_unknown(),
 ]
 
 
@@ -403,10 +340,15 @@ struct ManagedTensorSlice[
     input: IO,
     dtype: DType,
     rank: Int,
+    InFusion: InputFusion,
+    OutFusion: OutputFusion,
+    ComputeFusion: ComputeOutputFusion,
     //,
     io_spec: IOSpec[mut, input],
     *,
-    static_spec: StaticTensorSpec[dtype, rank],
+    static_spec: StaticTensorSpec[
+        dtype, rank, _, _, InFusion, OutFusion, ComputeFusion
+    ],
 ](DevicePassable, TrivialRegisterPassable, Writable):
     """A view of a tensor that does not own the underlying allocated pointer.
     When the object lifetime ends it does not free the underlying pointer.
@@ -424,11 +366,11 @@ struct ManagedTensorSlice[
         Self.dtype, Self.static_spec.to_layout(), MutAnyOrigin
     ]
 
-    fn _to_device_type(self, target: MutOpaquePointer[_]):
+    def _to_device_type(self, target: MutOpaquePointer[_]):
         target.bitcast[Self.device_type]()[] = self.to_layout_tensor()
 
     @staticmethod
-    fn get_type_name() -> String:
+    def get_type_name() -> String:
         return (
             "ManagedTensorSlice[mut = "
             + String(Self.mut)
@@ -447,16 +389,75 @@ struct ManagedTensorSlice[
     comptime _static_shape = Self.static_spec.shape
     comptime _static_strides = Self.static_spec.strides
 
-    comptime _in_lambda = Self.static_spec.in_lambda
-    comptime _out_lambda = Self.static_spec.out_lambda
+    # Fusion query aliases.
+    # _is_unfused and _has_input_fusion are derived purely from IOSpec.
+    # _has_output_store_fusion and _has_compute_fusion must inspect the
+    # actual type parameters because _bind_to_fused_compute_output (OutputFusion
+    # overload) produces the same IO (_FusedComputeOutput) as the
+    # ComputeOutputFusion overload but
+    # populates OutFusion instead of ComputeFusion.
+    comptime _is_unfused: Bool = not Self.input.is_fused()
+    comptime _has_input_fusion: Bool = (Self.input == IO.FusedInput)
+    comptime _has_output_store_fusion: Bool = not _type_is_eq[
+        Self.OutFusion, _NoFusionOut
+    ]()
+    comptime _has_compute_fusion: Bool = not _type_is_eq[
+        Self.ComputeFusion, _NoComputeFusion
+    ]()
 
-    var _ptr: UnsafePointer[Scalar[Self.dtype]]
+    var _ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
     var _spec: RuntimeTensorSpec[Self.dtype, Self.rank]
     var _runtime_strides: IndexList[Self.rank]
+    var in_fusion: Self.InFusion
+    var out_fusion: Self.OutFusion
+    var compute_fusion: Self.ComputeFusion
 
-    fn __init__(
+    @staticmethod
+    @always_inline
+    def _sentinel_in_fusion() -> Self.InFusion:
+        """Return a sentinel InFusion value, or an uninitialized placeholder
+        when the type parameter is a real fusion struct (never reached at
+        runtime, but must compile for all instantiations)."""
+        comptime if _type_is_eq[Self.InFusion, _NoFusionIn]():
+            return rebind[Self.InFusion](_NoFusionIn())
+        else:
+            var f: Self.InFusion
+            __mlir_op.`lit.ownership.mark_initialized`(
+                __get_mvalue_as_litref(f)
+            )
+            return f
+
+    @staticmethod
+    @always_inline
+    def _sentinel_out_fusion() -> Self.OutFusion:
+        """Return a sentinel OutFusion value, or an uninitialized placeholder
+        when the type parameter is a real fusion struct."""
+        comptime if _type_is_eq[Self.OutFusion, _NoFusionOut]():
+            return rebind[Self.OutFusion](_NoFusionOut())
+        else:
+            var f: Self.OutFusion
+            __mlir_op.`lit.ownership.mark_initialized`(
+                __get_mvalue_as_litref(f)
+            )
+            return f
+
+    @staticmethod
+    @always_inline
+    def _sentinel_compute_fusion() -> Self.ComputeFusion:
+        """Return a sentinel ComputeFusion value, or an uninitialized
+        placeholder when the type parameter is a real fusion struct."""
+        comptime if _type_is_eq[Self.ComputeFusion, _NoComputeFusion]():
+            return rebind[Self.ComputeFusion](_NoComputeFusion())
+        else:
+            var f: Self.ComputeFusion
+            __mlir_op.`lit.ownership.mark_initialized`(
+                __get_mvalue_as_litref(f)
+            )
+            return f
+
+    def __init__(
         out self,
-        ptr: UnsafePointer[Scalar[Self.dtype]],
+        ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
         slices: InlineArray[Slice, Self.rank],
         slicer_spec: RuntimeTensorSpec[Self.dtype, Self.rank],
     ):
@@ -470,17 +471,17 @@ struct ManagedTensorSlice[
 
         @parameter
         @always_inline
-        fn start_fn(slice: Slice) -> Int:
+        def start_fn(slice: Slice) -> Int:
             return slice.start.value()
 
         @parameter
         @always_inline
-        fn stop_fn(slice: Slice) -> Int:
+        def stop_fn(slice: Slice) -> Int:
             return slice.end.value()
 
         @parameter
         @always_inline
-        fn step_fn(slice: Slice) -> Int:
+        def step_fn(slice: Slice) -> Int:
             return slice.step.or_else(1)
 
         var start = _slice_to_tuple[start_fn](slices)
@@ -494,7 +495,7 @@ struct ManagedTensorSlice[
             )
         var slice_spec = RuntimeTensorSpec[Self.dtype](adjusted_shape)
 
-        var slicer_strides = _row_major_strides(adjusted_shape)
+        var slicer_strides = adjusted_shape.get_row_major_strides()
         var start_offset = _dot_prod(start, slicer_strides)
 
         var strides = IndexList[Self.rank]()
@@ -502,11 +503,36 @@ struct ManagedTensorSlice[
         comptime for i in range(Self.rank):
             strides[i] = step[i] * slicer_strides[i]
 
-        self = Self(ptr + start_offset, slice_spec, strides)
+        self._ptr = ptr + start_offset
+        self._spec = slice_spec
+        self._runtime_strides = strides
+        self.in_fusion = Self._sentinel_in_fusion()
+        self.out_fusion = Self._sentinel_out_fusion()
+        self.compute_fusion = Self._sentinel_compute_fusion()
 
-    fn __init__(
+    def __init__(
         out self,
-        ptr: UnsafePointer[Scalar[Self.dtype]],
+        ptr: UnsafePointer[Scalar[Self.dtype], origin=MutAnyOrigin],
+        spec: RuntimeTensorSpec[Self.dtype, Self.rank],
+        strides: IndexList[Self.rank],
+    ):
+        """Initializes a ManagedTensorSlice from a pointer, runtime tensor spec,
+        and strides.
+
+        In general, custom operations should not create `ManagedTensorSlice`
+        instances, but instead use the ones provided by the MAX inference
+        engine.
+        """
+        self._ptr = ptr
+        self._spec = spec
+        self._runtime_strides = strides
+        self.in_fusion = Self._sentinel_in_fusion()
+        self.out_fusion = Self._sentinel_out_fusion()
+        self.compute_fusion = Self._sentinel_compute_fusion()
+
+    def __init__(
+        out self,
+        ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
         shape: IndexList[Self.rank],
     ):
         """Initializes a ManagedTensorSlice from a pointer and shape.
@@ -517,11 +543,14 @@ struct ManagedTensorSlice[
         """
         self._ptr = ptr
         self._spec = RuntimeTensorSpec[Self.dtype, Self.rank](shape)
-        self._runtime_strides = _row_major_strides(shape)
+        self._runtime_strides = shape.get_row_major_strides()
+        self.in_fusion = Self._sentinel_in_fusion()
+        self.out_fusion = Self._sentinel_out_fusion()
+        self.compute_fusion = Self._sentinel_compute_fusion()
 
-    fn __init__(
+    def __init__(
         out self,
-        ptr: UnsafePointer[Scalar[Self.dtype]],
+        ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
         shape: IndexList[Self.rank],
         strides: IndexList[Self.rank],
     ):
@@ -531,14 +560,15 @@ struct ManagedTensorSlice[
         instances, but instead use the ones provided by the MAX inference
         engine.
         """
-        self = Self(
-            ptr,
-            RuntimeTensorSpec[Self.dtype, Self.rank](shape),
-            strides,
-        )
+        self._ptr = ptr
+        self._spec = RuntimeTensorSpec[Self.dtype, Self.rank](shape)
+        self._runtime_strides = strides
+        self.in_fusion = Self._sentinel_in_fusion()
+        self.out_fusion = Self._sentinel_out_fusion()
+        self.compute_fusion = Self._sentinel_compute_fusion()
 
     @always_inline
-    fn __getitem__(self, indices: IndexList[Self.rank]) -> Scalar[Self.dtype]:
+    def __getitem__(self, indices: IndexList[Self.rank]) -> Scalar[Self.dtype]:
         """Gets the value at the specified indices.
 
         Args:
@@ -548,13 +578,13 @@ struct ManagedTensorSlice[
           The value at the specified indices.
         """
         comptime assert (
-            not Self.static_spec.in_lambda
+            not Self._has_input_fusion
         ), "Direct load on fused tensor is forbidden"
         var offset = _dot_prod(indices, self.strides())
         return self._ptr[offset]
 
     @always_inline
-    fn __getitem__(self, *indices: Int) -> Scalar[Self.dtype]:
+    def __getitem__(self, *indices: Int) -> Scalar[Self.dtype]:
         """Gets the value at the specified indices.
 
         Args:
@@ -564,16 +594,15 @@ struct ManagedTensorSlice[
           The value at the specified indices.
         """
         comptime assert (
-            not Self.static_spec.in_lambda
+            not Self._has_input_fusion
         ), "Direct load on fused tensor is forbidden"
-        debug_assert(
-            len(indices) == Self.rank,
-            "mismatch between requested index and rank",
-        )
+        assert (
+            len(indices) == Self.rank
+        ), "mismatch between requested index and rank"
         return self[IndexList[Self.rank](indices)]
 
     @always_inline
-    fn __setitem__(self, *indices: Int, val: Scalar[Self.dtype]):
+    def __setitem__(self, *indices: Int, val: Scalar[Self.dtype]):
         """Stores the value at the specified indices.
 
         Args:
@@ -582,16 +611,15 @@ struct ManagedTensorSlice[
 
         """
         comptime assert (
-            not Self.static_spec.out_lambda
+            not Self._has_output_store_fusion
         ), "Direct store on fused tensor is forbidden"
-        debug_assert(
-            len(indices) == Self.rank,
-            "mismatch between requested index and rank",
-        )
+        assert (
+            len(indices) == Self.rank
+        ), "mismatch between requested index and rank"
         self[IndexList[Self.rank](indices)] = val
 
     @always_inline
-    fn __setitem__(
+    def __setitem__(
         self, indices: IndexList[Self.rank], val: Scalar[Self.dtype]
     ):
         """Stores the value at the specified indices.
@@ -602,12 +630,12 @@ struct ManagedTensorSlice[
 
         """
         comptime assert (
-            not Self.static_spec.out_lambda
+            not Self._has_output_store_fusion
         ), "Direct store on fused tensor is forbidden"
         var offset = _dot_prod(indices, self.strides())
         self._ptr[offset] = val
 
-    fn spec(self) -> RuntimeTensorSpec[Self.dtype, Self.rank]:
+    def spec(self) -> RuntimeTensorSpec[Self.dtype, Self.rank]:
         """Gets the `TensorSpec` of this tensor slice, which provides meta-data
         about the tensor slice.
 
@@ -617,7 +645,7 @@ struct ManagedTensorSlice[
         return self._spec
 
     @always_inline
-    fn shape(self) -> IndexList[Self.rank]:
+    def shape(self) -> IndexList[Self.rank]:
         """Gets the shape of this tensor slice, as an `IndexList`.
 
         Returns:
@@ -628,7 +656,7 @@ struct ManagedTensorSlice[
         )
 
     @always_inline
-    fn dim_size(self, index: Int) -> Int:
+    def dim_size(self, index: Int) -> Int:
         """Gets the size of a given dimension of this tensor slice using a run
         time value.
 
@@ -641,7 +669,7 @@ struct ManagedTensorSlice[
         return self.shape()[index]
 
     @always_inline
-    fn dim_size[index: Int](self) -> Int:
+    def dim_size[index: Int](self) -> Int:
         """Gets the size of a given dimension of this tensor slice using a
         compile time value.
 
@@ -658,7 +686,7 @@ struct ManagedTensorSlice[
             return Self._static_shape.get[index]()
 
     @always_inline
-    fn strides(self) -> IndexList[Self.rank]:
+    def strides(self) -> IndexList[Self.rank]:
         """Gets the strides of this tensor slice, as an `IndexList`.
 
         Returns:
@@ -669,7 +697,7 @@ struct ManagedTensorSlice[
         ](self._runtime_strides)
 
     @always_inline
-    fn stride_length(self, index: Int) -> Int:
+    def stride_length(self, index: Int) -> Int:
         """Gets the length of the stride of a given dimension of this tensor
         slice using a run time value.
 
@@ -682,7 +710,7 @@ struct ManagedTensorSlice[
         return self.strides()[index]
 
     @always_inline
-    fn stride_length[index: Int](self) -> Int:
+    def stride_length[index: Int](self) -> Int:
         """Gets the length of the stride of a given dimension of this tensor
         slice using a compile time value.
 
@@ -699,7 +727,7 @@ struct ManagedTensorSlice[
             return Self._static_strides.get[index]()
 
     @always_inline
-    fn size(self) -> Int:
+    def size(self) -> Int:
         """Computes the tensor slice's number of elements.
 
         Returns:
@@ -713,9 +741,9 @@ struct ManagedTensorSlice[
         return product
 
     @always_inline
-    fn unsafe_ptr[
+    def unsafe_ptr[
         _dtype: DType = Self.dtype
-    ](self) -> UnsafePointer[Scalar[_dtype]]:
+    ](self) -> UnsafePointer[Scalar[_dtype], MutAnyOrigin]:
         """Get the pointer stored in this tensor slice.
 
         Since this method obtains the pointer stored in this tensor slice, it
@@ -728,10 +756,10 @@ struct ManagedTensorSlice[
         Returns:
             The `UnsafePointer` which contains the data for this tensor slice.
         """
-        return rebind[UnsafePointer[Scalar[_dtype]]](self._ptr)
+        return rebind[UnsafePointer[Scalar[_dtype], MutAnyOrigin]](self._ptr)
 
     @always_inline
-    fn load[
+    def load[
         width: Int,
         # Necessary to make it simpler on the call site.
         _rank: Int,
@@ -762,30 +790,7 @@ struct ManagedTensorSlice[
 
     @__mogg_intrinsic_attr("mogg.tensor_fused_load")
     @always_inline
-    fn _fused_load[
-        width: Int,
-        # Necessary to make it simpler on the call site.
-        _rank: Int,
-        element_alignment: Int = 1,
-    ](self, index: IndexList[_rank]) capturing -> SIMD[Self.dtype, width]:
-        comptime assert _rank == Self.rank
-        var ridx = rebind[IndexList[Self.rank]](index)
-
-        comptime in_lambda = Self.static_spec.in_lambda
-        comptime alignment = Self.static_spec.alignment
-        comptime address_space = Self.static_spec.address_space
-        comptime strides = Self.static_spec.strides
-
-        comptime if in_lambda:
-            comptime in_fn = in_lambda.value()
-            return in_fn[width, element_alignment](ridx)
-        else:
-            return simd_load_from_managed_tensor_slice[
-                simd_width=width, element_alignment=element_alignment
-            ](self, ridx)
-
-    @always_inline("nodebug")
-    fn _lambda_load[
+    def _fused_load[
         width: Int,
         # Necessary to make it simpler on the call site.
         _rank: Int,
@@ -793,13 +798,34 @@ struct ManagedTensorSlice[
     ](self, index: IndexList[_rank]) -> SIMD[Self.dtype, width]:
         comptime assert _rank == Self.rank
         var ridx = rebind[IndexList[Self.rank]](index)
-        comptime in_lambda = Self.static_spec.in_lambda
-        comptime assert Bool(in_lambda)
-        comptime in_fn = in_lambda.value()
-        return in_fn[width, element_alignment](ridx)
+
+        comptime if Self._has_input_fusion:
+            return self.in_fusion.load[
+                Self.dtype, Self.rank, width, element_alignment
+            ](ridx)
+        else:
+            return simd_load_from_managed_tensor_slice[
+                simd_width=width, element_alignment=element_alignment
+            ](self, ridx)
+
+    @always_inline("nodebug")
+    def _lambda_load[
+        width: Int,
+        _rank: Int,
+        element_alignment: Int = 1,
+    ](self, index: IndexList[_rank]) -> SIMD[Self.dtype, width]:
+        comptime assert _rank == Self.rank
+        var ridx = rebind[IndexList[Self.rank]](index)
+
+        comptime assert (
+            Self._has_input_fusion
+        ), "_lambda_load called on unfused tensor"
+        return self.in_fusion.load[
+            Self.dtype, Self.rank, width, element_alignment
+        ](ridx)
 
     @always_inline
-    fn _compute_offset(self, index: IndexList[Self.rank]) -> Int:
+    def _compute_offset(self, index: IndexList[Self.rank]) -> Int:
         comptime if Self.rank == 0:
             return 0
 
@@ -836,7 +862,7 @@ struct ManagedTensorSlice[
         return offset
 
     @always_inline
-    fn store[
+    def store[
         width: Int,
         # Necessary to make it simpler on the call site.
         _rank: Int,
@@ -867,7 +893,7 @@ struct ManagedTensorSlice[
 
     @__mogg_intrinsic_attr("mogg.tensor_fused_store")
     @always_inline
-    fn _fused_store[
+    def _fused_store[
         width: Int,
         # Necessary to make it simpler on the call site.
         _rank: Int,
@@ -876,18 +902,14 @@ struct ManagedTensorSlice[
         self: ManagedTensorSlice[mut=True, static_spec=Self.static_spec, ...],
         index: IndexList[_rank],
         val: SIMD[Self.dtype, width],
-    ) capturing:
+    ):
         comptime assert _rank == Self.rank
         var ridx = rebind[IndexList[Self.rank]](index)
 
-        comptime out_lambda = Self.static_spec.out_lambda
-        comptime alignment = Self.static_spec.alignment
-        comptime address_space = Self.static_spec.address_space
-        comptime strides = Self.static_spec.strides
-
-        comptime if out_lambda:
-            comptime out_fn = out_lambda.value()
-            out_fn[width, element_alignment](ridx, val)
+        comptime if Self._has_output_store_fusion:
+            self.out_fusion.store[
+                Self.dtype, Self.rank, width, element_alignment
+            ](ridx, val)
         else:
             simd_store_into_managed_tensor_slice[
                 simd_width=width,
@@ -895,7 +917,7 @@ struct ManagedTensorSlice[
             ](self, ridx, val)
 
     @always_inline("nodebug")
-    fn _lambda_store[
+    def _lambda_store[
         width: Int,
         # Necessary to make it simpler on the call site.
         _rank: Int,
@@ -910,13 +932,16 @@ struct ManagedTensorSlice[
     ):
         comptime assert _rank == Self.rank
         var ridx = rebind[IndexList[Self.rank]](index)
-        comptime out_lambda = Self.static_spec.out_lambda
-        comptime assert Bool(out_lambda)
-        comptime out_fn = out_lambda.value()
-        out_fn[width, element_alignment](ridx, val)
+
+        comptime assert (
+            Self._has_output_store_fusion
+        ), "_lambda_store called on unfused tensor"
+        self.out_fusion.store[Self.dtype, Self.rank, width, element_alignment](
+            ridx, val
+        )
 
     @always_inline
-    fn _fused_compute_output_lambda[
+    def _fused_compute_output_lambda[
         width: Int,
         # Necessary to make it simpler on the call site.
         _rank: Int,
@@ -924,20 +949,19 @@ struct ManagedTensorSlice[
         self: ManagedTensorSlice[mut=True, static_spec=Self.static_spec, ...],
         index: IndexList[_rank],
         val: SIMD[Self.dtype, width],
-    ) capturing -> SIMD[Self.dtype, width]:
+    ) -> SIMD[Self.dtype, width]:
         comptime assert _rank == Self.rank
         var ridx = rebind[IndexList[Self.rank]](index)
 
-        comptime out_compute_lambda = Self.static_spec.out_compute_lambda
-
-        comptime if out_compute_lambda:
-            comptime out_fn = out_compute_lambda.value()
-            return out_fn[width](ridx, val)
+        comptime if Self._has_compute_fusion:
+            return self.compute_fusion.compute[Self.dtype, Self.rank, width](
+                ridx, val
+            )
         else:
             return val
 
     @always_inline
-    fn with_layout[
+    def with_layout[
         new_rank: Int,
         //,
         new_static_shape: DimList,
@@ -946,13 +970,15 @@ struct ManagedTensorSlice[
         self,
         new_runtime_shape: IndexList[new_rank],
         new_runtime_strides: IndexList[new_rank],
-        offset_ptr: Optional[UnsafePointer[Scalar[Self.dtype]]] = None,
+        offset_ptr: Optional[
+            UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+        ] = None,
         out result: ManagedTensorSlice[
             rank=new_rank,
             io_spec=Self.io_spec,
-            static_spec=Self.static_spec.with_layout[new_rank](
-                new_static_shape, new_static_strides
-            ),
+            static_spec=Self.static_spec.with_layout[
+                new_rank, new_static_shape, new_static_strides
+            ](),
         ],
     ):
         comptime assert (
@@ -961,107 +987,145 @@ struct ManagedTensorSlice[
         comptime assert (
             len(new_static_strides) == new_rank
         ), "static strides has incorrect rank"
-        debug_assert(
-            _is_consistent[new_static_shape](new_runtime_shape)
-            and _is_consistent[new_static_strides](new_runtime_strides)
-        )
+        assert _is_consistent[new_static_shape](
+            new_runtime_shape
+        ) and _is_consistent[new_static_strides](new_runtime_strides)
 
-        return {
+        return type_of(result)(
             offset_ptr.or_else(self._ptr),
             new_runtime_shape,
             new_runtime_strides,
-        }
+        )
 
-    @doc_private
+    @doc_hidden
     @always_inline
-    fn _bind_to_fused_input[
-        lambda_fn: StaticTensorSpec[Self.dtype, Self.rank].in_lambda_t
+    def _bind_to_fused_input[
+        F: InputFusion
     ](
         self,
+        fusion: F,
         out result: ManagedTensorSlice[
             dtype=Self.dtype,
             rank=Self.rank,
             io_spec=FusedInput,
-            static_spec=rebuild_static_tensor_specs_with_input_lambda(
-                Self.static_spec, lambda_fn
-            ),
+            static_spec=Self.static_spec.with_input_fusion[F](),
         ],
     ):
-        comptime assert (
-            not Self.static_spec.in_lambda
-            and not Self.static_spec.out_lambda
-            and not Self.static_spec.out_compute_lambda
-        ), "The tensor is already bound to a lambda"
-        return {self._ptr, self._spec, self._runtime_strides}
+        """Bind a trait-based input fusion struct to this tensor.
 
-    @doc_private
+        The returned MTS dispatches loads through `fusion.load()` instead of
+        reading from the underlying data pointer.
+        """
+        comptime assert (
+            Self._is_unfused
+        ), "The tensor is already bound to a fusion struct"
+        # rebind needed for unfused slots: _is_unfused guarantees the type
+        # params equal _NoFusionOut/_NoComputeFusion, but the compiler can't
+        # prove it statically.
+        return {
+            self._ptr,
+            self._spec,
+            self._runtime_strides,
+            fusion,
+            rebind[type_of(result).OutFusion](_NoFusionOut()),
+            rebind[type_of(result).ComputeFusion](_NoComputeFusion()),
+        }
+
+    @doc_hidden
     @always_inline
-    fn _bind_to_fused_output[
-        lambda_fn: StaticTensorSpec[Self.dtype, Self.rank].out_lambda_t
+    def _bind_to_fused_output[
+        F: OutputFusion
     ](
         self,
+        fusion: F,
         out result: ManagedTensorSlice[
             dtype=Self.dtype,
             rank=Self.rank,
             io_spec=FusedOutput,
-            static_spec=rebuild_static_tensor_specs_with_output_lambda(
-                Self.static_spec, lambda_fn
-            ),
+            static_spec=Self.static_spec.with_output_fusion[F](),
         ],
     ):
-        comptime assert (
-            not Self.static_spec.in_lambda
-            and not Self.static_spec.out_lambda
-            and not Self.static_spec.out_compute_lambda
-        ), "The tensor is already bound to a lambda"
-        return {self._ptr, self._spec, self._runtime_strides}
+        """Bind a trait-based output fusion struct to this tensor.
 
-    @doc_private
+        The returned MTS dispatches stores through `fusion.store()` instead of
+        writing to the underlying data pointer.
+        """
+        comptime assert (
+            Self._is_unfused
+        ), "The tensor is already bound to a fusion struct"
+        return {
+            self._ptr,
+            self._spec,
+            self._runtime_strides,
+            rebind[type_of(result).InFusion](_NoFusionIn()),
+            fusion,
+            rebind[type_of(result).ComputeFusion](_NoComputeFusion()),
+        }
+
+    @doc_hidden
     @always_inline
-    fn _bind_to_fused_compute_output[
-        lambda_fn: StaticTensorSpec[Self.dtype, Self.rank].out_compute_lambda_t
+    def _bind_to_fused_compute_output[
+        F: OutputFusion
     ](
         self,
+        fusion: F,
         out result: ManagedTensorSlice[
             dtype=Self.dtype,
             rank=Self.rank,
             io_spec=_FusedComputeOutput,
-            static_spec=rebuild_static_tensor_specs_with_compute_output_lambda(
-                Self.static_spec, lambda_fn
-            ),
+            static_spec=Self.static_spec.with_output_fusion[F](),
         ],
     ):
-        comptime assert (
-            not Self.static_spec.in_lambda
-            and not Self.static_spec.out_lambda
-            and not Self.static_spec.out_compute_lambda
-        ), "The tensor is already bound to a lambda"
-        return {self._ptr, self._spec, self._runtime_strides}
+        """Bind an OutputFusion struct but with _FusedComputeOutput io_spec.
 
-    @doc_private
+        Used for the OutputLegacyForCompute case: the kernel expects
+        _FusedComputeOutput io_spec but the fusion performs a store.
+        """
+        comptime assert (
+            Self._is_unfused
+        ), "The tensor is already bound to a fusion struct"
+        return {
+            self._ptr,
+            self._spec,
+            self._runtime_strides,
+            rebind[type_of(result).InFusion](_NoFusionIn()),
+            fusion,
+            rebind[type_of(result).ComputeFusion](_NoComputeFusion()),
+        }
+
+    @doc_hidden
     @always_inline
-    fn _bind_to_fused_compute_output[
-        lambda_fn: StaticTensorSpec[Self.dtype, Self.rank].out_lambda_t
+    def _bind_to_fused_compute_output[
+        F: ComputeOutputFusion
     ](
         self,
+        fusion: F,
         out result: ManagedTensorSlice[
             dtype=Self.dtype,
             rank=Self.rank,
             io_spec=_FusedComputeOutput,
-            static_spec=rebuild_static_tensor_specs_with_output_lambda(
-                Self.static_spec, lambda_fn
-            ),
+            static_spec=Self.static_spec.with_compute_fusion[F](),
         ],
     ):
+        """Bind a trait-based compute-output fusion struct to this tensor.
+
+        The returned MTS dispatches compute-output through
+        `fusion.compute()` to transform values before the final store.
+        """
         comptime assert (
-            not Self.static_spec.in_lambda
-            and not Self.static_spec.out_lambda
-            and not Self.static_spec.out_compute_lambda
-        ), "The tensor is already bound to a lambda"
-        return {self._ptr, self._spec, self._runtime_strides}
+            Self._is_unfused
+        ), "The tensor is already bound to a fusion struct"
+        return {
+            self._ptr,
+            self._spec,
+            self._runtime_strides,
+            rebind[type_of(result).InFusion](_NoFusionIn()),
+            rebind[type_of(result).OutFusion](_NoFusionOut()),
+            fusion,
+        }
 
     @always_inline
-    fn to_layout_tensor(
+    def to_layout_tensor(
         self,
         out result: LayoutTensor[
             Self.dtype, Self.static_spec.to_layout(), MutAnyOrigin
@@ -1077,7 +1141,7 @@ struct ManagedTensorSlice[
         )
 
     @always_inline
-    fn to_tile_tensor[
+    def to_tile_tensor[
         coord_dtype: DType
     ](
         self,
@@ -1116,10 +1180,10 @@ struct ManagedTensorSlice[
 
         return {
             self.unsafe_ptr().unsafe_origin_cast[MutExternalOrigin](),
-            layout.tile_layout.Layout(shape_tuple, stride_tuple),
+            TileLayout(shape_tuple, stride_tuple),
         }
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         """
         Formats this buffer to the provided Writer.
 
@@ -1129,7 +1193,7 @@ struct ManagedTensorSlice[
         writer.write("ManagedTensorSlice(")
 
         @parameter
-        fn serialize[T: Writable](val: T):
+        def serialize[T: Writable](val: T):
             writer.write(val)
 
         var shape = List[Int]()
@@ -1150,28 +1214,17 @@ struct ManagedTensorSlice[
         writer.write(", address_space = ", self.address_space)
         writer.write("}")
 
-    @no_inline
-    @deprecated("Representable is deprecated. Use Writable instead.")
-    fn __repr__(self) -> String:
-        """Gets the buffer as a string.
-
-        Returns:
-          A compact string representation of the buffer.
+    def write_repr_to(self, mut writer: Some[Writer]):
         """
-        return String.write(self)
+        Formats this buffer to the provided Writer.
 
-    @no_inline
-    @deprecated("Stringable is deprecated. Use Writable instead.")
-    fn __str__(self) -> String:
-        """Gets the buffer as a string.
-
-        Returns:
-          A compact string of the buffer.
+        Args:
+            writer: The object to write to.
         """
-        return String.write(self)
+        self.write_to(writer)
 
 
-fn _is_consistent[static_info: DimList](runtime_info: IndexList) -> Bool:
+def _is_consistent[static_info: DimList](runtime_info: IndexList) -> Bool:
     comptime if len(static_info) != runtime_info.size:
         return False
 
@@ -1188,7 +1241,7 @@ fn _is_consistent[static_info: DimList](runtime_info: IndexList) -> Bool:
 # TODO: Move to oss/modular/mojo/stdlib/stdlib/runtime/tracing.mojo and
 # rename to trace_arg
 @always_inline
-fn trace_slice_arg(name: String, buf: ManagedTensorSlice) -> String:
+def trace_slice_arg(name: String, buf: ManagedTensorSlice) -> String:
     """Helper to stringify the type and shape of a kernel argument for tracing.
 
     Args:
@@ -1211,30 +1264,60 @@ comptime OutputVariadicTensors = VariadicTensors[io_spec=Output, ...]
 comptime _MutableInputVariadicTensors = VariadicTensors[
     io_spec=MutableInput, ...
 ]
-comptime _FusedInputVariadicTensors = VariadicTensors[io_spec=FusedInput, ...]
-comptime _FusedOutputVariadicTensors = VariadicTensors[io_spec=FusedOutput, ...]
+
+
+@fieldwise_init
+struct StaticTensorSpecList[
+    dtype: DType,
+    rank: Int,
+    //,
+    internals_list: Variadic.ValuesOfType[
+        StaticTensorSpecInternal[dtype, rank]
+    ],
+    shapes_list: Variadic.ValuesOfType[IndexList[rank]],
+    strides_list: Variadic.ValuesOfType[IndexList[rank]],
+]:
+    """A statically indexable list of data that can be assembled into a
+    StaticTensorSpecList on demand. This handles the complexities that arise
+    with heterogenous specs.
+    """
+
+    def __getitem_param__[
+        index: Int
+    ](
+        self,
+        out result: StaticTensorSpec[
+            Self.dtype,
+            Self.rank,
+            DimList.from_index_list[Self.shapes_list[index]](),
+            DimList.from_index_list[Self.strides_list[index]](),
+        ],
+    ):
+        return {Self.internals_list[index]}
 
 
 @fieldwise_init
 struct VariadicTensors[
     mut: Bool,
     input: IO,
-    //,
     dtype: DType,
     rank: Int,
+    //,
     size: Int,
     io_spec: IOSpec[mut, input],
     *,
-    static_specs: InlineArray[StaticTensorSpec[dtype, rank], size],
+    static_specs: StaticTensorSpecList[dtype=dtype, rank=rank, ...],
 ](Sized, TrivialRegisterPassable):
     """A tuple-like container of tensors representing variadic arguments from
     the graph compiler."""
 
     var _tensors: StaticTuple[DynamicTensor[Self.dtype, Self.rank], Self.size]
 
-    fn __init__(
+    def __init__(
         out self,
-        ptrs: StaticTuple[UnsafePointer[Scalar[Self.dtype]], Self.size],
+        ptrs: StaticTuple[
+            UnsafePointer[Scalar[Self.dtype], MutAnyOrigin], Self.size
+        ],
         shapes: StaticTuple[IndexList[Self.rank], Self.size],
     ):
         """Initialize the variadic tensor from tuples of pointers and shapes.
@@ -1253,7 +1336,7 @@ struct VariadicTensors[
             )
             self._tensors._unsafe_ref(i) = tensor
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         """Returns the number of variadic arguments in the pack.
 
         Returns:
@@ -1261,7 +1344,7 @@ struct VariadicTensors[
         """
         return Self.size
 
-    fn __getitem__[
+    def __getitem_param__[
         index: Int
     ](
         self,
@@ -1280,7 +1363,222 @@ struct VariadicTensors[
         """
         comptime assert index < Self.size
         var tensor = self._tensors[index]
-        return {tensor._ptr, tensor._spec, tensor._runtime_strides}
+        return {
+            tensor._ptr,
+            tensor._spec,
+            tensor._runtime_strides,
+            _NoFusionIn(),
+            _NoFusionOut(),
+            _NoComputeFusion(),
+        }
+
+
+# ===----------------------------------------------------------------------=== #
+# New VariadicTensors (trait-based fusion, no capturing closures)
+# ===----------------------------------------------------------------------=== #
+
+
+struct _FusionPack[*Ts: TrivialRegisterPassable](TrivialRegisterPassable):
+    """TrivialRegisterPassable heterogeneous pack for fusion structs.
+
+    Unlike Tuple, this uses a value-based `!kgen.pack` (not reference-based),
+    making it safe to pass across the host-device boundary via GPU closures.
+    """
+
+    comptime _mlir_type = __mlir_type[`!kgen.pack<`, ~Self.Ts, `>`]
+    var _mlir_value: Self._mlir_type
+
+    @always_inline("nodebug")
+    def __init__(out self, *args: * Self.Ts):
+        self._mlir_value = __mlir_op.`kgen.rebind`[_type=Self._mlir_type](
+            args.get_loaded_kgen_pack()
+        )
+
+    @always_inline("nodebug")
+    def __getitem_param__[i: Int](self) -> Self.Ts[i]:
+        return __mlir_op.`kgen.pack.extract`[index=i.__mlir_index__()](
+            self._mlir_value
+        )
+
+
+struct _FusedInputVariadicTensors[
+    dtype: DType,
+    rank: Int,
+    size: Int,
+    //,
+    *FusionTypes: InputFusion,
+    static_specs: StaticTensorSpecList[dtype=dtype, rank=rank, ...],
+](Sized, TrivialRegisterPassable):
+    """Variadic input tensors with per-element heterogeneous fusion.
+
+    Tensor data (ptr, shape, strides) is stored in a homogeneous StaticTuple.
+    Per-element fusion structs are stored in a _FusionPack, where each
+    element conforms to InputFusion. Every element must have a real fusion
+    struct — use plain VariadicTensors for unfused variadics.
+    """
+
+    var _tensors: StaticTuple[DynamicTensor[Self.dtype, Self.rank], Self.size]
+    var _fusions: _FusionPack[*Self.FusionTypes]
+
+    def __init__(
+        out self,
+        ptrs: StaticTuple[
+            UnsafePointer[Scalar[Self.dtype], origin=MutAnyOrigin],
+            Self.size,
+        ],
+        shapes: StaticTuple[IndexList[Self.rank], Self.size],
+        fusions: _FusionPack[*Self.FusionTypes],
+    ):
+        comptime for i in range(Self.size):
+            comptime assert not _type_is_eq[
+                Self.FusionTypes[i], _NoFusionIn
+            ](), (
+                "_FusedInputVariadicTensors requires a real fusion struct"
+                " for every element; use plain VariadicTensors for unfused"
+                " inputs"
+            )
+        self._tensors = {}
+        for i in range(Self.size):
+            self._tensors._unsafe_ref(i) = DynamicTensor[Self.dtype, Self.rank](
+                ptrs[i], shapes[i]
+            )
+        self._fusions = fusions
+
+    def __len__(self) -> Int:
+        return Self.size
+
+    def __getitem_param__[
+        index: Int
+    ](
+        self,
+        out result: ManagedTensorSlice[
+            io_spec=FusedInput,
+            static_spec=Self.static_specs[index].with_input_fusion[
+                Self.FusionTypes[index]
+            ](),
+        ],
+    ):
+        """Returns the fused tensor at the given index as a ManagedTensorSlice.
+
+        The returned slice dispatches loads through the element's fusion
+        struct, so callers can use `_fused_load` or `_lambda_load` to
+        apply the fused computation.
+
+        Parameters:
+            index: The index into the variadic tensor arguments.
+
+        Returns:
+            The fused tensor at the specified index.
+        """
+        comptime assert index < Self.size
+        var tensor = self._tensors[index]
+        return {
+            tensor._ptr,
+            tensor._spec,
+            tensor._runtime_strides,
+            self._fusions[index],
+            rebind[type_of(result).OutFusion](_NoFusionOut()),
+            rebind[type_of(result).ComputeFusion](_NoComputeFusion()),
+        }
+
+    def shape[index: Int](self) -> IndexList[Self.rank]:
+        """Returns the shape of the tensor at the given index."""
+        comptime assert index < Self.size
+        return self._tensors[index].shape()
+
+    def get_fusion[index: Int](self) -> Self.FusionTypes[index]:
+        """Returns the fusion struct at the given index."""
+        return self._fusions[index]
+
+
+struct _FusedOutputVariadicTensors[
+    dtype: DType,
+    rank: Int,
+    size: Int,
+    //,
+    *FusionTypes: OutputFusion,
+    static_specs: StaticTensorSpecList[dtype=dtype, rank=rank, ...],
+](Sized, TrivialRegisterPassable):
+    """Variadic output tensors with per-element heterogeneous fusion.
+
+    Tensor data is stored in a homogeneous StaticTuple. Per-element fusion
+    structs are stored in a _FusionPack, where each element conforms
+    to OutputFusion. Every element must have a real fusion struct — use
+    plain VariadicTensors for unfused variadics.
+    """
+
+    var _tensors: StaticTuple[DynamicTensor[Self.dtype, Self.rank], Self.size]
+    var _fusions: _FusionPack[*Self.FusionTypes]
+
+    def __init__(
+        out self,
+        ptrs: StaticTuple[
+            UnsafePointer[Scalar[Self.dtype], origin=MutAnyOrigin],
+            Self.size,
+        ],
+        shapes: StaticTuple[IndexList[Self.rank], Self.size],
+        fusions: _FusionPack[*Self.FusionTypes],
+    ):
+        comptime for i in range(Self.size):
+            comptime assert not _type_is_eq[
+                Self.FusionTypes[i], _NoFusionOut
+            ](), (
+                "_FusedOutputVariadicTensors requires a real fusion struct"
+                " for every element; use plain VariadicTensors for unfused"
+                " outputs"
+            )
+        self._tensors = {}
+        for i in range(Self.size):
+            self._tensors._unsafe_ref(i) = DynamicTensor[Self.dtype, Self.rank](
+                ptrs[i], shapes[i]
+            )
+        self._fusions = fusions
+
+    def __len__(self) -> Int:
+        return Self.size
+
+    def __getitem_param__[
+        index: Int
+    ](
+        self,
+        out result: ManagedTensorSlice[
+            io_spec=FusedOutput,
+            static_spec=Self.static_specs[index].with_output_fusion[
+                Self.FusionTypes[index]
+            ](),
+        ],
+    ):
+        """Returns the fused tensor at the given index as a ManagedTensorSlice.
+
+        The returned slice dispatches stores through the element's fusion
+        struct, so callers can use `_lambda_store` to apply the fused
+        computation.
+
+        Parameters:
+            index: The index into the variadic tensor arguments.
+
+        Returns:
+            The fused tensor at the specified index.
+        """
+        comptime assert index < Self.size
+        var tensor = self._tensors[index]
+        return {
+            tensor._ptr,
+            tensor._spec,
+            tensor._runtime_strides,
+            rebind[type_of(result).InFusion](_NoFusionIn()),
+            self._fusions[index],
+            rebind[type_of(result).ComputeFusion](_NoComputeFusion()),
+        }
+
+    def shape[index: Int](self) -> IndexList[Self.rank]:
+        """Returns the shape of the tensor at the given index."""
+        comptime assert index < Self.size
+        return self._tensors[index].shape()
+
+    def get_fusion[index: Int](self) -> Self.FusionTypes[index]:
+        """Returns the fusion struct at the given index."""
+        return self._fusions[index]
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1288,8 +1586,8 @@ struct VariadicTensors[
 # ===----------------------------------------------------------------------=== #
 
 
-@doc_private
-fn get_kernel_simd_width[dtype: DType, target: StaticString]() -> Int:
+@doc_hidden
+def get_kernel_simd_width[dtype: DType, target: StaticString]() -> Int:
     """Get the simd width used in lambda functions.
 
     For non-simd arch like GPU, this is the width in terms of number of elements
@@ -1310,11 +1608,11 @@ fn get_kernel_simd_width[dtype: DType, target: StaticString]() -> Int:
 @__mogg_intrinsic_attr("mogg.for_each")
 @__mogg_intrinsic_attr("mogg.elemwise_for_each")
 @no_inline
-fn foreach[
+def foreach[
     dtype: DType,
     rank: Int,
     //,
-    func: fn[width: Int, element_alignment: Int](
+    func: def[width: Int, element_alignment: Int](
         IndexList[rank]
     ) capturing -> SIMD[dtype, width],
     *,
@@ -1341,14 +1639,13 @@ fn foreach[
         tensor: The output tensor slice which receives the return values from `func`.
         ctx: The call context (forward this from the custom operation).
     """
-    debug_assert(
-        ctx._handle or is_cpu[target](),
-        "Expecting non-null device ctx for GPU kernels",
-    )
+    assert (
+        ctx._handle or is_cpu[target]()
+    ), "Expecting non-null device ctx for GPU kernels"
 
     @parameter
     @always_inline
-    fn elementwise_fn_wrapper[
+    def elementwise_fn_wrapper[
         width: Int,
         rank: Int,
         alignment: Int = 1,
@@ -1356,7 +1653,7 @@ fn foreach[
         var val = func[width, alignment](rebind[IndexList[tensor.rank]](index))
         tensor._fused_store[element_alignment=alignment](index, val)
 
-    algorithm.functional.elementwise[
+    std.algorithm.functional.elementwise[
         elementwise_fn_wrapper,
         simd_width,
         use_blocking_impl=use_blocking_impl,
@@ -1366,14 +1663,64 @@ fn foreach[
 
 
 @__mogg_intrinsic_attr("mogg.for_each")
-@__mogg_intrinsic_attr("mogg.for_each.out_func")
 @no_inline
-fn foreach[
+def foreach[
     dtype: DType,
     rank: Int,
     //,
-    func: fn[width: Int](IndexList[rank]) capturing -> SIMD[dtype, width],
-    out_func: fn[width: Int](IndexList[rank]) capturing[_] -> None,
+    E: ElementwiseFusion,
+    *,
+    target: StaticString = "cpu",
+    simd_width: Int = get_kernel_simd_width[dtype, target](),
+    _trace_name: StaticString = "mogg.for_each",
+    use_blocking_impl: Bool = False,
+](
+    tensor: ManagedTensorSlice[mut=True, dtype=dtype, rank=rank, ...],
+    elem: E,
+    ctx: DeviceContextPtr = DeviceContextPtr(),
+) raises:
+    """Apply a pure elementwise fusion to each element of the tensor slice.
+
+    Parameters:
+        dtype: The data type of the elements in the tensor slice.
+        rank: The rank of the tensor slice.
+        E: The elementwise fusion struct type.
+        target: Indicates the type of the target device (e.g. "cpu", "gpu").
+        simd_width: The SIMD width for the target.
+        _trace_name: Name of the executed operation displayed in the trace.
+        use_blocking_impl: If the impl should use this thread for doing the work.
+
+    Args:
+        tensor: The output tensor slice which receives the computed values.
+        elem: The elementwise fusion struct.
+        ctx: The call context (forward this from the custom operation).
+    """
+
+    @parameter
+    @always_inline
+    def wrapper[
+        width: Int, element_alignment: Int
+    ](index: IndexList[rank]) capturing -> SIMD[dtype, width]:
+        return elem.compute[dtype, rank, width, element_alignment](index)
+
+    foreach[
+        func=wrapper,
+        target=target,
+        simd_width=simd_width,
+        _trace_name=_trace_name,
+        use_blocking_impl=use_blocking_impl,
+    ](tensor, ctx)
+
+
+@__mogg_intrinsic_attr("mogg.for_each")
+@__mogg_intrinsic_attr("mogg.for_each.out_func")
+@no_inline
+def foreach[
+    dtype: DType,
+    rank: Int,
+    //,
+    func: def[width: Int](IndexList[rank]) capturing -> SIMD[dtype, width],
+    out_func: def[width: Int](IndexList[rank]) capturing[_] -> None,
     *,
     target: StaticString = "cpu",
     simd_width: Int = get_kernel_simd_width[dtype, target](),
@@ -1399,20 +1746,19 @@ fn foreach[
         tensor: The input tensor slice which the consumed values.
         ctx: The call context (forward this from the custom operation).
     """
-    debug_assert(
-        ctx._handle or is_cpu[target](),
-        "Expecting non-null device ctx for GPU kernels",
-    )
+    assert (
+        ctx._handle or is_cpu[target]()
+    ), "Expecting non-null device ctx for GPU kernels"
 
     @parameter
     @always_inline
-    fn out_func_shim[
+    def out_func_shim[
         _width: Int, _rank: Int, _alignment: Int = 1
     ](index: IndexList[_rank]) capturing:
         idx = rebind[IndexList[rank]](index)
         out_func[_width](idx)
 
-    algorithm.functional.elementwise[
+    std.algorithm.functional.elementwise[
         out_func_shim,
         simd_width,
         use_blocking_impl=use_blocking_impl,
@@ -1421,11 +1767,11 @@ fn foreach[
     ](tensor.shape(), ctx)
 
 
-fn foreach[
+def foreach[
     dtype: DType,
     rank: Int,
     //,
-    func: fn[width: Int](IndexList[rank]) capturing -> SIMD[dtype, width],
+    func: def[width: Int](IndexList[rank]) capturing -> SIMD[dtype, width],
     *,
     target: StaticString = "cpu",
     simd_width: Int = get_kernel_simd_width[dtype, target](),
@@ -1453,7 +1799,7 @@ fn foreach[
 
     @parameter
     @always_inline
-    fn func_shim[
+    def func_shim[
         width: Int, element_alignment: Int
     ](index: IndexList[rank]) capturing -> SIMD[dtype, width]:
         return func[width](index)
@@ -1472,12 +1818,17 @@ fn foreach[
 # TensorCopy intrinsic used by view kernels.
 # z is a kernel output, and x a view of the input.
 @__mogg_intrinsic_attr("mogg.view_materialize")
-@doc_private
+@doc_hidden
 @no_inline
-fn view_copy_impl[
+def view_copy_impl[
     dtype: DType,
     rank: Int,
-    spec: StaticTensorSpec[dtype, rank],
+    InFusion: InputFusion,
+    OutFusion: OutputFusion,
+    ComputeFusion: ComputeOutputFusion,
+    spec: StaticTensorSpec[
+        dtype, rank, _, _, InFusion, OutFusion, ComputeFusion
+    ],
     //,
     *,
     target: StaticString,
@@ -1491,11 +1842,11 @@ fn view_copy_impl[
     comptime assert _compatible_with[
         x._static_shape, z._static_shape
     ](), "static shapes not compatible"
-    debug_assert(x.shape() == z.shape(), "runtime shapes not compatible")
+    assert x.shape() == z.shape(), "runtime shapes not compatible"
 
     @parameter
     @always_inline
-    fn func[
+    def func[
         width: Int, element_alignment: Int
     ](idx: IndexList[z.rank]) -> SIMD[z.dtype, width]:
         return simd_load_from_managed_tensor_slice[
@@ -1510,7 +1861,7 @@ fn view_copy_impl[
     ](z, ctx)
 
 
-fn _compatible_with[x: DimList, y: DimList]() -> Bool:
+def _compatible_with[x: DimList, y: DimList]() -> Bool:
     comptime if len(x) != len(y):
         return False
 

@@ -20,7 +20,7 @@ import logging
 import queue
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from json.decoder import JSONDecodeError
@@ -118,6 +118,77 @@ _T = TypeVar("_T")
 
 router = APIRouter(prefix="/v1")
 logger = logging.getLogger("max.serve")
+
+_CLIENT_DISCONNECTED_STATUS_CODE = 499
+
+
+class _ClientDisconnectedError(RuntimeError):
+    """Raised when a non-streaming request disconnects before completion."""
+
+
+async def _await_or_cancel_on_disconnect(
+    request: Request,
+    request_ids: Sequence[RequestID],
+    awaitable: Coroutine[Any, Any, _T],
+    cancel_request: Callable[[RequestID], None],
+) -> _T:
+    """Returns the operation result unless the client disconnects first.
+
+    These routes read the whole HTTP request body before generating a response,
+    so the next raw ASGI receive either blocks until disconnect or returns
+    `http.disconnect` immediately.
+    """
+
+    loop = asyncio.get_running_loop()
+    current_task = asyncio.current_task(loop=loop)
+    if current_task is None:
+        raise RuntimeError("disconnect guard requires a running task")
+
+    if getattr(request, "_is_disconnected", False):
+        awaitable.close()
+        for request_id in request_ids:
+            cancel_request(request_id)
+        raise _ClientDisconnectedError
+
+    client_disconnected = False
+
+    async def cancel_on_disconnect() -> None:
+        nonlocal client_disconnected
+        if (await request.receive())["type"] != "http.disconnect":
+            raise AssertionError(
+                "request.receive() returned after request body"
+            )
+
+        client_disconnected = True
+        for request_id in request_ids:
+            cancel_request(request_id)
+        current_task.cancel()
+
+    task_factory = cast(Callable[..., asyncio.Task[None]], asyncio.Task)
+    disconnect_task: asyncio.Task[None] = task_factory(
+        cancel_on_disconnect(),
+        loop=loop,
+        eager_start=True,
+    )
+
+    if disconnect_task.done():
+        disconnect_task.result()
+    try:
+        result = await awaitable
+        if client_disconnected:
+            raise _ClientDisconnectedError
+
+        if disconnect_task.done():
+            disconnect_task.result()
+        return result
+    except asyncio.CancelledError as err:
+        if client_disconnected:
+            awaitable.close()
+            raise _ClientDisconnectedError from err
+        raise
+    finally:
+        if not disconnect_task.done():
+            disconnect_task.cancel()
 
 
 def record_request_start() -> None:
@@ -239,20 +310,24 @@ class OpenAIChatResponseGenerator(
         self.logger.debug("Streaming: Start: %s", request)
         record_request_start()
         request_timer = StopWatch(start_ns=request.timestamp_ns)
+        n_reasoning_tokens = 0
         n_tokens = 0
-        prompt_tokens = 0
+        n_prompt_tokens = 0
         status_code = 200
         try:
             async for chunk in self.pipeline.next_token_chunk(request):
                 self.logger.debug(
-                    "Streaming: %s, TOKENS: %d, %s",
+                    "Streaming: %s, TOKENS: %d, %s%s",
                     request.request_id,
-                    chunk.token_count,
-                    chunk.decoded_tokens,
+                    # TODO: (MODELS-1115) assume that the reasoning tokens are at the start of the chunk
+                    # TODO: (MODELS-1117) determine whether to break out reasoning tokens into a separate metric
+                    (chunk.reasoning_token_count or 0) + chunk.token_count,
+                    (chunk.decoded_reasoning_tokens or ""),
+                    (chunk.decoded_tokens or ""),
                 )
 
                 if chunk.prompt_token_count:
-                    prompt_tokens = chunk.prompt_token_count
+                    n_prompt_tokens = chunk.prompt_token_count
 
                 # We support N = 1 at the moment and will generate a single choice.
                 # The choice index is set to 0.
@@ -265,7 +340,10 @@ class OpenAIChatResponseGenerator(
                     chunk_logprobs if chunk_logprobs.content else None
                 )
 
-                if chunk.decoded_tokens is not None:
+                if (
+                    chunk.decoded_tokens is not None
+                    or chunk.decoded_reasoning_tokens is not None
+                ):
                     choices = [
                         Choice3(
                             index=0,
@@ -274,6 +352,7 @@ class OpenAIChatResponseGenerator(
                                 function_call=None,
                                 role="assistant",
                                 refusal=None,
+                                reasoning=chunk.decoded_reasoning_tokens,
                             ),
                             logprobs=logprobs_response,
                             finish_reason=get_finish_reason_from_status(
@@ -282,7 +361,7 @@ class OpenAIChatResponseGenerator(
                         )
                     ]
                 else:
-                    # If we do not have decoded_tokens, we should guarantee we have a finish_reason.
+                    # If we do not have output tokens, we should guarantee we have a finish_reason.
                     choices = [
                         Choice3(
                             index=0,
@@ -309,18 +388,27 @@ class OpenAIChatResponseGenerator(
                     usage=None,
                     service_tier=None,
                 )
+                n_reasoning_tokens += chunk.reasoning_token_count or 0
                 n_tokens += chunk.token_count
                 payload = response.model_dump_json()
                 yield payload
 
-            logger.debug("Streaming: Done: %s, %d tokens", request, n_tokens)
+            # TODO: (MODELS-1117) determine whether to break out reasoning tokens into a separate metric
+            logger.debug(
+                "Streaming: Done: %s, %d tokens",
+                request,
+                n_reasoning_tokens + n_tokens,
+            )
 
             # If `include_usage=True`, send a final chunk with usage statistics
             if self.stream_options and self.stream_options.include_usage:
                 final_usage = Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=n_tokens,
-                    total_tokens=n_tokens + prompt_tokens,
+                    # TODO: (MODELS-1116) add reasoning token usage under completion_tokens_details
+                    prompt_tokens=n_prompt_tokens,
+                    completion_tokens=n_reasoning_tokens + n_tokens,
+                    total_tokens=n_prompt_tokens
+                    + n_reasoning_tokens
+                    + n_tokens,
                 )
 
                 final_response = CreateChatCompletionStreamResponse(
@@ -364,8 +452,9 @@ class OpenAIChatResponseGenerator(
                 status_code,
                 request.request_path,
                 request_timer.elapsed_ms,
-                n_tokens,
-                prompt_tokens,
+                # TODO: (MODELS-1117) determine whether to break out reasoning tokens into a separate metric
+                n_reasoning_tokens + n_tokens,
+                n_prompt_tokens,
             )
 
     async def complete(
@@ -377,8 +466,9 @@ class OpenAIChatResponseGenerator(
             )
         request = requests[0]
         record_request_start()
+        n_reasoning_tokens = 0
         n_tokens = 0
-        prompt_tokens: int | None = None
+        n_prompt_tokens = 0
         request_timer = StopWatch(start_ns=request.timestamp_ns)
         status_code = 200
         tool_use = request.tools is not None
@@ -386,14 +476,33 @@ class OpenAIChatResponseGenerator(
         try:
             completed_outputs = await self.pipeline.all_tokens(request)
 
+            n_reasoning_tokens = sum(
+                chunk.reasoning_token_count or 0 for chunk in completed_outputs
+            )
             n_tokens = sum(chunk.token_count for chunk in completed_outputs)
             if len(completed_outputs) > 0:
-                prompt_tokens = completed_outputs[0].prompt_token_count
+                n_prompt_tokens = completed_outputs[0].prompt_token_count or 0
 
             response_message = "".join(
-                chunk.decoded_tokens if chunk.decoded_tokens is not None else ""
+                chunk.decoded_tokens
                 for chunk in completed_outputs
+                if chunk.decoded_tokens is not None
             )
+
+            reasoning_message: str | None = None
+            # TODO: (MODELS-1115) assume that the reasoning tokens are at the start of the chunk
+            if (
+                len(completed_outputs) > 0
+                and completed_outputs[0].decoded_reasoning_tokens is not None
+            ):
+                reasoning_message = (
+                    "".join(
+                        chunk.decoded_reasoning_tokens
+                        for chunk in completed_outputs
+                        if chunk.decoded_reasoning_tokens is not None
+                    )
+                    or None
+                )
 
             # Extract log probabilities if available
             logprobs = _process_chat_log_probabilities(completed_outputs)
@@ -438,13 +547,19 @@ class OpenAIChatResponseGenerator(
                     logprobs=logprobs,
                 )
 
+            if reasoning_message is not None:
+                for choice in response_choices:
+                    choice.message.reasoning = reasoning_message
+
             usage = None
-            if n_tokens > 0:
+            if n_reasoning_tokens > 0 or n_tokens > 0:
                 usage = CompletionUsage(
-                    prompt_tokens=completed_outputs[0].prompt_token_count,
-                    completion_tokens=n_tokens,
-                    total_tokens=n_tokens
-                    + (completed_outputs[0].prompt_token_count or 0),
+                    # TODO: (MODELS-1116) add reasoning token usage under completion_tokens_details
+                    prompt_tokens=n_prompt_tokens,
+                    completion_tokens=n_reasoning_tokens + n_tokens,
+                    total_tokens=n_prompt_tokens
+                    + n_reasoning_tokens
+                    + n_tokens,
                 )
 
             response = CreateChatCompletionResponse(
@@ -463,8 +578,9 @@ class OpenAIChatResponseGenerator(
                 status_code,
                 request.request_path,
                 request_timer.elapsed_ms,
-                n_tokens,
-                prompt_tokens,
+                # TODO: (MODELS-1117) determine whether to break out reasoning tokens into a separate metric
+                n_reasoning_tokens + n_tokens,
+                n_prompt_tokens,
             )
 
     def _parse_resp_to_json(self, text: str) -> list[Any] | None:
@@ -757,7 +873,7 @@ def _get_target_endpoint(
 @router.post("/chat/completions", response_model=None)
 async def openai_create_chat_completion(
     request: Request,
-) -> CreateChatCompletionResponse | EventSourceResponse:
+) -> CreateChatCompletionResponse | EventSourceResponse | Response:
     request_id = request.state.request_id
     try:
         completion_request = CreateChatCompletionRequest.model_validate_json(
@@ -809,6 +925,7 @@ async def openai_create_chat_completion(
             SamplingParamsInput(
                 top_k=completion_request.top_k,
                 top_p=completion_request.top_p,
+                min_p=completion_request.min_p,
                 temperature=completion_request.temperature,
                 frequency_penalty=completion_request.frequency_penalty,
                 presence_penalty=completion_request.presence_penalty,
@@ -862,8 +979,16 @@ async def openai_create_chat_completion(
                 response_generator.stream(token_request), ping=100000, sep="\n"
             )
 
-        response = await response_generator.complete([token_request])
+        response = await _await_or_cancel_on_disconnect(
+            request,
+            [token_request.request_id],
+            response_generator.complete([token_request]),
+            pipeline.model_worker.cancel,
+        )
         return response
+    except _ClientDisconnectedError:
+        logger.info("Client disconnected for request %s", request_id)
+        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
     except JSONDecodeError as e:
         logger.exception("JSONDecodeError in request %s", request_id)
         raise HTTPException(status_code=400, detail="Missing JSON.") from e
@@ -943,7 +1068,7 @@ def _create_response_format(
 @router.post("/embeddings", response_model=None)
 async def openai_create_embeddings(
     request: Request,
-) -> CreateEmbeddingResponse:
+) -> CreateEmbeddingResponse | Response:
     request_id = request.state.request_id
 
     try:
@@ -986,8 +1111,19 @@ async def openai_create_embeddings(
             for idx, input_text in enumerate(embedding_inputs)
         ]
 
-        response = await response_generator.encode(embedding_requests)
+        response = await _await_or_cancel_on_disconnect(
+            request,
+            [
+                embedding_request.request_id
+                for embedding_request in embedding_requests
+            ],
+            response_generator.encode(embedding_requests),
+            pipeline.model_worker.cancel,
+        )
         return response
+    except _ClientDisconnectedError:
+        logger.info("Client disconnected for request %s", request_id)
+        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
     except JSONDecodeError as e:
         logger.exception("JSONDecodeError in request %s", request_id)
         raise HTTPException(status_code=400, detail="Missing JSON.") from e
@@ -1122,7 +1258,7 @@ class OpenAICompletionResponseGenerator(
         record_request_start()
         request_timer = StopWatch(start_ns=request.timestamp_ns)
         n_tokens = 0
-        prompt_tokens = 0
+        n_prompt_tokens = 0
         status_code = 200
         try:
             async for chunk in self.pipeline.next_token_chunk(request):
@@ -1134,7 +1270,7 @@ class OpenAICompletionResponseGenerator(
                 )
 
                 if chunk.prompt_token_count:
-                    prompt_tokens = chunk.prompt_token_count
+                    n_prompt_tokens = chunk.prompt_token_count
 
                 log_probs = _process_log_probabilities([chunk])
 
@@ -1210,7 +1346,7 @@ class OpenAICompletionResponseGenerator(
                 request.request_path,
                 request_timer.elapsed_ms,
                 n_tokens,
-                prompt_tokens,
+                n_prompt_tokens,
             )
 
     async def complete(
@@ -1220,7 +1356,7 @@ class OpenAICompletionResponseGenerator(
         # request and timestamp, request id, path should all be the same.
         record_request_start()
         n_tokens = 0
-        prompt_tokens = 0
+        n_prompt_tokens = 0
         request_timer = StopWatch(start_ns=requests[0].timestamp_ns)
         status_code = 200
 
@@ -1232,7 +1368,7 @@ class OpenAICompletionResponseGenerator(
             for i, req_outputs in enumerate(req_output_list):
                 n_tokens += sum(chunk.token_count for chunk in req_outputs)
                 if req_outputs and req_outputs[0].prompt_token_count:
-                    prompt_tokens += req_outputs[0].prompt_token_count
+                    n_prompt_tokens += req_outputs[0].prompt_token_count
 
                 log_probs = _process_log_probabilities(req_outputs)
                 response_message = "".join(
@@ -1272,7 +1408,7 @@ class OpenAICompletionResponseGenerator(
                 requests[0].request_path,
                 request_timer.elapsed_ms,
                 n_tokens,
-                prompt_tokens,
+                n_prompt_tokens,
             )
 
 
@@ -1328,7 +1464,7 @@ def get_prompts_from_openai_request(
 @router.post("/completions", response_model=None)
 async def openai_create_completion(
     request: Request,
-) -> CreateCompletionResponse | EventSourceResponse:
+) -> CreateCompletionResponse | EventSourceResponse | Response:
     """
     Legacy OpenAI /completion endpoint.
     https://platform.openai.com/docs/api-reference/completions
@@ -1362,6 +1498,7 @@ async def openai_create_completion(
                 SamplingParamsInput(
                     top_k=completion_request.top_k,
                     top_p=completion_request.top_p,
+                    min_p=completion_request.min_p,
                     temperature=completion_request.temperature,
                     frequency_penalty=completion_request.frequency_penalty,
                     presence_penalty=completion_request.presence_penalty,
@@ -1410,11 +1547,19 @@ async def openai_create_completion(
                 sep="\n",
             )
 
-        resp = await response_generator.complete(token_requests)
+        resp = await _await_or_cancel_on_disconnect(
+            request,
+            [token_request.request_id for token_request in token_requests],
+            response_generator.complete(token_requests),
+            pipeline.model_worker.cancel,
+        )
         # ICK: The token generator doesn't know about http requests, so sets
         # the wrong id.  Overwrite with the http id.
         resp.id = http_req_id
         return resp
+    except _ClientDisconnectedError:
+        logger.info("Client disconnected for request %s", http_req_id)
+        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
     except JSONDecodeError as e:
         logger.exception("JSONDecodeError for request %s", http_req_id)
         raise HTTPException(status_code=400, detail="Missing JSON.") from e
@@ -1473,7 +1618,7 @@ async def openai_get_model(model_id: str, request: Request) -> Model:
 @router.post("/audio/speech", response_model=None)
 async def create_streaming_audio_speech(
     request: Request,
-) -> CreateAudioGenerationResponse:
+) -> CreateAudioGenerationResponse | Response:
     """Audio generation endpoint that streams audio data."""
     try:
         request_id = request.state.request_id
@@ -1506,9 +1651,17 @@ async def create_streaming_audio_speech(
         )
 
         response_generator = OpenAISpeechResponseGenerator(pipeline)
-        response = await response_generator.synthesize_speech(audio_request)
+        response = await _await_or_cancel_on_disconnect(
+            request,
+            [audio_request.request_id],
+            response_generator.synthesize_speech(audio_request),
+            pipeline.model_worker.cancel,
+        )
         return response
 
+    except _ClientDisconnectedError:
+        logger.info("Client disconnected for request %s", request_id)
+        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
     except JSONDecodeError as e:
         logger.exception("JSONDecodeError in request %s", request_id)
         raise HTTPException(status_code=400, detail="Missing JSON.") from e

@@ -27,9 +27,10 @@ Architecture:
 """
 
 from std.math import ceildiv
+from std.math.uutils import ufloordiv, umod
 from std.sys import size_of
 
-from std.gpu import WARP_SIZE, thread_idx
+from std.gpu import WARP_SIZE, thread_idx_int as thread_idx
 from std.gpu.memory import AddressSpace, external_memory, fence_mbarrier_init
 from std.gpu.primitives.cluster import (
     block_rank_in_cluster,
@@ -38,10 +39,9 @@ from std.gpu.primitives.cluster import (
     elect_one_sync_with_mask,
 )
 from std.gpu.sync import named_barrier, syncwarp
-from layout.tile_layout import TensorLayout
-from layout import TileTensor
+from layout import TensorLayout, TileTensor
 from structured_kernels.tile_types import (
-    TMATile,
+    TmaOpType,
     static_row_major,
 )
 
@@ -244,15 +244,9 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     ]
 
     # ========== TMA Load Size Constants ==========
-    comptime a_expected_bytes = Self.SmemType.Core.a_smem_layout.size() * size_of[
-        Self.a_type
-    ]()
-    comptime b_expected_bytes = Self.SmemType.Core.b_smem_layout.size() * size_of[
-        Self.b_type
-    ]()
-    comptime a_scales_expected_bytes = Self.SmemType.Core.a_scales_smem_layout.size() * size_of[
-        Self.a_scales_type
-    ]()
+    comptime a_expected_bytes = Self.BM * Self.BK * size_of[Self.a_type]()
+    comptime b_expected_bytes = Self.BN * Self.BK * size_of[Self.b_type]()
+    comptime a_scales_expected_bytes = Self.BM * size_of[Self.a_scales_type]()
     comptime input_expected_bytes = Self.cta_group * (
         Self.a_expected_bytes
         + Self.b_expected_bytes
@@ -290,14 +284,11 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     comptime AScalesLayout = static_row_major[1, Self.BM]
 
     # TMA operation types (derived from new Layout types)
-    comptime ATmaTile = TMATile[Self.a_type, Self.ATileLayout, Self.ADescLayout]
-    comptime ATmaOp = Self.ATmaTile.InnerType
-    comptime BTmaTile = TMATile[Self.b_type, Self.BTileLayout, Self.BDescLayout]
-    comptime BTmaOp = Self.BTmaTile.InnerType
-    comptime AScalesTmaTile = TMATile[
+    comptime ATmaOp = TmaOpType[Self.a_type, Self.ATileLayout, Self.ADescLayout]
+    comptime BTmaOp = TmaOpType[Self.b_type, Self.BTileLayout, Self.BDescLayout]
+    comptime AScalesTmaOp = TmaOpType[
         Self.a_scales_type, Self.AScalesLayout, Self.AScalesLayout
     ]
-    comptime AScalesTmaOp = Self.AScalesTmaTile.InnerType
 
     # TMA load size constants (from desc layout dimensions)
     comptime a_tma_load_size = Self.a_tile_dim0 * Self.a_swizzle_elems
@@ -355,7 +346,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     # ========== Validation ==========
 
     @staticmethod
-    fn validate_config():
+    def validate_config():
         """Compile-time validation of kernel configuration."""
         comptime assert Self.transpose_b, "Only support transposed B"
         comptime assert (
@@ -383,7 +374,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn init_barriers(
+    def init_barriers(
         elect_one_warp: Bool,
         elect_one_thread: Bool,
         a_tma_op: Self.ATmaOp,
@@ -432,7 +423,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(a_scales_tma_op, `nvvm.grid_constant`)
-    fn run(
+    def run(
         # Grid-constant TMA descriptors
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
@@ -482,20 +473,20 @@ struct BlockwiseFP8_1D2DMatmulKernel[
         )
 
         # ===== Warp/Thread Election =====
-        var elect_one_warp = thread_idx.x // UInt(WARP_SIZE) == 0
+        var elect_one_warp = ufloordiv(thread_idx.x, WARP_SIZE) == 0
         var elect_one_thread = elect_one_sync_with_mask()
         var elect_one_cta = (
             block_rank_in_cluster() % 2 == 0 if Self.cta_group == 2 else True
         )
 
         # Peer CTA coordinates for multicast
-        var peer_rank_n = UInt(block_rank_in_cluster() % UInt32(Self.CLUSTER_N))
-        var peer_rank_m = UInt(
+        var peer_rank_n = Int(block_rank_in_cluster() % UInt32(Self.CLUSTER_N))
+        var peer_rank_m = Int(
             block_rank_in_cluster()
             // UInt32(Self.CLUSTER_N)
             % UInt32(Self.CLUSTER_M)
         )
-        var peer_m_rank = peer_rank_m % UInt(Self.cta_group)
+        var peer_m_rank = umod(peer_rank_m, Self.cta_group)
         var peer_cta_coord = (peer_rank_n, peer_rank_m, peer_m_rank)
 
         # Multicast masks
@@ -504,7 +495,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
         var mma_complete_mask = UInt16((1 << Self.cta_group) - 1)
 
         # K iteration count
-        var num_k_iters = Int(ceildiv(Int(K), Self.BK))
+        var num_k_iters = ceildiv(Int(K), Self.BK)
 
         # ===== Barrier Initialization =====
         Self.init_barriers(
@@ -634,7 +625,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
                     )
 
                     # Convert absolute N to tile index for b_scales lookup
-                    var n_tile = UInt(ctx.n()) // UInt(Self.MMA_N)
+                    var n_tile = ufloordiv(Int(ctx.n()), Self.MMA_N)
 
                     for k_iter in range(num_k_iters):
                         with epi_ctx.per_k_stage(input_pipeline) as epi_stage:
@@ -643,10 +634,10 @@ struct BlockwiseFP8_1D2DMatmulKernel[
                                 a_scales_tiles,
                                 epi_stage,
                                 work_tile_coord=(
-                                    UInt(ctx.m()),
+                                    Int(ctx.m()),
                                     n_tile,
                                 ),
-                                k_iter=UInt(k_iter),
+                                k_iter=k_iter,
                                 problem_shape=StaticTuple[Int32, 3](
                                     Int32(0),
                                     Int32(Self.static_N),
@@ -674,7 +665,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn load_input_tiles[
+    def load_input_tiles[
         tiles_origin: MutOrigin,
         //,
     ](
@@ -687,22 +678,22 @@ struct BlockwiseFP8_1D2DMatmulKernel[
             Self.SmemType.Core.num_group_pipeline_stages,
             Self.config.k_group_size,
         ],
-        peer_cta_coord: Tuple[UInt, UInt, UInt],
+        peer_cta_coord: Tuple[Int, Int, Int],
         work_ctx: GroupedWorkContext1D1D,
         iter_idx: Int,
         elect_one_cta: Bool,
     ):
         """Load A, B, and A-scales tiles using TMA."""
-        var peer_rank_n = Int(peer_cta_coord[0])
-        var peer_rank_m = Int(peer_cta_coord[1])
-        var peer_m_rank = Int(peer_cta_coord[2])
+        var peer_rank_n = peer_cta_coord[0]
+        var peer_rank_m = peer_cta_coord[1]
+        var peer_m_rank = peer_cta_coord[2]
 
         # M coordinate in contiguous token space
         var m_coord = work_ctx.m()
         var n_coord = work_ctx.n()
         var expert_id = work_ctx.expert_id()
 
-        # UInt required at TMA coord boundary
+        # Int required at TMA coord boundary
         var a_gmem_m_coord = peer_m_rank * Self.a_tma_rows + Int(m_coord)
         var b_gmem_n_coord = (
             peer_rank_m * Self.b_tma_rows
@@ -760,7 +751,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
 
     @staticmethod
     @always_inline
-    fn mma[
+    def mma[
         tiles_origin: MutOrigin,
         //,
     ](

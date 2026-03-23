@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType, TensorValue, ops
-from max.nn.float8_config import Float8Config
+from max.nn.quant_config import QuantConfig
 
 from ..attention.attention_with_rope import AttentionWithRope
 from ..attention.mask_config import MHAMaskVariant
@@ -24,15 +24,13 @@ from ..kernels import (
     flash_attention_ragged,
     fused_qk_ragged_rope,
     fused_qkv_ragged_matmul,
-    fused_qkv_ragged_matmul_scaled_float8,
-    quantize_dynamic_scaled_float8,
-    quantize_static_scaled_float8,
 )
 from ..kv_cache import (
     KVCacheParams,
     PagedCacheValues,
 )
 from ..linear import Linear
+from ..quant_ops import quantized_fused_qkv_matmul
 from ..rotary_embedding import RotaryEmbedding
 from .linear_lora import LinearLoRA, QKVLinearLoRA
 
@@ -59,7 +57,7 @@ class AttentionWithRopeAndLoRA(AttentionWithRope):
         stacked_qkv: bool = False,
         scale: float | None = None,
         has_bias: bool = False,
-        float8_config: Float8Config | None = None,
+        quant_config: QuantConfig | None = None,
         clip_qkv: float | None = None,
     ):
         """Initializes the LoRA-enabled attention layer.
@@ -97,7 +95,7 @@ class AttentionWithRopeAndLoRA(AttentionWithRope):
             stacked_qkv=stacked_qkv,
             scale=scale,
             has_bias=has_bias,
-            float8_config=float8_config,
+            quant_config=quant_config,
             clip_qkv=clip_qkv,
         )
 
@@ -145,34 +143,19 @@ class AttentionWithRopeAndLoRA(AttentionWithRope):
             self.wqkv_bias.to(x.device) if self.wqkv_bias is not None else None
         )
 
-        if self.float8_config:
-            # FP8 path
-            weight_scale = self.qkv_weight_scale
-            if self.float8_config.is_static:
-                assert self.qkv_input_scale is not None
-                x8 = quantize_static_scaled_float8(
-                    x, self.qkv_input_scale.to(DeviceRef.CPU())
-                )
-                x_scales = self.qkv_input_scale
-            else:
-                x8, x_scales = quantize_dynamic_scaled_float8(
-                    x,
-                    self.float8_config.input_scale,
-                    self.float8_config.weight_scale,
-                    scales_type=weight_scale.dtype,
-                )
-
-            xq_matmul = fused_qkv_ragged_matmul_scaled_float8(
-                self.kv_params,
-                input=x8,
+        if self.quant_config:
+            xq_matmul = quantized_fused_qkv_matmul(
+                kv_params=self.kv_params,
+                x=x,
                 wqkv=wqkv,
-                bias=wqkv_bias,
-                input_row_offsets=input_row_offsets,
                 kv_collection=kv_collection,
                 layer_idx=layer_idx,
+                input_row_offsets=input_row_offsets,
                 n_heads=self.n_heads,
-                input_scale=x_scales.to(x.device),
-                weight_scale=weight_scale.to(x.device),
+                quant_config=self.quant_config,
+                weight_scale=self.qkv_weight_scale,
+                input_scale=self.qkv_input_scale,
+                bias=wqkv_bias,
             )
         else:
             xq_matmul = fused_qkv_ragged_matmul(

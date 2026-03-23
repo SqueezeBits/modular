@@ -17,11 +17,11 @@ struct Person(Writable):
     var name: String
     var age: Int
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         t"{self.name} ({self.age})".write_to(writer)
 
 
-def string_summary():
+def string_summary() raises:
     from std.testing import assert_equal, assert_raises
 
     var person = Person("Alice", 30)
