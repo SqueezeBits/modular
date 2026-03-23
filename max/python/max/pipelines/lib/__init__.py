@@ -27,7 +27,6 @@ from .bfloat16_utils import (
 )
 from .config import (
     AudioGenerationConfig,
-    DenoisingCacheConfig,
     KVCacheConfig,
     KVConnectorConfig,
     LoRAConfig,
@@ -100,7 +99,6 @@ __all__ = [
     "AlwaysSignalBuffersMixin",
     "AudioGenerationConfig",
     "CompilationTimer",
-    "DenoisingCacheConfig",
     "EAGLESpeculativeDecodingPipeline",
     "EmbeddingsPipeline",
     "EmbeddingsPipelineType",

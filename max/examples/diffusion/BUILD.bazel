@@ -10,28 +10,15 @@ modular_py_library(
     ],
     deps = [
         "//max/python/max:tensor",  # Provides max.functional and max.tensor.Tensor
-        requirement("torch"),
-    ],
-)
-
-modular_py_binary(
-    name = "flux2_comparison",
-    srcs = ["flux2_comparison.py"],
-    tags = ["no-pydeps"],
-    deps = [
-        "//max/python/max/interfaces",
-        "//max/python/max/pipelines",
-        "//max/python/max/pipelines/core",
-        "//max/python/max/pipelines/lib",
-        requirement("diffusers"),
-        requirement("numpy"),
-        requirement("torch"),
     ],
 )
 
 modular_py_binary(
     name = "simple_offline_generation",
-    srcs = ["simple_offline_generation.py"],
+    srcs = [
+        "simple_offline_generation.py",
+        "simple_offline_video_generation.py",
+    ],
     tags = ["no-pydeps"],  # TODO: Fix and re-enable
     deps = [
         ":profiler",
@@ -43,5 +30,75 @@ modular_py_binary(
         requirement("pillow"),
         requirement("sentencepiece"),
         requirement("torch"),  # for test
+    ],
+)
+
+modular_py_binary(
+    name = "simple_offline_video_generation",
+    srcs = ["simple_offline_video_generation.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        ":profiler",
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "wan_compare_against_diffusers",
+    testonly = True,
+    srcs = ["wan_compare_against_diffusers.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("accelerate"),
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "wan_transformer_block_compare",
+    testonly = True,
+    srcs = [
+        "wan_compare_against_diffusers.py",
+        "wan_transformer_block_compare.py",
+    ],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("accelerate"),
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
+    name = "wan_comparison",
+    testonly = True,
+    srcs = ["wan_comparison.py"],
+    data = ["cat.jpg"],
+    tags = ["no-pydeps"],
+    deps = [
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("peft"),
+        requirement("pillow"),
+        requirement("torch"),
     ],
 )

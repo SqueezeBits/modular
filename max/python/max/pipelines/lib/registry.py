@@ -832,12 +832,10 @@ class PipelineRegistry:
 
             tokenizer = arch.tokenizer(**tokenizer_kwargs)
 
-            # Pixel generation pipeline needs pipeline_config, pipeline_model,
-            # and cache_config for FBCache/TaylorSeer optimizations.
+            # Pixel generation pipeline only needs pipeline_config and pipeline_model
             pixel_factory_kwargs: dict[str, Any] = {
                 "pipeline_config": pipeline_config,
                 "pipeline_model": arch.pipeline_model,
-                "cache_config": pipeline_config.cache,
             }
 
             pipeline_factory = cast(
