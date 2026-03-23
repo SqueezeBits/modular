@@ -90,6 +90,7 @@ class ZImageModelInputs(PixelModelInputs):
     num_images_per_prompt: int = 1
     mask: np.ndarray | None = None
     negative_mask: np.ndarray | None = None
+    explicit_negative_prompt: bool = False
     latents_tensor: Tensor
     sigmas_tensor: Tensor
     h_carrier: Tensor
@@ -762,25 +763,22 @@ class ZImagePipeline(DiffusionPipeline):
 
             negative_prompt_embeds: Tensor | None = None
             negative_tokens = model_inputs.negative_tokens
-            negative_tokens_array: np.ndarray | None = None
             negative_mask = model_inputs.negative_mask
-            if negative_tokens is not None:
-                negative_tokens_array = negative_tokens.array
             do_cfg = (
-                model_inputs.guidance_scale > 1.0
-                and negative_tokens_array is not None
+                model_inputs.guidance_scale > 0.0
+                and negative_tokens is not None
             )
             if do_cfg and negative_tokens is not None:
-                assert negative_tokens_array is not None
                 negative_prompt_embeds = self.prepare_prompt_embeddings(
-                    tokens=negative_tokens_array,
+                    tokens=negative_tokens.array,
                     mask=negative_mask,
                     num_images_per_prompt=model_inputs.num_images_per_prompt,
                 )
-                negative_prompt_embeds = self._align_prompt_seq_len(
-                    negative_prompt_embeds,
-                    int(prompt_embeds.shape[1]),
-                )
+                if not model_inputs.explicit_negative_prompt:
+                    negative_prompt_embeds = self._align_prompt_seq_len(
+                        negative_prompt_embeds,
+                        int(prompt_embeds.shape[1]),
+                    )
 
         dtype = prompt_embeds.dtype
         latents = model_inputs.latents_tensor
@@ -794,36 +792,43 @@ class ZImagePipeline(DiffusionPipeline):
         num_timesteps = timesteps.shape[0]
         if num_timesteps < 1:
             raise ValueError("No timesteps were provided for denoising.")
-        text_seq_len = int(prompt_embeds.shape[1])
-        text_seq_len_padded = text_seq_len + (-text_seq_len % 32)
 
         # 2) Prepare latents and conditioning tensors.
         device = self.transformer.devices[0]
         image_seq_len = int(latent_image_ids.shape[-2])
-        img_ids_key = (
-            f"img_ids::{text_seq_len_padded}_{image_seq_len}_"
-            f"{model_inputs.height}x{model_inputs.width}"
-        )
-        if img_ids_key in self._cached_img_ids:
-            img_ids = self._cached_img_ids[img_ids_key]
-        else:
-            img_ids_np = latent_image_ids.astype(np.int64, copy=True)
-            if img_ids_np.ndim == 3:
-                img_ids_np = img_ids_np[0]
-            img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
-            img_ids = Tensor(
-                storage=Buffer.from_dlpack(np.ascontiguousarray(img_ids_np)).to(
-                    device
-                )
-            )
-            self._cached_img_ids[img_ids_key] = img_ids
 
-        text_ids_key = f"text_ids::{text_seq_len}"
-        if text_ids_key in self._cached_text_ids:
-            txt_ids = self._cached_text_ids[text_ids_key]
-        else:
-            txt_ids = self._prepare_text_ids(text_seq_len, device)
-            self._cached_text_ids[text_ids_key] = txt_ids
+        def _prepare_conditioning_ids(
+            text_seq_len: int,
+        ) -> tuple[Tensor, Tensor]:
+            text_seq_len_padded = text_seq_len + (-text_seq_len % 32)
+            img_ids_key = (
+                f"img_ids::{text_seq_len_padded}_{image_seq_len}_"
+                f"{model_inputs.height}x{model_inputs.width}"
+            )
+            if img_ids_key in self._cached_img_ids:
+                img_ids_local = self._cached_img_ids[img_ids_key]
+            else:
+                img_ids_np = latent_image_ids.astype(np.int64, copy=True)
+                if img_ids_np.ndim == 3:
+                    img_ids_np = img_ids_np[0]
+                img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
+                img_ids_local = Tensor(
+                    storage=Buffer.from_dlpack(
+                        np.ascontiguousarray(img_ids_np)
+                    ).to(device)
+                )
+                self._cached_img_ids[img_ids_key] = img_ids_local
+
+            text_ids_key = f"text_ids::{text_seq_len}"
+            if text_ids_key in self._cached_text_ids:
+                txt_ids_local = self._cached_text_ids[text_ids_key]
+            else:
+                txt_ids_local = self._prepare_text_ids(text_seq_len, device)
+                self._cached_text_ids[text_ids_key] = txt_ids_local
+            return img_ids_local, txt_ids_local
+
+        text_seq_len = int(prompt_embeds.shape[1])
+        img_ids, txt_ids = _prepare_conditioning_ids(text_seq_len)
 
         if model_inputs.input_image is not None:
             raw_img = model_inputs.input_image
@@ -914,6 +919,14 @@ class ZImagePipeline(DiffusionPipeline):
                     if apply_cfg:
                         assert negative_prompt_embeds is not None
                         assert cache_neg is not None
+                        neg_img_ids = img_ids
+                        neg_txt_ids = txt_ids
+                        if model_inputs.explicit_negative_prompt:
+                            neg_img_ids, neg_txt_ids = (
+                                _prepare_conditioning_ids(
+                                    int(negative_prompt_embeds.shape[1])
+                                )
+                            )
                         with Tracer("cfg_transformer"):
                             neg_noise_pred = self.run_denoising_step(
                                 step=i,
@@ -922,8 +935,8 @@ class ZImagePipeline(DiffusionPipeline):
                                 latents=latents,
                                 prompt_embeds=negative_prompt_embeds,
                                 timestep=timestep,
-                                img_ids=img_ids,
-                                txt_ids=txt_ids,
+                                img_ids=neg_img_ids,
+                                txt_ids=neg_txt_ids,
                             )
                         pos_noise_pred = noise_pred
                         noise_delta = F.sub(noise_pred, neg_noise_pred)

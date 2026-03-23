@@ -1764,6 +1764,10 @@ PIPELINE_ORACLES: Mapping[str, PipelineOracle] = {
         "Tongyi-MAI/Z-Image",
         requests=test_data.DEFAULT_Z_IMAGE_PIXEL_GENERATION,
     ),
+    "Tongyi-MAI/Z-Image-negative-prompt-t2i": ImageGenerationOracle(
+        "Tongyi-MAI/Z-Image",
+        requests=test_data.DEFAULT_Z_IMAGE_NEGATIVE_PROMPT_PIXEL_GENERATION,
+    ),
     "Tongyi-MAI/Z-Image-Turbo-t2i": ImageGenerationOracle(
         "Tongyi-MAI/Z-Image-Turbo",
         num_steps=8,

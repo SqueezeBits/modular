@@ -699,6 +699,9 @@ class PixelContext:
     negative_tokens_2: TokenBuffer | None = field(default=None)
     """Negative tokens for secondary encoder. None for single-encoder models."""
 
+    explicit_negative_prompt: bool = field(default=False)
+    """Whether the request explicitly supplied a negative prompt."""
+
     # Precomputed tensors
     timesteps: npt.NDArray[np.float32] = field(
         default_factory=lambda: np.array([], dtype=np.float32)

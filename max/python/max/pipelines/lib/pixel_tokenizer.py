@@ -863,7 +863,7 @@ class PixelGenerationTokenizer(
 
         do_zimage_cfg = (
             self._pipeline_class_name == PipelineClassName.ZIMAGE
-            and image_options.guidance_scale > 1.0
+            and image_options.guidance_scale > 0.0
         )
         if self._pipeline_class_name == PipelineClassName.FLUX2_KLEIN:
             is_distilled_klein = bool(
@@ -1016,6 +1016,7 @@ class PixelGenerationTokenizer(
             negative_tokens=negative_token_buffer,
             negative_mask=negative_attn_mask,
             negative_tokens_2=negative_token_buffer_2,
+            explicit_negative_prompt=image_options.negative_prompt is not None,
             timesteps=timesteps,
             sigmas=sigmas,
             latents=latents,

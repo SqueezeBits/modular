@@ -386,6 +386,30 @@ DEFAULT_Z_IMAGE_TURBO_PIXEL_GENERATION = [
     for prompt in DEFAULT_PIXEL_GENERATION_PROMPTS
 ]
 
+# Z-Image base: keep the existing 5 prompts/settings, but add tailored
+# negative prompts so we can verify negative_prompt parity independently.
+DEFAULT_Z_IMAGE_NEGATIVE_PROMPTS = [
+    "blurry, low quality, cartoon, duplicate panther, extra limbs, distorted animal anatomy, oversaturated, text, watermark",
+    "blurry, low quality, duplicate cow, extra legs, deformed anatomy, duplicate subject, watermark, oversaturated, distorted proportions",
+    "blurry, low quality, deformed hands, extra fingers, extra limbs, bad anatomy, distorted face, duplicate person, text, watermark",
+    "blurry, low quality, deformed face, extra limbs, bad anatomy, duplicate person, cropped, text, watermark",
+    "blurry, low quality, malformed text, misspelled words, wrong quadrants, duplicate labels, extra objects, watermark, cropped",
+]
+
+DEFAULT_Z_IMAGE_NEGATIVE_PROMPT_PIXEL_GENERATION = [
+    MockPixelGenerationRequest.from_prompt(
+        prompt=prompt,
+        seed=42,
+        guidance_scale=5.0,
+        negative_prompt=negative_prompt,
+    )
+    for prompt, negative_prompt in zip(
+        DEFAULT_PIXEL_GENERATION_PROMPTS,
+        DEFAULT_Z_IMAGE_NEGATIVE_PROMPTS,
+        strict=True,
+    )
+]
+
 # The prompt contains Kimi-specific media tokens for the vLLM path, which
 # uses it directly.  The messages are the clean (no special tokens) version
 # that the MAX tokenizer runs through the HuggingFace chat template.
