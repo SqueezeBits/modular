@@ -10,31 +10,79 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
+"""Z-Image diffusion pipeline (ModuleV3).
+
+Wires together the Qwen3 text encoder, Z-Image transformer denoiser, and
+standard AutoencoderKL VAE. Mirrors ``Flux2Pipeline`` (``flux2_modulev3``)
+patterns for tracing, module docstrings, and flat weight path assignment.
+"""
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
 from typing import Any, Literal
 
 import numpy as np
-from max.driver import CPU, Device
+from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
-from max.pipelines.core import PixelContext
-from max.pipelines.lib.interfaces import DiffusionPipeline, PixelModelInputs
+from max.interfaces import PixelGenerationContext
+from max.pipelines.lib.interfaces import (
+    DenoisingCacheState,
+    DiffusionPipeline,
+    PixelModelInputs,
+)
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.profiler import Tracer, traced
+from PIL import Image as PILImage
 
 from ..autoencoders import AutoencoderKLModel
 from ..qwen3.text_encoder import Qwen3TextEncoderZImageModel
 from .model import ZImageTransformerModel
 
 
+_DEVICE_TENSOR_FIELDS = frozenset({
+    "latents_tensor",
+    "sigmas_tensor",
+    "h_carrier",
+    "w_carrier",
+})
+
+
+def _validate_z_image_context(context: PixelGenerationContext) -> None:
+    """Fail fast before device uploads (mirrors ``Flux2Pipeline.prepare_inputs``)."""
+    if context.latents.size == 0:
+        raise ValueError(
+            "ZImagePipeline requires non-empty latents in PixelGenerationContext."
+        )
+    for name in ("latent_image_ids", "sigmas", "timesteps"):
+        if not hasattr(context, name):
+            raise TypeError(
+                f"ZImagePipeline requires PixelGenerationContext with attribute "
+                f"{name!r} (e.g. max.pipelines.core.PixelContext); "
+                f"{type(context).__name__} has no {name!r}."
+            )
+        arr = getattr(context, name)
+        if not isinstance(arr, np.ndarray) or arr.size == 0:
+            raise ValueError(
+                f"ZImagePipeline requires non-empty {name} in PixelGenerationContext."
+            )
+
+
 @dataclass(kw_only=True)
 class ZImageModelInputs(PixelModelInputs):
+    """Z-Image execution inputs (Flux2-style device tensors + host metadata).
+
+    Scalar and NumPy fields are populated from :class:`PixelGenerationContext`
+    (concrete type :class:`~max.pipelines.core.PixelContext`) via
+    :meth:`kwargs_from_context`; ``latents_tensor``, ``sigmas_tensor``, and
+    shape carriers are required device tensors supplied by
+    :meth:`ZImagePipeline.prepare_inputs` in one shot (see ``Flux2ModelInputs``).
+    """
+
     width: int = 1024
     height: int = 1024
     guidance_scale: float = 5.0
@@ -42,18 +90,67 @@ class ZImageModelInputs(PixelModelInputs):
     num_images_per_prompt: int = 1
     mask: np.ndarray | None = None
     negative_mask: np.ndarray | None = None
-    latents_tensor: Tensor | None = None
-    sigmas_tensor: Tensor | None = None
-    h_carrier: Tensor | None = None
-    w_carrier: Tensor | None = None
+    latents_tensor: Tensor
+    sigmas_tensor: Tensor
+    h_carrier: Tensor
+    w_carrier: Tensor
+
+    @classmethod
+    def kwargs_from_context(
+        cls, context: PixelGenerationContext
+    ) -> dict[str, Any]:
+        """Build kwargs for all fields except device tensors (mirrors ``from_context``)."""
+        kwargs: dict[str, Any] = {}
+        for dataclass_field in fields(cls):
+            name = dataclass_field.name
+            if name in _DEVICE_TENSOR_FIELDS:
+                continue
+            if not hasattr(context, name):
+                continue
+            v = getattr(context, name)
+            if v is None:
+                if dataclass_field.default is not MISSING:
+                    kwargs[name] = dataclass_field.default
+                elif dataclass_field.default_factory is not MISSING:
+                    kwargs[name] = dataclass_field.default_factory()
+                else:
+                    kwargs[name] = None
+            else:
+                kwargs[name] = v
+        return kwargs
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.sigmas.size == 0:
+            raise ValueError(
+                "ZImagePipeline requires non-empty sigmas in context."
+            )
+        if self.latent_image_ids.size == 0:
+            raise ValueError(
+                "ZImagePipeline requires non-empty latent image ids in context."
+            )
 
 
 @dataclass
 class ZImagePipelineOutput:
+    """Container for Z-Image pipeline results.
+
+    Attributes:
+        images:
+            Decoded image data as a NumPy array or MAX :class:`~max.experimental.tensor.Tensor`,
+            depending on decode path and ``output_type``.
+    """
+
     images: np.ndarray | Tensor
 
 
 class ZImagePipeline(DiffusionPipeline):
+    """Diffusion pipeline for Z-Image generation (Qwen3 + transformer + VAE)."""
+
+    unprefixed_weight_component = "transformer"
+    default_num_inference_steps = 50
+    default_residual_threshold = 0.06
+
     vae: AutoencoderKLModel
     text_encoder: Qwen3TextEncoderZImageModel
     transformer: ZImageTransformerModel
@@ -64,7 +161,9 @@ class ZImagePipeline(DiffusionPipeline):
         "transformer": ZImageTransformerModel,
     }
 
+    @traced(message="ZImagePipeline.init_remaining_components")
     def init_remaining_components(self) -> None:
+        """Initialize derived attributes and compiled subgraphs."""
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1)
             if getattr(self, "vae", None)
@@ -76,49 +175,122 @@ class ZImagePipeline(DiffusionPipeline):
         self.build_scheduler_step()
         self.build_decode_latents()
 
+        self._init_cache_state(
+            dtype=self.transformer.config.dtype,
+            device=self.transformer.devices[0],
+        )
+
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
         self._cached_img_ids: dict[str, Tensor] = {}
         self._cached_shape_carriers: dict[int, Tensor] = {}
         self._cached_timesteps_batched: dict[str, Tensor] = {}
 
-    def prepare_inputs(self, context: PixelContext) -> ZImageModelInputs:  # type: ignore[override]
-        result = ZImageModelInputs.from_context(context)
-
-        if result.sigmas.size == 0:
-            raise ValueError(
-                "ZImagePipeline requires non-empty sigmas in context."
-            )
-        if result.latent_image_ids.size == 0:
-            raise ValueError(
-                "ZImagePipeline requires non-empty latent image ids in context."
-            )
-
+    @traced(message="ZImagePipeline.prepare_inputs")
+    def prepare_inputs(
+        self, context: PixelGenerationContext
+    ) -> ZImageModelInputs:
+        """Convert a :class:`PixelGenerationContext` into model inputs with device tensors."""
+        _validate_z_image_context(context)
+        kwargs = ZImageModelInputs.kwargs_from_context(context)
         device = self.transformer.devices[0]
-        result.latents_tensor = Tensor.from_dlpack(result.latents).to(device)
 
-        latent_h = int(result.latents.shape[-2])
-        latent_w = int(result.latents.shape[-1])
+        # Keep host NumPy fields aligned with the tensors we upload (Flux2-style).
+        kwargs["latents"] = np.asarray(context.latents)
+        kwargs["sigmas"] = np.asarray(context.sigmas)
+        kwargs["latent_image_ids"] = np.asarray(context.latent_image_ids)
+
+        latents_np = np.ascontiguousarray(kwargs["latents"])
+        latent_h = int(latents_np.shape[-2])
+        latent_w = int(latents_np.shape[-1])
         packed_h = int(latent_h // 2)
         packed_w = int(latent_w // 2)
+
+        latents_tensor = Tensor(
+            storage=Buffer.from_dlpack(latents_np).to(device)
+        )
+
         for n in (packed_h, packed_w):
             if n not in self._cached_shape_carriers:
-                self._cached_shape_carriers[n] = Tensor.from_dlpack(
-                    np.empty(n, dtype=np.float32)
-                ).to(device)
-        result.h_carrier = self._cached_shape_carriers[packed_h]
-        result.w_carrier = self._cached_shape_carriers[packed_w]
+                carrier = np.ascontiguousarray(np.empty(n, dtype=np.float32))
+                self._cached_shape_carriers[n] = Tensor(
+                    storage=Buffer.from_dlpack(carrier).to(device)
+                )
+        h_carrier = self._cached_shape_carriers[packed_h]
+        w_carrier = self._cached_shape_carriers[packed_w]
 
-        sigmas_key = (
-            f"sigmas::{result.num_inference_steps}::{latent_h}x{latent_w}"
-        )
+        num_steps = int(context.num_inference_steps)
+        sigmas_key = f"sigmas::{num_steps}::{latent_h}x{latent_w}"
         if sigmas_key in self._cached_sigmas:
-            result.sigmas_tensor = self._cached_sigmas[sigmas_key]
+            sigmas_tensor = self._cached_sigmas[sigmas_key]
         else:
-            result.sigmas_tensor = Tensor.from_dlpack(context.sigmas).to(device)
-            self._cached_sigmas[sigmas_key] = result.sigmas_tensor
+            sigmas_tensor = Tensor(
+                storage=Buffer.from_dlpack(
+                    np.ascontiguousarray(context.sigmas)
+                ).to(device)
+            )
+            self._cached_sigmas[sigmas_key] = sigmas_tensor
 
-        return result
+        return ZImageModelInputs(
+            **kwargs,
+            latents_tensor=latents_tensor,
+            sigmas_tensor=sigmas_tensor,
+            h_carrier=h_carrier,
+            w_carrier=w_carrier,
+        )
+
+    def create_cache_state(
+        self,
+        batch_size: int,
+        seq_len: int,
+        transformer_config: Any,
+    ) -> DenoisingCacheState:
+        """Allocate FBCache / Taylor tensors using Z-Image output layout."""
+        cfg = transformer_config
+        residual_dim, output_dim = cfg.fbcache_dims()
+        state = DenoisingCacheState()
+
+        def _device_zeros(shape: tuple[int, ...]) -> Tensor:
+            return Tensor(
+                storage=Buffer.zeros(
+                    shape, self._cache_dtype, device=self._cache_device
+                )
+            )
+
+        if self.cache_config.first_block_caching:
+            state.prev_residual = _device_zeros(
+                (batch_size, seq_len, residual_dim)
+            )
+            state.prev_output = _device_zeros((batch_size, seq_len, output_dim))
+
+        if self.cache_config.taylorseer:
+            for attr in (
+                "taylor_factor_0",
+                "taylor_factor_1",
+                "taylor_factor_2",
+            ):
+                setattr(
+                    state,
+                    attr,
+                    _device_zeros((batch_size, seq_len, output_dim)),
+                )
+
+        return state
+
+    def run_transformer(
+        self,
+        cache_state: DenoisingCacheState,
+        **kwargs: Any,
+    ) -> tuple[Tensor, ...]:
+        return self.transformer(
+            kwargs["latents"],
+            kwargs["prompt_embeds"],
+            kwargs["timestep"],
+            kwargs["img_ids"],
+            kwargs["txt_ids"],
+            prev_residual=cache_state.prev_residual,
+            prev_output=cache_state.prev_output,
+        )
 
     def build_preprocess_latents(self) -> None:
         device = self.transformer.devices[0]
@@ -257,7 +429,7 @@ class ZImagePipeline(DiffusionPipeline):
         )
         return latents
 
-    @traced
+    @traced(message="ZImagePipeline.prepare_prompt_embeddings")
     def prepare_prompt_embeddings(
         self,
         tokens: np.ndarray,
@@ -296,7 +468,21 @@ class ZImagePipeline(DiffusionPipeline):
                 f"Unexpected prompt_embeds rank={prompt_embeds.rank}; expected 2 or 3."
             )
         if num_images_per_prompt > 1:
-            prompt_embeds = F.tile(prompt_embeds, (num_images_per_prompt, 1, 1))
+            batch = int(prompt_embeds.shape[0])
+            seq = int(prompt_embeds.shape[1])
+            hidden = int(prompt_embeds.shape[2])
+            # Avoid F.tile: it can introduce unwanted device transfers; prefer
+            # broadcast_to (batch==1) or concat, matching Flux2 guidance.
+            if batch == 1:
+                prompt_embeds = F.broadcast_to(
+                    prompt_embeds,
+                    [num_images_per_prompt, seq, hidden],
+                )
+            else:
+                prompt_embeds = F.concat(
+                    [prompt_embeds] * num_images_per_prompt,
+                    axis=0,
+                )
 
         return prompt_embeds
 
@@ -312,10 +498,12 @@ class ZImagePipeline(DiffusionPipeline):
             return embeds[:, :target_seq_len, :]
 
         pad_len = target_seq_len - cur_len
-        pad = Tensor.zeros(
-            (int(embeds.shape[0]), pad_len, int(embeds.shape[2])),
-            dtype=embeds.dtype,
-            device=embeds.device,
+        pad = Tensor(
+            storage=Buffer.zeros(
+                (int(embeds.shape[0]), pad_len, int(embeds.shape[2])),
+                embeds.dtype,
+                device=embeds.device,
+            )
         )
         return F.concat([embeds, pad], axis=1)
 
@@ -327,9 +515,13 @@ class ZImagePipeline(DiffusionPipeline):
         """Build text position IDs in [1, 2, ..., seq_len] format."""
         text_ids = np.zeros((seq_len, 3), dtype=np.int64)
         text_ids[:, 0] = np.arange(1, seq_len + 1, dtype=np.int64)
-        return Tensor.from_dlpack(text_ids).to(device)
+        return Tensor(
+            storage=Buffer.from_dlpack(np.ascontiguousarray(text_ids)).to(
+                device
+            )
+        )
 
-    @traced
+    @traced(message="ZImagePipeline.decode_latents")
     def decode_latents(
         self,
         latents: Tensor,
@@ -437,7 +629,7 @@ class ZImagePipeline(DiffusionPipeline):
         all_timesteps = sigmas_curr.cast(DType.float32)
         return all_timesteps, all_dt
 
-    @traced
+    @traced(message="ZImagePipeline.preprocess_latents")
     def preprocess_latents(self, latents: Tensor, dtype: DType) -> Tensor:
         """Patchify and pack latents before denoising."""
         with Tracer("host_to_device_latents"):
@@ -488,11 +680,11 @@ class ZImagePipeline(DiffusionPipeline):
             image_bchw = np.repeat(image_bchw, batch_size, axis=0)
         image_bchw = np.ascontiguousarray(image_bchw)
 
-        return (
-            Tensor.from_dlpack(image_bchw).to(self.vae.devices[0]).cast(dtype)
-        )
+        return Tensor(
+            storage=Buffer.from_dlpack(image_bchw).to(self.vae.devices[0])
+        ).cast(dtype)
 
-    @traced
+    @traced(message="ZImagePipeline.prepare_img2img_latents")
     def prepare_img2img_latents(
         self,
         noise_latents: Tensor,
@@ -544,12 +736,15 @@ class ZImagePipeline(DiffusionPipeline):
                 timesteps_key
             ], transformed_timesteps
 
-        timesteps_tensor = Tensor.from_dlpack(
-            np.ascontiguousarray(transformed_timesteps)
-        ).to(device)
+        timesteps_tensor = Tensor(
+            storage=Buffer.from_dlpack(
+                np.ascontiguousarray(transformed_timesteps)
+            ).to(device)
+        )
         self._cached_timesteps_batched[timesteps_key] = timesteps_tensor
         return timesteps_tensor, transformed_timesteps
 
+    @traced(message="ZImagePipeline.execute")
     def execute(  # type: ignore[override]
         self,
         model_inputs: ZImageModelInputs,
@@ -591,16 +786,8 @@ class ZImagePipeline(DiffusionPipeline):
         latents = model_inputs.latents_tensor
         sigmas = model_inputs.sigmas_tensor
         latent_image_ids = model_inputs.latent_image_ids
-        if latents is None or sigmas is None or latent_image_ids is None:
-            raise ValueError(
-                "prepare_inputs must provide latents, sigmas, and latent_image_ids tensors."
-            )
         h_carrier = model_inputs.h_carrier
         w_carrier = model_inputs.w_carrier
-        if h_carrier is None or w_carrier is None:
-            raise ValueError(
-                "prepare_inputs must provide latent shape carriers."
-            )
 
         timesteps: np.ndarray = model_inputs.timesteps
         batch_size = int(prompt_embeds.shape[0])
@@ -624,7 +811,11 @@ class ZImagePipeline(DiffusionPipeline):
             if img_ids_np.ndim == 3:
                 img_ids_np = img_ids_np[0]
             img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
-            img_ids = Tensor.from_dlpack(img_ids_np).to(device)
+            img_ids = Tensor(
+                storage=Buffer.from_dlpack(np.ascontiguousarray(img_ids_np)).to(
+                    device
+                )
+            )
             self._cached_img_ids[img_ids_key] = img_ids
 
         text_ids_key = f"text_ids::{text_seq_len}"
@@ -635,13 +826,40 @@ class ZImagePipeline(DiffusionPipeline):
             self._cached_text_ids[text_ids_key] = txt_ids
 
         if model_inputs.input_image is not None:
-            img_arr = np.array(model_inputs.input_image)
+            raw_img = model_inputs.input_image
+            if isinstance(raw_img, np.ndarray):
+                img_arr = np.ascontiguousarray(
+                    raw_img.astype(np.uint8, copy=False)
+                )
+            elif isinstance(raw_img, PILImage.Image):
+                img_arr = np.asarray(raw_img.convert("RGB"), dtype=np.uint8)
+            else:
+                raise TypeError(
+                    "input_image must be a HWC uint8 ndarray or PIL.Image; "
+                    f"got {type(raw_img).__name__}"
+                )
             latents = self.prepare_img2img_latents(
                 noise_latents=latents,
                 image=img_arr,
                 sigmas=sigmas,
             )
         latents = self.preprocess_latents(latents, dtype)
+
+        image_seq_len = int(latents.shape[1])
+        cache_pos = self.create_cache_state(
+            batch_size,
+            image_seq_len,
+            self.transformer.config,
+        )
+        cache_neg = (
+            self.create_cache_state(
+                batch_size,
+                image_seq_len,
+                self.transformer.config,
+            )
+            if do_cfg
+            else None
+        )
 
         # 3) Prepare scheduler tensors.
         with Tracer("prepare_scheduler"):
@@ -682,24 +900,31 @@ class ZImagePipeline(DiffusionPipeline):
                     )
 
                     with Tracer("transformer"):
-                        noise_pred = self.transformer(
-                            latents,
-                            prompt_embeds,
-                            timestep,
-                            img_ids,
-                            txt_ids,
-                        )[0]
+                        noise_pred = self.run_denoising_step(
+                            step=i,
+                            cache_state=cache_pos,
+                            device=device,
+                            latents=latents,
+                            prompt_embeds=prompt_embeds,
+                            timestep=timestep,
+                            img_ids=img_ids,
+                            txt_ids=txt_ids,
+                        )
 
                     if apply_cfg:
                         assert negative_prompt_embeds is not None
+                        assert cache_neg is not None
                         with Tracer("cfg_transformer"):
-                            neg_noise_pred = self.transformer(
-                                latents,
-                                negative_prompt_embeds,
-                                timestep,
-                                img_ids,
-                                txt_ids,
-                            )[0]
+                            neg_noise_pred = self.run_denoising_step(
+                                step=i,
+                                cache_state=cache_neg,
+                                device=device,
+                                latents=latents,
+                                prompt_embeds=negative_prompt_embeds,
+                                timestep=timestep,
+                                img_ids=img_ids,
+                                txt_ids=txt_ids,
+                            )
                         pos_noise_pred = noise_pred
                         noise_delta = F.sub(noise_pred, neg_noise_pred)
                         noise_pred = F.add(

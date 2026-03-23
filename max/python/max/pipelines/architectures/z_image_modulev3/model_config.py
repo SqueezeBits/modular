@@ -19,9 +19,10 @@ from max.graph import DeviceRef
 from max.pipelines.lib import MAXModelConfigBase, SupportedEncoding
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from pydantic import Field
+from typing_extensions import Self
 
 
-class ZImageConfigBase(MAXModelConfigBase):
+class ZImageConfig(MAXModelConfigBase):
     all_patch_size: tuple[int, ...] = (2,)
     all_f_patch_size: tuple[int, ...] = (1,)
     in_channels: int = 16
@@ -40,20 +41,19 @@ class ZImageConfigBase(MAXModelConfigBase):
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
 
-
-class ZImageConfig(ZImageConfigBase):
-    @staticmethod
-    def generate(
+    @classmethod
+    def initialize_from_config(
+        cls,
         config_dict: dict[str, Any],
         encoding: SupportedEncoding,
         devices: list[Device],
-    ) -> ZImageConfigBase:
+    ) -> Self:
         init_dict = {
             key: value
             for key, value in config_dict.items()
-            if key in ZImageConfigBase.__annotations__
+            if key in cls.model_fields
         }
-        # Ignore omni-only fields in phase 1.
+        # Ignore omni-only fields in phase 1 (may appear in full checkpoints).
         init_dict.pop("siglip_feat_dim", None)
 
         init_dict.update(
@@ -62,5 +62,18 @@ class ZImageConfig(ZImageConfigBase):
                 "device": DeviceRef.from_device(devices[0]),
             }
         )
+        return cls(**init_dict)
 
-        return ZImageConfigBase(**init_dict)
+    def fbcache_dims(self) -> tuple[int, int]:
+        """(hidden_dim, output_dim) per image token for FBCache / Taylor tensors."""
+        out_dim = (
+            self.all_patch_size[0]
+            * self.all_patch_size[0]
+            * self.all_f_patch_size[0]
+            * self.in_channels
+        )
+        return self.dim, out_dim
+
+
+# Back-compat alias for call sites that refer to the config as a "base" type.
+ZImageConfigBase = ZImageConfig

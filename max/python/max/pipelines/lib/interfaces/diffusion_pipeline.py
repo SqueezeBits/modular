@@ -784,9 +784,13 @@ class PixelModelInputs:
     - Must be > 0.
     - For video generation, the naming may still be used for historical compatibility.
     """
-    input_image: Image.Image | None = None
+    input_image: Image.Image | npt.NDArray[np.uint8] | None = None
     """
-    Optional input image for image-to-image generation (PIL.Image.Image).
+    Optional input image for image-to-image generation.
+
+    Pixel/tokenizer paths typically supply HWC ``uint8`` :class:`numpy.ndarray`
+    (see :class:`~max.pipelines.core.PixelContext`). A :class:`PIL.Image.Image`
+    is still accepted for callers that construct inputs without a pixel context.
     """
 
     strength: float = 0.6

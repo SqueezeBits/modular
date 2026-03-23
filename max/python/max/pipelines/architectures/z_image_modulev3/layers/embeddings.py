@@ -18,7 +18,7 @@ from max.experimental import functional as F
 from max.experimental.nn import Linear, Module
 from max.experimental.tensor import Tensor
 
-from ...flux2.layers.embeddings import get_1d_rotary_pos_embed
+from ...flux2_modulev3.layers.embeddings import get_1d_rotary_pos_embed
 
 
 class TimestepEmbedder(Module[[Tensor], Tensor]):
@@ -49,12 +49,14 @@ class TimestepEmbedder(Module[[Tensor], Tensor]):
         embedding = F.concat([F.cos(args), F.sin(args)], axis=-1)
 
         if dim % 2:
-            zeros = Tensor.zeros(
-                [embedding.shape[0], 1],
-                dtype=embedding.dtype,
-                device=t.device,
+            # Avoid Tensor.zeros in the graph path; broadcast a scalar zero like
+            # other normalization blocks (see LayerNorm gamma/beta patterns).
+            zero = F.reshape(
+                F.constant(0.0, embedding.dtype, device=t.device),
+                (1, 1),
             )
-            embedding = F.concat([embedding, zeros], axis=-1)
+            zeros_col = F.broadcast_to(zero, (embedding.shape[0], 1))
+            embedding = F.concat([embedding, zeros_col], axis=-1)
 
         return embedding
 

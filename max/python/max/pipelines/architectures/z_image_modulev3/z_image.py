@@ -11,7 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections.abc import Sequence
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from max.dtype import DType
 from max.experimental import functional as F
@@ -20,10 +23,14 @@ from max.experimental.nn.norm import LayerNorm, RMSNorm
 from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
 from max.graph import TensorType
+from max.pipelines.lib.interfaces.cache_mixin import (
+    DenoisingCacheConfig,
+    fbcache_conditional_execution,
+)
 
 from .layers.attention import ZImageAttention
 from .layers.embeddings import RopeEmbedder, TimestepEmbedder
-from .model_config import ZImageConfigBase
+from .model_config import ZImageConfig
 
 ADALN_EMBED_DIM = 256
 
@@ -135,7 +142,11 @@ class FinalLayer(Module[..., Tensor]):
 
 
 class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
-    def __init__(self, config: ZImageConfigBase):
+    def __init__(
+        self,
+        config: ZImageConfig,
+        cache_config: DenoisingCacheConfig | None = None,
+    ):
         self.in_channels = config.in_channels
         self.out_channels = config.in_channels
         self.dim = config.dim
@@ -237,7 +248,39 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.max_dtype = config.dtype
         self.cap_feat_dim = config.cap_feat_dim
 
-    def input_types(self) -> tuple[TensorType, ...]:
+        self._forward_impl: Callable[..., tuple[Tensor, ...]] = (
+            self._forward_standard
+        )
+        self._input_types_impl: Callable[..., tuple[TensorType, ...]] = (
+            self._input_types_standard
+        )
+        self._rdt_value: float = 0.05
+        if cache_config is not None and cache_config.first_block_caching:
+            assert cache_config.residual_threshold is not None
+            self._rdt_value = cache_config.residual_threshold
+            self._forward_impl = self._forward_step_cache
+            self._input_types_impl = self._input_types_step_cache
+
+    def _fbcache_conditional_execution_output_types(self) -> list[TensorType]:
+        residual_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", self.dim],
+            device=self.max_device,
+        )
+        out_ch = (
+            self.patch_size
+            * self.patch_size
+            * self.f_patch_size
+            * self.out_channels
+        )
+        output_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", out_ch],
+            device=self.max_device,
+        )
+        return [residual_type, output_type]
+
+    def _base_input_types(self) -> tuple[TensorType, ...]:
         hidden_states_type = TensorType(
             self.max_dtype,
             shape=["batch_size", "image_seq_len", self.packed_channels],
@@ -263,7 +306,6 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             shape=["text_seq_len", len(self.axes_dims)],
             device=self.max_device,
         )
-
         return (
             hidden_states_type,
             encoder_hidden_states_type,
@@ -272,26 +314,26 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             txt_ids_type,
         )
 
-    def forward(
+    def _input_types_standard(self) -> tuple[TensorType, ...]:
+        return self._base_input_types()
+
+    def _input_types_step_cache(self) -> tuple[TensorType, ...]:
+        return self._base_input_types() + tuple(
+            self._fbcache_conditional_execution_output_types()
+        )
+
+    def input_types(self) -> tuple[TensorType, ...]:
+        return self._input_types_impl()
+
+    def _forward_preamble(
         self,
         hidden_states: Tensor,
         encoder_hidden_states: Tensor,
         timestep: Tensor,
         img_ids: Tensor,
         txt_ids: Tensor,
-        controlnet_block_samples: Tensor | None = None,
-        siglip_feats: Tensor | None = None,
-        image_noise_mask: Tensor | None = None,
-    ) -> tuple[Tensor]:
-        if controlnet_block_samples is not None:
-            raise NotImplementedError(
-                "controlnet_block_samples is not supported in z-image phase 1"
-            )
-        if siglip_feats is not None or image_noise_mask is not None:
-            raise NotImplementedError(
-                "Omni(siglip/image_noise_mask) is not supported in z-image phase 1"
-            )
-
+    ) -> tuple[Tensor, Any, Tensor, tuple[Tensor, Tensor]]:
+        """Embed inputs, run refiners, return unified seq before main ``layers[0]``."""
         x = self.x_embedder(hidden_states)
         t_emb = self.t_embedder(timestep * self.t_scale).cast(x.dtype)
 
@@ -316,12 +358,91 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             cap = layer(cap, freqs_cis=txt_freqs)
 
         img_len = x.shape[1]
-        unified = F.concat([x, cap], axis=1)
+        unified0 = F.concat([x, cap], axis=1)
+        return unified0, img_len, t_emb, unified_freqs
 
-        for layer in self.layers:
-            unified = layer(unified, freqs_cis=unified_freqs, adaln_input=t_emb)
+    def _run_first_main_layer(
+        self,
+        unified0: Tensor,
+        t_emb: Tensor,
+        unified_freqs: tuple[Tensor, Tensor],
+    ) -> Tensor:
+        return self.layers[0](
+            unified0,
+            freqs_cis=unified_freqs,
+            adaln_input=t_emb,
+        )
 
-        unified = self.final_layer(unified, c=t_emb)
-        sample = unified[:, :img_len, :]
+    def _run_remaining_after_first(
+        self,
+        unified: Tensor,
+        *,
+        img_len: Any,
+        t_emb: Tensor,
+        freqs_cis: tuple[Tensor, Tensor],
+    ) -> Tensor:
+        u = unified
+        for i in range(1, len(self.layers)):
+            u = self.layers[i](
+                u,
+                freqs_cis=freqs_cis,
+                adaln_input=t_emb,
+            )
+        u = self.final_layer(u, c=t_emb)
+        return u[:, :img_len, :]
 
-        return (sample,)
+    def _forward_standard(self, *args: Tensor) -> tuple[Tensor]:
+        hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids = args[:5]
+        unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            img_ids,
+            txt_ids,
+        )
+        u1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
+        out = self._run_remaining_after_first(
+            u1,
+            img_len=img_len,
+            t_emb=t_emb,
+            freqs_cis=unified_freqs,
+        )
+        return (out,)
+
+    def _forward_step_cache(self, *args: Tensor) -> tuple[Tensor, Tensor]:
+        (
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            img_ids,
+            txt_ids,
+            prev_residual,
+            prev_output,
+        ) = args
+        unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            img_ids,
+            txt_ids,
+        )
+        unified1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
+        first_block_residual = unified1[:, :img_len, :] - unified0[:, :img_len, :]
+
+        return fbcache_conditional_execution(
+            first_block_residual,
+            prev_residual,
+            prev_output,
+            self._rdt_value,
+            self._run_remaining_after_first,
+            dict(
+                unified=unified1,
+                img_len=img_len,
+                t_emb=t_emb,
+                freqs_cis=unified_freqs,
+            ),
+            self._fbcache_conditional_execution_output_types(),
+        )
+
+    def forward(self, *args: Tensor) -> tuple[Tensor, ...]:
+        return self._forward_impl(*args)
