@@ -365,6 +365,27 @@ DEFAULT_PIXEL_GENERATION = [
     for prompt in DEFAULT_PIXEL_GENERATION_PROMPTS
 ]
 
+# Tongyi-MAI/Z-Image (base): align torch reference with diffusers / ZImageModelInputs
+# defaults (guidance_scale=5.0, 50 steps).
+DEFAULT_Z_IMAGE_PIXEL_GENERATION = [
+    MockPixelGenerationRequest.from_prompt(
+        prompt=prompt, seed=42, guidance_scale=5.0
+    )
+    for prompt in DEFAULT_PIXEL_GENERATION_PROMPTS
+]
+
+# Z-Image-Turbo (distilled): few steps, no CFG — matches diffusers Turbo examples
+# (guidance_scale=0) and MAX (CFG only when guidance_scale > 1).
+DEFAULT_Z_IMAGE_TURBO_PIXEL_GENERATION = [
+    MockPixelGenerationRequest.from_prompt(
+        prompt=prompt,
+        seed=42,
+        num_inference_steps=8,
+        guidance_scale=0.0,
+    )
+    for prompt in DEFAULT_PIXEL_GENERATION_PROMPTS
+]
+
 # The prompt contains Kimi-specific media tokens for the vLLM path, which
 # uses it directly.  The messages are the clean (no special tokens) version
 # that the MAX tokenizer runs through the HuggingFace chat template.

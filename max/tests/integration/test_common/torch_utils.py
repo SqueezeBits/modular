@@ -343,6 +343,27 @@ def _is_flux2_pipeline(pipeline: Any) -> bool:
     return config_class_name == "Flux2Pipeline"
 
 
+def _is_z_image_pipeline(pipeline: Any) -> bool:
+    """Detect diffusers Z-Image pipelines (latents are BCHW, full transformer.in_channels)."""
+    class_name = pipeline.__class__.__name__
+    if class_name == "ZImagePipeline":
+        return True
+
+    config = getattr(pipeline, "config", None)
+    if config is None:
+        return False
+
+    config_class_name = None
+    if isinstance(config, dict):
+        config_class_name = config.get("_class_name")
+    elif hasattr(config, "get"):
+        config_class_name = config.get("_class_name")
+    else:
+        config_class_name = getattr(config, "_class_name", None)
+
+    return config_class_name == "ZImagePipeline"
+
+
 def _load_input_image(image_uri: str) -> Image.Image:
     """Load an input image for image-to-image generation."""
     if image_uri.startswith("s3://"):
@@ -380,6 +401,7 @@ def run_image_generation(
 
     pipeline.to(device)  # type: ignore[attr-defined]
     is_flux2 = _is_flux2_pipeline(pipeline)
+    is_z_image = _is_z_image_pipeline(pipeline)
 
     for mock_request in requests:
         prompt = mock_request.prompt
@@ -406,13 +428,19 @@ def run_image_generation(
 
         # Prepare latents using the same approach as MAX pipeline
         # This ensures deterministic and comparable outputs
-        num_channels_latents = pipeline.transformer.config.in_channels // 4  # type: ignore[attr-defined]
+        transformer_in_ch = pipeline.transformer.config.in_channels  # type: ignore[attr-defined]
+        num_channels_latents = (
+            transformer_in_ch
+            if is_z_image
+            else transformer_in_ch // 4
+        )
         vae_scale_factor = pipeline.vae_scale_factor  # type: ignore[attr-defined]
         latent_height = 2 * (height // (vae_scale_factor * 2))
         latent_width = 2 * (width // (vae_scale_factor * 2))
 
         # Generate latents using numpy RandomState (same as MAX).
         # Flux2 expects patchified latents shaped (B, C*4, H//2, W//2).
+        # Z-Image matches MAX pixel_tokenizer: (B, in_channels, H, W), no packing.
         if is_flux2:
             latents_np = _canonical_randn_tensor(
                 batch_size=1,
@@ -422,6 +450,15 @@ def run_image_generation(
                 seed=seed,
             )
             latents_np = _patchify_latents_numpy(latents_np)
+            latents = torch.from_numpy(latents_np)
+        elif is_z_image:
+            latents_np = _canonical_randn_tensor(
+                batch_size=1,
+                num_channels_latents=num_channels_latents,
+                latent_height=latent_height,
+                latent_width=latent_width,
+                seed=seed,
+            )
             latents = torch.from_numpy(latents_np)
         else:
             latents = torch.from_numpy(

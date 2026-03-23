@@ -44,6 +44,9 @@ from max.pipelines.architectures.flux1_modulev3.pipeline_flux import (
 from max.pipelines.architectures.flux2_modulev3.pipeline_flux2 import (
     Flux2Pipeline,
 )
+from max.pipelines.architectures.z_image_modulev3.pipeline_z_image import (
+    ZImagePipeline,
+)
 from max.pipelines.architectures.internvl.tokenizer import InternVLProcessor
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import (
@@ -1115,10 +1118,15 @@ class LoRAOracle(PipelineOracle):
 
 
 class ImageGenerationOracle(PipelineOracle):
-    """Pipeline oracle for FLUX image generation."""
+    """Pipeline oracle for FLUX and Z-Image text-to-image generation."""
 
     num_steps: int
     """Number of denoising steps."""
+
+    @staticmethod
+    def _is_z_image_model(model_path: str) -> bool:
+        p = model_path.lower().replace("_", "-")
+        return "z-image" in p
 
     def __init__(
         self,
@@ -1149,7 +1157,7 @@ class ImageGenerationOracle(PipelineOracle):
         encoding: pipelines.SupportedEncoding,
         device_specs: list[driver.DeviceSpec],
     ) -> MaxPipelineAndTokenizer:
-        """Create MAX FLUX pixel generation pipeline."""
+        """Create MAX pixel generation pipeline (FLUX or Z-Image)."""
 
         config = pipelines.PipelineConfig(
             model=pipelines.MAXModelConfig(
@@ -1160,6 +1168,7 @@ class ImageGenerationOracle(PipelineOracle):
         )
 
         is_flux2 = self.model_path.startswith("black-forest-labs/FLUX.2")
+        is_z_image = self._is_z_image_model(self.model_path)
         if is_flux2:
             tokenizer = PixelGenerationTokenizer(
                 model_path=self.model_path,
@@ -1170,6 +1179,17 @@ class ImageGenerationOracle(PipelineOracle):
             pipeline = PixelGenerationPipeline[PixelContext](
                 pipeline_config=config,
                 pipeline_model=Flux2Pipeline,
+            )
+        elif is_z_image:
+            tokenizer = PixelGenerationTokenizer(
+                model_path=self.model_path,
+                pipeline_config=config,
+                subfolder="tokenizer",
+                max_length=512,
+            )
+            pipeline = PixelGenerationPipeline[PixelContext](
+                pipeline_config=config,
+                pipeline_model=ZImagePipeline,
             )
         else:
             tokenizer = PixelGenerationTokenizer(
@@ -1196,7 +1216,7 @@ class ImageGenerationOracle(PipelineOracle):
         encoding: pipelines.SupportedEncoding | None,
         device: torch.device,
     ) -> TorchModelAndDataProcessor:
-        """Create diffusers FLUX pipeline."""
+        """Create a diffusers image pipeline (FLUX, Z-Image, etc.)."""
 
         revision = hf_repo_lock.revision_for_hf_repo(self.model_path)
 
@@ -1223,7 +1243,7 @@ class ImageGenerationOracle(PipelineOracle):
         num_steps: int,
         inputs: list[Any],
     ) -> list[dict[str, Any]]:
-        """Run image generation using diffusers FLUX."""
+        """Run image generation using diffusers (FLUX, Z-Image, etc.)."""
 
         return torch_utils.run_image_generation(
             pipeline=torch_pipeline_and_tokenizer.model,
@@ -1739,5 +1759,14 @@ PIPELINE_ORACLES: Mapping[str, PipelineOracle] = {
     "black-forest-labs/FLUX.2-dev-i2i": ImageGenerationOracle(
         "black-forest-labs/FLUX.2-dev",
         requests=test_data.FLUX2_PIXEL_GENERATION_I2I,
+    ),
+    "Tongyi-MAI/Z-Image-t2i": ImageGenerationOracle(
+        "Tongyi-MAI/Z-Image",
+        requests=test_data.DEFAULT_Z_IMAGE_PIXEL_GENERATION,
+    ),
+    "Tongyi-MAI/Z-Image-Turbo-t2i": ImageGenerationOracle(
+        "Tongyi-MAI/Z-Image-Turbo",
+        num_steps=8,
+        requests=test_data.DEFAULT_Z_IMAGE_TURBO_PIXEL_GENERATION,
     ),
 }
