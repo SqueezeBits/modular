@@ -496,7 +496,7 @@ async def generate_video(args: argparse.Namespace) -> None:
             "model_max_length", None
         )
         if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
-            max_length = 512
+            max_length = 226
         print(f"Using max length: {max_length} for tokenizer")
 
     if (

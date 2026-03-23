@@ -102,3 +102,21 @@ modular_py_binary(
         requirement("torch"),
     ],
 )
+
+modular_py_binary(
+    name = "wan_parity_check",
+    testonly = True,
+    srcs = ["wan_parity_check.py"],
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines",
+        "//max/python/max/pipelines/core",
+        "//max/python/max/pipelines/lib",
+        requirement("diffusers"),
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("sentencepiece"),
+        requirement("torch"),
+    ],
+)

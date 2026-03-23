@@ -118,15 +118,20 @@ class UniPCMultistepScheduler:
             num_inference_steps: Number of denoising steps.
         """
         if self.use_flow_sigmas:
-            alphas = np.linspace(
+            # Match diffusers UniPCMultistepScheduler.set_timesteps exactly:
+            # linspace over sigmas directly (not 1-alphas), drop last before shifting.
+            sigmas = np.linspace(
                 1, 1 / self.num_train_timesteps, num_inference_steps + 1
-            )
-            sigmas = 1.0 - alphas
-            sigmas = np.flip(
+            )[:-1]
+            sigmas = (
                 self.flow_shift * sigmas / (1 + (self.flow_shift - 1) * sigmas)
-            )[:-1].copy()
-            # Diffusers casts to int64 for step matching
-            timesteps = (sigmas * self.num_train_timesteps).astype(np.int64)
+            )
+            # Clamp sigma[0] just below 1.0 so timestep < num_train_timesteps
+            # (matches diffusers' `sigmas[0] -= eps` guard).
+            eps = 1.0 / self.num_train_timesteps
+            if sigmas[0] >= 1.0:
+                sigmas[0] -= eps
+            timesteps = (sigmas * self.num_train_timesteps).copy()
 
             if self.final_sigmas_type == "sigma_min":
                 sigma_last = float(sigmas[-1])
@@ -195,11 +200,9 @@ class UniPCMultistepScheduler:
         self.set_timesteps(num_inference_steps)
 
         if self.use_flow_sigmas:
-            # Return float timesteps from sigmas for the pipeline.
-            # self.timesteps stores int64 for step() matching.
-            timesteps = (self.sigmas[:-1] * self.num_train_timesteps).astype(
-                np.float32
-            )
+            # Use the int64-rounded timesteps from set_timesteps (matching
+            # diffusers), cast to float32 for the pipeline.
+            timesteps = self.timesteps.astype(np.float32)
             sigmas = self.sigmas.astype(np.float32)
         else:
             if reverse:
