@@ -54,10 +54,10 @@ from max.pipelines.architectures.mistral3.text_encoder.mistral3 import (
 from max.pipelines.architectures.mistral3.text_encoder.model_config import (
     Mistral3TextEncoderConfig,
 )
-from max.pipelines.architectures.qwen3_modulev3.text_encoder.model_config import (
+from max.pipelines.architectures.qwen3.text_encoder.model_config import (
     Qwen3TextEncoderConfig,
 )
-from max.pipelines.architectures.qwen3_modulev3.text_encoder.qwen3 import (
+from max.pipelines.architectures.qwen3.text_encoder.qwen3 import (
     Qwen3TextEncoderTransformer,
 )
 from max.profiler import Tracer, set_gpu_profiling_state

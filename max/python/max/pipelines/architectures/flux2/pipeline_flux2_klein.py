@@ -20,13 +20,12 @@ from typing import Any, cast
 import numpy as np
 from max.driver import Buffer
 from max.dtype import DType
-from max.experimental.tensor import Tensor
 from max.graph import TensorType, TensorValue, ops
 from max.pipelines.core import PixelContext
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.profiler import Tracer, traced
 
-from ..qwen3_modulev3.text_encoder import Qwen3TextEncoderKleinModel
+from ..qwen3.text_encoder import Qwen3TextEncoderKleinModel
 from .pipeline_flux2 import Flux2ModelInputs, Flux2Pipeline, Flux2PipelineOutput
 
 logger = logging.getLogger("max.pipelines")
@@ -166,16 +165,18 @@ class Flux2KleinPipeline(Flux2Pipeline):
         num_images_per_prompt: int = 1,
         attention_mask: np.ndarray | None = None,
     ) -> tuple[Buffer, Buffer]:
-        """Bridge Buffer-based v2 execution with the Tensor-based Qwen3 encoder."""
+        """Create prompt embeddings and text IDs using the v2 Qwen3 encoder."""
         seq_len = int(tokens.shape[0])
         batch_size = 1
 
         with Tracer("text_encoder"):
-            prompt_embeds_tensor = self.text_encoder(
-                Tensor(storage=tokens),
-                attention_mask=attention_mask,
+            prompt_embeds = cast(
+                Buffer,
+                self.text_encoder(
+                    tokens,
+                    attention_mask=attention_mask,
+                ),
             )
-            prompt_embeds = prompt_embeds_tensor.driver_tensor
 
         with Tracer("post_process"):
             if num_images_per_prompt != 1:
