@@ -17,12 +17,22 @@ from typing import Any
 from max.driver import Buffer, Device
 from max.engine import InferenceSession, Model
 from max.graph import Graph
-from max.graph.weights import Weights
+from max.graph.shape import Shape
+from max.graph.weights import WeightData, Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
+
+_STACKED_QKV_INFIXES = {
+    ".attn.qkv_proj.": (".attn.to_q.", ".attn.to_k.", ".attn.to_v."),
+    ".attn.add_qkv_proj.": (
+        ".attn.add_q_proj.",
+        ".attn.add_k_proj.",
+        ".attn.add_v_proj.",
+    ),
+}
 
 
 class Flux2TransformerModel(ComponentModel):
@@ -46,8 +56,16 @@ class Flux2TransformerModel(ComponentModel):
     def load_model(self) -> Callable[..., Any]:
         state_dict = {key: value.data() for key, value in self.weights.items()}
 
+        stacked_qkv = any(
+            ".attn.qkv_proj." in k or ".attn.add_qkv_proj." in k
+            for k in state_dict
+        )
+        if stacked_qkv:
+            state_dict = self._split_stacked_qkv(state_dict)
+
         has_guidance_embedder = any(
-            "time_guidance_embed.guidance_embedder." in k for k in state_dict
+            "time_guidance_embed.guidance_embedder." in k or "guidance_in." in k
+            for k in state_dict
         )
         if not has_guidance_embedder and getattr(
             self.config, "guidance_embeds", True
@@ -78,6 +96,38 @@ class Flux2TransformerModel(ComponentModel):
             weights_registry=self.state_dict,
         )
         return self.model.execute
+
+    @staticmethod
+    def _split_stacked_qkv(
+        state_dict: dict[str, WeightData],
+    ) -> dict[str, WeightData]:
+        """Split fused QKV weights into separate Q, K, V entries."""
+        out: dict[str, WeightData] = {}
+        for key, value in state_dict.items():
+            matched = False
+            for stacked, (q, k, v) in _STACKED_QKV_INFIXES.items():
+                if stacked not in key:
+                    continue
+                matched = True
+                if key.endswith((".weight", ".weight_scale")):
+                    buf = value.to_buffer()
+                    chunk = buf.shape[0] // 3
+                    for infix, i in zip([q, k, v], range(3), strict=False):
+                        split_name = key.replace(stacked, infix)
+                        split_buf = buf[i * chunk : (i + 1) * chunk, :]
+                        out[split_name] = WeightData(
+                            split_buf,
+                            split_name,
+                            value.dtype,
+                            Shape(split_buf.shape),
+                        )
+                elif key.endswith((".weight_scale_2", ".input_scale")):
+                    for infix in (q, k, v):
+                        out[key.replace(stacked, infix)] = value
+                break
+            if not matched:
+                out[key] = value
+        return out
 
     def __call__(
         self,
