@@ -1240,21 +1240,20 @@ class ImageGenerationOracle(PipelineOracle):
         needs_z_image_img2img = is_z_image and any(
             getattr(r, "input_image", None) for r in self._inputs
         )
+        torch_dtype = (
+            ENCODING_TO_TORCH_DTYPE[encoding] if encoding else torch.bfloat16
+        )
         if needs_z_image_img2img:
             pipeline = diffusers.ZImageImg2ImgPipeline.from_pretrained(
                 self.model_path,
                 revision=revision,
-                torch_dtype=ENCODING_TO_TORCH_DTYPE.get(
-                    encoding, torch.bfloat16
-                ),  # type: ignore
+                torch_dtype=torch_dtype,
             )
         else:
             pipeline = diffusers.DiffusionPipeline.from_pretrained(
                 self.model_path,
                 revision=revision,
-                torch_dtype=ENCODING_TO_TORCH_DTYPE.get(
-                    encoding, torch.bfloat16
-                ),  # type: ignore
+                torch_dtype=torch_dtype,
             )
         pipeline = pipeline.to(device)
 

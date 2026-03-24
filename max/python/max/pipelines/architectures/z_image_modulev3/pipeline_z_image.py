@@ -1057,6 +1057,12 @@ class ZImagePipeline(DiffusionPipeline):
                         neg_img_ids = img_ids
                         neg_txt_ids = txt_ids
                         if model_inputs.explicit_negative_prompt:
+                            assert (
+                                model_inputs.negative_img_ids_tensor is not None
+                            )
+                            assert (
+                                model_inputs.negative_txt_ids_tensor is not None
+                            )
                             neg_img_ids = model_inputs.negative_img_ids_tensor
                             neg_txt_ids = model_inputs.negative_txt_ids_tensor
                         with Tracer("cfg_transformer"):

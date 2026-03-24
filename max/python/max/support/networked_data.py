@@ -37,9 +37,9 @@ def fetch_bytes_from_s3(s3_path: str) -> bytes:
 
     try:
         import boto3  # type: ignore[import-not-found]
-        from botocore import UNSIGNED
-        from botocore.client import Config
-        from botocore.exceptions import (
+        from botocore import UNSIGNED  # type: ignore[import-not-found]
+        from botocore.client import Config  # type: ignore[import-not-found]
+        from botocore.exceptions import (  # type: ignore[import-not-found]
             NoCredentialsError,
             SSOTokenLoadError,
             UnauthorizedSSOTokenError,
