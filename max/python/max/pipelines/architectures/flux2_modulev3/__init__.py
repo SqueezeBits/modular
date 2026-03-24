@@ -11,11 +11,11 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from ..flux2 import flux2_klein_arch
 from .arch import (
     flux2_klein_modulev3_arch,
     flux2_modulev3_arch,
 )
-from ..flux2 import flux2_klein_arch
 from .model import Flux2TransformerModel
 
 __all__ = [

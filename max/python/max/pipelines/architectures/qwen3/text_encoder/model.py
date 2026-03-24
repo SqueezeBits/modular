@@ -213,7 +213,9 @@ class Qwen3TextEncoderModel(ComponentModel):
                 expected_seq_len=int(tokens.shape[0]),
             )
 
-        attention_bias = Buffer.from_numpy(attention_bias_np).to(self.devices[0])
+        attention_bias = Buffer.from_numpy(attention_bias_np).to(
+            self.devices[0]
+        )
         outputs = self.model.execute(tokens, attention_bias)
 
         if hidden_state_index is not None and hidden_state_index not in (0, -1):

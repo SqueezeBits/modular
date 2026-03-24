@@ -11,5 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from max.nn.rotary_embedding import RotaryEmbedding
+
 from .attention import EncoderAttention
-from .rotary_embedding import RotaryEmbedding

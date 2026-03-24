@@ -27,8 +27,9 @@ from max.nn.embedding import Embedding
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm import RMSNorm
+from max.nn.rotary_embedding import RotaryEmbedding
 
-from .layers import EncoderAttention, RotaryEmbedding
+from .layers import EncoderAttention
 
 if TYPE_CHECKING:
     from .model_config import Qwen3TextEncoderConfig
@@ -124,7 +125,15 @@ class EncoderTransformerBlock(Module):
         rope: RotaryEmbedding,
         attention_bias: TensorValue,
     ) -> TensorValue:
-        """Forward pass without KV cache."""
+        """Forward pass without KV cache.
+
+        Args:
+            x: Input hidden states [seq_len, hidden_dim]
+            rope: RoPE embedding module
+            attention_bias: Additive causal/padding mask
+        Returns:
+            Output hidden states [seq_len, hidden_dim]
+        """
         residual = x
         x = self.input_layernorm(x)
         x = self.self_attn(
@@ -219,9 +228,22 @@ class Qwen3TextEncoderTransformer(Module):
         tokens: TensorValueLike,
         attention_bias: TensorValue,
     ) -> tuple[TensorValue, ...]:
-        """Forward pass returning fused prompt embeddings."""
+        """Forward pass returning fused prompt embeddings.
+
+        Args:
+            tokens: Input token IDs [total_seq_len]
+            attention_bias: Additive causal+padding mask bias with shape
+                [1, 1, seq_len, seq_len].
+
+        Returns:
+            Tuple containing one tensor shaped [1, seq_len, num_layers * hidden_dim].
+        """
         h = self.embed_tokens(tokens)
 
+        # Match Hugging Face `output.hidden_states` indexing:
+        #   hidden_states[0] = token embeddings
+        #   hidden_states[i + 1] = output after transformer block i
+        # Flux2-Klein layer indices are specified against that HF contract.
         selected: dict[int, TensorValue] = {}
         if 0 in self._hidden_state_layers:
             selected[0] = h
@@ -238,9 +260,9 @@ class Qwen3TextEncoderTransformer(Module):
 
         hidden_states = [selected[i] for i in self._sorted_hidden_state_layers]
 
-        stacked = ops.stack(hidden_states, axis=0)
-        stacked = ops.unsqueeze(stacked, axis=0)
-        stacked = ops.permute(stacked, [0, 2, 1, 3])
+        stacked = ops.stack(hidden_states, axis=0)  # [L, S, D]
+        stacked = ops.unsqueeze(stacked, axis=0)  # [1, L, S, D]
+        stacked = ops.permute(stacked, [0, 2, 1, 3])  # [1, S, L, D]
         seq_len = stacked.shape[1]
         return (
             ops.reshape(

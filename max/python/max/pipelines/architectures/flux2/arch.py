@@ -23,8 +23,8 @@ from max.pipelines.lib.config import MAXModelConfig, PipelineConfig
 from max.pipelines.lib.interfaces import ArchConfig
 from typing_extensions import Self
 
-from .pipeline_flux2_klein import Flux2KleinPipeline
 from .pipeline_flux2 import Flux2Pipeline
+from .pipeline_flux2_klein import Flux2KleinPipeline
 
 
 @dataclass(kw_only=True)
