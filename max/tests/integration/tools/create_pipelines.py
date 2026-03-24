@@ -44,12 +44,13 @@ from max.pipelines.architectures.flux1_modulev3.pipeline_flux import (
 from max.pipelines.architectures.flux2_modulev3.pipeline_flux2 import (
     Flux2Pipeline,
 )
-from max.pipelines.architectures.z_image_modulev3.pipeline_z_image import (
-    ZImagePipeline,
 from max.pipelines.architectures.flux2_modulev3.pipeline_flux2_klein import (
     Flux2KleinPipeline,
 )
 from max.pipelines.architectures.internvl.tokenizer import InternVLProcessor
+from max.pipelines.architectures.z_image_modulev3.pipeline_z_image import (
+    ZImagePipeline,
+)
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import (
     PipelineRuntimeConfig,

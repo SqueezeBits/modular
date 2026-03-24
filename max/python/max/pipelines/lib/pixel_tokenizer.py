@@ -362,6 +362,10 @@ class PixelGenerationTokenizer(
 
         Args:
             image: PIL Image or numpy array (uint8) to preprocess.
+            target_height: Optional requested output height before latent prep.
+            target_width: Optional requested output width before latent prep.
+            preserve_aspect_ratio: Whether to keep the source aspect ratio when
+                resizing. When false, resize directly to the target dimensions.
 
         Returns:
             Preprocessed PIL Image with adjusted dimensions.
