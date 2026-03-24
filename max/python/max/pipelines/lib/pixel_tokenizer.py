@@ -314,6 +314,10 @@ class PixelGenerationTokenizer(
     def _preprocess_input_image(
         self,
         image: PIL.Image.Image | npt.NDArray[np.uint8],
+        *,
+        target_height: int | None = None,
+        target_width: int | None = None,
+        preserve_aspect_ratio: bool = True,
     ) -> PIL.Image.Image:
         """Preprocess input image for image-to-image generation.
 
@@ -347,7 +351,7 @@ class PixelGenerationTokenizer(
                 image = image.resize(
                     (new_width, new_height), PIL.Image.Resampling.LANCZOS
                 )
-                image_width, image_height = image.size
+            image_width, image_height = image.size
 
         image_width = max(
             (image_width // multiple_of) * multiple_of, multiple_of
@@ -356,10 +360,25 @@ class PixelGenerationTokenizer(
             (image_height // multiple_of) * multiple_of, multiple_of
         )
 
-        if image.size != (image_width, image_height):
-            image = self._resize_with_center_crop(
-                image, image_width, image_height
+        if target_width is not None:
+            image_width = max(
+                (int(target_width) // multiple_of) * multiple_of, multiple_of
             )
+        if target_height is not None:
+            image_height = max(
+                (int(target_height) // multiple_of) * multiple_of, multiple_of
+            )
+
+        if image.size != (image_width, image_height):
+            if preserve_aspect_ratio:
+                image = self._resize_with_center_crop(
+                    image, image_width, image_height
+                )
+            else:
+                image = image.resize(
+                    (image_width, image_height),
+                    resample=PIL.Image.Resampling.LANCZOS,
+                )
 
         return image
 
@@ -934,7 +953,14 @@ class PixelGenerationTokenizer(
         # 2. Preprocess input image if provided
         preprocessed_image_array = None
         if input_image is not None:
-            preprocessed_image = self._preprocess_input_image(input_image)
+            preprocessed_image = self._preprocess_input_image(
+                input_image,
+                target_height=image_options.height,
+                target_width=image_options.width,
+                preserve_aspect_ratio=(
+                    self._pipeline_class_name != PipelineClassName.ZIMAGE
+                ),
+            )
             height = image_options.height or preprocessed_image.height
             width = image_options.width or preprocessed_image.width
             preprocessed_image_array = np.array(

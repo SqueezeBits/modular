@@ -412,7 +412,11 @@ def _z_image_img2img_starting_latents(
     num_channels_latents = int(pipeline.transformer.config.in_channels)
     image_seq_len = (latent_height // 2) * (latent_width // 2)
 
-    init_image = pipeline.image_processor.preprocess(input_image)
+    init_image = pipeline.image_processor.preprocess(
+        input_image,
+        height=height,
+        width=width,
+    )
     init_image = init_image.to(device=device, dtype=torch.float32)
 
     encode_dtype = next(pipeline.vae.parameters()).dtype
