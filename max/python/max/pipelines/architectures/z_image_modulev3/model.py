@@ -59,6 +59,7 @@ class ZImageTransformerModel(ComponentModel):
             encoding,
             devices,
         )
+        self._cached_default_ids: dict[tuple[int, int, int, str], Tensor] = {}
         self.load_model()
 
     @traced(message="ZImageTransformerModel.load_model")
@@ -85,20 +86,26 @@ class ZImageTransformerModel(ComponentModel):
             weights=state_dict,
         )
 
-    @staticmethod
     def _default_ids(
+        self,
         seq_len: int,
         axes: int,
         start_index: int,
         device: Device,
     ) -> Tensor:
+        cache_key = (seq_len, axes, start_index, str(device))
+        if cache_key in self._cached_default_ids:
+            return self._cached_default_ids[cache_key]
+
         ids = np.zeros((seq_len, axes), dtype=np.int64)
         ids[:, 0] = np.arange(
             start_index, start_index + seq_len, dtype=np.int64
         )
-        return Tensor(
+        ids_tensor = Tensor(
             storage=Buffer.from_dlpack(np.ascontiguousarray(ids)).to(device)
         )
+        self._cached_default_ids[cache_key] = ids_tensor
+        return ids_tensor
 
     @traced(message="ZImageTransformerModel.__call__")
     def __call__(

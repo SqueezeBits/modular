@@ -185,8 +185,12 @@ class ZImagePipeline(DiffusionPipeline):
         self._cached_text_ids: dict[str, Tensor] = {}
         self._cached_sigmas: dict[str, Tensor] = {}
         self._cached_img_ids: dict[str, Tensor] = {}
+        self._cached_img_ids_base_np: dict[str, np.ndarray] = {}
         self._cached_shape_carriers: dict[int, Tensor] = {}
         self._cached_timesteps_batched: dict[str, Tensor] = {}
+        self._cached_timesteps_host: dict[str, np.ndarray] = {}
+        self._cached_prompt_token_tensors: dict[str, Tensor] = {}
+        self._cached_prompt_padding: dict[str, Tensor] = {}
 
     @traced(message="ZImagePipeline.prepare_inputs")
     def prepare_inputs(
@@ -457,11 +461,24 @@ class ZImagePipeline(DiffusionPipeline):
             if not np.all(selected_mask):
                 selected_tokens = tokens[selected_mask]
 
-        text_input_ids = Tensor.constant(
-            selected_tokens,
-            dtype=DType.int64,
-            device=self.text_encoder.devices[0],
+        selected_tokens = np.ascontiguousarray(
+            selected_tokens.astype(np.int64, copy=False)
         )
+        token_digest = hashlib.sha1(selected_tokens.tobytes()).hexdigest()
+        token_key = (
+            f"prompt_tokens::{selected_tokens.shape[0]}::{token_digest}::"
+            f"{self.text_encoder.devices[0]}"
+        )
+        if token_key in self._cached_prompt_token_tensors:
+            text_input_ids = self._cached_prompt_token_tensors[token_key]
+        else:
+            text_input_ids = Tensor(
+                storage=Buffer.from_dlpack(selected_tokens).to(
+                    self.text_encoder.devices[0]
+                )
+            )
+            self._cached_prompt_token_tensors[token_key] = text_input_ids
+
         prompt_embeds = self.text_encoder(text_input_ids)
         if prompt_embeds.rank == 2:
             prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
@@ -488,8 +505,8 @@ class ZImagePipeline(DiffusionPipeline):
 
         return prompt_embeds
 
-    @staticmethod
     def _align_prompt_seq_len(
+        self,
         embeds: Tensor,
         target_seq_len: int,
     ) -> Tensor:
@@ -500,13 +517,21 @@ class ZImagePipeline(DiffusionPipeline):
             return embeds[:, :target_seq_len, :]
 
         pad_len = target_seq_len - cur_len
-        pad = Tensor(
-            storage=Buffer.zeros(
-                (int(embeds.shape[0]), pad_len, int(embeds.shape[2])),
-                embeds.dtype,
-                device=embeds.device,
-            )
+        pad_key = (
+            f"prompt_pad::{int(embeds.shape[0])}::{pad_len}::"
+            f"{int(embeds.shape[2])}::{embeds.dtype}::{embeds.device}"
         )
+        if pad_key in self._cached_prompt_padding:
+            pad = self._cached_prompt_padding[pad_key]
+        else:
+            pad = Tensor(
+                storage=Buffer.zeros(
+                    (int(embeds.shape[0]), pad_len, int(embeds.shape[2])),
+                    embeds.dtype,
+                    device=embeds.device,
+                )
+            )
+            self._cached_prompt_padding[pad_key] = pad
         return F.concat([embeds, pad], axis=1)
 
     @staticmethod
@@ -678,13 +703,17 @@ class ZImagePipeline(DiffusionPipeline):
         image_f32 = image.astype(np.float32) / 127.5 - 1.0
         image_chw = np.transpose(image_f32, (2, 0, 1))
         image_bchw = np.expand_dims(image_chw, axis=0)
-        if batch_size > 1:
-            image_bchw = np.repeat(image_bchw, batch_size, axis=0)
         image_bchw = np.ascontiguousarray(image_bchw)
 
-        return Tensor(
+        image_tensor = Tensor(
             storage=Buffer.from_dlpack(image_bchw).to(self.vae.devices[0])
         ).cast(dtype)
+        if batch_size > 1:
+            image_tensor = F.broadcast_to(
+                image_tensor,
+                [batch_size, 3, height, width],
+            )
+        return image_tensor
 
     @traced(message="ZImagePipeline.prepare_img2img_latents")
     def prepare_img2img_latents(
@@ -726,24 +755,34 @@ class ZImagePipeline(DiffusionPipeline):
         self,
         timesteps: np.ndarray,
         device: Device,
+        cache_key: str | None = None,
     ) -> tuple[Tensor, np.ndarray]:
         transformed_timesteps = (1.0 - timesteps).astype(np.float32, copy=False)
-        num_timesteps = int(transformed_timesteps.shape[0])
-        timesteps_digest = hashlib.sha1(
-            transformed_timesteps.astype(np.float32, copy=False).tobytes()
-        ).hexdigest()
-        timesteps_key = f"timesteps::{num_timesteps}_{timesteps_digest}"
-        if timesteps_key in self._cached_timesteps_batched:
-            return self._cached_timesteps_batched[
-                timesteps_key
-            ], transformed_timesteps
+
+        if cache_key is None:
+            num_timesteps = int(transformed_timesteps.shape[0])
+            first_t = float(transformed_timesteps[0]) if num_timesteps > 0 else 0.0
+            last_t = float(transformed_timesteps[-1]) if num_timesteps > 0 else 0.0
+            cache_key = (
+                f"timesteps::{num_timesteps}::{first_t:.8f}::{last_t:.8f}"
+            )
+
+        if (
+            cache_key in self._cached_timesteps_batched
+            and cache_key in self._cached_timesteps_host
+        ):
+            return (
+                self._cached_timesteps_batched[cache_key],
+                self._cached_timesteps_host[cache_key],
+            )
+
+        transformed_timesteps = np.ascontiguousarray(transformed_timesteps)
 
         timesteps_tensor = Tensor(
-            storage=Buffer.from_dlpack(
-                np.ascontiguousarray(transformed_timesteps)
-            ).to(device)
+            storage=Buffer.from_dlpack(transformed_timesteps).to(device)
         )
-        self._cached_timesteps_batched[timesteps_key] = timesteps_tensor
+        self._cached_timesteps_batched[cache_key] = timesteps_tensor
+        self._cached_timesteps_host[cache_key] = transformed_timesteps
         return timesteps_tensor, transformed_timesteps
 
     @traced(message="ZImagePipeline.execute")
@@ -802,6 +841,23 @@ class ZImagePipeline(DiffusionPipeline):
             text_seq_len: int,
         ) -> tuple[Tensor, Tensor]:
             text_seq_len_padded = text_seq_len + (-text_seq_len % 32)
+            img_ids_base_key = (
+                f"img_ids_base::{image_seq_len}_{model_inputs.height}x"
+                f"{model_inputs.width}"
+            )
+            if img_ids_base_key in self._cached_img_ids_base_np:
+                img_ids_base_np = self._cached_img_ids_base_np[
+                    img_ids_base_key
+                ]
+            else:
+                img_ids_base_np = np.asarray(
+                    latent_image_ids, dtype=np.int64
+                )
+                if img_ids_base_np.ndim == 3:
+                    img_ids_base_np = img_ids_base_np[0]
+                img_ids_base_np = np.ascontiguousarray(img_ids_base_np)
+                self._cached_img_ids_base_np[img_ids_base_key] = img_ids_base_np
+
             img_ids_key = (
                 f"img_ids::{text_seq_len_padded}_{image_seq_len}_"
                 f"{model_inputs.height}x{model_inputs.width}"
@@ -809,9 +865,7 @@ class ZImagePipeline(DiffusionPipeline):
             if img_ids_key in self._cached_img_ids:
                 img_ids_local = self._cached_img_ids[img_ids_key]
             else:
-                img_ids_np = latent_image_ids.astype(np.int64, copy=True)
-                if img_ids_np.ndim == 3:
-                    img_ids_np = img_ids_np[0]
+                img_ids_np = img_ids_base_np.copy()
                 img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
                 img_ids_local = Tensor(
                     storage=Buffer.from_dlpack(
@@ -875,10 +929,17 @@ class ZImagePipeline(DiffusionPipeline):
                 dts_seq = dts_seq.driver_tensor
 
             timesteps_seq: Any
+            timesteps_key = (
+                f"timesteps::{num_timesteps}::{model_inputs.height}x"
+                f"{model_inputs.width}::{int(model_inputs.input_image is not None)}::"
+                f"{model_inputs.num_inference_steps}::{model_inputs.strength:.4f}::"
+                f"{float(getattr(self, '_scheduler_shift', 1.0)):.4f}"
+            )
             timesteps_seq, transformed_timesteps = (
                 self._prepare_timestep_broadcast(
                     timesteps=timesteps,
                     device=device,
+                    cache_key=timesteps_key,
                 )
             )
             if hasattr(timesteps_seq, "driver_tensor"):
