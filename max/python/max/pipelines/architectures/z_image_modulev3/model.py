@@ -16,8 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-from max.driver import Buffer, Device
+from max.driver import Device
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
@@ -59,7 +58,6 @@ class ZImageTransformerModel(ComponentModel):
             encoding,
             devices,
         )
-        self._cached_default_ids: dict[tuple[int, int, int, str], Tensor] = {}
         self.load_model()
 
     @traced(message="ZImageTransformerModel.load_model")
@@ -86,35 +84,14 @@ class ZImageTransformerModel(ComponentModel):
             weights=state_dict,
         )
 
-    def _default_ids(
-        self,
-        seq_len: int,
-        axes: int,
-        start_index: int,
-        device: Device,
-    ) -> Tensor:
-        cache_key = (seq_len, axes, start_index, str(device))
-        if cache_key in self._cached_default_ids:
-            return self._cached_default_ids[cache_key]
-
-        ids = np.zeros((seq_len, axes), dtype=np.int64)
-        ids[:, 0] = np.arange(
-            start_index, start_index + seq_len, dtype=np.int64
-        )
-        ids_tensor = Tensor(
-            storage=Buffer.from_dlpack(np.ascontiguousarray(ids)).to(device)
-        )
-        self._cached_default_ids[cache_key] = ids_tensor
-        return ids_tensor
-
     @traced(message="ZImageTransformerModel.__call__")
     def __call__(
         self,
         hidden_states: Tensor,
         encoder_hidden_states: Tensor,
         timestep: Tensor,
-        img_ids: Tensor | None = None,
-        txt_ids: Tensor | None = None,
+        img_ids: Tensor,
+        txt_ids: Tensor,
         prev_residual: Tensor | None = None,
         prev_output: Tensor | None = None,
         controlnet_block_samples: Tensor | None = None,
@@ -128,20 +105,6 @@ class ZImageTransformerModel(ComponentModel):
         if siglip_feats is not None or image_noise_mask is not None:
             raise NotImplementedError(
                 "Omni(siglip/image_noise_mask) is not supported in z-image phase 1"
-            )
-
-        axes = len(self.config.axes_dims)
-        txt_len = int(encoder_hidden_states.shape[1])
-        img_len = int(hidden_states.shape[1])
-
-        if txt_ids is None:
-            txt_ids = self._default_ids(txt_len, axes, 1, hidden_states.device)
-        if img_ids is None:
-            img_ids = self._default_ids(
-                img_len,
-                axes,
-                txt_len + 1,
-                hidden_states.device,
             )
 
         model_args: tuple[Any, ...] = (

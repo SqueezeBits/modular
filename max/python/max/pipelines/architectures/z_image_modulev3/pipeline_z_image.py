@@ -37,7 +37,6 @@ from max.pipelines.lib.interfaces import (
 )
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.profiler import Tracer, traced
-from PIL import Image as PILImage
 
 from ..autoencoders import AutoencoderKLModel
 from ..qwen3.text_encoder import Qwen3TextEncoderZImageModel
@@ -45,6 +44,13 @@ from .model import ZImageTransformerModel
 
 _DEVICE_TENSOR_FIELDS = frozenset(
     {
+        "tokens_tensor",
+        "negative_tokens_tensor",
+        "txt_ids_tensor",
+        "img_ids_tensor",
+        "negative_txt_ids_tensor",
+        "negative_img_ids_tensor",
+        "input_image_tensor",
         "latents_tensor",
         "sigmas_tensor",
         "h_carrier",
@@ -89,9 +95,15 @@ class ZImageModelInputs(PixelModelInputs):
     guidance_scale: float = 5.0
     num_inference_steps: int = 50
     num_images_per_prompt: int = 1
-    mask: np.ndarray | None = None
-    negative_mask: np.ndarray | None = None
     explicit_negative_prompt: bool = False
+    do_cfg: bool = False
+    tokens_tensor: Tensor
+    negative_tokens_tensor: Tensor | None = None
+    txt_ids_tensor: Tensor
+    img_ids_tensor: Tensor
+    negative_txt_ids_tensor: Tensor | None = None
+    negative_img_ids_tensor: Tensor | None = None
+    input_image_tensor: Tensor | None = None
     latents_tensor: Tensor
     sigmas_tensor: Tensor
     h_carrier: Tensor
@@ -200,6 +212,7 @@ class ZImagePipeline(DiffusionPipeline):
         _validate_z_image_context(context)
         kwargs = ZImageModelInputs.kwargs_from_context(context)
         device = self.transformer.devices[0]
+        text_device = self.text_encoder.devices[0]
 
         # Keep host NumPy fields aligned with the tensors we upload (Flux2-style).
         kwargs["latents"] = np.asarray(context.latents)
@@ -211,6 +224,58 @@ class ZImagePipeline(DiffusionPipeline):
         latent_w = int(latents_np.shape[-1])
         packed_h = int(latent_h // 2)
         packed_w = int(latent_w // 2)
+        image_seq_len = int(np.asarray(context.latent_image_ids).shape[-2])
+
+        tokens_np = self._select_tokens_for_text_encoder(
+            context.tokens.array, context.mask
+        )
+        tokens_tensor = self._token_tensor_from_numpy(tokens_np, text_device)
+        txt_ids_tensor, img_ids_tensor = self._prepare_conditioning_ids(
+            text_seq_len=int(tokens_np.shape[0]),
+            image_seq_len=image_seq_len,
+            latent_image_ids=np.asarray(context.latent_image_ids),
+            height=int(context.height),
+            width=int(context.width),
+            device=device,
+        )
+
+        negative_tokens_tensor: Tensor | None = None
+        negative_txt_ids_tensor: Tensor | None = None
+        negative_img_ids_tensor: Tensor | None = None
+        if context.negative_tokens is not None:
+            negative_tokens_np = self._select_tokens_for_text_encoder(
+                context.negative_tokens.array,
+                context.negative_mask,
+            )
+            negative_tokens_tensor = self._token_tensor_from_numpy(
+                negative_tokens_np, text_device
+            )
+            if context.explicit_negative_prompt:
+                (
+                    negative_txt_ids_tensor,
+                    negative_img_ids_tensor,
+                ) = self._prepare_conditioning_ids(
+                    text_seq_len=int(negative_tokens_np.shape[0]),
+                    image_seq_len=image_seq_len,
+                    latent_image_ids=np.asarray(context.latent_image_ids),
+                    height=int(context.height),
+                    width=int(context.width),
+                    device=device,
+                )
+        do_cfg = (
+            float(context.guidance_scale) > 0.0
+            and negative_tokens_tensor is not None
+        )
+
+        input_image_tensor: Tensor | None = None
+        if context.input_image is not None:
+            input_image_tensor = self._image_to_tensor(
+                image=np.ascontiguousarray(
+                    context.input_image.astype(np.uint8, copy=False)
+                ),
+                batch_size=int(context.num_images_per_prompt),
+                dtype=self.vae.config.dtype,
+            )
 
         latents_tensor = Tensor(
             storage=Buffer.from_dlpack(latents_np).to(device)
@@ -239,6 +304,14 @@ class ZImagePipeline(DiffusionPipeline):
 
         return ZImageModelInputs(
             **kwargs,
+            do_cfg=do_cfg,
+            tokens_tensor=tokens_tensor,
+            negative_tokens_tensor=negative_tokens_tensor,
+            txt_ids_tensor=txt_ids_tensor,
+            img_ids_tensor=img_ids_tensor,
+            negative_txt_ids_tensor=negative_txt_ids_tensor,
+            negative_img_ids_tensor=negative_img_ids_tensor,
+            input_image_tensor=input_image_tensor,
             latents_tensor=latents_tensor,
             sigmas_tensor=sigmas_tensor,
             h_carrier=h_carrier,
@@ -438,15 +511,43 @@ class ZImagePipeline(DiffusionPipeline):
     @traced(message="ZImagePipeline.prepare_prompt_embeddings")
     def prepare_prompt_embeddings(
         self,
-        tokens: np.ndarray,
-        mask: np.ndarray | None,
+        tokens: Tensor,
         num_images_per_prompt: int,
     ) -> Tensor:
         """Encode prompt tokens into text embeddings."""
+        prompt_embeds = self.text_encoder(tokens)
+        if prompt_embeds.rank == 2:
+            prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
+        elif prompt_embeds.rank != 3:
+            raise ValueError(
+                f"Unexpected prompt_embeds rank={prompt_embeds.rank}; expected 2 or 3."
+            )
+        if num_images_per_prompt > 1:
+            batch = int(prompt_embeds.shape[0])
+            seq = int(prompt_embeds.shape[1])
+            hidden = int(prompt_embeds.shape[2])
+            if batch == 1:
+                prompt_embeds = F.broadcast_to(
+                    prompt_embeds,
+                    [num_images_per_prompt, seq, hidden],
+                )
+            else:
+                prompt_embeds = F.concat(
+                    [prompt_embeds] * num_images_per_prompt,
+                    axis=0,
+                )
+
+        return prompt_embeds
+
+    @staticmethod
+    def _select_tokens_for_text_encoder(
+        tokens: np.ndarray,
+        mask: np.ndarray | None,
+    ) -> np.ndarray:
         if tokens.ndim == 2:
             tokens = tokens[0]
-        selected_tokens = tokens
 
+        selected_tokens = tokens
         if mask is not None:
             if mask.ndim == 2:
                 mask = mask[0]
@@ -461,49 +562,69 @@ class ZImagePipeline(DiffusionPipeline):
             if not np.all(selected_mask):
                 selected_tokens = tokens[selected_mask]
 
-        selected_tokens = np.ascontiguousarray(
+        return np.ascontiguousarray(
             selected_tokens.astype(np.int64, copy=False)
         )
-        token_digest = hashlib.sha1(selected_tokens.tobytes()).hexdigest()
+
+    def _token_tensor_from_numpy(
+        self,
+        tokens: np.ndarray,
+        device: Device,
+    ) -> Tensor:
+        token_digest = hashlib.sha1(tokens.tobytes()).hexdigest()
         token_key = (
-            f"prompt_tokens::{selected_tokens.shape[0]}::{token_digest}::"
-            f"{self.text_encoder.devices[0]}"
+            f"prompt_tokens::{tokens.shape[0]}::{token_digest}::{device}"
         )
         if token_key in self._cached_prompt_token_tensors:
-            text_input_ids = self._cached_prompt_token_tensors[token_key]
+            return self._cached_prompt_token_tensors[token_key]
+
+        text_input_ids = Tensor(storage=Buffer.from_dlpack(tokens).to(device))
+        self._cached_prompt_token_tensors[token_key] = text_input_ids
+        return text_input_ids
+
+    def _prepare_conditioning_ids(
+        self,
+        text_seq_len: int,
+        image_seq_len: int,
+        latent_image_ids: np.ndarray,
+        height: int,
+        width: int,
+        device: Device,
+    ) -> tuple[Tensor, Tensor]:
+        text_seq_len_padded = text_seq_len + (-text_seq_len % 32)
+        img_ids_base_key = f"img_ids_base::{image_seq_len}_{height}x{width}"
+        if img_ids_base_key in self._cached_img_ids_base_np:
+            img_ids_base_np = self._cached_img_ids_base_np[img_ids_base_key]
         else:
-            text_input_ids = Tensor(
-                storage=Buffer.from_dlpack(selected_tokens).to(
-                    self.text_encoder.devices[0]
+            img_ids_base_np = np.asarray(latent_image_ids, dtype=np.int64)
+            if img_ids_base_np.ndim == 3:
+                img_ids_base_np = img_ids_base_np[0]
+            img_ids_base_np = np.ascontiguousarray(img_ids_base_np)
+            self._cached_img_ids_base_np[img_ids_base_key] = img_ids_base_np
+
+        img_ids_key = (
+            f"img_ids::{text_seq_len_padded}_{image_seq_len}_{height}x{width}"
+        )
+        if img_ids_key in self._cached_img_ids:
+            img_ids_tensor = self._cached_img_ids[img_ids_key]
+        else:
+            img_ids_np = img_ids_base_np.copy()
+            img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
+            img_ids_tensor = Tensor(
+                storage=Buffer.from_dlpack(np.ascontiguousarray(img_ids_np)).to(
+                    device
                 )
             )
-            self._cached_prompt_token_tensors[token_key] = text_input_ids
+            self._cached_img_ids[img_ids_key] = img_ids_tensor
 
-        prompt_embeds = self.text_encoder(text_input_ids)
-        if prompt_embeds.rank == 2:
-            prompt_embeds = F.unsqueeze(prompt_embeds, axis=0)
-        elif prompt_embeds.rank != 3:
-            raise ValueError(
-                f"Unexpected prompt_embeds rank={prompt_embeds.rank}; expected 2 or 3."
-            )
-        if num_images_per_prompt > 1:
-            batch = int(prompt_embeds.shape[0])
-            seq = int(prompt_embeds.shape[1])
-            hidden = int(prompt_embeds.shape[2])
-            # Avoid F.tile: it can introduce unwanted device transfers; prefer
-            # broadcast_to (batch==1) or concat, matching Flux2 guidance.
-            if batch == 1:
-                prompt_embeds = F.broadcast_to(
-                    prompt_embeds,
-                    [num_images_per_prompt, seq, hidden],
-                )
-            else:
-                prompt_embeds = F.concat(
-                    [prompt_embeds] * num_images_per_prompt,
-                    axis=0,
-                )
+        text_ids_key = f"text_ids::{text_seq_len}"
+        if text_ids_key in self._cached_text_ids:
+            txt_ids_tensor = self._cached_text_ids[text_ids_key]
+        else:
+            txt_ids_tensor = self._prepare_text_ids(text_seq_len, device)
+            self._cached_text_ids[text_ids_key] = txt_ids_tensor
 
-        return prompt_embeds
+        return txt_ids_tensor, img_ids_tensor
 
     def _align_prompt_seq_len(
         self,
@@ -719,16 +840,10 @@ class ZImagePipeline(DiffusionPipeline):
     def prepare_img2img_latents(
         self,
         noise_latents: Tensor,
-        image: np.ndarray,
+        image_tensor: Tensor,
         sigmas: Tensor,
     ) -> Tensor:
         noise_latents = noise_latents.to(self.transformer.devices[0])
-        batch_size = int(noise_latents.shape[0])
-        image_tensor = self._image_to_tensor(
-            image=image,
-            batch_size=batch_size,
-            dtype=self.vae.config.dtype,
-        )
 
         encoder_output = self.vae.encode(image_tensor, return_dict=True)
         posterior = (
@@ -761,8 +876,12 @@ class ZImagePipeline(DiffusionPipeline):
 
         if cache_key is None:
             num_timesteps = int(transformed_timesteps.shape[0])
-            first_t = float(transformed_timesteps[0]) if num_timesteps > 0 else 0.0
-            last_t = float(transformed_timesteps[-1]) if num_timesteps > 0 else 0.0
+            first_t = (
+                float(transformed_timesteps[0]) if num_timesteps > 0 else 0.0
+            )
+            last_t = (
+                float(transformed_timesteps[-1]) if num_timesteps > 0 else 0.0
+            )
             cache_key = (
                 f"timesteps::{num_timesteps}::{first_t:.8f}::{last_t:.8f}"
             )
@@ -785,6 +904,36 @@ class ZImagePipeline(DiffusionPipeline):
         self._cached_timesteps_host[cache_key] = transformed_timesteps
         return timesteps_tensor, transformed_timesteps
 
+    def _prepare_scheduler_inputs(
+        self,
+        model_inputs: ZImageModelInputs,
+        sigmas: Tensor,
+        device: Device,
+    ) -> tuple[Any, Any, np.ndarray]:
+        _, all_dts = self.prepare_scheduler(sigmas)
+        dts_seq: Any = all_dts
+        if hasattr(dts_seq, "driver_tensor"):
+            dts_seq = dts_seq.driver_tensor
+
+        timesteps = model_inputs.timesteps
+        num_timesteps = timesteps.shape[0]
+        timesteps_key = (
+            f"timesteps::{num_timesteps}::{model_inputs.height}x"
+            f"{model_inputs.width}::{int(model_inputs.input_image is not None)}::"
+            f"{model_inputs.num_inference_steps}::{model_inputs.strength:.4f}::"
+            f"{float(getattr(self, '_scheduler_shift', 1.0)):.4f}"
+        )
+        timesteps_seq, transformed_timesteps = self._prepare_timestep_broadcast(
+            timesteps=timesteps,
+            device=device,
+            cache_key=timesteps_key,
+        )
+        timesteps_seq_any: Any = timesteps_seq
+        if hasattr(timesteps_seq_any, "driver_tensor"):
+            timesteps_seq_any = timesteps_seq_any.driver_tensor
+
+        return timesteps_seq_any, dts_seq, transformed_timesteps
+
     @traced(message="ZImagePipeline.execute")
     def execute(  # type: ignore[override]
         self,
@@ -796,22 +945,17 @@ class ZImagePipeline(DiffusionPipeline):
         # 1) Encode prompt embeddings.
         with Tracer("prepare_prompt_embeddings"):
             prompt_embeds = self.prepare_prompt_embeddings(
-                tokens=model_inputs.tokens.array,
-                mask=model_inputs.mask,
+                tokens=model_inputs.tokens_tensor,
                 num_images_per_prompt=model_inputs.num_images_per_prompt,
             )
 
             negative_prompt_embeds: Tensor | None = None
-            negative_tokens = model_inputs.negative_tokens
-            negative_mask = model_inputs.negative_mask
-            do_cfg = (
-                model_inputs.guidance_scale > 0.0
-                and negative_tokens is not None
-            )
-            if do_cfg and negative_tokens is not None:
+            if (
+                model_inputs.do_cfg
+                and model_inputs.negative_tokens_tensor is not None
+            ):
                 negative_prompt_embeds = self.prepare_prompt_embeddings(
-                    tokens=negative_tokens.array,
-                    mask=negative_mask,
+                    tokens=model_inputs.negative_tokens_tensor,
                     num_images_per_prompt=model_inputs.num_images_per_prompt,
                 )
                 if not model_inputs.explicit_negative_prompt:
@@ -823,7 +967,6 @@ class ZImagePipeline(DiffusionPipeline):
         dtype = prompt_embeds.dtype
         latents = model_inputs.latents_tensor
         sigmas = model_inputs.sigmas_tensor
-        latent_image_ids = model_inputs.latent_image_ids
         h_carrier = model_inputs.h_carrier
         w_carrier = model_inputs.w_carrier
 
@@ -835,72 +978,13 @@ class ZImagePipeline(DiffusionPipeline):
 
         # 2) Prepare latents and conditioning tensors.
         device = self.transformer.devices[0]
-        image_seq_len = int(latent_image_ids.shape[-2])
+        img_ids = model_inputs.img_ids_tensor
+        txt_ids = model_inputs.txt_ids_tensor
 
-        def _prepare_conditioning_ids(
-            text_seq_len: int,
-        ) -> tuple[Tensor, Tensor]:
-            text_seq_len_padded = text_seq_len + (-text_seq_len % 32)
-            img_ids_base_key = (
-                f"img_ids_base::{image_seq_len}_{model_inputs.height}x"
-                f"{model_inputs.width}"
-            )
-            if img_ids_base_key in self._cached_img_ids_base_np:
-                img_ids_base_np = self._cached_img_ids_base_np[
-                    img_ids_base_key
-                ]
-            else:
-                img_ids_base_np = np.asarray(
-                    latent_image_ids, dtype=np.int64
-                )
-                if img_ids_base_np.ndim == 3:
-                    img_ids_base_np = img_ids_base_np[0]
-                img_ids_base_np = np.ascontiguousarray(img_ids_base_np)
-                self._cached_img_ids_base_np[img_ids_base_key] = img_ids_base_np
-
-            img_ids_key = (
-                f"img_ids::{text_seq_len_padded}_{image_seq_len}_"
-                f"{model_inputs.height}x{model_inputs.width}"
-            )
-            if img_ids_key in self._cached_img_ids:
-                img_ids_local = self._cached_img_ids[img_ids_key]
-            else:
-                img_ids_np = img_ids_base_np.copy()
-                img_ids_np[:, 0] = img_ids_np[:, 0] + text_seq_len_padded + 1
-                img_ids_local = Tensor(
-                    storage=Buffer.from_dlpack(
-                        np.ascontiguousarray(img_ids_np)
-                    ).to(device)
-                )
-                self._cached_img_ids[img_ids_key] = img_ids_local
-
-            text_ids_key = f"text_ids::{text_seq_len}"
-            if text_ids_key in self._cached_text_ids:
-                txt_ids_local = self._cached_text_ids[text_ids_key]
-            else:
-                txt_ids_local = self._prepare_text_ids(text_seq_len, device)
-                self._cached_text_ids[text_ids_key] = txt_ids_local
-            return img_ids_local, txt_ids_local
-
-        text_seq_len = int(prompt_embeds.shape[1])
-        img_ids, txt_ids = _prepare_conditioning_ids(text_seq_len)
-
-        if model_inputs.input_image is not None:
-            raw_img = model_inputs.input_image
-            if isinstance(raw_img, np.ndarray):
-                img_arr = np.ascontiguousarray(
-                    raw_img.astype(np.uint8, copy=False)
-                )
-            elif isinstance(raw_img, PILImage.Image):
-                img_arr = np.asarray(raw_img.convert("RGB"), dtype=np.uint8)
-            else:
-                raise TypeError(
-                    "input_image must be a HWC uint8 ndarray or PIL.Image; "
-                    f"got {type(raw_img).__name__}"
-                )
+        if model_inputs.input_image_tensor is not None:
             latents = self.prepare_img2img_latents(
                 noise_latents=latents,
-                image=img_arr,
+                image_tensor=model_inputs.input_image_tensor,
                 sigmas=sigmas,
             )
         latents = self.preprocess_latents(latents, dtype)
@@ -917,36 +1001,22 @@ class ZImagePipeline(DiffusionPipeline):
                 image_seq_len,
                 self.transformer.config,
             )
-            if do_cfg
+            if model_inputs.do_cfg
             else None
         )
 
         # 3) Prepare scheduler tensors.
         with Tracer("prepare_scheduler"):
-            _, all_dts = self.prepare_scheduler(sigmas)
-            dts_seq: Any = all_dts
-            if hasattr(dts_seq, "driver_tensor"):
-                dts_seq = dts_seq.driver_tensor
-
-            timesteps_seq: Any
-            timesteps_key = (
-                f"timesteps::{num_timesteps}::{model_inputs.height}x"
-                f"{model_inputs.width}::{int(model_inputs.input_image is not None)}::"
-                f"{model_inputs.num_inference_steps}::{model_inputs.strength:.4f}::"
-                f"{float(getattr(self, '_scheduler_shift', 1.0)):.4f}"
-            )
-            timesteps_seq, transformed_timesteps = (
-                self._prepare_timestep_broadcast(
-                    timesteps=timesteps,
+            timesteps_seq, dts_seq, transformed_timesteps = (
+                self._prepare_scheduler_inputs(
+                    model_inputs=model_inputs,
+                    sigmas=sigmas,
                     device=device,
-                    cache_key=timesteps_key,
                 )
             )
-            if hasattr(timesteps_seq, "driver_tensor"):
-                timesteps_seq = timesteps_seq.driver_tensor
 
         cfg_active: np.ndarray | None = None
-        if do_cfg:
+        if model_inputs.do_cfg:
             if model_inputs.cfg_truncation <= 1.0:
                 cfg_active = (
                     transformed_timesteps <= model_inputs.cfg_truncation
@@ -960,7 +1030,9 @@ class ZImagePipeline(DiffusionPipeline):
                 with Tracer(f"denoising_step_{i}"):
                     timestep = timesteps_seq[i : i + 1]
                     apply_cfg = bool(
-                        do_cfg and cfg_active is not None and cfg_active[i]
+                        model_inputs.do_cfg
+                        and cfg_active is not None
+                        and cfg_active[i]
                     )
                     current_guidance_scale = (
                         model_inputs.guidance_scale if apply_cfg else 0.0
@@ -984,11 +1056,8 @@ class ZImagePipeline(DiffusionPipeline):
                         neg_img_ids = img_ids
                         neg_txt_ids = txt_ids
                         if model_inputs.explicit_negative_prompt:
-                            neg_img_ids, neg_txt_ids = (
-                                _prepare_conditioning_ids(
-                                    int(negative_prompt_embeds.shape[1])
-                                )
-                            )
+                            neg_img_ids = model_inputs.negative_img_ids_tensor
+                            neg_txt_ids = model_inputs.negative_txt_ids_tensor
                         with Tracer("cfg_transformer"):
                             neg_noise_pred = self.run_denoising_step(
                                 step=i,
