@@ -1222,11 +1222,26 @@ class ImageGenerationOracle(PipelineOracle):
 
         # Load the exact pipeline class from model config.
         # AutoPipelineForText2Image in diffusers==0.36.0 cannot resolve FLUX2.
-        pipeline = diffusers.DiffusionPipeline.from_pretrained(
-            self.model_path,
-            revision=revision,
-            torch_dtype=ENCODING_TO_TORCH_DTYPE.get(encoding, torch.bfloat16),  # type: ignore
+        is_z_image = self._is_z_image_model(self.model_path)
+        needs_z_image_img2img = is_z_image and any(
+            getattr(r, "input_image", None) for r in self._inputs
         )
+        if needs_z_image_img2img:
+            pipeline = diffusers.ZImageImg2ImgPipeline.from_pretrained(
+                self.model_path,
+                revision=revision,
+                torch_dtype=ENCODING_TO_TORCH_DTYPE.get(
+                    encoding, torch.bfloat16
+                ),  # type: ignore
+            )
+        else:
+            pipeline = diffusers.DiffusionPipeline.from_pretrained(
+                self.model_path,
+                revision=revision,
+                torch_dtype=ENCODING_TO_TORCH_DTYPE.get(
+                    encoding, torch.bfloat16
+                ),  # type: ignore
+            )
         pipeline = pipeline.to(device)
 
         # Return pipeline as "model" and None as data_processor (not needed for diffusers)
@@ -1772,5 +1787,9 @@ PIPELINE_ORACLES: Mapping[str, PipelineOracle] = {
         "Tongyi-MAI/Z-Image-Turbo",
         num_steps=8,
         requests=test_data.DEFAULT_Z_IMAGE_TURBO_PIXEL_GENERATION,
+    ),
+    "Tongyi-MAI/Z-Image-i2i": ImageGenerationOracle(
+        "Tongyi-MAI/Z-Image",
+        requests=test_data.DEFAULT_Z_IMAGE_PIXEL_GENERATION_I2I,
     ),
 }
