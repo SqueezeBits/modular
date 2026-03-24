@@ -43,13 +43,14 @@ from ..autoencoders import AutoencoderKLModel
 from ..qwen3.text_encoder import Qwen3TextEncoderZImageModel
 from .model import ZImageTransformerModel
 
-
-_DEVICE_TENSOR_FIELDS = frozenset({
-    "latents_tensor",
-    "sigmas_tensor",
-    "h_carrier",
-    "w_carrier",
-})
+_DEVICE_TENSOR_FIELDS = frozenset(
+    {
+        "latents_tensor",
+        "sigmas_tensor",
+        "h_carrier",
+        "w_carrier",
+    }
+)
 
 
 def _validate_z_image_context(context: PixelGenerationContext) -> None:

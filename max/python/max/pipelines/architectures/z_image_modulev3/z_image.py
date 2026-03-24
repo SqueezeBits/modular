@@ -392,7 +392,9 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         return u[:, :img_len, :]
 
     def _forward_standard(self, *args: Tensor) -> tuple[Tensor]:
-        hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids = args[:5]
+        hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids = args[
+            :5
+        ]
         unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
             hidden_states,
             encoder_hidden_states,
@@ -427,7 +429,9 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             txt_ids,
         )
         unified1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
-        first_block_residual = unified1[:, :img_len, :] - unified0[:, :img_len, :]
+        first_block_residual = (
+            unified1[:, :img_len, :] - unified0[:, :img_len, :]
+        )
 
         return fbcache_conditional_execution(
             first_block_residual,

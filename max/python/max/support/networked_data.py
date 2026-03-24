@@ -51,12 +51,11 @@ def fetch_bytes_from_s3(s3_path: str) -> bytes:
         ) from e
 
     bucket, key = path_parts
+
     def _download_bytes(*, anonymous: bool = False) -> bytes:
         buffer = io.BytesIO()
         client_kwargs = (
-            {"config": Config(signature_version=UNSIGNED)}
-            if anonymous
-            else {}
+            {"config": Config(signature_version=UNSIGNED)} if anonymous else {}
         )
         s3 = boto3.client("s3", **client_kwargs)
         s3.download_fileobj(bucket, key, buffer)

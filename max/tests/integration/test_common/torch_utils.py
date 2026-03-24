@@ -462,9 +462,7 @@ def _z_image_img2img_starting_latents(
         seed,
     )
     noise = torch.from_numpy(latents_np).to(device=device, dtype=torch.float32)
-    return pipeline.scheduler.scale_noise(
-        image_latents, latent_timestep, noise
-    )
+    return pipeline.scheduler.scale_noise(image_latents, latent_timestep, noise)
 
 
 def _load_input_image(image_uri: str) -> Image.Image:
@@ -539,9 +537,7 @@ def run_image_generation(
         # This ensures deterministic and comparable outputs
         transformer_in_ch = pipeline.transformer.config.in_channels  # type: ignore[attr-defined]
         num_channels_latents = (
-            transformer_in_ch
-            if is_z_image
-            else transformer_in_ch // 4
+            transformer_in_ch if is_z_image else transformer_in_ch // 4
         )
         vae_scale_factor = pipeline.vae_scale_factor  # type: ignore[attr-defined]
         latent_height = 2 * (height // (vae_scale_factor * 2))
