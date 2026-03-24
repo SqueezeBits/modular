@@ -43,8 +43,8 @@ class ImageProviderOptions(BaseModel):
         description=(
             "Guidance scale for classifier-free guidance. "
             "Higher values make the generation follow the prompt more closely. "
-            "Set to 1.0 to disable CFG. Some distilled models (e.g. Z-Image-Turbo) "
-            "may prefer 0.0. Defaults to 3.5."
+            "Set to 1.0 to disable CFG. Some distilled or guidance-light models "
+            "may prefer lower values. Defaults to 3.5."
         ),
         ge=0.0,
     )
@@ -100,8 +100,8 @@ class ImageProviderOptions(BaseModel):
     cfg_normalization: bool = Field(
         False,
         description=(
-            "Enable Z-Image CFG renormalization. "
-            "When enabled, guided prediction norm is clipped to the positive "
+            "Enable CFG output renormalization when supported by the selected model. "
+            "When enabled, the guided prediction norm is clipped to the positive "
             "prediction norm."
         ),
     )
@@ -109,7 +109,7 @@ class ImageProviderOptions(BaseModel):
     cfg_truncation: float = Field(
         1.0,
         description=(
-            "Z-Image CFG truncation threshold in normalized time. "
+            "CFG truncation threshold in normalized time when supported by the selected model. "
             "CFG is disabled for steps where t_norm > cfg_truncation."
         ),
         gt=0.0,

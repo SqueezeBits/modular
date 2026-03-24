@@ -170,13 +170,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cfg-normalization",
         action="store_true",
-        help="Enable Z-Image CFG renormalization.",
+        help="Enable CFG output renormalization when supported by the selected model.",
     )
     parser.add_argument(
         "--cfg-truncation",
         type=float,
         default=1.0,
-        help="Z-Image CFG truncation threshold in normalized time (> 0).",
+        help="CFG truncation threshold in normalized time when supported by the selected model (> 0).",
     )
     parser.add_argument(
         "--seed",
@@ -266,7 +266,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--prefer-module-v3",
         action="store_true",
-        help="Use the ModuleV3 FLUX implementation instead of the default architecture.",
+        help="Prefer the ModuleV3 implementation when the selected model provides one.",
     )
 
     args = parser.parse_args(argv)

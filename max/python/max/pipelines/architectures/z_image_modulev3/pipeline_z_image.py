@@ -13,8 +13,9 @@
 """Z-Image diffusion pipeline (ModuleV3).
 
 Wires together the Qwen3 text encoder, Z-Image transformer denoiser, and
-standard AutoencoderKL VAE. Mirrors ``Flux2Pipeline`` (``flux2_modulev3``)
-patterns for tracing, module docstrings, and flat weight path assignment.
+standard AutoencoderKL VAE. Follows the shared diffusion-pipeline structure
+used by the image generation architectures in this directory, including
+tracing, module docstrings, and flat weight path assignment.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ _DEVICE_TENSOR_FIELDS = frozenset(
 
 
 def _validate_z_image_context(context: PixelGenerationContext) -> None:
-    """Fail fast before device uploads (mirrors ``Flux2Pipeline.prepare_inputs``)."""
+    """Fail fast before device uploads."""
     if context.latents.size == 0:
         raise ValueError(
             "ZImagePipeline requires non-empty latents in PixelGenerationContext."
@@ -81,13 +82,13 @@ def _validate_z_image_context(context: PixelGenerationContext) -> None:
 
 @dataclass(kw_only=True)
 class ZImageModelInputs(PixelModelInputs):
-    """Z-Image execution inputs (Flux2-style device tensors + host metadata).
+    """Z-Image execution inputs with device tensors and host metadata.
 
     Scalar and NumPy fields are populated from :class:`PixelGenerationContext`
     (concrete type :class:`~max.pipelines.core.PixelContext`) via
     :meth:`kwargs_from_context`; ``latents_tensor``, ``sigmas_tensor``, and
     shape carriers are required device tensors supplied by
-    :meth:`ZImagePipeline.prepare_inputs` in one shot (see ``Flux2ModelInputs``).
+    :meth:`ZImagePipeline.prepare_inputs` in one shot.
     """
 
     width: int = 1024
@@ -113,7 +114,7 @@ class ZImageModelInputs(PixelModelInputs):
     def kwargs_from_context(
         cls, context: PixelGenerationContext
     ) -> dict[str, Any]:
-        """Build kwargs for all fields except device tensors (mirrors ``from_context``)."""
+        """Build kwargs for all fields except device tensors."""
         kwargs: dict[str, Any] = {}
         for dataclass_field in fields(cls):
             name = dataclass_field.name
@@ -214,7 +215,7 @@ class ZImagePipeline(DiffusionPipeline):
         device = self.transformer.devices[0]
         text_device = self.text_encoder.devices[0]
 
-        # Keep host NumPy fields aligned with the tensors we upload (Flux2-style).
+        # Keep host NumPy fields aligned with the tensors we upload.
         kwargs["latents"] = np.asarray(context.latents)
         kwargs["sigmas"] = np.asarray(context.sigmas)
         kwargs["latent_image_ids"] = np.asarray(context.latent_image_ids)
