@@ -388,9 +388,7 @@ class Flux2Pipeline(DiffusionPipeline):
         self._bn_mean: Tensor = self.vae.bn.running_mean
         self._bn_var: Tensor = self.vae.bn.running_var
         num_channels = int(self._bn_mean.shape[0])
-        self._postprocess_and_decode = self.vae.build_fused_decode(
-            device, num_channels
-        )
+        self.vae.build_fused_decode(device, num_channels)
 
     def concat_image_latents(
         self,
@@ -596,7 +594,8 @@ class Flux2Pipeline(DiffusionPipeline):
         Returns:
             uint8 Tensor of shape (B, H, W, C) with values in [0, 255].
         """
-        return self._postprocess_and_decode(latents, h_carrier, w_carrier)
+        # Call through self.vae so the profiler proxy captures component/vae timing.
+        return self.vae(latents, h_carrier, w_carrier)
 
     @staticmethod
     def _prepare_text_ids(
