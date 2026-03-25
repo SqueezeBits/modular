@@ -20,10 +20,9 @@ from .kernels import (
     convert_weights_to_fp8_fnuz_if_needed,
     dynamic_block_scaled_matmul_fp4,
     dynamic_scaled_matmul,
-    matmul_static_scaled_float8,
+    matmul_quantized_input_static_scaled_float8,
     quantize_dynamic_block_scaled_fp4,
     quantize_dynamic_scaled_float8,
-    quantize_static_scaled_float8,
 )
 
 
@@ -109,9 +108,12 @@ def matmul_float8(
     )
 
     if input_scale is not None:
-        x = quantize_static_scaled_float8(x, input_scale, out_type=weight.dtype)
-
-        return matmul_static_scaled_float8(x, weight, input_scale, weight_scale)
+        return matmul_quantized_input_static_scaled_float8(
+            x,
+            weight,
+            input_scale,
+            weight_scale,
+        )
     else:
         x, x_scales = quantize_dynamic_scaled_float8(
             x,

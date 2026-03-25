@@ -11165,6 +11165,98 @@ struct QuantizeStaticScaledFloat8[*, scale_is_inverted: Bool]:
         )
 
 
+@compiler.register("mo.matmul_quantized_input_static_scaled_float8")
+struct MatmulQuantizedInputStaticScaledFloat8:
+    @always_inline
+    @staticmethod
+    def execute[
+        output_type: DType,
+        input_type: DType,
+        weight_type: DType,
+        scale_type: DType,
+        target: StaticString,
+    ](
+        output_tensor: OutputTensor[dtype=output_type, rank=2, ...],
+        input_tensor: InputTensor[dtype=input_type, rank=2, ...],
+        weight_tensor: InputTensor[dtype=weight_type, rank=2, ...],
+        input_scale: Scalar[scale_type],
+        weight_scale: Scalar[scale_type],
+        ctx: DeviceContextPtr,
+    ) raises:
+        comptime assert is_gpu[target](), "only valid on GPUs"
+        comptime assert input_type in (
+            DType.float16,
+            DType.bfloat16,
+            DType.float32,
+        ), "input dtype should be float16, bfloat16 or float32"
+        comptime assert weight_type in (
+            DType.float8_e4m3fn,
+            DType.float8_e4m3fnuz,
+        ), "weight dtype should be float8_e4m3fn or float8_e4m3fnuz"
+
+        var output_tt = output_tensor.to_tile_tensor[DType.int64]()
+        var input_tt = input_tensor.to_tile_tensor[DType.int64]()
+        var weight_tt = weight_tensor.to_tile_tensor[DType.int64]()
+        var input_scale_loaded = input_scale.cast[DType.float32]()
+        var cuda_ctx = ctx.get_device_context()
+
+        # This is a single BF16-input custom-op entrypoint for the static FP8
+        # path. It still materializes quantized activations inside the op
+        # because the matmul load path does not yet support quantize-on-load.
+        comptime K = type_of(input_tt).static_shape[1]
+        var M = Int(input_tt.dim[0]())
+        var quantized_input_buf = cuda_ctx.enqueue_create_buffer[weight_type](
+            M * K
+        )
+        var quantized_input = TileTensor(
+            quantized_input_buf.unsafe_ptr(),
+            row_major(Coord(Idx(M), Idx(K))),
+        )
+        quantize_static_scaled_fp8[](
+            quantized_input,
+            input_tt,
+            input_scale_loaded,
+            cuda_ctx,
+        )
+
+        @parameter
+        @__copy_capture(output_tt, input_scale, weight_scale)
+        @always_inline
+        def scaled_output_fn[
+            dtype: DType, width: Int, *, alignment: Int = 1
+        ](idx: IndexList[2], val: SIMD[dtype, width]):
+            var scale = input_scale.cast[dtype]() * weight_scale.cast[dtype]()
+            var scaled_val = val * scale
+
+            output_tt.store_linear[width=width, alignment=alignment](
+                idx, scaled_val.cast[output_type]()
+            )
+
+        # Create a dummy buffer to instruct the matmul kernel to accumulate
+        # in float32. The null pointer tells vendor matmul to allocate a
+        # temp buffer; the epilogue lambda writes to the real output.
+        comptime N = type_of(weight_tt).static_shape[0]
+        var output_dummy = NDBuffer[
+            rank=2, DType.float32, MutAnyOrigin, DimList[Dim(), N]()
+        ](
+            {},
+            IndexList[2](M, N),
+        )
+
+        matmul[
+            target=target,
+            transpose_b=True,
+            elementwise_lambda_fn=scaled_output_fn,
+        ](
+            TileTensor(output_dummy),
+            quantized_input,
+            weight_tt,
+            Optional(cuda_ctx),
+        )
+
+        _ = quantized_input_buf^
+
+
 @compiler.register("mo.quantize_dynamic_scaled_float8")
 struct QuantizeDynamicScaledFloat8:
     @parameter

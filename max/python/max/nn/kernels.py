@@ -4497,6 +4497,73 @@ def block_scales_interleave(
     return result
 
 
+def matmul_quantized_input_static_scaled_float8(
+    input: TensorValue,
+    weight: TensorValue,
+    input_scale: TensorValue,
+    weight_scale: TensorValue,
+) -> TensorValue:
+    """Quantizes a rank-2 floating input to FP8 and immediately runs a
+    static-scaled FP8 matmul.
+
+    This provides a single custom-op entrypoint for the current static FP8
+    linear path. The present kernel implementation still materializes the
+    quantized activations inside the op before dispatching the FP8 matmul.
+    """
+    if input_scale.shape not in [[], [1]]:
+        raise ValueError(
+            f"expected input_scale to be a scalar, but got shape of {input_scale.shape}"
+        )
+    if weight_scale.shape not in [[], [1]]:
+        raise ValueError(
+            f"expected weight_scale to be a scalar, but got shape of {weight_scale.shape}"
+        )
+
+    if input.dtype not in (DType.float16, DType.bfloat16, DType.float32):
+        raise ValueError(
+            f"expected input dtype to be float16, bfloat16, or float32, but got {input.dtype}"
+        )
+    if weight.dtype not in (DType.float8_e4m3fn, DType.float8_e4m3fnuz):
+        raise ValueError(
+            f"expected weight dtype to be float8_e4m3fn or float8_e4m3fnuz, but got {weight.dtype}"
+        )
+
+    if input.rank != 2:
+        raise ValueError(f"expected input rank to be 2, but got {input.rank}")
+    if weight.rank != 2:
+        raise ValueError(f"expected weight rank to be 2, but got {weight.rank}")
+
+    if input.shape[1] != weight.shape[1]:
+        raise ValueError("K dimension does not match for matmul")
+
+    if input_scale.device != DeviceRef.CPU():
+        raise ValueError(
+            f"expected input_scale to be on CPU, but got {input_scale.device}"
+        )
+    if weight_scale.device != DeviceRef.CPU():
+        raise ValueError(
+            f"expected weight_scale to be on CPU, but got {weight_scale.device}"
+        )
+
+    return ops.custom(
+        "mo.matmul_quantized_input_static_scaled_float8",
+        device=input.device,
+        values=[
+            input,
+            weight,
+            input_scale.reshape([]),
+            weight_scale.reshape([]),
+        ],
+        out_types=[
+            TensorType(
+                dtype=DType.bfloat16,
+                shape=[input.shape[0], weight.shape[0]],
+                device=input.device,
+            )
+        ],
+    )[0].tensor
+
+
 def matmul_static_scaled_float8(
     input: TensorValue,
     weight: TensorValue,
