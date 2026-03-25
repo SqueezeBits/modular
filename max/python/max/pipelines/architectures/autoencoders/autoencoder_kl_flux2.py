@@ -337,6 +337,25 @@ class AutoencoderKLFlux2Model(BaseAutoencoderModel):
 
         return self._fused_model
 
+    def __call__(
+        self, latents: Tensor, h_carrier: Tensor, w_carrier: Tensor
+    ) -> Tensor:
+        """Decode packed latents using the fused postprocess+decode graph.
+
+        This routes through the compiled ``_fused_model`` built by
+        ``build_fused_decode()``, allowing the profiler proxy to capture
+        VAE decode timing via ``component/vae``.
+
+        Args:
+            latents: Packed latents of shape (B, S, C).
+            h_carrier: 1-D shape carrier of length packed_h.
+            w_carrier: 1-D shape carrier of length packed_w.
+
+        Returns:
+            uint8 Tensor of shape (B, H, W, C).
+        """
+        return self._fused_model(latents, h_carrier, w_carrier)
+
     @property
     def bn(self) -> SimpleNamespace:
         """Property to access BatchNorm statistics, compatible with diffusers API.
