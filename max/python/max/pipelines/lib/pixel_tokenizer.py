@@ -73,6 +73,7 @@ class PipelineClassName(str, Enum):
     ZIMAGE = "ZImagePipeline"
     WAN = "WanPipeline"
     WAN_I2V = "WanImageToVideoPipeline"
+    WAN_ANIMATE = "WanAnimatePipeline"
 
     @classmethod
     def from_diffusers_config(
@@ -208,7 +209,7 @@ class PixelGenerationTokenizer(
 
         # Store static model dimensions
         self._default_sample_size = 128
-        if self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V):
+        if self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V, PipelineClassName.WAN_ANIMATE):
             # Noise latent channels = out_channels (16), not in_channels
             # which may be 36 for I2V (16 noise + 4 mask + 16 image)
             self._num_channels_latents = transformer_config.get(
@@ -875,7 +876,7 @@ class PixelGenerationTokenizer(
                 and image_options.negative_prompt is not None
             )
         if (
-            self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V)
+            self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V, PipelineClassName.WAN_ANIMATE)
             and image_options.guidance_scale > 1.0
             and image_options.negative_prompt is not None
         ):
@@ -962,7 +963,7 @@ class PixelGenerationTokenizer(
         )
         boundary_timestep: float | None = None
         step_coefficients: npt.NDArray[np.float32] | None = None
-        if self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V):
+        if self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V, PipelineClassName.WAN_ANIMATE):
             if getattr(self._scheduler, "use_flow_sigmas", False):
                 self._scheduler.flow_shift = self._select_wan_flow_shift(
                     height, width
@@ -975,7 +976,7 @@ class PixelGenerationTokenizer(
         timesteps, sigmas = self._scheduler.retrieve_timesteps_and_sigmas(
             image_seq_len, num_inference_steps
         )
-        if self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V) and hasattr(
+        if self._pipeline_class_name in (PipelineClassName.WAN, PipelineClassName.WAN_I2V, PipelineClassName.WAN_ANIMATE) and hasattr(
             self._scheduler, "build_step_coefficients"
         ):
             step_coefficients = self._scheduler.build_step_coefficients()

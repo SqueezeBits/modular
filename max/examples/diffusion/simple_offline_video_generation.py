@@ -259,9 +259,105 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Path to .npy file with pre-generated initial noise (for parity testing).",
     )
+    parser.add_argument(
+        "--shared-inputs",
+        type=str,
+        default=None,
+        help="Dir with dumped diffusers intermediates for strict parity testing.",
+    )
+
+    # Wan-Animate arguments
+    parser.add_argument(
+        "--driving-video",
+        type=str,
+        default=None,
+        help="Raw driving video for Wan-Animate. Used with --preprocess.",
+    )
+    parser.add_argument(
+        "--preprocess",
+        action="store_true",
+        help="Preprocess --driving-video to extract pose skeleton and face crops.",
+    )
+    parser.add_argument(
+        "--save-preprocessed",
+        type=str,
+        default=None,
+        help="Directory to save preprocessed pose/face videos for reuse.",
+    )
+    parser.add_argument(
+        "--pose-video",
+        type=str,
+        default=None,
+        help="Path to preprocessed pose video for Wan-Animate.",
+    )
+    parser.add_argument(
+        "--face-video",
+        type=str,
+        default=None,
+        help="Path to preprocessed face video for Wan-Animate.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["animate", "replace"],
+        default="animate",
+        help="Wan-Animate mode: 'animate' (motion transfer) or 'replace' (character replacement).",
+    )
+    parser.add_argument(
+        "--background-video",
+        type=str,
+        default=None,
+        help="Path to background video for Wan-Animate replace mode.",
+    )
+    parser.add_argument(
+        "--mask-video",
+        type=str,
+        default=None,
+        help="Path to mask video for Wan-Animate replace mode.",
+    )
+    parser.add_argument(
+        "--segment-frame-length",
+        type=int,
+        default=77,
+        help="Number of frames per segment for Wan-Animate.",
+    )
+    parser.add_argument(
+        "--prev-segment-conditioning-frames",
+        type=int,
+        default=1,
+        help="Number of overlap frames between segments for Wan-Animate.",
+    )
+    parser.add_argument(
+        "--motion-encode-batch-size",
+        type=int,
+        default=8,
+        help="Batch size for motion encoder in Wan-Animate.",
+    )
+    parser.add_argument(
+        "--pytorch-motion-encoder",
+        action="store_true",
+        default=False,
+        help="Use PyTorch bridge for motion encoder (for parity testing).",
+    )
 
     args = parser.parse_args(argv)
     assert args.prompt, "Prompt must be a non-empty string."
+
+    # Validate --preprocess / --driving-video / --pose-video mutual exclusivity
+    if args.preprocess:
+        assert args.driving_video, (
+            "--driving-video is required when --preprocess is set."
+        )
+        assert args.pose_video is None and args.face_video is None, (
+            "--pose-video and --face-video cannot be used with --preprocess."
+        )
+    elif args.driving_video:
+        assert False, (
+            "--driving-video requires --preprocess to extract pose and face."
+        )
+    elif args.pose_video:
+        assert args.face_video, (
+            "--face-video is required when --pose-video is provided."
+        )
 
     # Auto-compute height/width from input image if not specified
     if args.height is None or args.width is None:
@@ -429,6 +525,34 @@ def save_video(frames: list[np.ndarray], output_path: str, fps: int) -> None:
         print(f"Video saved to: {output_path}")
 
 
+def _load_video_frames_ffmpeg(video_path: str) -> list[Any]:
+    """Load video frames as list of PIL Images using ffmpeg."""
+    import PIL.Image
+
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0", video_path,
+    ]
+    info = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    w, h = (int(x) for x in info.split(","))
+
+    cmd = [
+        "ffmpeg", "-i", video_path, "-f", "rawvideo",
+        "-pix_fmt", "rgb24", "-v", "error", "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    raw = proc.stdout
+    frame_size = w * h * 3
+    num_frames = len(raw) // frame_size
+    frames: list[Any] = []
+    for i in range(num_frames):
+        frame = np.frombuffer(
+            raw, dtype=np.uint8, count=frame_size, offset=i * frame_size
+        ).reshape(h, w, 3)
+        frames.append(PIL.Image.fromarray(frame))
+    return frames
+
+
 def _video_frames_from_raw_output(images: np.ndarray) -> list[np.ndarray]:
     """Convert raw pipeline video output [B, C, T, H, W] to uint8 RGB frames."""
     if images.ndim != 5:
@@ -460,6 +584,17 @@ async def generate_video(args: argparse.Namespace) -> None:
     )
     assert arch is not None, "No matching diffusion architecture found."
 
+    # Animate auto-routing: if pose/driving-video provided, switch to WanAnimatePipeline
+    is_animate = args.pose_video or (args.driving_video and args.preprocess)
+    if is_animate and arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
+        animate_arch = PIPELINE_REGISTRY.architectures.get("WanAnimatePipeline")
+        if animate_arch is not None:
+            print(
+                "Animate auto-routing → WanAnimatePipeline"
+                " (--pose-video provided)"
+            )
+            arch = animate_arch
+
     # TI2V auto-routing: if resolved as WanPipeline but --input-image provided,
     # switch to WanI2VPipeline for image conditioning support.
     if arch.name == "WanPipeline" and args.input_image:
@@ -472,6 +607,11 @@ async def generate_video(args: argparse.Namespace) -> None:
                 " (--input-image provided)"
             )
             arch = i2v_arch
+
+    # Wan-Animate defaults to 30 fps (matching diffusers/official config)
+    if arch.name == "WanAnimatePipeline" and args.fps == 16:
+        args.fps = 30
+        print("Wan-Animate: auto-set fps=30 (use --fps to override)")
 
     # Inject LoRA config into diffusers_config if CLI args provided
     diffusers_config = config.model.diffusers_config
@@ -503,6 +643,8 @@ async def generate_video(args: argparse.Namespace) -> None:
         )
         if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
             max_length = 226
+        elif arch.name == "WanAnimatePipeline":
+            max_length = 512
         print(f"Using max length: {max_length} for tokenizer")
 
     if (
@@ -540,7 +682,17 @@ async def generate_video(args: argparse.Namespace) -> None:
     )
 
     effective_num_frames = args.num_frames
-    if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
+    if arch.name == "WanAnimatePipeline" and (args.pose_video or args.driving_video):
+        # Derive frame count from pose or driving video using ffprobe
+        video_for_frames = args.pose_video or args.driving_video
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", video_for_frames],
+            capture_output=True, text=True,
+        )
+        effective_num_frames = int(result.stdout.strip())
+        print(f"Wan-Animate: derived {effective_num_frames} frames from {video_for_frames}")
+    elif arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
         effective_num_frames = _normalize_wan_num_frames(
             args.num_frames, phase="main"
         )
@@ -564,11 +716,63 @@ async def generate_video(args: argparse.Namespace) -> None:
         print(f"Input image: {args.input_image} ({input_image.size[0]}x{input_image.size[1]})")
     context = await tokenizer.new_context(request, input_image=input_image)
 
+    # Attach animate-specific fields to context
+    if is_animate and arch.name == "WanAnimatePipeline":
+        if args.preprocess and args.driving_video:
+            from max.examples.diffusion.wan_animate_preprocess import (
+                preprocess_driving_video,
+                save_preprocessed,
+            )
+
+            raw_frames = _load_video_frames_ffmpeg(args.driving_video)
+            print(f"Preprocessing {len(raw_frames)} driving video frames...")
+            pose_frames, face_frames = preprocess_driving_video(
+                raw_frames, device="cuda"
+            )
+            if args.save_preprocessed:
+                save_preprocessed(
+                    pose_frames, face_frames, args.save_preprocessed
+                )
+            context.pose_video = pose_frames
+            context.face_video = face_frames
+            print(
+                f"Preprocessing complete: {len(pose_frames)} pose frames, "
+                f"{len(face_frames)} face frames."
+            )
+        else:
+            context.pose_video = _load_video_frames_ffmpeg(args.pose_video)
+            context.face_video = _load_video_frames_ffmpeg(args.face_video) if args.face_video else None
+        context.input_image = input_image
+        context.mode = args.mode
+        context.segment_frame_length = args.segment_frame_length
+        context.prev_segment_conditioning_frames = args.prev_segment_conditioning_frames
+        context.motion_encode_batch_size = args.motion_encode_batch_size
+        context.use_pytorch_motion_encoder = args.pytorch_motion_encoder
+        if args.background_video:
+            context.background_video = _load_video_frames_ffmpeg(args.background_video)
+        if args.mask_video:
+            context.mask_video = _load_video_frames_ffmpeg(args.mask_video)
+        print(
+            f"Wan-Animate: {len(context.pose_video)} pose frames, "
+            f"mode={args.mode}, segment_len={args.segment_frame_length}"
+        )
+
     # Override initial noise if provided (for parity testing)
     if args.initial_noise:
         noise = np.load(args.initial_noise).astype(np.float32)
         context.latents = noise
         print(f"Loaded initial noise from {args.initial_noise}: {noise.shape}")
+
+    # Shared inputs directory for strict parity testing
+    if args.shared_inputs:
+        context.shared_inputs_dir = args.shared_inputs
+        # Also load seg 0 noise as initial latents if available
+        seg0_noise = os.path.join(args.shared_inputs, "noise_seg0.npy")
+        if os.path.exists(seg0_noise) and not args.initial_noise:
+            noise = np.load(seg0_noise).astype(np.float32)
+            context.latents = noise
+            print(f"Loaded seg0 noise from shared inputs: {noise.shape}")
+        print(f"Using shared inputs from {args.shared_inputs}")
 
     inputs = PixelGenerationInputs[PixelContext](
         batch={context.request_id: context}
@@ -582,7 +786,7 @@ async def generate_video(args: argparse.Namespace) -> None:
             if args.warmup_negative_prompt is not None
             else args.negative_prompt
         )
-        if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
+        if arch.name in ("WanPipeline", "WanImageToVideoPipeline", "WanAnimatePipeline"):
             warmup_height = (
                 args.warmup_height
                 if args.warmup_height is not None
@@ -624,7 +828,7 @@ async def generate_video(args: argparse.Namespace) -> None:
                 if args.warmup_num_inference_steps is not None
                 else args.num_inference_steps
             )
-        if arch.name in ("WanPipeline", "WanImageToVideoPipeline"):
+        if arch.name in ("WanPipeline", "WanImageToVideoPipeline", "WanAnimatePipeline"):
             warmup_num_frames = _normalize_wan_num_frames(
                 warmup_num_frames, phase="warmup"
             )

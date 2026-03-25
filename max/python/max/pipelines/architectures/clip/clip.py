@@ -16,7 +16,7 @@ from functools import partial
 from max.driver import Device
 from max.dtype import DType
 from max.experimental import functional as F
-from max.experimental.nn import Embedding, Linear, Module
+from max.experimental.nn import Conv2d, Embedding, Linear, Module
 from max.experimental.nn.norm import LayerNorm
 from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
@@ -221,7 +221,10 @@ class CLIPMLP(Module[[Tensor], Tensor]):
             config.hidden_size,
             bias=True,
         )
-        self.act_fn = partial(F.gelu, approximate="quick")
+        if config.hidden_act == "quick_gelu":
+            self.act_fn = partial(F.gelu, approximate="quick")
+        else:
+            self.act_fn = F.gelu
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         """Apply MLP block.
@@ -513,3 +516,130 @@ class CLIPTextModel(Module[..., tuple[Tensor, Tensor]]):
             attention_mask=attention_mask,
             position_ids=position_ids,
         )
+
+
+class CLIPVisionEmbeddings(Module[..., Tensor]):
+    def __init__(self, config: ClipConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.image_size = config.image_size
+        self.patch_size = config.patch_size
+        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.num_positions = self.num_patches + 1  # +1 for cls token
+
+        self.class_embedding = Tensor.zeros(
+            [self.embed_dim],
+            dtype=config.dtype,
+        )
+        self.patch_embedding = Conv2d(
+            kernel_size=self.patch_size,
+            in_channels=config.num_channels,
+            out_channels=self.embed_dim,
+            dtype=config.dtype,
+            stride=self.patch_size,
+            has_bias=False,
+            permute=True,
+        )
+        self.position_embedding = Embedding(
+            self.num_positions,
+            dim=self.embed_dim,
+        )
+
+    def forward(self, pixel_values: Tensor) -> Tensor:
+        batch_size = pixel_values.shape[0]
+
+        # Patch embedding: [B, 3, 224, 224] -> [B, 1280, 16, 16]
+        patch_embeds = self.patch_embedding(pixel_values)
+        # Flatten spatial: [B, 1280, 16, 16] -> [B, 1280, 256]
+        patch_embeds = F.reshape(
+            patch_embeds,
+            (batch_size, self.embed_dim, self.num_patches),
+        )
+        # Transpose: [B, 1280, 256] -> [B, 256, 1280]
+        patch_embeds = F.transpose(patch_embeds, 1, 2)
+
+        # Prepend cls token: [1280] -> [1, 1, 1280] -> [B, 1, 1280]
+        cls_token = self.class_embedding.to(pixel_values.device)
+        cls_token = F.cast(cls_token, patch_embeds.dtype)
+        cls_token = F.unsqueeze(F.unsqueeze(cls_token, 0), 0)
+        cls_tokens = F.broadcast_to(
+            cls_token, (batch_size, 1, self.embed_dim)
+        )
+
+        # Concat: [B, 1+256, 1280] = [B, 257, 1280]
+        embeddings = F.concat([cls_tokens, patch_embeds], axis=1)
+
+        # Add position embeddings
+        position_ids = F.arange(
+            0,
+            self.num_positions,
+            step=1,
+            dtype=DType.int32,
+            device=pixel_values.device,
+        )
+        position_ids = F.unsqueeze(position_ids, 0)
+        pos_embeds = self.position_embedding(position_ids)
+        pos_embeds = F.cast(pos_embeds, embeddings.dtype)
+        embeddings = embeddings + pos_embeds
+
+        return embeddings
+
+
+class CLIPVisionTransformer(Module[[Tensor], Tensor]):
+    def __init__(self, config: ClipConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.embeddings = CLIPVisionEmbeddings(config)
+        # Note: weight key is "pre_layrnorm" (typo in HF checkpoint)
+        self.pre_layrnorm = LayerNorm(
+            self.embed_dim,
+            eps=config.layer_norm_eps,
+            keep_dtype=True,
+        )
+        self.encoder = CLIPEncoder(config)
+        self.post_layernorm = LayerNorm(
+            self.embed_dim,
+            eps=config.layer_norm_eps,
+            keep_dtype=True,
+        )
+
+    def forward(self, pixel_values: Tensor) -> Tensor:
+        hidden_states = self.embeddings(pixel_values)
+        hidden_states = self.pre_layrnorm(hidden_states)
+
+        # Run all layers except the last to get the penultimate hidden state.
+        # Diffusers uses hidden_states[-2] (output_hidden_states=True),
+        # which is the second-to-last layer output.
+        for layer in self.encoder.layers[:-1]:
+            hidden_states = layer(hidden_states, None, None)
+
+        # Return penultimate hidden state (before last encoder layer).
+        # This matches diffusers' `hidden_states[-2]`.
+        return hidden_states
+
+
+class CLIPVisionModel(Module[[Tensor], Tensor]):
+    def __init__(self, config: ClipConfig):
+        super().__init__()
+        self.vision_model = CLIPVisionTransformer(config)
+        self.device = config.device
+        self.config = config
+
+    def input_types(self) -> tuple[TensorType, ...]:
+        return (
+            TensorType(
+                self.config.dtype,
+                shape=[
+                    "batch_size",
+                    self.config.num_channels,
+                    self.config.image_size,
+                    self.config.image_size,
+                ],
+                device=self.device,
+            ),
+        )
+
+    def forward(self, pixel_values: Tensor) -> Tensor:
+        return self.vision_model(pixel_values)

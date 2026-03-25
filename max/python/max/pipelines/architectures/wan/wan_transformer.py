@@ -206,7 +206,7 @@ class _LNWithBias(Module):
         self.bias = Weight("bias", dtype, [dim], device)
 
     def __call__(self, x: TensorValue) -> TensorValue:
-        return ops.layer_norm(x, self.weight, self.bias)
+        return ops.layer_norm(x, self.weight, self.bias, epsilon=1e-5)
 
 
 class _GELU_FF(Module):
@@ -507,9 +507,6 @@ class WanCrossAttention(Module):
                 device=device,
                 has_bias=True,
             )
-            self.norm_added_q = WanRMSNorm(
-                dim, eps=eps, dtype=dtype, device=device
-            )
             self.norm_added_k = WanRMSNorm(
                 dim, eps=eps, dtype=dtype, device=device
             )
@@ -531,14 +528,6 @@ class WanCrossAttention(Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        # Added image KV (Wan 2.1 I2V)
-        if self._has_added_kv and image_embeds is not None:
-            added_key = self.norm_added_k(self.add_k_proj(image_embeds))
-            added_value = self.add_v_proj(image_embeds)
-            # Concatenate image KV with text KV along sequence dim
-            key = ops.concat([key, added_key], axis=1)
-            value = ops.concat([value, added_value], axis=1)
-
         # Reshape to multi-head
         batch_size = query.shape[0]
         q_seq_len = query.shape[1]
@@ -553,7 +542,7 @@ class WanCrossAttention(Module):
             value, [batch_size, kv_seq_len, self.num_heads, self.head_dim]
         )
 
-        # Flash attention (no RoPE for cross-attention)
+        # Flash attention for text KV
         original_dtype = query.dtype
         scale = 1.0 / (self.head_dim**0.5)
         hidden_states = flash_attention_gpu(
@@ -563,6 +552,30 @@ class WanCrossAttention(Module):
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=scale,
         )
+
+        # Dual-path: SEPARATE image attention + SUM (not concat)
+        # Matches diffusers WanAttnProcessor which does two independent
+        # attention passes (text and image) and sums the results.
+        if self._has_added_kv and image_embeds is not None:
+            added_key = self.norm_added_k(self.add_k_proj(image_embeds))
+            added_value = self.add_v_proj(image_embeds)
+            img_kv_len = added_key.shape[1]
+            added_key = ops.reshape(
+                added_key,
+                [batch_size, img_kv_len, self.num_heads, self.head_dim],
+            )
+            added_value = ops.reshape(
+                added_value,
+                [batch_size, img_kv_len, self.num_heads, self.head_dim],
+            )
+            hidden_states_img = flash_attention_gpu(
+                query,
+                added_key,
+                added_value,
+                mask_variant=MHAMaskVariant.NULL_MASK,
+                scale=scale,
+            )
+            hidden_states = hidden_states + hidden_states_img
 
         # Reshape back
         hidden_states = ops.reshape(
@@ -674,10 +687,12 @@ class WanTransformerBlock(Module):
     ) -> TensorValue:
         rotary_emb = (rope_cos, rope_sin)
 
-        # Modulation: scale_shift_table[1,6,D] + timestep_proj[B,6,D]
-        mod = self.scale_shift_table + timestep_proj  # [B, 6, D]
+        # Modulation in f32 (matches diffusers: scale_shift_table + temb.float())
+        mod = ops.cast(self.scale_shift_table, DType.float32) + ops.cast(
+            timestep_proj, DType.float32
+        )  # [B, 6, D] f32
 
-        # Split into 6 modulation parameters
+        # Split into 6 modulation parameters (f32)
         shift_sa = mod[:, 0:1, :]  # [B, 1, D]
         scale_sa = mod[:, 1:2, :]
         gate_sa = mod[:, 2:3, :]
@@ -685,22 +700,30 @@ class WanTransformerBlock(Module):
         scale_ff = mod[:, 4:5, :]
         gate_ff = mod[:, 5:6, :]
 
-        # Self-attention
-        x = self.norm1(hidden_states)
-        x = x * (1 + scale_sa) + shift_sa
+        # Self-attention: norm in f32, modulate in f32, cast back
+        x = ops.cast(self.norm1(hidden_states), DType.float32)
+        x = ops.cast(x * (1 + scale_sa) + shift_sa, hidden_states.dtype)
         x = self.attn1(x, rotary_emb)
-        hidden_states = hidden_states + gate_sa * x
+        # Residual in f32 (matches diffusers: hidden_states.float() + ...)
+        hidden_states = ops.cast(
+            ops.cast(hidden_states, DType.float32) + ops.cast(x, DType.float32) * gate_sa,
+            hidden_states.dtype,
+        )
 
         # Cross-attention (with optional image KV for 2.1 I2V)
         x = self.norm2(hidden_states)
         x = self.attn2(x, encoder_hidden_states, image_embeds=image_embeds)
         hidden_states = hidden_states + x
 
-        # Feed-forward
-        x = self.norm3(hidden_states)
-        x = x * (1 + scale_ff) + shift_ff
+        # Feed-forward: norm in f32, modulate in f32, cast back
+        x = ops.cast(self.norm3(hidden_states), DType.float32)
+        x = ops.cast(x * (1 + scale_ff) + shift_ff, hidden_states.dtype)
         x = self.ffn(x)
-        hidden_states = hidden_states + gate_ff * x
+        # Residual in f32
+        hidden_states = ops.cast(
+            ops.cast(hidden_states, DType.float32) + ops.cast(x, DType.float32) * gate_ff,
+            hidden_states.dtype,
+        )
 
         return hidden_states
 

@@ -41,6 +41,11 @@ class ClipConfig(MAXModelConfigBase):
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
 
+    # Vision-specific fields (used by CLIPVisionModel)
+    image_size: int = 224
+    patch_size: int = 14
+    num_channels: int = 3
+
     @classmethod
     def initialize_from_config(
         cls,

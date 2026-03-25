@@ -11,4 +11,4 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .model import ClipModel
+from .model import ClipModel, ClipVisionModel

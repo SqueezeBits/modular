@@ -33,12 +33,23 @@ modular_py_binary(
     ],
 )
 
+modular_py_library(
+    name = "wan_animate_preprocess",
+    srcs = ["wan_animate_preprocess.py"],
+    deps = [
+        requirement("numpy"),
+        requirement("opencv-python"),
+        requirement("pillow"),
+    ],
+)
+
 modular_py_binary(
     name = "simple_offline_video_generation",
     srcs = ["simple_offline_video_generation.py"],
     tags = ["no-pydeps"],
     deps = [
         ":profiler",
+        ":wan_animate_preprocess",
         "//max/python/max/interfaces",
         "//max/python/max/pipelines",
         "//max/python/max/pipelines/core",

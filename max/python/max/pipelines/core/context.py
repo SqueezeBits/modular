@@ -747,6 +747,8 @@ class PixelContext:
     """Pre-computed scheduler step coefficients."""
     boundary_timestep: float | None = field(default=None)
     """Timestep threshold for switching between high/low noise experts."""
+    shared_inputs_dir: str | None = field(default=None)
+    """Directory with dumped diffusers intermediate tensors for parity testing."""
     status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
 
     @property
