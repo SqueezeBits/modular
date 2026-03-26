@@ -48,7 +48,6 @@ from pathlib import Path
 from typing import cast, get_args
 
 from max.driver import DeviceSpec
-from max.examples.diffusion.profiler import profile_execute
 from max.interfaces import (
     PipelineTask,
     PixelGenerationInputs,
@@ -616,6 +615,8 @@ async def generate_image(args: argparse.Namespace) -> None:
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
     if args.profile_timings:
+        from max.examples.diffusion.profiler import profile_execute
+
         with profile_execute(pipeline) as prof:
             for i in range(args.num_profile_iterations):
                 print(

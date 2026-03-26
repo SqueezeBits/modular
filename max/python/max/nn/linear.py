@@ -78,12 +78,10 @@ class Linear(Module, Shardable):
     Model init moves the bias to the target device if present."""
 
     input_scale: Weight | None = None
-    """The optional input scale stored on CPU with shape ().
-    Model init moves the input_scale to the target device if present."""
+    """The optional input scale stored on the target device with shape ()."""
 
     weight_scale: Weight | None = None
-    """The optional weight scale stored on CPU with shape () or (N,).
-    Model init moves the weight_scale to the target device if present."""
+    """The optional weight scale stored on the target device with shape () or (N,)."""
 
     weight_scale_2: Weight | None = None
     """The optional weight scale 2 used for fp4 quantization."""
@@ -161,7 +159,7 @@ class Linear(Module, Shardable):
                     name=f"{name}.input_scale" if name else "input_scale",
                     dtype=quant_config.input_scale.dtype,
                     shape=(),
-                    device=DeviceRef.CPU(),
+                    device=device,
                     quantization_encoding=quantization_encoding,
                 )
 
@@ -184,7 +182,7 @@ class Linear(Module, Shardable):
                 # TODO: Pass a per-layer quantization type.
                 # For now since we only support row-wise
                 shape=weight_scale_shape,
-                device=DeviceRef.CPU(),
+                device=device,
                 quantization_encoding=quantization_encoding,
             )
             if quant_config.is_nvfp4:
@@ -192,7 +190,7 @@ class Linear(Module, Shardable):
                     name=f"{name}.weight_scale_2" if name else "weight_scale_2",
                     dtype=quant_config.input_scale.dtype,
                     shape=(),
-                    device=DeviceRef.CPU(),
+                    device=device,
                     quantization_encoding=quantization_encoding,
                 )
 
