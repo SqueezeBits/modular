@@ -16,7 +16,7 @@ from __future__ import annotations
 from math import prod
 
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
 from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu
 from max.nn.layer import LayerList, Module
@@ -58,12 +58,7 @@ class WanConv3d(Module):
 
 
 class WanLayerNorm(Module):
-    """LayerNorm using decomposed ops for float32 numerical stability.
-
-    The built-in ``layer_norm_gpu_block`` kernel hits
-    ``CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`` for dim=5120, so we decompose
-    into basic ops (mean, rsqrt, multiply) that each launch small kernels.
-    """
+    """LayerNorm using the built-in fused ``ops.layer_norm`` kernel."""
 
     def __init__(
         self,
@@ -86,6 +81,9 @@ class WanLayerNorm(Module):
                 self.bias = Weight("bias", dtype, [dim], device)
 
     def __call__(self, x: TensorValue) -> TensorValue:
+        if self.has_weight and self.has_bias:
+            return ops.layer_norm(x, self.weight, self.bias, epsilon=self.eps)
+        # Non-affine: decomposed ops (no gamma/beta to pass to fused kernel)
         original_dtype = x.dtype
         x = ops.cast(x, DType.float32)
         mean = ops.mean(x, axis=-1)
@@ -100,11 +98,7 @@ class WanLayerNorm(Module):
 
 
 class WanRMSNorm(Module):
-    """RMSNorm using decomposed ops for float32 numerical stability.
-
-    Same reason as WanLayerNorm: the built-in ``rms_norm`` custom kernel
-    may also hit resource limits for dim=5120.
-    """
+    """RMSNorm using the built-in fused ``rms_norm`` custom kernel."""
 
     def __init__(
         self,
@@ -119,12 +113,21 @@ class WanRMSNorm(Module):
         self.eps = eps
 
     def __call__(self, x: TensorValue) -> TensorValue:
-        original_dtype = x.dtype
-        x = ops.cast(x, DType.float32)
-        rms = ops.mean(x * x, axis=-1)
-        x = x * ops.rsqrt(rms + self.eps)
-        x = x * ops.cast(self.weight, DType.float32)
-        return ops.cast(x, original_dtype)
+        weight = ops.cast(self.weight, x.dtype)
+        if x.device:
+            weight = weight.to(x.device)
+        return ops.custom(
+            "rms_norm",
+            x.device,
+            [
+                x,
+                weight,
+                ops.constant(self.eps, dtype=x.dtype, device=DeviceRef.CPU()),
+                ops.constant(0.0, dtype=x.dtype, device=DeviceRef.CPU()),
+            ],
+            [TensorType(dtype=x.dtype, shape=x.shape, device=x.device)],
+            parameters={"multiply_before_cast": True},
+        )[0].tensor
 
 
 class WanTextProjection(Module):
