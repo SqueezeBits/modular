@@ -47,6 +47,8 @@ and pass the resulting `pose_video` and `face_video` to the pipeline.
 | 6 CLIP Vision → MAX-native | ✅ Done | Replaces PyTorch bridge. Returns penultimate hidden state (`hidden_states[-2]`). |
 | 6.1 f32 precision fix | ✅ Done | Transformer block modulation/residual ops in f32 matching diffusers. |
 | 7 Motion Encoder → MAX-native | ✅ Done | StyleGAN2 CNN as MAX Graph. PyTorch bridge optionally available via `--pytorch-motion-encoder`. |
+| 8 Performance profiling | ✅ Done | MAX 1.93x slower E2E vs compiled diffusers. Top bottlenecks: VAE encode 2.25x, transformer 1.59x per step. See Phase 8 section. |
+| 8.5 Transformer optimization | ✅ Done | Fused RMSNorm/LayerNorm kernels: 11% E2E improvement (286→254s), transformer 15% faster per step (5215→4413ms). Gap vs torch.compile: 1.71x (down from 1.93x). |
 
 ---
 
@@ -425,6 +427,167 @@ frames padded to 153, the last 47 frames were completely different.
 
 ---
 
+## Next Steps
+
+### Phase 7: Motion Encoder → MAX-Native — ✅ DONE
+
+Replaced PyTorch bridge with fully MAX-native Graph API implementation.
+Standalone parity: **cos=0.999976** across all 77 frames (480p test).
+
+| Component | Implementation |
+|---|---|
+| `EqualConv2d`/`EqualLinear` | Scale `1/sqrt(fan_in)` baked into weights at load time |
+| `FusedLeakyReLU` | `ops.where(x > 0, x * sqrt(2), x * 0.2 * sqrt(2))` with channel bias |
+| FIR blur filter | Depthwise `ops.conv2d` with `[1,3,3,1]` kernel as Weight (auto-placed on device) |
+| QR decomposition | `np.linalg.qr` at load time; `diag @ Q.T` simplified to single matmul `x @ Q.T` |
+
+New classes in `wan_animate_transformer.py`:
+- `_MotionActivation` — fused bias + leaky_relu + scale
+- `_MotionConv2d` — conv2d with optional blur and activation (NHWC/RSCF layout)
+- `_MotionResBlock` — two convs + skip, `(out + skip) / sqrt(2)`
+- `_MotionLinear` — pre-scaled linear layer
+- `WanAnimateMotionEncoder` — full encoder module
+- `WanAnimateMotionEncoderBridge` — PyTorch bridge (kept for optional use)
+
+Weight preprocessing in `wan_animate_model.py`:
+- Conv: OIHW → RSCF transpose, scale baked in
+- Linear: [out, in] → [in, out] transpose, scale baked in
+- `motion_synthesis_weight` → QR → `q_matrix` (float32)
+- FIR blur filters synthesized at load time
+- Indexed keys remapped: `res_blocks.{i}.` → `res_blocks_{i}.`
+
+**PyTorch bridge fallback**: The original `WanAnimateMotionEncoderBridge` is
+retained and can be activated via `--pytorch-motion-encoder` CLI flag (or
+`use_pytorch_motion_encoder=True` in `WanAnimateModelInputs`). This uses
+identical cuDNN ops as diffusers and is useful for parity testing. The bridge
+is loaded lazily only when requested — no PyTorch overhead in default mode.
+
+### Phase 8: Performance Profiling & Optimization
+
+Compare end-to-end latency and per-component latency between diffusers
+(with `torch.compile`) and MAX for the Wan Animate pipeline. If MAX is slower,
+identify bottlenecks and optimize.
+
+**Step 8.1: Update `profiler.py`**
+
+The current `profiler.py` method/component target lists are tuned for Flux-style
+pipelines. Wan Animate has different components (motion encoder, face encoder,
+CLIP image encoder, multi-segment VAE encode/decode) that need explicit profiling
+targets. Modify `profiler.py` to:
+
+- Add Wan Animate method specs: `clip_encode`, `_encode_pose_segment`,
+  `_encode_face_segment`, `_run_animate_denoising`, `_decode_segment_latents`,
+  `_build_segment_condition`, `_prepare_animate_i2v_condition`
+- Add Wan Animate component specs: `motion_encoder`, `face_encoder`,
+  `image_encoder` (CLIP), `transformer`, `vae` (with encode/decode split)
+- For diffusers: add Wan Animate `__call__` method wrapping plus component
+  wrapping for `transformer.motion_encoder`, `transformer.face_encoder`,
+  `image_encoder`, `vae`, `text_encoder`
+- Ensure both end-to-end and per-component timings are captured
+
+**Step 8.2: Add profiling to `wan_animate_move_diffusers.py`**
+
+- Add `--profile-timings`, `--num-warmups` (default 1), `--num-profile-iterations` (default 1)
+- Before profiling: `torch.compile` each component (transformer, VAE,
+  text_encoder, image_encoder) following the pattern in `run_diffusers_flux.py`
+- Run warmup iterations, then profile with `profile_execute(pipe, is_diffusers=True)`
+- Report method and component timings
+
+**Step 8.3: Verify MAX `--profile-timings` works for Wan Animate**
+
+- The existing `simple_offline_video_generation.py` already supports
+  `--profile-timings` — verify it works end-to-end with the animate pipeline
+  and produces meaningful per-component breakdown
+
+**Step 8.4: Baseline numbers** — ✅ DONE
+
+Config: 480×848, 2 segments (77 frames each), 20 steps, guidance_scale=1.0,
+seed=42, single GPU (H100).
+
+| Component | Diffusers | Diffusers (compiled) | MAX | MAX/Compiled |
+|---|---|---|---|---|
+| **E2E** | **167.0s** | **148.2s** | **285.9s** | **1.93x** |
+| Transformer (per step, 40 total) | 3,744ms | 3,286ms | 5,215ms | 1.59x |
+| VAE encode (per call, 5–6 total) | 1,291ms | 1,282ms | 2,886ms | 2.25x |
+| VAE decode (per call, 2 total) | 2,701ms | 2,733ms | 3,758ms | 1.38x |
+| CLIP image encode | 442ms | 19ms | (in face_seg) | — |
+| Motion encoder (per batch of 8) | (in transformer) | (in transformer) | 2,150ms | — |
+| Face encoder (per call) | (in transformer) | (in transformer) | 1.4ms | — |
+| Text encoder | 277ms | 44ms | 63ms | 1.43x |
+| encode_face_segment (total) | — | — | 44,414ms | — |
+| encode_pose_segment (total) | — | — | 13,414ms | — |
+
+`torch.compile(mode="max-autotune", fullgraph=True)` applied to transformer,
+VAE, text_encoder, and image_encoder. 1 warmup iteration before profiling.
+
+**Analysis:**
+- **Transformer** dominates both: 89% of compiled diffusers E2E, 73% of MAX
+  E2E. MAX is 1.59x slower per step vs compiled. `torch.compile` gives
+  diffusers a 12% per-step speedup.
+- **VAE encode** is 2.25x slower — largest relative gap. Called 5–6 times
+  (pose segments + ref image). Total: 6.4s (compiled) vs 17.3s (MAX).
+- **Motion encoder** adds 43s in MAX (15% of E2E). In diffusers, this runs
+  inside the first transformer step (not separately measurable).
+- **Text encoder** is comparable after torch.compile (44ms vs 63ms).
+- **CLIP image encode**: torch.compile dramatically helps (442ms → 19ms).
+
+**Step 8.5: Optimize if MAX is slower**
+
+Based on profiled report, identify the top bottleneck components and optimize.
+Potential optimization targets:
+- Graph compilation overhead (warm-up vs steady-state)
+- VAE encode/decode efficiency
+- Transformer block execution
+- Data transfer overhead (CPU↔GPU, tensor conversions)
+
+**Step 8.5a: Fuse transformer block groups** — ❌ REVERTED
+
+Attempted fusing 5 blocks + 1 face adapter into single graphs. The larger graph
+was **slower** (10.0s/step vs 8.76s baseline steady-state). The MAX compiler is
+less efficient with very large graphs. Reverted to individual block execution.
+
+**Step 8.5b: Replace decomposed norms with fused kernels** — ✅ DONE
+
+Replaced decomposed `WanRMSNorm` (5 ops: cast, mul+mean, mul+rsqrt, mul, cast)
+with the built-in fused `ops.custom("rms_norm")` kernel. Also replaced affine
+`WanLayerNorm` with `ops.layer_norm`. The earlier `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`
+workaround for dim=5120 is no longer needed — the fused kernels work correctly.
+
+- 5 RMSNorm + 1 affine LayerNorm per block x 40 blocks = 240 fused norms/step
+- Each fused norm replaces ~5 decomposed kernel launches
+
+**Step 8.5 profiling results** (480x848, 2 segments, 20 steps, guidance=1.0, H100):
+
+| Component | Diffusers (compiled) | MAX (8.4) | MAX (8.5 fused) | 8.5/Compiled |
+|---|---|---|---|---|
+| **E2E** | **148.2s** | **285.9s** | **253.6s** | **1.71x** |
+| Transformer (per step, 40 total) | 3,286ms | 5,215ms | 4,413ms | 1.34x |
+| VAE encode (per call, 5–6 total) | 1,282ms | 2,886ms | 2,774ms | 2.16x |
+| VAE decode (per call, 2 total) | 2,733ms | 3,758ms | 3,664ms | 1.34x |
+| Motion encoder (per batch of 8) | (in transformer) | 2,150ms | 2,143ms | — |
+| Face encoder (per call) | (in transformer) | 1.4ms | 0.8ms | — |
+| Text encoder | 44ms | 63ms | 58ms | 1.32x |
+
+E2E comparison:
+
+| Scenario | E2E | vs Compiled Diffusers |
+|---|---|---|
+| MAX 8.4 baseline (with warmup) | 285.9s | 1.93x |
+| **MAX 8.5 fused norms (with warmup)** | **253.6s** | **1.71x** |
+| Diffusers (torch.compile, warmup) | 148.2s | 1.00x |
+
+Key findings:
+- **Warmup has negligible impact** (~1s). Block graphs compile near-instantly.
+- **Fused norms: 11% E2E improvement** (285.9 → 253.6s). Eliminates ~200
+  redundant kernel launches per step.
+- **Transformer per-step: 15% faster** (5,215 → 4,413ms). Gap vs compiled
+  diffusers narrowed from 1.59x to 1.34x.
+- **Remaining E2E gap vs torch.compile: 1.71x** (down from 1.93x).
+  Remaining gap likely from torch.compile's cross-op fusion and optimized
+  attention kernels.
+
+---
+
 ## Architecture Reference
 
 ### How Wan-Animate Differs from Wan I2V
@@ -729,39 +892,6 @@ motion_encoder.motion_synthesis_weight                 # [512, 20] QR-decomposed
 ---
 
 ## Next Steps
-
-### Phase 7: Motion Encoder → MAX-Native — ✅ DONE
-
-Replaced PyTorch bridge with fully MAX-native Graph API implementation.
-Standalone parity: **cos=0.999976** across all 77 frames (480p test).
-
-| Component | Implementation |
-|---|---|
-| `EqualConv2d`/`EqualLinear` | Scale `1/sqrt(fan_in)` baked into weights at load time |
-| `FusedLeakyReLU` | `ops.where(x > 0, x * sqrt(2), x * 0.2 * sqrt(2))` with channel bias |
-| FIR blur filter | Depthwise `ops.conv2d` with `[1,3,3,1]` kernel as Weight (auto-placed on device) |
-| QR decomposition | `np.linalg.qr` at load time; `diag @ Q.T` simplified to single matmul `x @ Q.T` |
-
-New classes in `wan_animate_transformer.py`:
-- `_MotionActivation` — fused bias + leaky_relu + scale
-- `_MotionConv2d` — conv2d with optional blur and activation (NHWC/RSCF layout)
-- `_MotionResBlock` — two convs + skip, `(out + skip) / sqrt(2)`
-- `_MotionLinear` — pre-scaled linear layer
-- `WanAnimateMotionEncoder` — full encoder module
-- `WanAnimateMotionEncoderBridge` — PyTorch bridge (kept for optional use)
-
-Weight preprocessing in `wan_animate_model.py`:
-- Conv: OIHW → RSCF transpose, scale baked in
-- Linear: [out, in] → [in, out] transpose, scale baked in
-- `motion_synthesis_weight` → QR → `q_matrix` (float32)
-- FIR blur filters synthesized at load time
-- Indexed keys remapped: `res_blocks.{i}.` → `res_blocks_{i}.`
-
-**PyTorch bridge fallback**: The original `WanAnimateMotionEncoderBridge` is
-retained and can be activated via `--pytorch-motion-encoder` CLI flag (or
-`use_pytorch_motion_encoder=True` in `WanAnimateModelInputs`). This uses
-identical cuDNN ops as diffusers and is useful for parity testing. The bridge
-is loaded lazily only when requested — no PyTorch overhead in default mode.
 
 ### Replace Mode (Phase 4)
 

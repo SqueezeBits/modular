@@ -223,6 +223,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Directory to save all intermediate tensors for parity testing.",
     )
+    parser.add_argument(
+        "--profile-timings",
+        action="store_true",
+        help="Profile per-component and per-method timings.",
+    )
+    parser.add_argument(
+        "--num-warmups",
+        type=int,
+        default=1,
+        help="Number of warmup runs before profiling.",
+    )
+    parser.add_argument(
+        "--num-profile-iterations",
+        type=int,
+        default=1,
+        help="Number of profiling iterations.",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Apply torch.compile to transformer and VAE before profiling.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -640,7 +662,48 @@ def run(args: argparse.Namespace) -> Path:
         pipe_kwargs["callback_on_step_end"] = dumper.make_step_callback()
         pipe_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
-    frames = pipe(**pipe_kwargs).frames[0]
+    if args.profile_timings:
+        from profiler import profile_execute
+
+        if args.torch_compile:
+            print("Applying torch.compile to all components...")
+            pipe.transformer = torch.compile(
+                pipe.transformer, mode="max-autotune", fullgraph=True
+            )
+            pipe.vae = torch.compile(
+                pipe.vae, mode="max-autotune", fullgraph=True
+            )
+            if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+                pipe.text_encoder = torch.compile(
+                    pipe.text_encoder,
+                    mode="max-autotune",
+                    fullgraph=True,
+                )
+            if (
+                hasattr(pipe, "image_encoder")
+                and pipe.image_encoder is not None
+            ):
+                pipe.image_encoder = torch.compile(
+                    pipe.image_encoder,
+                    mode="max-autotune",
+                    fullgraph=True,
+                )
+
+        for i in range(args.num_warmups):
+            print(f"Running warmup {i + 1} of {args.num_warmups}")
+            pipe(**pipe_kwargs)
+
+        with profile_execute(pipe, is_diffusers=True) as prof:
+            for i in range(args.num_profile_iterations):
+                print(
+                    f"Running profiled inference {i + 1} of "
+                    f"{args.num_profile_iterations}"
+                )
+                result = pipe(**pipe_kwargs)
+        prof.report(unit="ms")
+        frames = result.frames[0]
+    else:
+        frames = pipe(**pipe_kwargs).frames[0]
 
     if dumper is not None:
         # Compute num_segments for config saving.
