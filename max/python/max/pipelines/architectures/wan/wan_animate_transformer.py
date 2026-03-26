@@ -11,12 +11,11 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-"""Wan-Animate transformer components (MAX Graph API + PyTorch bridges).
+"""Wan-Animate transformer components (MAX Graph API).
 
 New modules for Wan-Animate that extend the base Wan transformer:
 - WanAnimatePosePatchEmbedding: Conv3d for pose latent injection
 - WanAnimateMotionEncoder: MAX-native StyleGAN2-based motion encoder
-- WanAnimateMotionEncoderBridge: PyTorch bridge (kept for reference/fallback)
 - WanAnimateFaceEncoder: CausalConv1d face encoder (MAX Graph API)
 - WanAnimateFaceBlock: Face adapter cross-attention (MAX Graph API)
 - WanAnimatePreProcess: Extended pre-processing with pose + CLIP
@@ -769,81 +768,6 @@ class WanAnimateMotionEncoder(Module):
         q_t = ops.permute(self.q_matrix, [1, 0])  # [motion_dim, out_dim]
         motion_vec = ops.matmul(x, q_t)  # [B, out_dim=512]
         return ops.cast(motion_vec, DType.bfloat16)
-
-
-class WanAnimateMotionEncoderBridge:
-    """PyTorch bridge for the StyleGAN2-based motion encoder.
-
-    Loads the motion encoder sub-model from the diffusers checkpoint
-    and runs get_motion() via PyTorch. This runs once per segment
-    (not per denoising step), so performance is not critical.
-    """
-
-    def __init__(self, model_path: str, device: str = "cuda") -> None:
-        import torch
-        from diffusers import WanAnimateTransformer3DModel
-
-        logger.info("Loading motion encoder from %s", model_path)
-        # Build model on CPU (not meta) to preserve computed buffers
-        # like blur_kernel (FIR antialiasing filter, not in checkpoint).
-        diffusers_model = WanAnimateTransformer3DModel.from_config(
-            WanAnimateTransformer3DModel.load_config(
-                model_path, subfolder="transformer"
-            )
-        )
-        # Load only motion_encoder weights from safetensors
-        from safetensors.torch import load_file
-        from pathlib import Path
-
-        transformer_dir = Path(model_path)
-        if not transformer_dir.is_dir():
-            from huggingface_hub import snapshot_download
-            transformer_dir = Path(snapshot_download(model_path))
-        transformer_dir = transformer_dir / "transformer"
-
-        motion_state_dict: dict[str, torch.Tensor] = {}
-        for sf_path in sorted(transformer_dir.glob("*.safetensors")):
-            sd = load_file(str(sf_path), device="cpu")
-            for k, v in sd.items():
-                if k.startswith("motion_encoder."):
-                    motion_state_dict[k] = v
-
-        me_state = {
-            k[len("motion_encoder."):]: v
-            for k, v in motion_state_dict.items()
-        }
-        # strict=False: blur_kernel buffers are computed at init, not in checkpoint
-        diffusers_model.motion_encoder.load_state_dict(me_state, strict=False)
-        self.motion_encoder = diffusers_model.motion_encoder.to(
-            device=device, dtype=torch.bfloat16
-        ).eval()
-        self.device = device
-
-    def encode(
-        self, face_pixels: np.ndarray, batch_size: int = 8
-    ) -> np.ndarray:
-        """Encode face crops to motion vectors.
-
-        Args:
-            face_pixels: [T, 3, 512, 512] float32 in [-1, 1].
-
-        Returns:
-            [T, 512] float32 motion vectors.
-        """
-        import torch  
-        num_frames = face_pixels.shape[0]
-        all_motions = []
-
-        with torch.no_grad():
-            for start in range(0, num_frames, batch_size):
-                end = min(start + batch_size, num_frames)
-                batch = torch.from_numpy(face_pixels[start:end]).to(
-                    device=self.device, dtype=torch.bfloat16,
-                )
-                motion = self.motion_encoder(batch)
-                all_motions.append(motion.float().cpu().numpy())
-
-        return np.concatenate(all_motions, axis=0)  # [T, 512]
 
 
 class CLIPImageEncoderBridge:

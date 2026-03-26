@@ -55,7 +55,6 @@ from .model import WanTransformerModel
 from .pipeline_wan import WanCompiled, WanModelInputs, WanPipeline, WanPipelineOutput
 from .pipeline_wan_i2v import WanI2VPipeline
 from .wan_animate_model import WanAnimateTransformerModel
-from .wan_animate_transformer import WanAnimateMotionEncoderBridge
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +79,6 @@ class WanAnimateModelInputs(WanModelInputs):
     prev_segment_conditioning_frames: int = 1
     # Motion encoder batch size
     motion_encode_batch_size: int = 8
-    # Use PyTorch bridge for motion encoder instead of MAX-native.
-    # Useful for parity testing against diffusers (identical cuDNN ops).
-    use_pytorch_motion_encoder: bool = False
     # Shared inputs dir for parity testing (dumped from diffusers)
     shared_inputs_dir: str | None = None
 
@@ -170,29 +166,7 @@ class WanAnimatePipeline(WanI2VPipeline):
         self.transformer_2 = None
         super().init_remaining_components()
 
-        # PyTorch bridge for motion encoder (loaded lazily on first use,
-        # only when use_pytorch_motion_encoder=True).
-        self._pytorch_motion_encoder: WanAnimateMotionEncoderBridge | None = (
-            None
-        )
-        self._model_path = str(
-            self.pipeline_config.model.huggingface_weight_repo or ""
-        )
-
         # image_encoder is set as an attribute by _load_sub_models via setattr
-
-    def _get_pytorch_motion_encoder(self) -> WanAnimateMotionEncoderBridge:
-        """Lazily load the PyTorch motion encoder bridge."""
-        if self._pytorch_motion_encoder is None:
-            device = (
-                "cuda"
-                if str(self.transformer.devices[0]) != "cpu"
-                else "cpu"
-            )
-            self._pytorch_motion_encoder = WanAnimateMotionEncoderBridge(
-                self._model_path, device=device
-            )
-        return self._pytorch_motion_encoder
 
     @traced(message="WanAnimatePipeline.execute")
     def execute(  # type: ignore[override]
@@ -364,7 +338,6 @@ class WanAnimatePipeline(WanI2VPipeline):
                     seg_face,
                     model_inputs.motion_encode_batch_size,
                     device,
-                    use_pytorch=model_inputs.use_pytorch_motion_encoder,
                 )
 
             _dump(f"motion_vectors_seg{seg_idx}", motion_vectors)
@@ -807,7 +780,6 @@ class WanAnimatePipeline(WanI2VPipeline):
         face_frames: list[Any],
         batch_size: int,
         device: Device,
-        use_pytorch: bool = False,
     ) -> tuple[Buffer, np.ndarray]:
         """Encode face frames via motion encoder + face encoder.
 
@@ -815,8 +787,6 @@ class WanAnimatePipeline(WanI2VPipeline):
             face_frames: List of face frame images.
             batch_size: Batch size for motion encoder.
             device: Target device.
-            use_pytorch: If True, use PyTorch bridge for motion encoding
-                (identical to diffusers). If False (default), use MAX-native.
 
         Returns:
             Tuple of (face_emb Buffer [B, T//4+1, 5, 5120],
@@ -845,28 +815,22 @@ class WanAnimatePipeline(WanI2VPipeline):
 
         face_pixels = np.stack(face_np_list, axis=0)  # [T, 3, 512, 512]
 
-        if use_pytorch:
-            # PyTorch bridge: identical cuDNN ops as diffusers
-            motion_vectors = self._get_pytorch_motion_encoder().encode(
-                face_pixels, batch_size=batch_size
+        # MAX-native motion encoder
+        num_frames = face_pixels.shape[0]
+        all_motions: list[np.ndarray] = []
+        for start in range(0, num_frames, batch_size):
+            end = min(start + batch_size, num_frames)
+            batch_np = face_pixels[start:end]
+            batch_buf = _numpy_f32_to_buffer(
+                batch_np.astype(np.float32),
+                self.vae.config.dtype,
+                device,
             )
-        else:
-            # MAX-native motion encoder
-            num_frames = face_pixels.shape[0]
-            all_motions: list[np.ndarray] = []
-            for start in range(0, num_frames, batch_size):
-                end = min(start + batch_size, num_frames)
-                batch_np = face_pixels[start:end]
-                batch_buf = _numpy_f32_to_buffer(
-                    batch_np.astype(np.float32),
-                    self.vae.config.dtype,
-                    device,
-                )
-                motion_buf = self.transformer.encode_motion(batch_buf)
-                all_motions.append(_buffer_to_numpy_f32(motion_buf))
-            motion_vectors = np.concatenate(
-                all_motions, axis=0
-            )  # [T, 512]
+            motion_buf = self.transformer.encode_motion(batch_buf)
+            all_motions.append(_buffer_to_numpy_f32(motion_buf))
+        motion_vectors = np.concatenate(
+            all_motions, axis=0
+        )  # [T, 512]
 
         # Face encoder (MAX Graph): [1, T, 512] -> [1, T//4+1, 5, 5120]
         motion_buf = _numpy_f32_to_buffer(
@@ -1218,10 +1182,6 @@ class WanAnimatePipeline(WanI2VPipeline):
         if hasattr(context, "motion_encode_batch_size"):
             animate_inputs.motion_encode_batch_size = (
                 context.motion_encode_batch_size
-            )
-        if hasattr(context, "use_pytorch_motion_encoder"):
-            animate_inputs.use_pytorch_motion_encoder = (
-                context.use_pytorch_motion_encoder
             )
         if hasattr(context, "shared_inputs_dir"):
             animate_inputs.shared_inputs_dir = context.shared_inputs_dir

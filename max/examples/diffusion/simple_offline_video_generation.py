@@ -338,13 +338,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=8,
         help="Batch size for motion encoder in Wan-Animate.",
     )
-    parser.add_argument(
-        "--pytorch-motion-encoder",
-        action="store_true",
-        default=False,
-        help="Use PyTorch bridge for motion encoder (for parity testing).",
-    )
-
     args = parser.parse_args(argv)
     assert args.prompt, "Prompt must be a non-empty string."
 
@@ -753,7 +746,6 @@ async def generate_video(args: argparse.Namespace) -> None:
         context.segment_frame_length = args.segment_frame_length
         context.prev_segment_conditioning_frames = args.prev_segment_conditioning_frames
         context.motion_encode_batch_size = args.motion_encode_batch_size
-        context.use_pytorch_motion_encoder = args.pytorch_motion_encoder
         if args.background_video:
             context.background_video = _load_video_frames_ffmpeg(args.background_video)
         if args.mask_video:
