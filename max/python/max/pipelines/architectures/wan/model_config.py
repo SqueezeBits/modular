@@ -21,73 +21,39 @@ from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from pydantic import Field
 
 
-class AutoencoderKLWanConfigBase(MAXModelConfigBase):
-    # Defaults mirror Wan2.2 AutoencoderKLWan config.
-    base_dim: int = 96
-    decoder_base_dim: int | None = None
-    z_dim: int = 16
-    dim_mult: tuple[int, ...] = (1, 2, 4, 4)
-    num_res_blocks: int = 2
-    attn_scales: tuple[float, ...] = ()
-    temporal_downsample: tuple[bool, ...] = (False, True, True)
-    dropout: float = 0.0
-    is_residual: bool = False
-    in_channels: int = 3
-    out_channels: int = 3
-    patch_size: int | None = None
-    scale_factor_temporal: int = 4
-    scale_factor_spatial: int = 8
-    latents_mean: tuple[float, ...] = (
-        -0.7571,
-        -0.7089,
-        -0.9113,
-        0.1075,
-        -0.1745,
-        0.9653,
-        -0.1517,
-        1.5508,
-        0.4134,
-        -0.0715,
-        0.5517,
-        -0.3632,
-        -0.1922,
-        -0.9497,
-        0.2503,
-        -0.2921,
-    )
-    latents_std: tuple[float, ...] = (
-        2.8184,
-        1.4541,
-        2.3275,
-        2.6558,
-        1.2196,
-        1.7708,
-        2.6052,
-        2.0743,
-        3.2687,
-        2.1526,
-        2.8652,
-        1.5579,
-        1.6382,
-        1.1253,
-        2.8251,
-        1.9160,
-    )
+class WanConfigBase(MAXModelConfigBase):
+    # Defaults mirror diffusers WanTransformer3DModel constructor defaults.
+    patch_size: tuple[int, int, int] = (1, 2, 2)
+    num_attention_heads: int = 40
+    attention_head_dim: int = 128
+    in_channels: int = 16
+    out_channels: int = 16
+    text_dim: int = 4096
+    freq_dim: int = 256
+    ffn_dim: int = 13824
+    num_layers: int = 40
+    cross_attn_norm: bool = True
+    qk_norm: str | None = "rms_norm_across_heads"
+    eps: float = 1e-6
+    image_dim: int | None = None
+    added_kv_proj_dim: int | None = None
+    rope_max_seq_len: int = 1024
+    pos_embed_seq_len: int | None = None
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
 
 
-class AutoencoderKLWanConfig(AutoencoderKLWanConfigBase):
+class WanConfig(WanConfigBase):
     @staticmethod
     def generate(
         config_dict: dict[str, Any],
         encoding: SupportedEncoding,
         devices: list[Device],
-    ) -> "AutoencoderKLWanConfig":
+    ) -> "WanConfig":
         init_dict = {
             key: value
             for key, value in config_dict.items()
-            if key in AutoencoderKLWanConfigBase.__annotations__
+            if key in WanConfigBase.__annotations__
         }
         init_dict.update(
             {
@@ -95,4 +61,4 @@ class AutoencoderKLWanConfig(AutoencoderKLWanConfigBase):
                 "device": DeviceRef.from_device(devices[0]),
             }
         )
-        return AutoencoderKLWanConfig(**init_dict)
+        return WanConfig(**init_dict)

@@ -13,7 +13,6 @@
 
 """Configuration classes for MAX pipelines."""
 
-from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 from max.pipelines.lib.pipeline_runtime_config import (
     DEFAULT_MAX_BATCH_INPUT_TOKENS,
 )
@@ -46,7 +45,6 @@ from .speculative_config import SpeculativeConfig, SpeculativeMethod
 __all__ = [
     "DEFAULT_MAX_BATCH_INPUT_TOKENS",
     "AudioGenerationConfig",
-    "DenoisingCacheConfig",
     "KVCacheConfig",
     "LoRAConfig",
     "MAXModelConfig",

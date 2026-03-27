@@ -678,6 +678,7 @@ class PixelContext:
         guidance_scale: Guidance scale for classifier-free guidance.
         num_images_per_prompt: Number of images/videos to generate per prompt.
         input_image: Optional input image for image-to-image generation (PIL.Image.Image).
+        residual_threshold: Residual threshold for step-cache early stopping.
         model_name: Name of the model being used.
     """
 
@@ -730,10 +731,22 @@ class PixelContext:
     true_cfg_scale: float = field(default=1.0)
     num_warmup_steps: int = field(default=0)
     num_images_per_prompt: int = field(default=1)
+    residual_threshold: float = field(default=0.08)
+    """Residual threshold for step-cache early stopping during denoising."""
     input_image: npt.NDArray[np.uint8] | None = field(default=None)
     """Input image as numpy array (H, W, C) in uint8 format for image-to-image generation."""
     image: npt.NDArray[np.uint8] | None = field(default=None)
     """Decoded output image (H, W, C) uint8 [0, 255]. Set after generation completes."""
+    num_frames: int | None = field(default=None)
+    """Number of frames for video generation."""
+    frames_per_second: int = field(default=16)
+    """Frame rate for video output."""
+    guidance_scale_2: float | None = field(default=None)
+    """Secondary guidance scale for low-noise expert (MoE models)."""
+    step_coefficients: npt.NDArray[np.float32] | None = field(default=None)
+    """Pre-computed scheduler step coefficients."""
+    boundary_timestep: float | None = field(default=None)
+    """Timestep threshold for switching between high/low noise experts."""
     status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
 
     @property
