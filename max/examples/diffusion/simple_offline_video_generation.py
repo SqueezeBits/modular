@@ -510,7 +510,7 @@ def save_video(frames: list[np.ndarray], output_path: str, fps: int) -> None:
         "-preset",
         "medium",
         "-crf",
-        "18",
+        "26",
         output_path,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -883,38 +883,19 @@ async def generate_video(args: argparse.Namespace) -> None:
                 print(
                     f"Running inference {i + 1} of {args.num_profile_iterations}"
                 )
-                try:
-                    outputs = pipeline.execute(inputs)
-                except Exception:
-                    # Video output post-processing may fail through the
-                    # PixelGenerationPipeline wrapper; timing is still valid.
-                    outputs = None
+                model_inputs = pipeline._pipeline_model.prepare_inputs(
+                    context
+                )
+                model_outputs = pipeline._pipeline_model.execute(
+                    model_inputs
+                )
         prof.report(unit="ms")
-        if outputs is None:
-            print("Profiling complete (output post-processing skipped).")
-            return
-
-        output = outputs[context.request_id]
-        output = await tokenizer.postprocess(output)
-
-        if not output.is_done:
-            print(f"WARNING: Generation status: {output.final_status}")
+        if not isinstance(model_outputs.images, np.ndarray):
+            print("Profiling complete (no raw numpy output).")
             return
 
         print("Generation complete!")
-        if not output.output:
-            print("ERROR: No output generated")
-            return
-
-        frames = []
-        for image_content in output.output:
-            if not getattr(image_content, "image_data", None):
-                continue
-            print(
-                "ERROR: profile mode still returned encoded image payloads; "
-                "run without --profile-timings for the raw fast path."
-            )
-            return
+        frames = _video_frames_from_raw_output(model_outputs.images)
     else:
         import time as _time
 

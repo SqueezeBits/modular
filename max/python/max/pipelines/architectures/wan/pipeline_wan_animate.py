@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import sys
+import time as _time_mod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -174,12 +175,12 @@ class WanAnimatePipeline(WanI2VPipeline):
         model_inputs: WanAnimateModelInputs,
         **kwargs: object,
     ) -> WanPipelineOutput:
-        import time as _time
+
 
         del kwargs
         device = self.transformer.devices[0]
 
-        t_start = _time.perf_counter()
+        t_start = _time_mod.perf_counter()
 
         # Set up intermediate tensor dumping for parity testing.
         dump_dir = model_inputs.shared_inputs_dir
@@ -299,7 +300,38 @@ class WanAnimatePipeline(WanI2VPipeline):
             num_pose_frames, num_segments, segment_len, prev_cond_frames, mode,
         )
 
-        t_prep = _time.perf_counter()
+        t_prep = _time_mod.perf_counter()
+
+        # Pre-compute ref condition (same for all segments)
+        vae_t = self.vae_scale_factor_temporal
+        h_l = h // self.vae_scale_factor_spatial
+        w_l = w // self.vae_scale_factor_spatial
+        z_dim = self.vae.config.z_dim
+
+        ref_image = model_inputs.input_image
+        if not isinstance(ref_image, np.ndarray):
+            ref_image = np.array(ref_image)
+        ref_f32 = ref_image.astype(np.float32) / 127.5 - 1.0
+        if ref_f32.ndim == 3:
+            ref_f32 = ref_f32.transpose(2, 0, 1)
+        if ref_f32.shape[1] != h or ref_f32.shape[2] != w:
+            import PIL.Image
+            pil = PIL.Image.fromarray(
+                ((ref_f32.transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+            )
+            pil = pil.resize((w, h), PIL.Image.Resampling.LANCZOS)
+            ref_f32 = (np.array(pil).astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
+
+        ref_video = ref_f32[np.newaxis, :, np.newaxis, :, :]
+        ref_buf = _numpy_f32_to_buffer(ref_video, self.vae.config.dtype, device)
+        ref_latent_np = _buffer_to_numpy_f32(self.vae.encode(ref_buf))
+
+        lat_mean = np.array(self.vae.config.latents_mean, dtype=np.float32).reshape(1, z_dim, 1, 1, 1)
+        lat_inv_std = 1.0 / np.array(self.vae.config.latents_std, dtype=np.float32).reshape(1, z_dim, 1, 1, 1)
+        ref_latent_std = (ref_latent_np - lat_mean) * lat_inv_std
+
+        ref_mask = np.ones((1, vae_t, 1, h_l, w_l), dtype=np.float32)
+        y_ref = np.concatenate([ref_mask, ref_latent_std], axis=1)
 
         # === Segment loop ===
         all_out_frames: list[np.ndarray] = []
@@ -320,6 +352,7 @@ class WanAnimatePipeline(WanI2VPipeline):
             )
 
             # 5. Encode pose segment via VAE
+            _t_vae_enc = _time_mod.perf_counter()
             with Tracer(f"segment_{seg_idx}:vae_encode_pose"):
                 pose_latents = self._encode_pose_segment(
                     seg_pose, h, w, device
@@ -329,27 +362,31 @@ class WanAnimatePipeline(WanI2VPipeline):
                     tuple(int(d) for d in pose_latents.shape),
                     num_seg_frames,
                 )
+            logger.info(
+                "Segment %d VAE encode pose: %.1fs",
+                seg_idx, _time_mod.perf_counter() - _t_vae_enc,
+            )
 
             _dump(f"pose_latents_seg{seg_idx}", pose_latents)
 
             # 6. Encode face segment via motion encoder + face encoder
+            _t_face = _time_mod.perf_counter()
             with Tracer(f"segment_{seg_idx}:encode_face"):
                 face_emb, motion_vectors = self._encode_face_segment(
                     seg_face,
-                    model_inputs.motion_encode_batch_size,
                     device,
                 )
+            logger.info(
+                "Segment %d face encode: %.1fs",
+                seg_idx, _time_mod.perf_counter() - _t_face,
+            )
 
             _dump(f"motion_vectors_seg{seg_idx}", motion_vectors)
             _dump(f"face_emb_seg{seg_idx}", face_emb)
 
             # 7. Build I2V conditioning (reuse proven I2V method)
+            _t_cond = _time_mod.perf_counter()
             with Tracer(f"segment_{seg_idx}:build_condition"):
-                vae_t = self.vae_scale_factor_temporal
-                h_l = h // self.vae_scale_factor_spatial
-                w_l = w // self.vae_scale_factor_spatial
-                z_dim = self.vae.config.z_dim
-
                 # Create segment-level model inputs with correct num_frames
                 seg_model_inputs = WanAnimateModelInputs(
                     tokens=model_inputs.tokens,
@@ -368,34 +405,7 @@ class WanAnimatePipeline(WanI2VPipeline):
                 t_l = int(pose_latents.shape[2])  # e.g., 20 for 77 frames
                 total_latent_t = 1 + t_l  # ref(1) + segment(T_l) = 21
 
-                # Build ref condition: single ref frame VAE encode
-                ref_image = model_inputs.input_image
-                if not isinstance(ref_image, np.ndarray):
-                    ref_image = np.array(ref_image)
-                ref_f32 = ref_image.astype(np.float32) / 127.5 - 1.0
-                if ref_f32.ndim == 3:
-                    ref_f32 = ref_f32.transpose(2, 0, 1)
-                if ref_f32.shape[1] != h or ref_f32.shape[2] != w:
-                    import PIL.Image
-                    pil = PIL.Image.fromarray(
-                        ((ref_f32.transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-                    )
-                    pil = pil.resize((w, h), PIL.Image.Resampling.LANCZOS)
-                    ref_f32 = (np.array(pil).astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
-
-                # Encode ref as single-frame video [1, 3, 1, H, W]
-                ref_video = ref_f32[np.newaxis, :, np.newaxis, :, :]
-                ref_buf = _numpy_f32_to_buffer(ref_video, self.vae.config.dtype, device)
-                ref_latent_np = _buffer_to_numpy_f32(self.vae.encode(ref_buf))
-
-                # Standardize ref latents
-                lat_mean = np.array(self.vae.config.latents_mean, dtype=np.float32).reshape(1, z_dim, 1, 1, 1)
-                lat_inv_std = 1.0 / np.array(self.vae.config.latents_std, dtype=np.float32).reshape(1, z_dim, 1, 1, 1)
-                ref_latent_std = (ref_latent_np - lat_mean) * lat_inv_std
-
-                # Build ref condition: [mask(vae_t) | latent(z_dim)] = [20, 1, H_l, W_l]
-                ref_mask = np.ones((1, vae_t, 1, h_l, w_l), dtype=np.float32)
-                y_ref = np.concatenate([ref_mask, ref_latent_std], axis=1)
+                # y_ref is pre-computed before the segment loop
 
                 # Build prev-segment condition.
                 if seg_idx == 0 or prev_segment_cond_video is None:
@@ -528,6 +538,11 @@ class WanAnimatePipeline(WanI2VPipeline):
                     latent_model_input, condition
                 )
 
+            logger.info(
+                "Segment %d build condition: %.1fs",
+                seg_idx, _time_mod.perf_counter() - _t_cond,
+            )
+
             # Pre-compile VAE decoder for this segment
             lat_shape = latents.shape
             self.vae.prewarm_for_latent_shape(
@@ -555,6 +570,7 @@ class WanAnimatePipeline(WanI2VPipeline):
                 )
 
             # 10. Denoising loop
+            _t_denoise_seg = _time_mod.perf_counter()
             with Tracer(f"segment_{seg_idx}:denoising"):
                 latents = self._run_animate_denoising(
                     latents=latents,
@@ -573,14 +589,23 @@ class WanAnimatePipeline(WanI2VPipeline):
                     spatial_shape=spatial_shape,
                     guidance_scale=guidance_scale_high,
                 )
+            logger.info(
+                "Segment %d denoising (20 steps): %.1fs",
+                seg_idx, _time_mod.perf_counter() - _t_denoise_seg,
+            )
 
             _dump(f"final_latents_seg{seg_idx}", latents)
 
             # 11. VAE decode (skip first latent frame = conditioned ref image)
+            _t_vae_dec = _time_mod.perf_counter()
             with Tracer(f"segment_{seg_idx}:vae_decode"):
                 decoded = self._decode_segment_latents(
                     latents, model_inputs, skip_first=True
                 )
+            logger.info(
+                "Segment %d VAE decode: %.1fs",
+                seg_idx, _time_mod.perf_counter() - _t_vae_dec,
+            )
 
             # For segments 1+, strip first prev_cond_frames from output
             if seg_idx > 0 and prev_cond_frames > 0:
@@ -598,14 +623,14 @@ class WanAnimatePipeline(WanI2VPipeline):
             seg_start += effective_seg_len
             seg_end += effective_seg_len
 
-        t_denoise = _time.perf_counter()
+        t_denoise = _time_mod.perf_counter()
 
         # === Assembly ===
         video = np.concatenate(all_out_frames, axis=2)
         # Trim to original pose video length
         video = video[:, :, :num_pose_frames, :, :]
 
-        t_total = _time.perf_counter()
+        t_total = _time_mod.perf_counter()
         logger.info(
             "Animate timing: prep=%.1fs, denoise=%.1fs, total=%.1fs",
             t_prep - t_start, t_denoise - t_prep, t_total - t_start,
@@ -778,23 +803,22 @@ class WanAnimatePipeline(WanI2VPipeline):
     def _encode_face_segment(
         self,
         face_frames: list[Any],
-        batch_size: int,
         device: Device,
-    ) -> tuple[Buffer, np.ndarray]:
+    ) -> tuple[Buffer, Buffer]:
         """Encode face frames via motion encoder + face encoder.
 
         Args:
             face_frames: List of face frame images.
-            batch_size: Batch size for motion encoder.
             device: Target device.
 
         Returns:
             Tuple of (face_emb Buffer [B, T//4+1, 5, 5120],
-            motion_vectors ndarray [T, 512]).
+            motion_vectors Buffer [T, 512]).
         """
         # Convert face frames to [T, 3, 512, 512] float32 in [-1, 1]
         import PIL.Image
 
+        _t_pil = _time_mod.perf_counter()
         face_np_list = []
         for frame in face_frames:
             if not isinstance(frame, np.ndarray):
@@ -813,33 +837,46 @@ class WanAnimatePipeline(WanI2VPipeline):
                     frame = frame.astype(np.float32) / 127.5 - 1.0
             face_np_list.append(frame)
 
+        logger.info(
+            "  face PIL resize: %.1fs (%d frames)",
+            _time_mod.perf_counter() - _t_pil, len(face_np_list),
+        )
+        _t0 = _time_mod.perf_counter()
         face_pixels = np.stack(face_np_list, axis=0)  # [T, 3, 512, 512]
+        logger.info(
+            "  face np.stack: %.1fs",
+            _time_mod.perf_counter() - _t0,
+        )
 
-        # MAX-native motion encoder
+        # MAX-native motion encoder — single batch for all frames.
+        # Pass Buffer directly to face encoder via zero-copy view(),
+        # avoiding GPU→CPU→GPU roundtrip.
         num_frames = face_pixels.shape[0]
-        all_motions: list[np.ndarray] = []
-        for start in range(0, num_frames, batch_size):
-            end = min(start + batch_size, num_frames)
-            batch_np = face_pixels[start:end]
-            batch_buf = _numpy_f32_to_buffer(
-                batch_np.astype(np.float32),
-                self.vae.config.dtype,
-                device,
-            )
-            motion_buf = self.transformer.encode_motion(batch_buf)
-            all_motions.append(_buffer_to_numpy_f32(motion_buf))
-        motion_vectors = np.concatenate(
-            all_motions, axis=0
-        )  # [T, 512]
-
-        # Face encoder (MAX Graph): [1, T, 512] -> [1, T//4+1, 5, 5120]
-        motion_buf = _numpy_f32_to_buffer(
-            motion_vectors[np.newaxis].astype(np.float32),
+        _t0 = _time_mod.perf_counter()
+        all_buf = _numpy_f32_to_buffer(
+            face_pixels.astype(np.float32),
             self.vae.config.dtype,
             device,
         )
-        face_emb = self.transformer.encode_face(motion_buf)
-        return face_emb, motion_vectors
+        motion_buf = self.transformer.encode_motion(all_buf)
+        logger.info(
+            "  motion encoder: %.1fs (%d frames, single batch)",
+            _time_mod.perf_counter() - _t0, num_frames,
+        )
+
+        # Face encoder (MAX Graph): [1, T, 512] -> [1, T//4+1, 5, 5120]
+        # Unsqueeze motion_buf [T, 512] -> [1, T, 512] via zero-copy view.
+        _t0 = _time_mod.perf_counter()
+        motion_shape = tuple(int(d) for d in motion_buf.shape)
+        motion_buf_3d = motion_buf.view(
+            motion_buf.dtype, (1, motion_shape[0], motion_shape[1])
+        )
+        face_emb = self.transformer.encode_face(motion_buf_3d)
+        logger.info(
+            "  face encoder: %.1fs",
+            _time_mod.perf_counter() - _t0,
+        )
+        return face_emb, motion_buf
 
     def _build_segment_condition(
         self,
@@ -1028,6 +1065,11 @@ class WanAnimatePipeline(WanI2VPipeline):
             disable=not sys.stderr.isatty(),
         )
 
+        # Pre-compute uncond face embedding once (constant across steps)
+        uncond_face_emb: Buffer | None = None
+        if do_cfg and negative_prompt_embeds is not None:
+            uncond_face_emb = self._get_uncond_face_emb(face_emb)
+
         for i in progress:  # type: ignore[attr-defined]
             with Tracer(f"denoise_step_{i}"):
                 dit_timestep = batched_timesteps[i]
@@ -1062,6 +1104,7 @@ class WanAnimatePipeline(WanI2VPipeline):
                 # CFG (2-pass: positive then negative)
                 if do_cfg and negative_prompt_embeds is not None:
                     assert guidance_scale is not None
+                    assert uncond_face_emb is not None
                     noise_uncond = self.transformer(
                         latent_model_input,
                         dit_timestep,
@@ -1071,8 +1114,7 @@ class WanAnimatePipeline(WanI2VPipeline):
                         rope_cos,
                         rope_sin,
                         spatial_shape,
-                        # Zero out face for uncond: face * 0 - 1
-                        self._get_uncond_face_emb(face_emb),
+                        uncond_face_emb,
                         num_temporal_frames,
                     )
                     noise_uncond = getattr(
