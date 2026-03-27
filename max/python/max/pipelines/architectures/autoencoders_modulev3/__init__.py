@@ -11,8 +11,5 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .scheduler_factory import SchedulerFactory
-from .scheduling_flow_match_euler_discrete import (
-    FlowMatchEulerDiscreteScheduler,
-)
-from .scheduling_unipc_multistep import UniPCMultistepScheduler
+from .autoencoder_kl import AutoencoderKLModel
+from .autoencoder_kl_flux2 import AutoencoderKLFlux2Model

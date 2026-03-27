@@ -25,7 +25,12 @@ from .cache_mixin import (
     teacache_conditional_execution,
 )
 from .component_model import ComponentModel
-from .diffusion_pipeline import DiffusionPipeline, PixelModelInputs
+from .diffusion_pipeline import (
+    CompileWrapper,
+    DiffusionPipeline,
+    PixelModelInputs,
+    max_compile,
+)
 from .generate import GenerateMixin
 from .pipeline_model import (
     AlwaysSignalBuffersMixin,
