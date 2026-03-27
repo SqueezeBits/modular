@@ -288,12 +288,21 @@ class WanAnimatePipeline(WanI2VPipeline):
         bg_frames = None
         mask_frames = None
         if mode == "replace":
-            if model_inputs.background_video is not None:
-                bg_frames = self._load_video_frames(
-                    model_inputs.background_video
+            if model_inputs.background_video is None:
+                raise ValueError(
+                    "Replace mode requires background_video (--background-video)"
                 )
-            if model_inputs.mask_video is not None:
-                mask_frames = self._load_video_frames(model_inputs.mask_video)
+            if model_inputs.mask_video is None:
+                raise ValueError(
+                    "Replace mode requires mask_video (--mask-video)"
+                )
+            bg_frames = self._load_video_frames(model_inputs.background_video)
+            mask_frames = self._load_video_frames(model_inputs.mask_video)
+            # Pad bg/mask to fill complete segments (same reflect-pad as pose/face)
+            if len(bg_frames) < total_needed:
+                bg_frames = _reflect_pad(bg_frames, total_needed)
+            if len(mask_frames) < total_needed:
+                mask_frames = _reflect_pad(mask_frames, total_needed)
 
         logger.info(
             "Animate: %d pose frames, %d segments (segment_len=%d, prev_cond=%d), mode=%s",
@@ -407,27 +416,56 @@ class WanAnimatePipeline(WanI2VPipeline):
 
                 # y_ref is pre-computed before the segment loop
 
-                # Build prev-segment condition.
-                if seg_idx == 0 or prev_segment_cond_video is None:
-                    # First segment: encode a zero (black) video through VAE.
-                    # The VAE's bias terms produce non-zero latents for zero
-                    # input, matching diffusers' behavior.
-                    prev_video = np.zeros(
-                        (1, 3, num_seg_frames, h, w), dtype=np.float32
+                # Build prev-segment condition (mode-aware).
+                if mode == "replace":
+                    # Replace mode: background video fills non-conditioned frames.
+                    seg_bg_frames = (bg_frames or [])[seg_start:seg_end]
+                    seg_mask_frames = (mask_frames or [])[seg_start:seg_end]
+                    prev_video = self._build_replace_cond_video(
+                        seg_bg_frames,
+                        prev_segment_cond_video,
+                        h, w, prev_cond_frames,
+                    )
+                    cond_lat_t = (
+                        0 if seg_idx == 0
+                        else (prev_cond_frames - 1) // self.vae_scale_factor_temporal + 1
+                    )
+                    prev_mask = self._build_replace_mask(
+                        seg_mask_frames,
+                        h, w, h_l, w_l, vae_t, t_l, cond_lat_t,
                     )
                 else:
-                    # Subsequent segments: use last frames from decoded output.
-                    # prev_segment_cond_video is [1, 3, N, H, W] in [-1, 1].
-                    # Pad to full segment length with zeros.
-                    prev_n = prev_segment_cond_video.shape[2]
-                    remaining = num_seg_frames - prev_n
-                    zero_pad = np.zeros(
-                        (1, 3, remaining, h, w), dtype=np.float32
+                    # Animate mode: zeros fill non-conditioned frames.
+                    if seg_idx == 0 or prev_segment_cond_video is None:
+                        # First segment: encode a zero (black) video through VAE.
+                        # The VAE's bias terms produce non-zero latents for zero
+                        # input, matching diffusers' behavior.
+                        prev_video = np.zeros(
+                            (1, 3, num_seg_frames, h, w), dtype=np.float32
+                        )
+                    else:
+                        # Subsequent segments: use last frames from decoded output.
+                        # prev_segment_cond_video is [1, 3, N, H, W] in [-1, 1].
+                        # Pad to full segment length with zeros.
+                        prev_n = prev_segment_cond_video.shape[2]
+                        remaining = num_seg_frames - prev_n
+                        zero_pad = np.zeros(
+                            (1, 3, remaining, h, w), dtype=np.float32
+                        )
+                        prev_video = np.concatenate(
+                            [prev_segment_cond_video, zero_pad], axis=2
+                        )
+                    prev_mask = np.zeros(
+                        (1, vae_t, t_l, h_l, w_l), dtype=np.float32
                     )
-                    prev_video = np.concatenate(
-                        [prev_segment_cond_video, zero_pad], axis=2
-                    )
+                    if seg_idx > 0 and prev_segment_cond_video is not None:
+                        # Mark first prev_cond_frames latent frames as conditioned
+                        cond_lat_t = (
+                            prev_cond_frames - 1
+                        ) // self.vae_scale_factor_temporal + 1
+                        prev_mask[:, :, :cond_lat_t, :, :] = 1.0
 
+                # VAE-encode the conditioning video and standardize (both modes).
                 prev_buf = _numpy_f32_to_buffer(
                     prev_video, self.vae.config.dtype, device
                 )
@@ -435,22 +473,6 @@ class WanAnimatePipeline(WanI2VPipeline):
                     self.vae.encode(prev_buf)
                 )
                 prev_latent_std = (prev_latent_np - lat_mean) * lat_inv_std
-
-                # Build mask: 1s for conditioned frames, 0s for the rest
-                if seg_idx == 0 or prev_segment_cond_video is None:
-                    prev_mask = np.zeros(
-                        (1, vae_t, t_l, h_l, w_l), dtype=np.float32
-                    )
-                else:
-                    # Mark first prev_cond_frames latent frames as conditioned
-                    prev_mask = np.zeros(
-                        (1, vae_t, t_l, h_l, w_l), dtype=np.float32
-                    )
-                    # prev_cond_frames pixel frames → latent frames
-                    cond_lat_t = (
-                        prev_cond_frames - 1
-                    ) // self.vae_scale_factor_temporal + 1
-                    prev_mask[:, :, :cond_lat_t, :, :] = 1.0
 
                 y_prev = np.concatenate(
                     [prev_mask, prev_latent_std], axis=1
@@ -747,6 +769,127 @@ class WanAnimatePipeline(WanI2VPipeline):
         ).astype(np.float32)
 
         return _numpy_f32_to_buffer(condition, self.vae.config.dtype, device)
+
+    def _build_replace_cond_video(
+        self,
+        bg_frames_seg: list[Any],
+        prev_cond_video: np.ndarray | None,
+        h: int,
+        w: int,
+        prev_cond_frames: int,
+    ) -> np.ndarray:
+        """Build full-segment conditioning video for replace mode.
+
+        First segment (prev_cond_video=None): returns the full background segment.
+        Subsequent segments: returns [prev_generated_frames | background_remainder].
+
+        Returns:
+            np.ndarray [1, 3, T, H, W] float32 in [-1, 1].
+        """
+        import PIL.Image
+
+        frames_np = []
+        for frame in bg_frames_seg:
+            if not isinstance(frame, np.ndarray):
+                frame = np.array(frame)
+            if frame.ndim == 3 and frame.shape[2] >= 3:
+                frame = frame[:, :, :3]
+                if frame.shape[0] != h or frame.shape[1] != w:
+                    pil = PIL.Image.fromarray(frame.astype(np.uint8))
+                    pil = pil.resize((w, h), PIL.Image.Resampling.BICUBIC)
+                    frame = np.array(pil)
+                frame = frame.astype(np.float32) / 127.5 - 1.0
+                frame = frame.transpose(2, 0, 1)  # [3, H, W]
+            frames_np.append(frame)
+
+        bg_np = np.stack(frames_np, axis=0)[np.newaxis]   # [1, T, 3, H, W]
+        bg_np = bg_np.transpose(0, 2, 1, 3, 4)            # [1, 3, T, H, W]
+
+        if prev_cond_video is None:
+            return bg_np
+
+        # Concat [prev_cond_frames | background_remainder]
+        bg_remainder = bg_np[:, :, prev_cond_frames:, :, :]
+        return np.concatenate([prev_cond_video, bg_remainder], axis=2)
+
+    def _build_replace_mask(
+        self,
+        mask_frames_seg: list[Any],
+        h: int,
+        w: int,
+        h_l: int,
+        w_l: int,
+        vae_t: int,
+        t_l: int,
+        cond_lat_t: int,
+    ) -> np.ndarray:
+        """Build the I2V mask for replace mode.
+
+        Inverts the pixel mask (background=1, character=0), downsamples to
+        latent spatial dims, expands the first frame by vae_t (matching
+        diffusers get_i2v_mask), then reshapes to [1, vae_t, T_l, H_l, W_l].
+
+        Args:
+            mask_frames_seg: Pixel-space mask frames (1=foreground/character).
+            h, w: Target pixel resolution.
+            h_l, w_l: Latent spatial dims.
+            vae_t: VAE temporal scale factor (4).
+            t_l: Number of latent temporal frames.
+            cond_lat_t: Number of leading latent frames to force to 1
+                (0 for first segment, cond frames count for subsequent).
+
+        Returns:
+            np.ndarray [1, vae_t, T_l, H_l, W_l] float32.
+        """
+        import PIL.Image
+
+        T = len(mask_frames_seg)
+        # Build [T, H_l, W_l] mask in [0, 1] at latent spatial resolution
+        mask_lat = np.zeros((T, h_l, w_l), dtype=np.float32)
+        for i, frame in enumerate(mask_frames_seg):
+            if not isinstance(frame, np.ndarray):
+                frame = np.array(frame)
+            if frame.ndim == 3:
+                frame = frame[:, :, 0]  # single channel (binary mask)
+            arr = frame.astype(np.float32) / 255.0
+            # Resize to target pixel resolution if needed
+            if arr.shape[0] != h or arr.shape[1] != w:
+                pil = PIL.Image.fromarray(
+                    (arr * 255).clip(0, 255).astype(np.uint8)
+                )
+                pil = pil.resize((w, h), PIL.Image.Resampling.NEAREST)
+                arr = np.array(pil).astype(np.float32) / 255.0
+            # Downsample to latent spatial dims using nearest-neighbor
+            pil = PIL.Image.fromarray(
+                (arr * 255).clip(0, 255).astype(np.uint8)
+            )
+            pil = pil.resize((w_l, h_l), PIL.Image.Resampling.NEAREST)
+            mask_lat[i] = np.array(pil).astype(np.float32) / 255.0
+
+        # Invert: background=1 (preserve), character=0 (generate)
+        mask_lat = 1.0 - mask_lat  # [T, H_l, W_l]
+
+        # Shape [1, 1, T, H_l, W_l] for get_i2v_mask equivalent logic
+        mask_5d = mask_lat[np.newaxis, np.newaxis, :, :, :]
+
+        # Force leading conditioning frames to 1 (from previous segment)
+        if cond_lat_t > 0:
+            mask_5d[:, :, :cond_lat_t, :, :] = 1.0
+
+        # Expand first frame by vae_t (matching diffusers get_i2v_mask):
+        # [1,1,T,H_l,W_l] → first frame ×vae_t → [1,1,vae_t+T-1,H_l,W_l]
+        # = [1,1,t_l*vae_t,H_l,W_l] since T = (t_l-1)*vae_t+1
+        first_frame = np.repeat(mask_5d[:, :, 0:1, :, :], vae_t, axis=2)
+        mask_expanded = np.concatenate(
+            [first_frame, mask_5d[:, :, 1:, :, :]], axis=2
+        )
+
+        # Reshape [1, 1, t_l*vae_t, H_l, W_l] → [1, t_l, vae_t, H_l, W_l]
+        # then transpose → [1, vae_t, t_l, H_l, W_l]
+        mask_expanded = mask_expanded.reshape(1, -1, vae_t, h_l, w_l)
+        mask_expanded = mask_expanded.transpose(0, 2, 1, 3, 4)
+
+        return mask_expanded.astype(np.float32)
 
     def _encode_pose_segment(
         self,
