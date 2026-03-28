@@ -49,6 +49,8 @@ and pass the resulting `pose_video` and `face_video` to the pipeline.
 | 8 Performance profiling | ✅ Done | MAX 1.93x slower E2E vs compiled diffusers. Top bottlenecks: VAE encode 2.25x, transformer 1.59x per step. See Phase 8 section. |
 | 9 Optimization pass | ✅ Done | Fused norms -11% E2E; bf16 mod + fused norm -11.1%/step; single-batch motion encoder -7.3% E2E. Final: 203s (~1.37x vs diffusers). |
 | 10 Minimize CPU transfers | ✅ Done | Motion encoder Buffer passthrough: -2.5% E2E (203→198s). Other roundtrips too cheap to justify compiled graph overhead. |
+| 11 Single-block profiling | ✅ Done | GPU 1.30x slower, wall 1.69x. CPU dispatch 60% of gap. Elementwise 6.1x, norms 3.5x, concat 5.7ms extra. Flash attn MAX wins (0.86x). |
+| 12 Trace analysis + block-group fusion | ✅ Done | Chrome traces: MAX has 0 cpu_op events — no Python overhead. Block-group fusion (50→10 calls): 3,920ms vs 3,918ms (no gain, GPU already pipelined). All Python-level opts exhausted. |
 
 ---
 
@@ -1029,6 +1031,72 @@ numpy casting optimization.
 
 ---
 
+### Phase 11: Pipeline-Level Python Optimizations
+
+Identified and fixed several redundant or incorrect Python-level operations in
+`pipeline_wan_animate.py`:
+
+**Fix 1: `_i2v_concat_model` unconditional recompile (bug fix)**
+
+`self._i2v_concat_model = None` was set unconditionally before the `if None`
+check, causing the i2v concat graph to recompile every segment. Changed to
+cache by `(latent_shape, condition_shape)` key and only recompile on shape
+change. For constant-resolution pipelines this saves one compilation per
+extra segment.
+
+**Fix 2: Static buffers recreated each segment**
+
+`spatial_shape` (3-element int8) and `num_temporal_frames_buf` (scalar int32)
+were allocated and uploaded to GPU every segment despite being constant for a
+given resolution. Changed to compute-and-cache on first segment, reuse
+thereafter.
+
+**Fix 3: Scheduler state rebuilt every segment**
+
+`_prepare_scheduler_state` creates 20+20 `Buffer.from_numpy(...).to(device)`
+calls for `batched_timesteps` and `coeff_buffers`. These are identical across
+all segments (same timesteps, same coefficients, same latent shape). Changed to
+compute once and reuse, with shape-key invalidation for resolution changes.
+
+**Fix 4: Unnecessary PIL LANCZOS resize for already-512×512 face frames**
+
+`_encode_face_segment` always ran `PIL.fromarray + resize(512, 512, LANCZOS)`
+on every face frame, even when the frame was already 512×512. Added
+`if frame.shape[0] != 512 or frame.shape[1] != 512` guard. For
+`face_official.mp4` (512×512 source) this eliminates 77 PIL resize calls per
+segment (~1-3s total).
+
+**Fix 5: Redundant 226MB numpy copy**
+
+`face_pixels.astype(np.float32)` in `_encode_face_segment` copied a 77×3×512×512
+float32 array that was already float32. Removed the no-op cast.
+
+**Measured impact** (2-step run, 480×848, 2 segments, H100):
+
+| Component | Baseline | Optimized | Delta |
+|---|---|---|---|
+| Seg 0: face PIL resize | 0.2s | 0.1s | -0.1s |
+| Seg 0: face encode | 10.5s | 7.8s | -2.7s* |
+| Seg 0: build condition | 5.0s | 5.0s | 0 |
+| Seg 1: face encode | 0.9s | 0.8s | -0.1s |
+| Seg 1: build condition | 5.1s | 4.9s | -0.2s |
+| **E2E (2-step)** | **70.8s** | **63.2s** | **-10.7%** |
+
+\* The 2.7s seg-0 face encode delta is GPU cold-start variability (motion encoder
+compiled fresh for baseline), not from our changes.
+
+Actual reliable improvements from our fixes:
+- PIL resize skip: ~0.1s/segment (face_official.mp4 is already 512×512)
+- Scheduler/concat cache: ~0.2s/segment 2+
+- Redundant float32 copy: ~0.1s
+- **Total: ~0.5-1s per 2-segment video** (marginal at 20-step E2E scale)
+
+The `_i2v_concat_model` bug fix is most important for correctness (prevented
+recompilation every segment). Savings scale with number of segments (4+
+segments = more meaningful).
+
+---
+
 ### Phase 11: Single-Block Profiling — MAX vs Diffusers (compiled)
 
 **Config:** 480×848, block indices 0/5/10/20/39, 3 warmups, 10 iters, H100.
@@ -1089,10 +1157,104 @@ All blocks are nearly identical in cost (uniform architecture across 40 blocks).
 
 #### Optimization targets (compiler/runtime level, not Python-addressable)
 
-1. **CPU dispatch overhead (60% of gap)**: requires CUDA graph capture or batched graph dispatch. Current 50 separate `graph.execute()` per step vs single fused CUDA graph in torch.compile.
+1. **CPU dispatch overhead (60% of gap)**: requires CUDA graph capture or batched graph dispatch.
 2. **Elementwise fusion**: MAX compiler should fuse `gate*x + residual`, GEGLU activation chain across graph boundaries.
 3. **Concat elimination**: cross-attention KV views could be pre-allocated to avoid explicit concat.
 4. **Norm fusion with adjacent compute**: fuse norm kernel with following matmul read to match torch.compile's pattern.
+
+---
+
+### Phase 12: Chrome Trace Analysis + Block-Group Fusion (second attempt)
+
+#### Motivation
+
+Phase 11 showed ~60% of the per-block wall-clock gap is CPU dispatch overhead
+(~38ms/block in MAX vs ~7ms in compiled diffusers). The hypothesis was that
+tracing the full transformer forward pass (not just one block) might reveal
+additional Python-level overhead invisible to per-block profiling.
+
+#### Trace collection
+
+Scripts: `profile_transformer_max.py` and `profile_transformer_diffusers.py`
+(both support `--trace-dir` flag).
+
+```bash
+./bazelw run //max/examples/diffusion:profile_transformer_max -- \
+    --model Wan-AI/Wan2.2-Animate-14B-Diffusers \
+    --input-image wan_test_assets/character.jpeg \
+    --pose-video wan_test_assets/pose_official.mp4 \
+    --face-video wan_test_assets/face_official.mp4 \
+    --trace-dir outputs/traces_transformer
+
+python max/examples/diffusion/profile_transformer_diffusers.py \
+    --image wan_test_assets/character.jpeg \
+    --pose-video wan_test_assets/pose_official.mp4 \
+    --face-video wan_test_assets/face_official.mp4 \
+    --trace-dir outputs/traces_transformer
+```
+
+#### Trace analysis findings (480×848, H200)
+
+| Metric | MAX | Diffusers (eager) |
+|---|---|---|
+| `cpu_op` events in trace | **0** | 21,551 |
+| Python-level framework calls | none visible | `aten::*`, autograd, etc. |
+| Per-step wall-clock | 3,920ms | 3,745ms |
+
+MAX has **zero Python-visible CPU operations** in the trace — all computation
+is inside compiled MAX graphs. The CPU overhead seen in Phase 11's per-block
+wall-clock (~38ms/block) is the MAX runtime's own C++ graph dispatch layer,
+not Python overhead, and is not visible as `cpu_op` events in the profiler.
+
+There is no Python-addressable CPU overhead to optimize: the transformer
+forward is already a pure sequence of `graph.execute()` calls with no Python
+computation between them.
+
+**Conclusion from trace analysis:** The remaining gap vs torch.compile is
+entirely below the Python layer (GPU kernel efficiency + C++ dispatch overhead).
+No further Python-level optimization is possible on the transformer.
+
+#### Block-group fusion attempt (second attempt) — ❌ NO IMPROVEMENT
+
+**Hypothesis:** Reducing from 50 `graph.execute()` calls/step to 10 (by fusing
+5 blocks + 1 face adapter per group) would reduce C++ dispatch overhead by 5×.
+
+**Implementation:** Added `_WanBlockGroup(Module)` class that wraps 5
+`WanTransformerBlock` + 1 `WanAnimateFaceBlock` into a single compiled MAX
+graph. 8 groups replace 40 blocks + 8 adapters.
+
+Key implementation detail: `group_module.state_dict()` must be called *before*
+graph construction to trigger `recursive_named_layers` prefixing (sets
+`weight.name = "block_0.norm1.weight"` etc.), preventing `ValueError: Weight
+'weight' already exists in Graph` when multiple blocks share the same weight
+names within one graph.
+
+**Result:**
+
+| Configuration | Per-step | Notes |
+|---|---|---|
+| Baseline (50 `graph.execute()`) | 3,918ms | pre + 40 blocks + 8 adapters + post |
+| Block-group fusion (10 calls) | 3,920ms | pre + 8 groups + post |
+
+No measurable speedup (within noise).
+
+**Root cause:** The negative overhead observed in Phase 9 component breakdown
+(GPU pipelining hides ~17% of dispatch cost) means the GPU is already running
+ahead of the CPU. The 50 `graph.execute()` calls are already fully pipelined —
+the GPU finishes one block before the CPU even dispatches the next. Reducing
+dispatch count provides no wall-clock benefit when GPU execution time >> CPU
+dispatch time.
+
+The block-group fusion implementation **remains in the codebase** as a clean
+architectural refactor (10 calls vs 50 is simpler), but provides no
+performance improvement.
+
+**Final state:** All Python/graph-API level optimizations are exhausted. The
+remaining 1.34x gap vs torch.compile (480p) is entirely at the GPU kernel and
+C++ runtime level:
+- GPU kernel efficiency (matmul, norms, elementwise)
+- C++ graph dispatch layer overhead
+- Flash attention parity is actually a MAX advantage (0.86x)
 
 ---
 
