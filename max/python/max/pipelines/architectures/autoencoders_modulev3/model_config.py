@@ -36,6 +36,7 @@ class AutoencoderKLConfigBase(MAXModelConfigBase):
     shift_factor: float | None = None
     latents_mean: tuple[float] | None = None
     latents_std: tuple[float] | None = None
+    force_upcast: bool = True
     use_quant_conv: bool = True
     use_post_quant_conv: bool = True
     mid_block_add_attention: bool = True
@@ -74,7 +75,6 @@ class AutoencoderKLConfig(AutoencoderKLConfigBase):
             and float(init_dict["scaling_factor"]) == 0.0
         ):
             raise ValueError("`scaling_factor` must be non-zero.")
-
         return AutoencoderKLConfig(**init_dict)
 
 
@@ -124,5 +124,4 @@ class AutoencoderKLFlux2Config(AutoencoderKLConfigBase):
             and float(init_dict["scaling_factor"]) == 0.0
         ):
             raise ValueError("`scaling_factor` must be non-zero.")
-
         return AutoencoderKLFlux2Config(**init_dict)
