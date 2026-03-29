@@ -316,7 +316,9 @@ def _load_pipeline(
         diffusers_config["lora"] = lora_cfg
 
     # Tokenizer setup.
-    max_length = getattr(args, "max_length", None) or 226  # for wan umt5
+    # Diffusers pads tokens to 512 but the pipeline trims embeddings to
+    # embed_seq_len (226 for Wan) before cross-attention.
+    max_length = getattr(args, "max_length", None) or 512
     tokenizer = PixelGenerationTokenizer(
         model_path=args.model,
         pipeline_config=config,

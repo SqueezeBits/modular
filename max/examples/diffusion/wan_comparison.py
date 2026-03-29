@@ -610,33 +610,13 @@ def _run_diffusers(args: argparse.Namespace) -> list[Result]:
 # -- MAX ----------------------------------------------------------------------
 
 
-def _max_runner_group_key(case: dict[str, Any]) -> tuple[Any, ...]:
-    target: WanTarget = case["target"]
-    lora_info = None
-    if case["lora"] and target.lora and case["mode"] in target.lora:
-        info = target.lora[case["mode"]]
-        lora_info = (
-            info["repo"],
-            info.get("subfolder"),
-            info.get("weight_name"),
-        )
-    return (
-        case["repo_id"],
-        case["mode"],
-        lora_info,
-        target.encoding,
-    )
 
-
-def _build_max_case_args(
+def _build_max_argv(
     args: argparse.Namespace,
     case: dict[str, Any],
     output_file: str,
-) -> argparse.Namespace:
-    from max.examples.diffusion.simple_offline_video_generation import (
-        parse_args as parse_max_video_args,
-    )
-
+) -> list[str]:
+    """Build CLI argv for ``simple_offline_video_generation``."""
     target: WanTarget = case["target"]
     argv = [
         "--model",
@@ -674,115 +654,78 @@ def _build_max_case_args(
         argv.extend(["--lora-scale", "1.0"])
     if target.encoding:
         argv.extend(["--quantization-encoding", target.encoding])
-    return parse_max_video_args(argv)
+    return argv
+
+
+def _parse_max_e2e_time(output: str) -> float | None:
+    """Extract E2E execute time (seconds) from profiling report."""
+    import re
+
+    m = re.search(r"E2E execute\s+\d+\s+([\d.]+)", output)
+    if m:
+        return float(m.group(1)) / 1000.0  # ms → s
+    return None
 
 
 def _run_max(args: argparse.Namespace) -> list[Result]:
-    from max.examples.diffusion.simple_offline_video_generation import (
-        _build_request_body,
-        _load_pipeline,
-        _video_frames_from_raw_output,
-        save_video,
-    )
+    """Run MAX via subprocess to avoid torch/CUDA memory conflicts."""
+    import subprocess
 
-    print("\n=== MAX ===")
+    # Locate the simple_offline_video_generation binary.
+    # Under bazel run, sibling binaries live next to this script's binary.
+    self_bin = Path(sys.argv[0]).resolve()
+    max_bin = self_bin.parent / "simple_offline_video_generation"
+    if not max_bin.exists():
+        # Fallback: use bazel-bin output path directly.
+        max_bin = Path(
+            "bazel-bin/max/examples/diffusion/simple_offline_video_generation"
+        )
+    if not max_bin.exists():
+        raise FileNotFoundError(
+            "Cannot find simple_offline_video_generation binary. "
+            "Run: ./bazelw build //max/examples/diffusion:simple_offline_video_generation"
+        )
+
+    print(f"\n=== MAX (subprocess: {max_bin.name}) ===")
     cases = _get_cases(args)
     out_dir = Path(args.output_dir) / "max"
     out_dir.mkdir(parents=True, exist_ok=True)
     results: list[Result] = []
-    grouped_cases: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+
     for case in cases:
-        grouped_cases.setdefault(_max_runner_group_key(case), []).append(case)
+        fname = str(case["label"]).replace(" ", "_").lower()
+        output_file = str(out_dir / f"{fname}.mp4")
+        argv = _build_max_argv(args, case, output_file)
 
-    loop = asyncio.new_event_loop()
-    try:
-        for group_cases in grouped_cases.values():
-            first_case = group_cases[0]
-            init_args = _build_max_case_args(
-                args, first_case, str(out_dir / "_init_probe.mp4")
+        result = Result(label=str(case["label"]))
+        for i in range(args.num_iterations):
+            print(f"  {case['label']} iter {i + 1}/{args.num_iterations}")
+            t0 = time.perf_counter()
+            proc = subprocess.run(
+                [str(max_bin)] + argv,
+                capture_output=True,
+                text=True,
             )
-            init_start = time.perf_counter()
-            tokenizer, pipeline = _load_pipeline(init_args)
-            print(
-                "  shared init "
-                f"{first_case['target'].name} {first_case['mode']} "
-                f"{'LoRA' if first_case['lora'] else 'base'}: "
-                f"{time.perf_counter() - init_start:.1f}s"
-            )
+            t_wall = time.perf_counter() - t0
 
-            for case in group_cases:
-                fname = str(case["label"]).replace(" ", "_").lower()
-                output_file = str(out_dir / f"{fname}.mp4")
-                case_args = _build_max_case_args(args, case, output_file)
+            if proc.returncode != 0:
+                print("    FAILED")
+                # Show last few lines of stderr/stdout for diagnostics.
+                for line in (proc.stderr or proc.stdout or "").strip().split("\n")[-5:]:
+                    print(f"      {line}")
+                continue
 
-                result = Result(label=str(case["label"]))
-                for i in range(args.num_iterations):
-                    print(
-                        f"  {case['label']} iter {i + 1}/{args.num_iterations}"
-                    )
-                    try:
-                        body = _build_request_body(case_args)
-                        from max.interfaces import RequestID
-                        from max.interfaces.request import OpenResponsesRequest
+            # Parse E2E time from profiling output; fall back to wall time.
+            e2e = _parse_max_e2e_time(proc.stdout + proc.stderr)
+            dt = e2e if e2e is not None else t_wall
+            result.durations.append(dt)
+            phase = f"e2e={dt:.1f}s, wall={t_wall:.1f}s"
+            result.phase_timings.append(phase)
+            print(f"    {phase}")
 
-                        request = OpenResponsesRequest(
-                            request_id=RequestID(), body=body
-                        )
-                        input_image = None
-                        if case.get("mode") == "i2v" and args.input_image:
-                            from PIL import Image as _PILImage
+        results.append(result)
 
-                            input_image = _PILImage.open(
-                                args.input_image
-                            ).convert("RGB")
-                        ctx = loop.run_until_complete(
-                            tokenizer.new_context(
-                                request, input_image=input_image
-                            )
-                        )
-                        t0 = time.perf_counter()
-                        mi = pipeline._pipeline_model.prepare_inputs(ctx)
-                        t1 = time.perf_counter()
-                        mo = pipeline._pipeline_model.execute(mi)
-                        t2 = time.perf_counter()
-                    except Exception:
-                        print("    FAILED")
-                        import traceback
-
-                        for line in (
-                            traceback.format_exc().strip().split("\n")[-5:]
-                        ):
-                            print(f"      {line}")
-                        continue
-
-                    import numpy as np
-
-                    if not isinstance(mo.images, np.ndarray):
-                        print("    FAILED: non-numpy output")
-                        continue
-
-                    total = t2 - t0
-                    result.durations.append(total)
-                    phase = (
-                        f"prep={t1 - t0:.1f}s, "
-                        f"execute={t2 - t1:.1f}s, "
-                        f"total={total:.1f}s"
-                    )
-                    result.phase_timings.append(phase)
-                    print(f"    {phase}")
-
-                    if i == 0:
-                        frames = _video_frames_from_raw_output(mo.images)
-                        save_video(frames, output_file, case_args.fps)
-
-                results.append(result)
-
-            del tokenizer, pipeline
-            gc.collect()
-
-        return results
-    finally:
-        loop.close()
+    return results
 
 
 # -- Summary ------------------------------------------------------------------

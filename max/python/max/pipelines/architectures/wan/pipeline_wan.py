@@ -214,16 +214,27 @@ class WanPipeline(DiffusionPipeline):
         self.transformer_2.prepare_state_dict()
         if self._try_dual_load_transformer2():
             self._moe_dual_loaded = True
-            logger.info("MoE dual-load: transformer_2 compiled on GPU")
+            logger.info(
+                "MoE dual-load enabled: transformer_2 will stay resident "
+                "without weight swapping"
+            )
         else:
-            sd2 = self.transformer_2.prepare_state_dict()
-            self.transformer._get_cached_weight_registries(sd2)
+            # Weight-swap: secondary weights loaded lazily on first swap
+            # to keep init VRAM usage low for symbolic block graphs.
             logger.info("MoE swap mode: transformer_2 will use weight swap")
 
     def init_remaining_components(self) -> None:
         """Initialize VAE config, MoE, and compile runtime graphs."""
         self._setup_vae_config()
         self._setup_moe()
+
+        # Compile transformer for the default resolution.
+        # TODO(compiler): use symbolic seq_len once engine OOM is fixed.
+        h, w, nf = self.default_resolution
+        seq_len = self._compute_seq_len(h, w, nf)
+        self.transformer.load_model(
+            seq_text_len=self.embed_seq_len, seq_len=seq_len,
+        )
 
         self.build_guidance()
         self.build_unipc_step()
@@ -580,13 +591,36 @@ class WanPipeline(DiffusionPipeline):
         target_num_frames = min(decoded_np.shape[2], num_frames)
         return decoded_np[:, :, :target_num_frames, :height, :width]
 
+    # Diffusers pads tokens to 512 but trims final embeddings to 226 for
+    # cross-attention.  Subclasses can override for different models.
+    embed_seq_len: int = 226
+
+    # Default resolution for block graph compilation (height, width, frames).
+    # TODO(compiler): remove once symbolic seq_len is supported.
+    default_resolution: tuple[int, int, int] = (720, 1280, 81)
+
+    def _compute_seq_len(self, height: int, width: int, num_frames: int) -> int:
+        """Compute the latent sequence length for a given resolution."""
+        p_t, p_h, p_w = self.transformer.config.patch_size
+        ls = self.compute_video_latent_shape(
+            batch_size=1,
+            z_dim=int(self.vae.config.z_dim),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            scale_factor_temporal=self.vae_scale_factor_temporal,
+            scale_factor_spatial=self.vae_scale_factor_spatial,
+        )
+        return (ls[2] // p_t) * (ls[3] // p_h) * (ls[4] // p_w)
+
+    # Standard resolutions to pre-compile block graphs for.
     def prepare_prompt_embeddings(
         self,
         model_inputs: WanModelInputs,
     ) -> tuple[Buffer, Buffer | None, bool]:
         """Encode positive and optional negative prompts via T5."""
         logger.info("Preparing Wan prompt embeddings")
-        max_seq_len = int(model_inputs.tokens.array.shape[-1])
+        max_seq_len = self.embed_seq_len
         prompt_embeds = self._get_t5_prompt_embeds(
             tokens=model_inputs.tokens,
             attention_mask=model_inputs.mask,
@@ -1117,19 +1151,10 @@ class WanPipeline(DiffusionPipeline):
                     num_elements *= d
                 # bfloat16 = 2 bytes
                 estimated_bytes += num_elements * 2
-        # Add 20% headroom for compilation workspace
-        required = int(estimated_bytes * 1.2)
-        if free_vram < required:
-            logger.info(
-                "Insufficient VRAM for dual-load: %.1f GB free, "
-                "%.1f GB required",
-                free_vram / 1e9,
-                required / 1e9,
-            )
-            return False
-
-        self.transformer_2.load_model()
-        return True
+        # Weight-swap mode: secondary weights are loaded lazily on first
+        # use in _activate_transformer_weights to avoid reserving VRAM at
+        # init (which would conflict with symbolic block graph workspace).
+        return False
 
     def _activate_transformer_weights(self, *, use_secondary: bool) -> None:
         if not use_secondary:

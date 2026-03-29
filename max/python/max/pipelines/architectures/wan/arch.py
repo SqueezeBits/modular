@@ -37,7 +37,8 @@ class WanArchConfig(ArchConfig):
     pipeline_config: PipelineConfig
 
     def get_max_seq_len(self) -> int:
-        return 0
+        # Tokenizer padding length — matches diffusers __call__ default.
+        return 512
 
     @classmethod
     def initialize(cls, pipeline_config: PipelineConfig) -> Self:

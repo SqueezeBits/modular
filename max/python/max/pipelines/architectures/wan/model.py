@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from __future__ import annotations
-
+import logging
 import threading
 from collections.abc import Callable
 from functools import lru_cache
@@ -35,6 +35,8 @@ from .wan_transformer import (
     WanTransformerPostProcess,
     WanTransformerPreProcess,
 )
+
+logger = logging.getLogger(__name__)
 
 # Weight key remapping from diffusers -> MAX module naming
 _KEY_REMAP = [
@@ -275,7 +277,7 @@ class WanTransformerModel(ComponentModel):
         self.session = session or InferenceSession(devices=devices)
         self._load_lock = threading.Lock()
         if eager_load:
-            self.load_model()
+            self.prepare_state_dict()
 
     def _ensure_state_dict(self) -> dict[str, Any]:
         if self._state_dict is None:
@@ -398,9 +400,7 @@ class WanTransformerModel(ComponentModel):
         """Reload weights into already-compiled models for MoE weight switching."""
         with self._load_lock:
             if self.model is None:
-                self.load_model()
-            if self.model is None:
-                raise RuntimeError("Wan transformer model failed to load.")
+                raise RuntimeError("Wan transformer model not compiled.")
 
             pre_registry, block_registries, post_registry = (
                 self._get_cached_weight_registries(state_dict)
@@ -413,12 +413,21 @@ class WanTransformerModel(ComponentModel):
                 compiled_block._load(block_registry)
             self.model.post._load(post_registry)
 
-    def load_model(self) -> Callable[..., Any]:
+    def load_model(
+        self,
+        *,
+        seq_text_len: int,
+        seq_len: int,
+        batch_size: int = 1,
+    ) -> Callable[..., Any]:
         """Compile the transformer as separate pre/block/post graphs.
 
-        Compiles a single block graph and reuses it for all layers,
-        swapping weights via session.load(). This avoids redundant
-        compilations while keeping peak VRAM low.
+        Block graphs are compiled with concrete ``batch_size``, ``seq_len``
+        and ``seq_text_len``.  Pre/post graphs use symbolic spatial dims.
+
+        TODO(compiler): Switch block graphs to symbolic ``seq_len`` once
+        the engine memory manager no longer allocates worst-case buffers
+        for symbolic dims (~18.5 GB vs ~6.5 GB concrete for 720p).
         """
         with self._load_lock:
             if self.model is not None:
@@ -453,7 +462,7 @@ class WanTransformerModel(ComponentModel):
                 TensorType(DType.float32, ["batch"], device=dev),
                 TensorType(
                     dtype,
-                    ["batch", "seq_text", self.config.text_dim],
+                    ["batch", seq_text_len, self.config.text_dim],
                     device=dev,
                 ),
             ]
@@ -470,23 +479,26 @@ class WanTransformerModel(ComponentModel):
                 pre_graph, weights_registry=pre_module.state_dict()
             )
 
-            # --- Block graph (compile once, reuse for all layers) ---
+            # --- Block graph (concrete dims) ---
             block_input_types = [
-                TensorType(dtype, ["batch", "seq_len", dim], device=dev),
-                TensorType(dtype, ["batch", "seq_text", dim], device=dev),
-                TensorType(dtype, ["batch", 6, dim], device=dev),
+                TensorType(
+                    dtype, [batch_size, seq_len, dim], device=dev
+                ),
+                TensorType(
+                    dtype, [batch_size, seq_text_len, dim], device=dev
+                ),
+                TensorType(dtype, [batch_size, 6, dim], device=dev),
                 TensorType(
                     DType.float32,
-                    ["seq_len", self.config.attention_head_dim],
+                    [seq_len, self.config.attention_head_dim],
                     device=dev,
                 ),
                 TensorType(
                     DType.float32,
-                    ["seq_len", self.config.attention_head_dim],
+                    [seq_len, self.config.attention_head_dim],
                     device=dev,
                 ),
             ]
-
             block_template = WanTransformerBlock(
                 dim=dim,
                 ffn_dim=self.config.ffn_dim,
@@ -499,7 +511,6 @@ class WanTransformerModel(ComponentModel):
                 dtype=dtype,
                 device=dev_ref,
             )
-
             block_template.load_state_dict(
                 block_weights_list[0], weight_alignment=1, strict=True
             )
@@ -510,20 +521,30 @@ class WanTransformerModel(ComponentModel):
                     *(v.tensor for v in block_graph.inputs)
                 )
                 block_graph.output(block_out)
-            block_0_model = self.session.load(
-                block_graph, weights_registry=block_template.state_dict()
-            )
-            block_models: list[Model] = [block_0_model]
 
-            for i in range(1, self.config.num_layers):
-                block_template.load_state_dict(
-                    block_weights_list[i], weight_alignment=1, strict=True
-                )
-                block_i_model = self.session.load(
+            block_models: list[Model] = [
+                self.session.load(
                     block_graph,
                     weights_registry=block_template.state_dict(),
                 )
-                block_models.append(block_i_model)
+            ]
+            for i in range(1, self.config.num_layers):
+                block_template.load_state_dict(
+                    block_weights_list[i],
+                    weight_alignment=1,
+                    strict=True,
+                )
+                block_models.append(
+                    self.session.load(
+                        block_graph,
+                        weights_registry=block_template.state_dict(),
+                    )
+                )
+            logger.info(
+                "Compiled block graph (batch=%d, seq_len=%d, "
+                "seq_text=%d, %d layers)",
+                batch_size, seq_len, seq_text_len, len(block_models),
+            )
 
             # --- Post-processing graph ---
             post_input_types = [
@@ -576,9 +597,9 @@ class WanTransformerModel(ComponentModel):
         spatial_shape: Buffer,
     ) -> Buffer:
         if self.model is None:
-            self.load_model()
-        if self.model is None:
-            raise RuntimeError("Wan transformer model failed to load.")
+            raise RuntimeError(
+                "Wan transformer model not compiled. Call load_model() first."
+            )
         return self.model(
             hidden_states,
             timestep,
