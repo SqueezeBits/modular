@@ -1139,20 +1139,25 @@ class ZImagePipeline(DiffusionPipeline):
             and not self.cache_config.taylorseer
             and not self.cache_config.teacache
         )
+        use_fast_denoise = bool(
+            not self.cache_config.first_block_caching
+            and not self.cache_config.taylorseer
+            and not self.cache_config.teacache
+        )
+
+        # Cache states are only needed for the non-split fallback path.
         cache_pos = self.create_cache_state(
             batch_size,
             image_seq_len,
             self.transformer.config,
         )
-        cache_neg = (
-            self.create_cache_state(
+        cache_neg: DenoisingCacheState | None = None
+        if not use_fast_denoise and model_inputs.do_cfg and not use_batched_cfg_mode:
+            cache_neg = self.create_cache_state(
                 batch_size,
                 image_seq_len,
                 self.transformer.config,
             )
-            if model_inputs.do_cfg and not use_batched_cfg_mode
-            else None
-        )
 
         # 3) Prepare scheduler tensors.
         with Tracer("prepare_scheduler"):
@@ -1193,42 +1198,34 @@ class ZImagePipeline(DiffusionPipeline):
                 device,
             )
 
-        cfg_timestep_vectors: list[Tensor] | None = None
+        # Batched CFG prompt embeddings (only for batched mode).
         cfg_prompt_embeds: Tensor | None = None
         if use_batched_cfg_mode:
-            cfg_width = batch_size * 2
-            cfg_timestep_vectors = self._get_cached_cfg_timestep_vectors(
-                transformed_timesteps,
-                cfg_width,
-                device,
-            )
             assert negative_prompt_embeds is not None
             cfg_prompt_embeds = F.concat(
                 [prompt_embeds, negative_prompt_embeds], axis=0
             )
 
-        use_fast_denoise = bool(
-            not self.cache_config.first_block_caching
-            and not self.cache_config.taylorseer
-            and not self.cache_config.teacache
-        )
+        # Batched CFG timestep vectors (only for non-fast fallback).
+        cfg_timestep_vectors: list[Tensor] | None = None
+        if use_batched_cfg_mode and not use_fast_denoise:
+            cfg_timestep_vectors = self._get_cached_cfg_timestep_vectors(
+                transformed_timesteps,
+                batch_size * 2,
+                device,
+            )
 
         # 4) Denoising loop.
-        _preamble_out: tuple[Tensor, ...] | None = None
         with Tracer("denoising_loop"):
             for i in range(num_timesteps):
                 apply_cfg = i < cfg_cutoff_step
                 timestep = timestep_scalars[i]
                 dt = dt_scalars[i]
+                preamble_out: tuple[Tensor, ...] | None = None
                 with Tracer(f"denoising_step_{i}"):
-                    pos_noise_pred: Tensor | None = None
-                    neg_noise_pred: Tensor | None = None
                     with Tracer("transformer"):
                         if apply_cfg and use_batched_cfg_mode:
-                            assert negative_prompt_embeds is not None
                             assert cfg_prompt_embeds is not None
-                            assert cfg_timestep_vectors is not None
-
                             if use_fast_denoise:
                                 noise_pred_cfg = self.run_transformer_cfg_split(
                                     latents=latents,
@@ -1238,53 +1235,54 @@ class ZImagePipeline(DiffusionPipeline):
                                     txt_ids=txt_ids,
                                 )
                             else:
+                                assert cfg_timestep_vectors is not None
+                                latents_cfg = self.duplicate_batch(latents)
                                 noise_pred_cfg = self.run_denoising_step(
                                     step=i,
                                     cache_state=cache_pos,
                                     device=device,
                                     latents=latents_cfg,
                                     prompt_embeds=cfg_prompt_embeds,
-                                    timestep=timestep_cfg,
+                                    timestep=cfg_timestep_vectors[i],
                                     img_ids=img_ids,
                                     txt_ids=txt_ids,
                                 )
                             assert guidance_scale_tensor is not None
                             if model_inputs.cfg_normalization:
-                                (
-                                    pos_noise_pred,
-                                    noise_pred,
-                                ) = self.cfg_finalize_batched_with_norm(
+                                _, noise_pred = self.cfg_finalize_batched_with_norm(
                                     noise_pred_cfg,
                                     guidance_scale_tensor,
                                 )
                             else:
-                                (
-                                    pos_noise_pred,
-                                    noise_pred,
-                                ) = self.cfg_finalize_batched_no_norm(
+                                _, noise_pred = self.cfg_finalize_batched_no_norm(
                                     noise_pred_cfg,
                                     guidance_scale_tensor,
                                 )
-                        else:
-                            if use_fast_denoise and apply_cfg:
-                                # Non-batched CFG with split: share preamble,
-                                # run main separately for pos and neg.
-                                _preamble_out = (
-                                    self.transformer.run_preamble(
-                                        latents, timestep, img_ids, txt_ids,
-                                    )
+                        elif apply_cfg:
+                            # Non-batched CFG: split preamble shared,
+                            # run main separately for pos and neg.
+                            if use_fast_denoise:
+                                preamble_out = self.transformer.run_preamble(
+                                    latents, timestep, img_ids, txt_ids,
                                 )
-                                x_sh, t_emb_sh, uf_pos, tf_pos = (
-                                    _preamble_out
-                                )
+                                x_sh, t_emb_sh, uf_sh, tf_sh = preamble_out
                                 noise_pred = self.transformer.run_cfg_main(
-                                    x_sh,
-                                    prompt_embeds,
-                                    t_emb_sh,
-                                    uf_pos,
-                                    tf_pos,
+                                    x_sh, prompt_embeds, t_emb_sh, uf_sh, tf_sh,
                                 )[0]
-                            elif use_fast_denoise:
+                            else:
+                                noise_pred = self.run_denoising_step(
+                                    step=i,
+                                    cache_state=cache_pos,
+                                    device=device,
+                                    latents=latents,
+                                    prompt_embeds=prompt_embeds,
+                                    timestep=timestep,
+                                    img_ids=img_ids,
+                                    txt_ids=txt_ids,
+                                )
+                        else:
+                            # No CFG this step.
+                            if use_fast_denoise:
                                 noise_pred = self.run_transformer(
                                     cache_pos,
                                     latents=latents,
@@ -1305,39 +1303,27 @@ class ZImagePipeline(DiffusionPipeline):
                                     txt_ids=txt_ids,
                                 )
 
+                    # Negative pass for non-batched CFG.
                     if apply_cfg and not use_batched_cfg_mode:
                         assert negative_prompt_embeds is not None
                         neg_img_ids = img_ids
                         neg_txt_ids = txt_ids
                         if model_inputs.explicit_negative_prompt:
-                            assert (
-                                model_inputs.negative_img_ids_tensor is not None
-                            )
-                            assert (
-                                model_inputs.negative_txt_ids_tensor is not None
-                            )
+                            assert model_inputs.negative_img_ids_tensor is not None
+                            assert model_inputs.negative_txt_ids_tensor is not None
                             neg_img_ids = model_inputs.negative_img_ids_tensor
                             neg_txt_ids = model_inputs.negative_txt_ids_tensor
                         with Tracer("cfg_transformer"):
                             if use_fast_denoise:
-                                # Reuse x, t_emb from positive preamble;
-                                # only recompute RoPE for negative txt_ids.
-                                assert _preamble_out is not None
-                                x_sh, t_emb_sh, _, _ = _preamble_out
-                                neg_uf, neg_tf = (
-                                    self.transformer.compute_rope(
-                                        neg_img_ids, neg_txt_ids,
-                                    )
+                                assert preamble_out is not None
+                                x_sh, t_emb_sh, _, _ = preamble_out
+                                neg_uf, neg_tf = self.transformer.compute_rope(
+                                    neg_img_ids, neg_txt_ids,
                                 )
-                                neg_noise_pred = (
-                                    self.transformer.run_cfg_main(
-                                        x_sh,
-                                        negative_prompt_embeds,
-                                        t_emb_sh,
-                                        neg_uf,
-                                        neg_tf,
-                                    )[0]
-                                )
+                                neg_noise_pred = self.transformer.run_cfg_main(
+                                    x_sh, negative_prompt_embeds, t_emb_sh,
+                                    neg_uf, neg_tf,
+                                )[0]
                             else:
                                 assert cache_neg is not None
                                 neg_noise_pred = self.run_denoising_step(
@@ -1350,17 +1336,14 @@ class ZImagePipeline(DiffusionPipeline):
                                     img_ids=neg_img_ids,
                                     txt_ids=neg_txt_ids,
                                 )
-                        pos_noise_pred = noise_pred
-                        assert pos_noise_pred is not None
-                        assert neg_noise_pred is not None
                         assert guidance_scale_tensor is not None
                         noise_pred = self.cfg_combine(
-                            pos_noise_pred,
+                            noise_pred,
                             neg_noise_pred,
                             guidance_scale_tensor,
                         )
                         noise_pred = self._apply_cfg_renormalization(
-                            pos_noise_pred,
+                            noise_pred,
                             noise_pred,
                             model_inputs.cfg_normalization,
                         )
