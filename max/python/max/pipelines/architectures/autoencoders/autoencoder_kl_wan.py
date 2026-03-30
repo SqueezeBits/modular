@@ -507,26 +507,85 @@ class AutoencoderKLWanModel(ComponentModel):
             )
 
         video_np = _buffer_to_numpy_f32(video, CPU())
+        t_total = int(video_np.shape[2])
+        chunks = [np.ascontiguousarray(video_np[:, :, :1])]
+        for start in range(1, t_total, WAN_ENCODER_CHUNK_SIZE):
+            end = min(start + WAN_ENCODER_CHUNK_SIZE, t_total)
+            chunks.append(np.ascontiguousarray(video_np[:, :, start:end]))
+        return self._encode_chunk_sequence(chunks)
+
+    def encode_zero_padded_video_condition(
+        self,
+        first_frame: np.ndarray,
+        *,
+        batch_size: int,
+        num_frames: int,
+    ) -> Buffer:
+        """Encode a zero-padded I2V conditioning video without materializing it.
+
+        The conditioning path only contains a real first frame; all later
+        frames are zeros. Stream those chunks directly into the cached encoder
+        so we avoid allocating the full ``[B, 3, T, H, W]`` input tensor.
+        """
+        if num_frames <= 0:
+            raise ValueError("num_frames must be positive for I2V encoding.")
+        if first_frame.ndim != 4:
+            raise ValueError(
+                "Expected first_frame with shape [B, 3, H, W], "
+                f"got {first_frame.shape}."
+            )
+
+        image_f32 = np.ascontiguousarray(first_frame, dtype=np.float32)
+        if image_f32.shape[0] == 1 and batch_size > 1:
+            image_f32 = np.repeat(image_f32, batch_size, axis=0)
+        elif image_f32.shape[0] != batch_size:
+            raise ValueError(
+                "first_frame batch dimension must be 1 or match batch_size, "
+                f"got {image_f32.shape[0]} and {batch_size}."
+            )
+
+        chunks = [image_f32[:, :, np.newaxis, :, :]]
+        if num_frames > 1:
+            _, channels, height, width = image_f32.shape
+            zero_chunk = np.zeros(
+                (
+                    batch_size,
+                    channels,
+                    WAN_ENCODER_CHUNK_SIZE,
+                    height,
+                    width,
+                ),
+                dtype=np.float32,
+            )
+            remaining_frames = num_frames - 1
+            while remaining_frames > 0:
+                chunk_len = min(WAN_ENCODER_CHUNK_SIZE, remaining_frames)
+                chunks.append(zero_chunk[:, :, :chunk_len])
+                remaining_frames -= chunk_len
+
+        return self._encode_chunk_sequence(chunks)
+
+    def _encode_chunk_sequence(self, chunks: list[np.ndarray]) -> Buffer:
+        """Encode a pre-split Wan VAE chunk sequence."""
+        if self.first_chunk_encoder is None:
+            self.load_model()
+        first_chunk_encoder = self.first_chunk_encoder
+        rest_chunk_encoder = self.rest_chunk_encoder
+        if first_chunk_encoder is None or rest_chunk_encoder is None:
+            raise RuntimeError(
+                "VAE encoder weights not available. "
+                "Ensure the model checkpoint includes encoder weights."
+            )
+
         target_dtype = self.config.dtype
         device = self.devices[0]
         cpu = CPU()
 
-        t_total = video_np.shape[2]
         latent_chunks: list[np.ndarray] = []
         caches: list[Buffer] | None = None
-        num_chunks = 1 + (t_total - 1) // WAN_ENCODER_CHUNK_SIZE
-
         with Tracer("wan_vae_encode"):
-            for i in range(num_chunks):
-                if i == 0:
-                    chunk_np = np.ascontiguousarray(video_np[:, :, :1])
-                else:
-                    start = 1 + WAN_ENCODER_CHUNK_SIZE * (i - 1)
-                    end = 1 + WAN_ENCODER_CHUNK_SIZE * i
-                    chunk_np = np.ascontiguousarray(video_np[:, :, start:end])
-
+            for i, chunk_np in enumerate(chunks):
                 chunk_buf = _numpy_f32_to_buffer(chunk_np, target_dtype, device)
-
                 if i == 0:
                     outputs = first_chunk_encoder.execute(chunk_buf)
                 else:
