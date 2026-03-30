@@ -27,6 +27,7 @@ from max.graph import DeviceRef, Graph, TensorType
 from max.graph.buffer_utils import cast_dlpack_to
 from max.graph.weights import WeightData, Weights
 from max.pipelines.lib import SupportedEncoding
+from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
 from .model_config import WanConfig
@@ -129,18 +130,31 @@ def _remap_state_dict(
         if key not in fused_keys:
             state_dict[key] = tensor
 
-    cpu_device = CPU()
     for key in state_dict:
         tensor = state_dict[key]
         if isinstance(tensor, WeightData):
             src_dtype = tensor.dtype
-            dlpack_obj = tensor.to_buffer()
         else:
             src_dtype = DType.float32
-            dlpack_obj = tensor
-        state_dict[key] = cast_dlpack_to(
-            dlpack_obj, src_dtype, target_dtype, cpu_device
-        )
+        if src_dtype == target_dtype:
+            continue
+        if src_dtype == DType.float32 and target_dtype == DType.bfloat16:
+            arr = np.from_dlpack(
+                tensor.to_buffer() if isinstance(tensor, WeightData)
+                else tensor
+            )
+            u16 = float32_to_bfloat16_as_uint16(np.ascontiguousarray(arr))
+            state_dict[key] = Buffer.from_numpy(u16).view(
+                DType.bfloat16, arr.shape
+            )
+        else:
+            dlpack_obj = (
+                tensor.to_buffer() if isinstance(tensor, WeightData)
+                else tensor
+            )
+            state_dict[key] = cast_dlpack_to(
+                dlpack_obj, src_dtype, target_dtype, CPU()
+            )
 
     return state_dict
 
