@@ -223,12 +223,7 @@ class WanI2VPipeline(WanPipeline):
 
         # Pre-compile I2V concat graph (latent dtype, not f32)
         if self._i2v_concat_model is None:
-            latent_model_input = self._cast_f32_to_model_dtype.execute(latents)[
-                0
-            ]
-            self._i2v_concat_model = self._compile_i2v_concat(
-                latent_model_input, i2v_condition
-            )
+            self.build_i2v_concat()
 
         with Tracer("prepare_scheduler"):
             if model_inputs.step_coefficients is None:
