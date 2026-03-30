@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-from std.sys.intrinsics import _type_is_eq
 
 from std.algorithm.functional import unswitch
 from std.gpu.host import DeviceContext, DeviceBuffer
@@ -30,17 +29,17 @@ from layout import (
     TileTensor,
     UNKNOWN_VALUE,
     coord_to_index_list,
-    row_major,
+    lt_to_tt,
 )
 from linalg.matmul import elementwise_epilogue_type, matmul
 from nn._ragged_utils import get_batch_from_row_offsets
-from nn.flash_attention import (
+from nn.attention.cpu.mha import (
     flash_attention_kv_cache as flash_attention_kv_cache_cpu,
 )
 from nn.fused_qk_rope import fused_qk_rope
-from nn.mha import flash_attention as gpu_flash_attention
-from nn.mha_mask import MHAMask
-from nn.mha_utils import (
+from nn.attention.gpu.mha import flash_attention as gpu_flash_attention
+from nn.attention.mha_mask import MHAMask
+from nn.attention.mha_utils import (
     dispatch_mask,
     dispatch_materialized_mask,
 )
@@ -429,7 +428,7 @@ def _matmul_common[
         transpose_b=True,
         target=target,
         elementwise_lambda_fn=elementwise_lambda_fn,
-    ](c_nd, hidden_state_2d, weight, context)
+    ](lt_to_tt(c_nd), lt_to_tt(hidden_state_2d), lt_to_tt(weight), context)
 
     comptime if is_cpu[target]():
         c_nd.ptr.free()

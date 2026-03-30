@@ -254,10 +254,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         self._input_types_impl: Callable[..., tuple[TensorType, ...]] = (
             self._input_types_standard
         )
-        self._rdt_value: float = 0.05
         if cache_config is not None and cache_config.first_block_caching:
-            assert cache_config.residual_threshold is not None
-            self._rdt_value = cache_config.residual_threshold
             self._forward_impl = self._forward_step_cache
             self._input_types_impl = self._input_types_step_cache
 
@@ -318,8 +315,11 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         return self._base_input_types()
 
     def _input_types_step_cache(self) -> tuple[TensorType, ...]:
-        return self._base_input_types() + tuple(
-            self._fbcache_conditional_execution_output_types()
+        rdt_type = TensorType(DType.float32, shape=[], device=self.max_device)
+        return (
+            self._base_input_types()
+            + tuple(self._fbcache_conditional_execution_output_types())
+            + (rdt_type,)
         )
 
     def input_types(self) -> tuple[TensorType, ...]:
@@ -388,8 +388,13 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
                 freqs_cis=freqs_cis,
                 adaln_input=t_emb,
             )
-        u = self.final_layer(u, c=t_emb)
         return u[:, :img_len, :]
+
+    def _forward_postamble(
+        self, hidden_states: Tensor, t_emb: Tensor
+    ) -> Tensor:
+        """Final layer after the transformer backbone."""
+        return self.final_layer(hidden_states, c=t_emb)
 
     def _forward_standard(self, *args: Tensor) -> tuple[Tensor]:
         hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids = args[
@@ -403,13 +408,13 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             txt_ids,
         )
         u1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
-        out = self._run_remaining_after_first(
+        remaining = self._run_remaining_after_first(
             u1,
             img_len=img_len,
             t_emb=t_emb,
             freqs_cis=unified_freqs,
         )
-        return (out,)
+        return (self._forward_postamble(remaining, t_emb),)
 
     def _forward_step_cache(self, *args: Tensor) -> tuple[Tensor, Tensor]:
         (
@@ -420,6 +425,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             txt_ids,
             prev_residual,
             prev_output,
+            residual_threshold,
         ) = args
         unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
             hidden_states,
@@ -437,7 +443,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             first_block_residual,
             prev_residual,
             prev_output,
-            self._rdt_value,
+            residual_threshold,
             self._run_remaining_after_first,
             dict(
                 unified=unified1,
@@ -445,6 +451,8 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
                 t_emb=t_emb,
                 freqs_cis=unified_freqs,
             ),
+            self._forward_postamble,
+            t_emb,
             self._fbcache_conditional_execution_output_types(),
         )
 

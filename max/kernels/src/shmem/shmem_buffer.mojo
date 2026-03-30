@@ -11,7 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.os import abort
 from std.sys import (
     CompilationTarget,
     has_nvidia_gpu_accelerator,
@@ -21,7 +20,7 @@ from std.sys import (
 from std.ffi import external_call
 
 from std.gpu.host import DeviceContext, HostBuffer
-from std.gpu.host.device_context import _checked, _DeviceContextPtr
+from std.gpu.host.device_context import _checked, _CString, _DeviceContextPtr
 
 from .shmem_api import shmem_free, shmem_malloc
 from std.builtin.device_passable import DevicePassable
@@ -95,7 +94,7 @@ struct SHMEMBuffer[dtype: DType](DevicePassable, Sized):
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_DtoH_async_sized",
-                UnsafePointer[Byte, MutAnyOrigin],
+                _CString[],
                 _DeviceContextPtr,
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
@@ -124,7 +123,7 @@ struct SHMEMBuffer[dtype: DType](DevicePassable, Sized):
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_DtoH_async_sized",
-                UnsafePointer[Byte, MutAnyOrigin],
+                _CString[],
                 _DeviceContextPtr,
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
@@ -155,7 +154,7 @@ struct SHMEMBuffer[dtype: DType](DevicePassable, Sized):
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_HtoD_async_sized",
-                UnsafePointer[Byte, MutAnyOrigin],
+                _CString[],
                 _DeviceContextPtr,
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
@@ -184,7 +183,7 @@ struct SHMEMBuffer[dtype: DType](DevicePassable, Sized):
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_HtoD_async_sized",
-                UnsafePointer[Byte, MutAnyOrigin],
+                _CString[],
                 _DeviceContextPtr,
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],

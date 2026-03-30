@@ -144,6 +144,9 @@ struct NonNullUnsafePointer[
         comptime assert (
             size_of[type_of(self)]() == size_of[Int]()
         ), "Pointer/Int size mismatch"
+        assert unsafe_from_address != Int(
+            _Null[Self.address_space]()
+        ), "cannot create a non-null pointer from the null address"
         self = NonNullUnsafePointer(to=unsafe_from_address).bitcast[
             type_of(self)
         ]()[]
@@ -970,3 +973,35 @@ struct NonNullUnsafePointer[
         __get_address_as_uninit_lvalue(
             self.address
         ) = __get_address_as_owned_value(src.address)
+
+
+# ===-----------------------------------------------------------------------===#
+# bitcast
+# ===-----------------------------------------------------------------------===#
+
+
+@always_inline
+def bitcast[
+    From: AnyType,
+    origin: Origin,
+    //,
+    To: AnyType,
+](pointer: Optional[NonNullUnsafePointer[From, origin]]) -> Optional[
+    NonNullUnsafePointer[To, origin]
+]:
+    """Bitcasts an `Optional[NonNullUnsafePointer]` to point to a different type.
+
+    Parameters:
+        From: The source pointee type.
+        origin: The origin of the pointer.
+        To: The target pointee type.
+
+    Args:
+        pointer: The optional pointer to bitcast.
+
+    Returns:
+        An optional pointer to `To` with the same address and origin.
+    """
+    return NonNullUnsafePointer(to=pointer).bitcast[
+        Optional[NonNullUnsafePointer[To, origin]]
+    ]()[]

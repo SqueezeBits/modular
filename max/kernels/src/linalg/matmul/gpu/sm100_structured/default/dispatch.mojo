@@ -12,7 +12,6 @@
 # ===----------------------------------------------------------------------=== #
 from std.math import ceildiv
 from std.sys import (
-    align_of,
     get_defined_bool,
     get_defined_int,
     simd_width_of,
@@ -25,7 +24,7 @@ from std.gpu.primitives.grid_controls import PDLLevel
 from std.gpu.host import DeviceContext, get_gpu_target
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu.host.info import B200
-from layout import Coord, Idx, TileTensor, row_major
+from layout import Coord, Idx, TileTensor
 from std.logger import Logger
 
 from std.utils.index import Index, IndexList
@@ -48,7 +47,6 @@ from ...tile_scheduler import RasterOrder
 from .matmul import (
     blackwell_matmul_tma_umma_warp_specialized,
     blackwell_batched_matmul_tma_umma_warp_specialized,
-    matmul_sm100_fallback,
 )
 from internal_utils import Table
 from .tuning_configs import (
@@ -571,6 +569,12 @@ def matmul_dispatch_sm100_bf16[
         Index(5376, 10752),
     ]
 
+    comptime Kimi_2_5_NK = [
+        Index(1024, 512),
+        Index(1536, 1536),
+        Index(7168, 1024),
+    ]
+
     comptime static_NK = Index(static_N, static_K)
 
     # Always use heuristic dispatch for FP8 c_type otherwise it will fallback to naive gemm.
@@ -623,10 +627,18 @@ def matmul_dispatch_sm100_bf16[
             pdl_level=pdl_level,
         ](c, a, b, ctx)
 
+    comptime if Index(static_N, static_K) in Kimi_2_5_NK:
+        return heuristic_and_outliers_dispatch[
+            transpose_b=transpose_b,
+            elementwise_lambda_fn=elementwise_lambda_fn,
+            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
+            pdl_level=pdl_level,
+        ](c, a, b, ctx)
+
     return DISPATCH_MISS
 
 
-# NOTE: vendor blas, naive matmul, and multistage gemm dosen't support compute lambdas so we need to wrap them in a lambda function.
+# NOTE: vendor blas, naive matmul, and multistage gemm doesn't support compute lambdas so we need to wrap them in a lambda function.
 # if there is no compute lambda, then this wrapper will be a simple element wise lambda.
 @always_inline
 def _vendor_blas_matmul_sm100[

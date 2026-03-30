@@ -17,7 +17,7 @@ from std.gpu import barrier
 from std.gpu.primitives.cluster import block_rank_in_cluster, cluster_sync
 from std.gpu.host import DeviceContext, Dim
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu import cluster_dim, cluster_idx, thread_idx
+from std.gpu import cluster_dim, cluster_idx, thread_idx_uint as thread_idx
 from std.gpu.memory import fence_mbarrier_init
 from layout import Layout, LayoutTensor
 from layout._fillers import arange, random
@@ -28,7 +28,6 @@ from layout.tma_async import (
     TMATensorTile,
     _idx_product,
     create_tensor_tile,
-    create_tma_tile,
 )
 from std.memory import stack_allocation
 from std.testing import assert_equal

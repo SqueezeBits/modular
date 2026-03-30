@@ -718,7 +718,16 @@ class ZImagePipeline(DiffusionPipeline):
 
     @staticmethod
     def _to_numpy(image: Tensor) -> np.ndarray:
-        cpu_image: Tensor = image.cast(DType.float32).to(CPU())
+        # Match Flux/standard VAE contract: decoder outputs roughly [-1, 1] in NCHW.
+        # Convert on device before D2H to shrink transfer and satisfy pixel APIs
+        # (NHWC uint8 in [0, 255]).
+        image = image.cast(DType.float32)
+        image = image * 0.5 + 0.5
+        image = image.clip(min=0.0, max=1.0)
+        image = F.permute(image, (0, 2, 3, 1))
+        image = image * 255.0
+        image = image.cast(DType.uint8)
+        cpu_image: Tensor = image.to(CPU())
         return np.from_dlpack(cpu_image)
 
     @staticmethod

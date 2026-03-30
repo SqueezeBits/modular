@@ -13,19 +13,19 @@
 
 from std.math import isclose
 from std.random import rand
-from std.sys import argv, get_defined_bool
+from std.sys import argv
 
 
 from std.gpu import *
 from std.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
 from std.memory import memset_zero
-from nn.mha import (
+from nn.attention.gpu.mha import (
     _naive_attention_with_transpose,
     flash_attention,
     mha_gpu_naive,
 )
-from nn.mha_mask import MaterializedMask
+from nn.attention.mha_mask import NullMask
 from std.testing import assert_almost_equal
 
 from std.utils.index import Index
@@ -258,7 +258,7 @@ def test[
                 q_device,
                 k_device,
                 v_device,
-                MaterializedMask(mask3d),
+                NullMask(),
                 scale,
                 ctx,
                 num_partitions,
@@ -269,7 +269,7 @@ def test[
                 q_device,
                 k_device,
                 v_device,
-                MaterializedMask(mask4d),
+                NullMask(),
                 scale,
                 ctx,
                 num_partitions,
@@ -490,6 +490,19 @@ def test_context_encoding[
         against_gpu_naive=True,
     ](1, 1, ctx)
 
+    # Large-magnitude inputs to stress-test FMA softmax numerical stability.
+    # Trained models can produce large QK dot products that expose precision
+    # issues in the FMA exp path.
+    test[
+        4,
+        DType.bfloat16,
+        DType.bfloat16,
+        depth=depth,
+        num_heads=16,
+        group=8,
+        against_gpu_naive=True,
+    ](256, 256, ctx, use_index_input=True)
+
 
 def test_decoding[
     batch_size: Int,
@@ -579,10 +592,7 @@ def test_decoding[
 def main() raises:
     with DeviceContext() as ctx:
         # experimental kernel only supports depth == 128
-        comptime experimental_kernel = get_defined_bool[
-            "USE_EXPERIMENTAL_CDNA4_MHA_KERNEL", False
-        ]()
-        comptime depths = [64, 128, 256] if not experimental_kernel else [128]
+        comptime depths = [64, 128, 256]
 
         comptime for i in range(len(depths)):
             comptime depth = depths[i]

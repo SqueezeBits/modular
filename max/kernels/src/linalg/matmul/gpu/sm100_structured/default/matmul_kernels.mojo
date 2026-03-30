@@ -32,7 +32,7 @@ The kernel implements a warp-specialized architecture:
 from std.math import ceildiv
 from std.sys import align_of, size_of
 
-from std.gpu import WARP_SIZE, barrier, warp_id
+from std.gpu import WARP_SIZE, barrier, warp_id_uint as warp_id
 from std.gpu.primitives.cluster import (
     block_rank_in_cluster,
     cluster_sync,
@@ -44,7 +44,7 @@ from std.gpu import (
     lane_id_int as lane_id,
     thread_idx_int as thread_idx,
 )
-from std.gpu import warp_id as get_warp_id
+from std.gpu import warp_id_uint as get_warp_id
 from std.gpu.memory import (
     AddressSpace,
     external_memory,
@@ -63,7 +63,6 @@ from layout import (
     Coord,
     CoordLike,
     Idx,
-    Layout as LegacyLayout,
     RowMajorLayout,
     TensorLayout,
     TileTensor,
@@ -79,13 +78,12 @@ from structured_kernels.tile_types import (
     tma_desc_layout_3d,
 )
 from layout.tile_layout import _IntToComptimeInt
-from layout.swizzle import Swizzle
 from layout.tensor_core_async import (
     tile_layout_k_major,
     tile_layout_k_major_typed,
     tile_layout_mn_major,
 )
-from layout.tma_async import SharedMemBarrier, TMATensorTile
+from layout.tma_async import SharedMemBarrier
 
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
@@ -97,7 +95,6 @@ from linalg.utils import (
     elementwise_epilogue_type,
 )
 from ..structured_kernels.config import MatmulConfig, OutputPipelineConfig
-from structured_kernels.pipeline import ProducerConsumerPipeline
 from ..structured_kernels.tile_pipeline import (
     InputTilePipeline,
     StandardTilePayload,
@@ -668,7 +665,7 @@ struct BlackwellMatmulSM100Kernel[
         comptime assert Self.c_type in (
             DType.bfloat16,
             DType.float8_e4m3fn,
-        ), "c_type cannot be float32 or float8_e4m3fn"
+        ), "c_type must be bfloat16 or float8_e4m3fn"
         comptime assert Self.transpose_b, "Only support transposed B (K-major)"
         comptime assert Self.cta_group in (
             1,
@@ -1075,7 +1072,7 @@ struct BlackwellMatmulSM100Kernel[
                             )
 
                             for i in range(
-                                0, num_iters, Self.config.k_group_size
+                                0, Int(num_iters), Self.config.k_group_size
                             ):
                                 with producer.acquire() as tiles:
                                     Self.load_input_tiles(
@@ -1140,7 +1137,7 @@ struct BlackwellMatmulSM100Kernel[
                                     with input_pipeline.consumer() as consumer:
                                         for i in range(
                                             0,
-                                            num_iters,
+                                            Int(num_iters),
                                             Self.config.k_group_size,
                                         ):
                                             with consumer.acquire() as input_tiles:  # waits for TMA
@@ -1153,8 +1150,8 @@ struct BlackwellMatmulSM100Kernel[
                                                     0,
                                                 )
 
-                    comptime if Self.pdl_level > PDLLevel.OFF:
-                        launch_dependent_grids()
+                comptime if Self.pdl_level > PDLLevel.OFF:
+                    launch_dependent_grids()
 
         if WarpRole.is_epilogue():
             Self.EpilogueCtx.Sync.wait()  # wait for MMA to publish TMEM addr
@@ -1332,7 +1329,9 @@ struct BlackwellMatmulSM100Kernel[
                             var k_start = current.k_start
                             var k_end = k_start + current.num_k_tiles
                             for i in range(
-                                k_start, k_end, Self.config.k_group_size
+                                Int(k_start),
+                                Int(k_end),
+                                Self.config.k_group_size,
                             ):
                                 with producer.acquire() as tiles:  # waits for consumer
                                     Self.load_input_tiles_splitk(
@@ -1385,8 +1384,8 @@ struct BlackwellMatmulSM100Kernel[
                                     var k_end = k_start + current.num_k_tiles
                                     with input_pipeline.consumer() as consumer:
                                         for i in range(
-                                            k_start,
-                                            k_end,
+                                            Int(k_start),
+                                            Int(k_end),
                                             Self.config.k_group_size,
                                         ):
                                             with consumer.acquire() as input_tiles:  # waits for TMA

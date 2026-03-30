@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, overload
 
 import numpy as np
+from PIL import Image
 import numpy.typing as npt
 from max._core.driver import Device
 from max.driver import CPU, Accelerator, Buffer
@@ -37,7 +38,6 @@ from max.graph.weights import load_weights
 from max.interfaces import PixelGenerationContext
 from max.interfaces.tokens import TokenBuffer
 from max.pipelines.lib.interfaces.component_model import ComponentModel
-from PIL import Image
 from tqdm import tqdm
 from typing_extensions import Self
 
@@ -49,6 +49,18 @@ logger = logging.getLogger("max.pipelines")
 
 CompileTarget: TypeAlias = Callable[..., Any] | Module[..., Any]
 CompileDecorator: TypeAlias = Callable[[CompileTarget], "CompileWrapper"]
+
+
+@dataclass
+class DiffusionPipelineOutput:
+    """Output of a diffusion pipeline.
+
+    Attributes:
+        images: NHWC uint8 NumPy array of shape (B, H, W, C) with values
+            in [0, 255].
+    """
+
+    images: npt.NDArray[np.uint8]
 
 
 class DiffusionPipeline(ABC):
@@ -75,7 +87,7 @@ class DiffusionPipeline(ABC):
     """Model-specific default for the FBCache relative difference threshold.
 
     Subclasses may override this to provide a model-appropriate default.
-    Used when ``DenoisingCacheConfig.residual_threshold`` is ``None``.
+    Used when the request does not specify a ``residual_threshold``.
     """
 
     default_taylorseer_cache_interval: int = 5
@@ -98,6 +110,22 @@ class DiffusionPipeline(ABC):
     Subclasses may override this to provide a model-appropriate default.
     Used when ``DenoisingCacheConfig.taylorseer_max_order`` is ``None``.
     """
+
+    default_teacache_rel_l1_thresh: float = 0.4
+    """Model-specific default for the TeaCache relative-L1 threshold.
+
+    Subclasses may override this to provide a model-appropriate default.
+    Used when ``DenoisingCacheConfig.teacache_rel_l1_thresh`` is ``None``.
+    """
+
+    default_teacache_coefficients: tuple[float, ...] = (
+        4.98651651e02,
+        -2.83781631e02,
+        5.58554382e01,
+        -3.82021401e00,
+        2.64230861e-01,
+    )
+    """Default TeaCache polynomial coefficients for FLUX-style rescaling."""
 
     def __init__(
         self,
@@ -132,8 +160,6 @@ class DiffusionPipeline(ABC):
         """
         # Mutates in-place; DenoisingCacheConfig is unfrozen.
         cc = self.cache_config
-        if cc.residual_threshold is None:
-            cc.residual_threshold = self.default_residual_threshold
         if cc.taylorseer_cache_interval is None:
             cc.taylorseer_cache_interval = (
                 self.default_taylorseer_cache_interval
@@ -142,22 +168,26 @@ class DiffusionPipeline(ABC):
             cc.taylorseer_warmup_steps = self.default_taylorseer_warmup_steps
         if cc.taylorseer_max_order is None:
             cc.taylorseer_max_order = self.default_taylorseer_max_order
+        if cc.teacache_rel_l1_thresh is None:
+            cc.teacache_rel_l1_thresh = self.default_teacache_rel_l1_thresh
+        if cc.teacache_coefficients is None:
+            cc.teacache_coefficients = list(self.default_teacache_coefficients)
 
     @abstractmethod
     def init_remaining_components(self) -> None:
         """Initialize non-ComponentModel components (e.g., image processors)."""
 
     @abstractmethod
-    def prepare_inputs(
-        self, context: PixelGenerationContext
-    ) -> PixelModelInputs:
+    def prepare_inputs(self, context: PixelGenerationContext) -> Any:
         """Prepare inputs for the pipeline."""
         raise NotImplementedError(
             f"prepare_inputs is not implemented for {self.__class__.__name__}"
         )
 
     @abstractmethod
-    def execute(self, model_inputs: PixelModelInputs, **kwargs: Any) -> Any:
+    def execute(
+        self, model_inputs: Any, **kwargs: Any
+    ) -> DiffusionPipelineOutput:
         """Execute the pipeline with the given model inputs.
 
         Args:
@@ -165,7 +195,7 @@ class DiffusionPipeline(ABC):
             **kwargs: Additional pipeline-specific execution parameters.
 
         Returns:
-            Pipeline-specific output (e.g., generated images).
+            A DiffusionPipelineOutput containing NHWC uint8 images.
         """
         raise NotImplementedError(
             f"execute is not implemented for {self.__class__.__name__}"
@@ -338,6 +368,7 @@ class DiffusionPipeline(ABC):
         batch_size: int,
         seq_len: int,
         transformer_config: Any,
+        text_seq_len: int = 0,
     ) -> DenoisingCacheState:
         """Create per-request cache state with fresh tensors.
 
@@ -347,6 +378,8 @@ class DiffusionPipeline(ABC):
             transformer_config: Transformer config carrying dimension info.
                 Must have ``num_attention_heads``, ``attention_head_dim``,
                 ``patch_size``, ``out_channels``, and ``in_channels`` attributes.
+            text_seq_len: Text sequence length. Reserved for cache modes that
+                require text-aware allocations.
         """
         from .cache_mixin import DenoisingCacheState
 
@@ -400,6 +433,19 @@ class DiffusionPipeline(ABC):
                     attr,
                     _device_zeros((batch_size, seq_len, output_dim)),
                 )
+
+        if self.cache_config.teacache:
+            state.teacache_prev_modulated_input = _device_zeros(
+                (batch_size, seq_len, residual_dim)
+            )
+            state.teacache_cached_residual = _device_zeros(
+                (batch_size, seq_len, residual_dim)
+            )
+            state.teacache_accumulated_rel_l1 = Tensor(
+                storage=Buffer.from_dlpack(
+                    np.array([0.0], dtype=np.float32)
+                ).to(self._cache_device)
+            )
 
         return state
 
@@ -585,7 +631,14 @@ class DiffusionPipeline(ABC):
 
         # 4. Full compute path
         result = self.run_transformer(cache_state, **kwargs)
-        if cache_config.first_block_caching:
+        if cache_config.teacache:
+            (
+                cache_state.teacache_prev_modulated_input,
+                cache_state.teacache_cached_residual,
+                cache_state.teacache_accumulated_rel_l1,
+                noise_pred,
+            ) = result
+        elif cache_config.first_block_caching:
             new_residual, noise_pred = result
             cache_state.prev_residual = new_residual
             cache_state.prev_output = noise_pred

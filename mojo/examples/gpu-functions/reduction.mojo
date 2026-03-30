@@ -25,7 +25,12 @@ from std.benchmark import (
     ThroughputMeasure,
 )
 from std.bit import log2_floor
-from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
+from std.gpu import (
+    barrier,
+    block_dim_uint as block_dim,
+    block_idx_uint as block_idx,
+    thread_idx_uint as thread_idx,
+)
 from std.gpu.primitives import warp
 from std.gpu.globals import WARP_SIZE
 from std.gpu.host import DeviceContext, DeviceBuffer
@@ -62,7 +67,7 @@ def sum_kernel[
     threads_in_grid = KERNEL_TPB * NUM_BLOCKS
     var sum: Int32 = 0
 
-    for i in range(global_tid, size, threads_in_grid):
+    for i in range(Int(global_tid), size, Int(threads_in_grid)):
         idx = i * batch_size
         # Load in a vectorized fashion and reduce the loaded SIMD vector
         if idx < size:
@@ -76,7 +81,7 @@ def sum_kernel[
     comptime KERNEL_LOG_TPB = log2_floor(KERNEL_TPB)
 
     comptime for power in range(
-        1, KERNEL_LOG_TPB - UInt(log2_floor(WARP_SIZE)) + 1
+        1, Int(KERNEL_LOG_TPB - UInt(log2_floor(WARP_SIZE)) + 1)
     ):
         active_threads >>= 1
         if tid < UInt(active_threads):

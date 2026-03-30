@@ -30,7 +30,6 @@ from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
 )
 from std.math import ceildiv, align_up
 from std.utils.index import Index, IndexList
-from std.utils.numerics import get_accum_type
 from std.utils.static_tuple import StaticTuple
 from linalg.fp4_utils import (
     SF_MN_GROUP_SIZE,
@@ -49,12 +48,10 @@ from std.builtin.simd import (
 from layout import (
     Coord,
     Idx,
-    IntTuple,
     Layout,
     LayoutTensor,
     RuntimeInt,
     RuntimeLayout,
-    RuntimeTuple,
     TileTensor,
     UNKNOWN_VALUE,
     row_major,
@@ -447,15 +444,15 @@ def _test_kernel_impl_base[
             transpose_b=transpose_b,
             config=matmul_config,
         ](
-            c_lt,
-            a_lt,
-            a_offsets_lt,
-            a_scale_offsets_lt,
-            b_lt,
-            expert_ids_lt,
-            a_scales_lt,
-            b_scales_lt,
-            expert_scales_lt,
+            c_tensor,
+            a_tensor,
+            a_offsets_tensor,
+            a_scale_offsets_tensor,
+            b_tensor,
+            expert_ids_tensor,
+            a_scales_tensor,
+            b_scales_tensor,
+            expert_scales_tensor,
             num_active_experts,
             ctx,
         )
@@ -478,7 +475,6 @@ def _test_kernel_impl_base[
         )
 
         # Construct scale TileTensors from raw pointers with explicit
-        # row_major layouts (NDBuffer→TileTensor doesn't work for 5D/6D).
         comptime k_groups = ceildiv(expert_shape[1], SF_VECTOR_SIZE * SF_ATOM_K)
         comptime n_groups = ceildiv(expert_shape[0], SF_MN_GROUP_SIZE)
         var a_scales_tt = TileTensor(
