@@ -590,3 +590,41 @@ class ZImageCFGMain(Module[..., Sequence[Tensor]]):
 
         hidden = unified[:, :img_len, :]
         return (self.final_layer(hidden, c=t_emb),)
+
+
+class ZImageRoPEOnly(Module[..., Sequence[Tensor]]):
+    """Compute RoPE frequencies for a given (img_ids, txt_ids) pair.
+
+    Returns (unified_freqs, txt_freqs) in model dtype, ready for
+    ZImageCFGMain.  Used by the explicit-negative split path so we
+    can reuse the shared preamble (x, t_emb) while computing new
+    RoPE for different negative txt_ids.
+    """
+
+    def __init__(self, transformer: ZImageTransformer2DModel):
+        self.rope_embedder = transformer.rope_embedder
+        self.axes_dims = transformer.axes_dims
+        self.max_dtype = transformer.max_dtype
+        self.max_device = transformer.max_device
+
+    def input_types(self) -> tuple[TensorType, ...]:
+        return (
+            TensorType(
+                DType.int64,
+                shape=["image_seq_len", len(self.axes_dims)],
+                device=self.max_device,
+            ),
+            TensorType(
+                DType.int64,
+                shape=["text_seq_len", len(self.axes_dims)],
+                device=self.max_device,
+            ),
+        )
+
+    def forward(
+        self, img_ids: Tensor, txt_ids: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        img_seq_len = img_ids.shape[0]
+        unified_ids = F.concat([img_ids, txt_ids], axis=0)
+        unified_freqs = self.rope_embedder(unified_ids).cast(self.max_dtype)
+        return (unified_freqs, unified_freqs[img_seq_len:])

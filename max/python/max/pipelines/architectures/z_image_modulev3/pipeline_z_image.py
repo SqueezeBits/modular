@@ -1214,6 +1214,7 @@ class ZImagePipeline(DiffusionPipeline):
         )
 
         # 4) Denoising loop.
+        _preamble_out: tuple[Tensor, ...] | None = None
         with Tracer("denoising_loop"):
             for i in range(num_timesteps):
                 apply_cfg = i < cfg_cutoff_step
@@ -1265,7 +1266,25 @@ class ZImagePipeline(DiffusionPipeline):
                                     guidance_scale_tensor,
                                 )
                         else:
-                            if use_fast_denoise:
+                            if use_fast_denoise and apply_cfg:
+                                # Non-batched CFG with split: share preamble,
+                                # run main separately for pos and neg.
+                                _preamble_out = (
+                                    self.transformer.run_preamble(
+                                        latents, timestep, img_ids, txt_ids,
+                                    )
+                                )
+                                x_sh, t_emb_sh, uf_pos, tf_pos = (
+                                    _preamble_out
+                                )
+                                noise_pred = self.transformer.run_cfg_main(
+                                    x_sh,
+                                    prompt_embeds,
+                                    t_emb_sh,
+                                    uf_pos,
+                                    tf_pos,
+                                )[0]
+                            elif use_fast_denoise:
                                 noise_pred = self.run_transformer(
                                     cache_pos,
                                     latents=latents,
@@ -1288,7 +1307,6 @@ class ZImagePipeline(DiffusionPipeline):
 
                     if apply_cfg and not use_batched_cfg_mode:
                         assert negative_prompt_embeds is not None
-                        assert cache_neg is not None
                         neg_img_ids = img_ids
                         neg_txt_ids = txt_ids
                         if model_inputs.explicit_negative_prompt:
@@ -1302,15 +1320,26 @@ class ZImagePipeline(DiffusionPipeline):
                             neg_txt_ids = model_inputs.negative_txt_ids_tensor
                         with Tracer("cfg_transformer"):
                             if use_fast_denoise:
-                                neg_noise_pred = self.run_transformer(
-                                    cache_neg,
-                                    latents=latents,
-                                    prompt_embeds=negative_prompt_embeds,
-                                    timestep=timestep,
-                                    img_ids=neg_img_ids,
-                                    txt_ids=neg_txt_ids,
-                                )[0]
+                                # Reuse x, t_emb from positive preamble;
+                                # only recompute RoPE for negative txt_ids.
+                                assert _preamble_out is not None
+                                x_sh, t_emb_sh, _, _ = _preamble_out
+                                neg_uf, neg_tf = (
+                                    self.transformer.compute_rope(
+                                        neg_img_ids, neg_txt_ids,
+                                    )
+                                )
+                                neg_noise_pred = (
+                                    self.transformer.run_cfg_main(
+                                        x_sh,
+                                        negative_prompt_embeds,
+                                        t_emb_sh,
+                                        neg_uf,
+                                        neg_tf,
+                                    )[0]
+                                )
                             else:
+                                assert cache_neg is not None
                                 neg_noise_pred = self.run_denoising_step(
                                     step=i,
                                     cache_state=cache_neg,

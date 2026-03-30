@@ -31,6 +31,7 @@ from .model_config import ZImageConfig
 from .weight_adapters import convert_z_image_transformer_state_dict
 from .z_image import (
     ZImageCFGMain,
+    ZImageRoPEOnly,
     ZImageSharedPreamble,
     ZImageTransformer2DModel,
 )
@@ -83,21 +84,26 @@ class ZImageTransformerModel(ComponentModel):
             )
             preamble = ZImageSharedPreamble(transformer)
             cfg_main = ZImageCFGMain(transformer)
+            rope_only = ZImageRoPEOnly(transformer)
             transformer.to(self.devices[0])
             preamble.to(self.devices[0])
             cfg_main.to(self.devices[0])
+            rope_only.to(self.devices[0])
 
         self.model = transformer.compile(
             *transformer.input_types(),
             weights=state_dict,
         )
 
-        # Compile split graphs for batched-CFG: preamble (batch=1) + main (batch=2).
+        # Compile split graphs for CFG: preamble (batch=1) + main (batch=N).
         self.preamble_model = preamble.compile(
             *preamble.input_types(), weights=state_dict,
         )
         self.cfg_main_model = cfg_main.compile(
             *cfg_main.input_types(), weights=state_dict,
+        )
+        self.rope_only_model = rope_only.compile(
+            *rope_only.input_types(), weights=state_dict,
         )
 
     def run_preamble(
@@ -120,6 +126,11 @@ class ZImageTransformerModel(ComponentModel):
         return self.cfg_main_model(
             x, encoder_hidden_states, t_emb, unified_freqs, txt_freqs
         )
+
+    def compute_rope(
+        self, img_ids: Tensor, txt_ids: Tensor,
+    ) -> Any:
+        return self.rope_only_model(img_ids, txt_ids)
 
     @traced(message="ZImageTransformerModel.__call__")
     def __call__(
