@@ -47,7 +47,6 @@ from .speculative_config import SpeculativeConfig, SpeculativeMethod
 __all__ = [
     "DEFAULT_MAX_BATCH_INPUT_TOKENS",
     "AudioGenerationConfig",
-    "DenoisingCacheConfig",
     "KVCacheConfig",
     "KVConnectorConfig",
     "KVConnectorType",

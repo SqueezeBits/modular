@@ -46,6 +46,6 @@ class ComponentModel(ABC):
         self.cache_config = cache_config
 
     @abstractmethod
-    def load_model(self) -> Callable[..., Any] | None:
+    def load_model(self) -> Callable[..., Any]:
         """Load and return a runtime model instance."""
         ...
