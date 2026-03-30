@@ -447,4 +447,6 @@ class WanI2VPipeline(WanPipeline):
                         coeff_buffers[i],
                         step_state,
                     )
+                del noise_pred_buf
+                del latent_model_input
         return latents, step_state

@@ -235,13 +235,17 @@ class BlockLevelModel:
             pre_out[2],
             pre_out[3],
         )
+        del pre_out
         for block in self.blocks:
             block_out = block.execute(
                 hs, text_emb, timestep_proj, rope_cos, rope_sin
             )
             hs = block_out[0]
+            del block_out
         post_out = self.post.execute(hs, temb, spatial_shape)
-        return post_out[0]
+        result = post_out[0]
+        del post_out
+        return result
 
 
 class WanTransformerModel(ComponentModel):
@@ -422,12 +426,9 @@ class WanTransformerModel(ComponentModel):
     ) -> Callable[..., Any]:
         """Compile the transformer as separate pre/block/post graphs.
 
-        Block graphs are compiled with concrete ``batch_size``, ``seq_len``
-        and ``seq_text_len``.  Pre/post graphs use symbolic spatial dims.
-
-        TODO(compiler): Switch block graphs to symbolic ``seq_len`` once
-        the engine memory manager no longer allocates worst-case buffers
-        for symbolic dims (~18.5 GB vs ~6.5 GB concrete for 720p).
+        Block graphs are compiled with symbolic ``seq_len`` and concrete
+        ``batch_size`` / ``seq_text_len``. Pre/post graphs use symbolic
+        spatial dims.
         """
         with self._load_lock:
             if self.model is not None:
@@ -479,10 +480,11 @@ class WanTransformerModel(ComponentModel):
                 pre_graph, weights_registry=pre_module.state_dict()
             )
 
-            # --- Block graph (concrete dims) ---
+            # --- Block graph (symbolic seq_len) ---
+            block_seq_len_dim: str = "seq_len"
             block_input_types = [
                 TensorType(
-                    dtype, [batch_size, seq_len, dim], device=dev
+                    dtype, [batch_size, block_seq_len_dim, dim], device=dev
                 ),
                 TensorType(
                     dtype, [batch_size, seq_text_len, dim], device=dev
@@ -490,12 +492,12 @@ class WanTransformerModel(ComponentModel):
                 TensorType(dtype, [batch_size, 6, dim], device=dev),
                 TensorType(
                     DType.float32,
-                    [seq_len, self.config.attention_head_dim],
+                    [block_seq_len_dim, self.config.attention_head_dim],
                     device=dev,
                 ),
                 TensorType(
                     DType.float32,
-                    [seq_len, self.config.attention_head_dim],
+                    [block_seq_len_dim, self.config.attention_head_dim],
                     device=dev,
                 ),
             ]
@@ -541,9 +543,12 @@ class WanTransformerModel(ComponentModel):
                     )
                 )
             logger.info(
-                "Compiled block graph (batch=%d, seq_len=%d, "
-                "seq_text=%d, %d layers)",
-                batch_size, seq_len, seq_text_len, len(block_models),
+                "Compiled block graph (batch=%d, seq_len=symbolic "
+                "default=%d, seq_text=%d, %d layers)",
+                batch_size,
+                seq_len,
+                seq_text_len,
+                len(block_models),
             )
 
             # --- Post-processing graph ---
