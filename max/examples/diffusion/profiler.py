@@ -250,6 +250,10 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
                 ("scheduler_step", "scheduler_step"),
                 ("preprocess_latents", "preprocess_latents"),
                 ("prepare_image_latents", "prepare_image_latents"),
+                (
+                    "run_transformer_cfg_split",
+                    "component/transformer",
+                ),
             ]
         else:
             specs = [
@@ -297,6 +301,8 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
                 torch.cuda.synchronize()
                 dt: float = perf_counter() - t0
                 self._accum(label, dt)
+                if label.startswith("component/"):
+                    self._accum_component(label, dt)
 
         wrapper.__is_execute_profiler_wrapper__ = True  # type: ignore[attr-defined]
         wrapper.__wrapped__ = original  # type: ignore[attr-defined]

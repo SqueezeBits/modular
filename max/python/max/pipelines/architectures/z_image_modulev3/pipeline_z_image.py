@@ -397,8 +397,10 @@ class ZImagePipeline(DiffusionPipeline):
         duplicated CFG batch.
         """
         # Phase 1: shared preamble at batch=1.
-        x, t_emb, unified_freqs, txt_freqs = self.transformer.run_preamble(
-            latents, timestep, img_ids, txt_ids,
+        x, t_emb, unified_freqs, txt_freqs = (
+            self.transformer.run_preamble(
+                latents, timestep, img_ids, txt_ids,
+            )
         )
 
         # Duplicate shared results to batch=2.
@@ -1212,7 +1214,6 @@ class ZImagePipeline(DiffusionPipeline):
         )
 
         # 4) Denoising loop.
-        _shared_preamble: tuple[Tensor, ...] | None = None
         with Tracer("denoising_loop"):
             for i in range(num_timesteps):
                 apply_cfg = i < cfg_cutoff_step
@@ -1264,24 +1265,7 @@ class ZImagePipeline(DiffusionPipeline):
                                     guidance_scale_tensor,
                                 )
                         else:
-                            if use_fast_denoise and apply_cfg:
-                                # Run preamble once and cache for negative reuse.
-                                _shared_preamble = (
-                                    self.transformer.run_preamble(
-                                        latents, timestep, img_ids, txt_ids,
-                                    )
-                                )
-                                x_sh, t_emb_sh, uf_sh, tf_sh = (
-                                    _shared_preamble
-                                )
-                                noise_pred = self.transformer.run_cfg_main(
-                                    x_sh,
-                                    prompt_embeds,
-                                    t_emb_sh,
-                                    uf_sh,
-                                    tf_sh,
-                                )[0]
-                            elif use_fast_denoise:
+                            if use_fast_denoise:
                                 noise_pred = self.run_transformer(
                                     cache_pos,
                                     latents=latents,
@@ -1318,45 +1302,14 @@ class ZImagePipeline(DiffusionPipeline):
                             neg_txt_ids = model_inputs.negative_txt_ids_tensor
                         with Tracer("cfg_transformer"):
                             if use_fast_denoise:
-                                # Reuse shared preamble (x, t_emb) from the
-                                # positive pass.  For explicit negative prompts
-                                # txt_ids may differ, so recompute txt_freqs
-                                # from the unified_freqs using the correct
-                                # img_seq offset.
-                                assert _shared_preamble is not None
-                                x_sh, t_emb_sh, unified_freqs_sh, txt_freqs_sh = (
-                                    _shared_preamble
-                                )
-                                if model_inputs.explicit_negative_prompt:
-                                    # Recompute unified_freqs with neg txt_ids.
-                                    neg_preamble = (
-                                        self.transformer.run_preamble(
-                                            latents,
-                                            timestep,
-                                            neg_img_ids,
-                                            neg_txt_ids,
-                                        )
-                                    )
-                                    _, _, neg_uf, neg_tf = neg_preamble
-                                    neg_noise_pred = (
-                                        self.transformer.run_cfg_main(
-                                            x_sh,
-                                            negative_prompt_embeds,
-                                            t_emb_sh,
-                                            neg_uf,
-                                            neg_tf,
-                                        )[0]
-                                    )
-                                else:
-                                    neg_noise_pred = (
-                                        self.transformer.run_cfg_main(
-                                            x_sh,
-                                            negative_prompt_embeds,
-                                            t_emb_sh,
-                                            unified_freqs_sh,
-                                            txt_freqs_sh,
-                                        )[0]
-                                    )
+                                neg_noise_pred = self.run_transformer(
+                                    cache_neg,
+                                    latents=latents,
+                                    prompt_embeds=negative_prompt_embeds,
+                                    timestep=timestep,
+                                    img_ids=neg_img_ids,
+                                    txt_ids=neg_txt_ids,
+                                )[0]
                             else:
                                 neg_noise_pred = self.run_denoising_step(
                                     step=i,

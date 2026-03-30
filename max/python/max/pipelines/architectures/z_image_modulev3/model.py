@@ -100,7 +100,6 @@ class ZImageTransformerModel(ComponentModel):
             *cfg_main.input_types(), weights=state_dict,
         )
 
-    @traced(message="ZImageTransformerModel.run_preamble")
     def run_preamble(
         self,
         hidden_states: Tensor,
@@ -110,7 +109,6 @@ class ZImageTransformerModel(ComponentModel):
     ) -> Any:
         return self.preamble_model(hidden_states, timestep, img_ids, txt_ids)
 
-    @traced(message="ZImageTransformerModel.run_cfg_main")
     def run_cfg_main(
         self,
         x: Tensor,
