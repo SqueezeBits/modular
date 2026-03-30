@@ -875,7 +875,7 @@ class ZImagePipeline(DiffusionPipeline):
     ) -> Tensor:
         latents_dtype = latents.dtype
         latents = latents.cast(DType.float32)
-        latents = latents + dt * noise_pred
+        latents = latents - dt * noise_pred
         latents = latents.cast(latents_dtype)
         return latents
 
@@ -1294,7 +1294,6 @@ class ZImagePipeline(DiffusionPipeline):
                         )
 
                     with Tracer("scheduler_step"):
-                        noise_pred = F.mul(noise_pred, -1.0)
                         latents = self.scheduler_step(latents, noise_pred, dt)
 
         with Tracer("decode_outputs"):
