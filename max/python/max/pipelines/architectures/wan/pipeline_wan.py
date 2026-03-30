@@ -702,7 +702,6 @@ class WanPipeline(DiffusionPipeline):
             self.prepare_prompt_embeddings(model_inputs)
         )
         return prompt_embeds, negative_prompt_embeds, None, do_cfg
-
     def prepare_prompt_embeddings(
         self,
         model_inputs: WanModelInputs,
@@ -1225,6 +1224,7 @@ class WanPipeline(DiffusionPipeline):
                 num_elements = 1
                 for d in v.shape:
                     num_elements *= d
+                estimated_bytes += num_elements * 2  # bfloat16
                 estimated_bytes += num_elements * 2  # bfloat16
 
         margin = 1.2  # 20% headroom
