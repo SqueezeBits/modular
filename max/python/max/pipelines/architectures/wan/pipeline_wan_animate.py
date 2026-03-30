@@ -78,8 +78,6 @@ class WanAnimateModelInputs(WanModelInputs):
     # Segment parameters
     segment_frame_length: int = 77
     prev_segment_conditioning_frames: int = 1
-    # Motion encoder batch size
-    motion_encode_batch_size: int = 8
     # Shared inputs dir for parity testing (dumped from diffusers)
     shared_inputs_dir: str | None = None
 
@@ -182,30 +180,6 @@ class WanAnimatePipeline(WanI2VPipeline):
 
         t_start = _time_mod.perf_counter()
 
-        # Set up intermediate tensor dumping for parity testing.
-        dump_dir = model_inputs.shared_inputs_dir
-        if dump_dir:
-            max_dump_dir = os.path.join(
-                os.path.dirname(dump_dir), "max_dump"
-            )
-            os.makedirs(max_dump_dir, exist_ok=True)
-            logger.info("Dumping MAX intermediates to %s", max_dump_dir)
-        else:
-            max_dump_dir = None
-
-        def _dump(name: str, arr: Any) -> None:
-            if max_dump_dir is None or arr is None:
-                return
-            if isinstance(arr, Buffer):
-                arr = _buffer_to_numpy_f32(arr)
-            elif not isinstance(arr, np.ndarray):
-                arr = np.asarray(arr, dtype=np.float32)
-            if arr.dtype != np.float32:
-                arr = arr.astype(np.float32)
-            path = os.path.join(max_dump_dir, f"{name}.npy")
-            np.save(path, arr)
-            logger.info("  [dump] %s: %s -> %s", name, arr.shape, path)
-
         # === One-time setup ===
 
         h = int(model_inputs.height)
@@ -231,9 +205,6 @@ class WanAnimatePipeline(WanI2VPipeline):
             clip_features = self.image_encoder.encode(
                 model_inputs.input_image
             )
-
-        _dump("prompt_embeds", prompt_embeds)
-        _dump("clip_features", clip_features)
 
         # 3. Prepare latents for I2V condition (will be used per segment)
         with Tracer("prepare_i2v_base"):
@@ -376,12 +347,10 @@ class WanAnimatePipeline(WanI2VPipeline):
                 seg_idx, _time_mod.perf_counter() - _t_vae_enc,
             )
 
-            _dump(f"pose_latents_seg{seg_idx}", pose_latents)
-
             # 6. Encode face segment via motion encoder + face encoder
             _t_face = _time_mod.perf_counter()
             with Tracer(f"segment_{seg_idx}:encode_face"):
-                face_emb, motion_vectors = self._encode_face_segment(
+                face_emb = self._encode_face_segment(
                     seg_face,
                     device,
                 )
@@ -389,9 +358,6 @@ class WanAnimatePipeline(WanI2VPipeline):
                 "Segment %d face encode: %.1fs",
                 seg_idx, _time_mod.perf_counter() - _t_face,
             )
-
-            _dump(f"motion_vectors_seg{seg_idx}", motion_vectors)
-            _dump(f"face_emb_seg{seg_idx}", face_emb)
 
             # 7. Build I2V conditioning (reuse proven I2V method)
             _t_cond = _time_mod.perf_counter()
@@ -482,10 +448,6 @@ class WanAnimatePipeline(WanI2VPipeline):
                 y_full = np.concatenate([y_ref, y_prev], axis=2).astype(np.float32)
                 condition = _numpy_f32_to_buffer(y_full, self.vae.config.dtype, device)
 
-                if seg_idx == 0:
-                    _dump("ref_image_latents", y_ref)
-                _dump(f"prev_cond_seg{seg_idx}", y_prev)
-
                 logger.info(
                     "Condition shape: %s, noise T=%d, pose T=%d",
                     y_full.shape, total_latent_t, t_l,
@@ -524,7 +486,6 @@ class WanAnimatePipeline(WanI2VPipeline):
                     latents_np = np.random.randn(*noise_shape).astype(
                         np.float32
                     )
-                _dump(f"noise_seg{seg_idx}", latents_np)
                 latents = Buffer.from_numpy(latents_np).to(device)
 
             # Compute RoPE for this segment's latent dimensions.
@@ -549,16 +510,9 @@ class WanAnimatePipeline(WanI2VPipeline):
                 np.array([ppf], dtype=np.int32)
             ).to(device)
 
-            # 9. Pre-compile concat graph for this segment
-            # Reset for each segment (temporal dim may differ)
-            self._i2v_concat_model = None
-            if self._i2v_concat_model is None:
-                latent_model_input = (
-                    self.compiled.cast_f32_to_model_dtype.execute(latents)[0]
-                )
-                self._i2v_concat_model = self._compile_i2v_concat(
-                    latent_model_input, condition
-                )
+            # 9. Pre-compile concat graph for this segment (reset per segment — temporal dim may differ)
+            latent_model_input = self.compiled.cast_f32_to_model_dtype.execute(latents)[0]
+            self._i2v_concat_model = self._compile_i2v_concat(latent_model_input, condition)
 
             logger.info(
                 "Segment %d build condition: %.1fs",
@@ -616,8 +570,6 @@ class WanAnimatePipeline(WanI2VPipeline):
                 seg_idx, _time_mod.perf_counter() - _t_denoise_seg,
             )
 
-            _dump(f"final_latents_seg{seg_idx}", latents)
-
             # 11. VAE decode (skip first latent frame = conditioned ref image)
             _t_vae_dec = _time_mod.perf_counter()
             with Tracer(f"segment_{seg_idx}:vae_decode"):
@@ -674,101 +626,6 @@ class WanAnimatePipeline(WanI2VPipeline):
             from diffusers.utils import load_video
             return load_video(str(video))
         return list(video)
-
-    def _prepare_animate_i2v_condition(
-        self,
-        model_inputs: WanAnimateModelInputs,
-        num_seg_frames: int,
-        device: Device,
-    ) -> Buffer:
-        """Prepare I2V condition for a segment, matching diffusers approach.
-
-        Encodes a full video (ref image at frame 0, zeros elsewhere) through
-        VAE at once, then builds [mask | latents] condition tensor.
-
-        Returns:
-            Buffer [B, 20, 1+T_l, H_l, W_l]
-        """
-        image = model_inputs.input_image
-        if image is None:
-            raise ValueError("Animate pipeline requires input_image")
-        if not isinstance(image, np.ndarray):
-            image = np.array(image)
-
-        h = int(model_inputs.height)
-        w = int(model_inputs.width)
-        num_frames = num_seg_frames
-
-        # Normalize to [-1, 1]
-        image_f32 = image.astype(np.float32) / 127.5 - 1.0
-        if image_f32.ndim == 3:
-            image_f32 = image_f32.transpose(2, 0, 1)  # [3, H, W]
-
-        # Resize if needed
-        if image_f32.shape[1] != h or image_f32.shape[2] != w:
-            import PIL.Image
-
-            pil_img = PIL.Image.fromarray(
-                ((image_f32.transpose(1, 2, 0) + 1.0) * 127.5)
-                .clip(0, 255)
-                .astype(np.uint8)
-            )
-            pil_img = pil_img.resize((w, h), PIL.Image.Resampling.LANCZOS)
-            image_f32 = (
-                np.array(pil_img).astype(np.float32) / 127.5 - 1.0
-            ).transpose(2, 0, 1)
-
-        # Build full video: ref image at frame 0, zeros elsewhere
-        # Shape: [1, 3, num_frames, H, W]
-        video_condition = np.zeros(
-            (1, 3, num_frames, h, w), dtype=np.float32
-        )
-        video_condition[:, :, 0:1, :, :] = image_f32[np.newaxis, :, np.newaxis, :, :]
-
-        # VAE encode the full conditioning video
-        enc_buf = _numpy_f32_to_buffer(
-            video_condition, self.vae.config.dtype, device
-        )
-        enc_latent = self.vae.encode(enc_buf)
-        latent_cond_np = _buffer_to_numpy_f32(enc_latent)
-
-        # Standardize
-        z_dim = self.vae.config.z_dim
-        mean = np.array(
-            self.vae.config.latents_mean, dtype=np.float32
-        ).reshape(1, z_dim, 1, 1, 1)
-        inv_std = 1.0 / np.array(
-            self.vae.config.latents_std, dtype=np.float32
-        ).reshape(1, z_dim, 1, 1, 1)
-        latent_cond_np = (latent_cond_np - mean) * inv_std
-
-        # Build mask: [B, 1, num_frames, H_l, W_l]
-        t_latent = latent_cond_np.shape[2]
-        h_l = latent_cond_np.shape[3]
-        w_l = latent_cond_np.shape[4]
-
-        mask = np.zeros(
-            (1, 1, num_frames, h_l, w_l), dtype=np.float32
-        )
-        mask[:, :, 0, :, :] = 1.0  # First frame is conditioned
-
-        # Expand mask temporally: [B, 1, num_frames, H_l, W_l] -> [B, vae_t, T_l, H_l, W_l]
-        vae_t = self.vae_scale_factor_temporal
-        first_mask = np.repeat(mask[:, :, 0:1, :, :], vae_t, axis=2)
-        mask_expanded = np.concatenate(
-            [first_mask, mask[:, :, 1:, :, :]], axis=2
-        )
-        mask_expanded = mask_expanded.reshape(
-            1, -1, vae_t, h_l, w_l
-        )
-        mask_expanded = mask_expanded.transpose(0, 2, 1, 3, 4)
-
-        # Concat: [mask(vae_t ch), latent_condition(z_dim ch)] -> [B, 20, T_l, H_l, W_l]
-        condition = np.concatenate(
-            [mask_expanded, latent_cond_np], axis=1
-        ).astype(np.float32)
-
-        return _numpy_f32_to_buffer(condition, self.vae.config.dtype, device)
 
     def _build_replace_cond_video(
         self,
@@ -947,7 +804,7 @@ class WanAnimatePipeline(WanI2VPipeline):
         self,
         face_frames: list[Any],
         device: Device,
-    ) -> tuple[Buffer, Buffer]:
+    ) -> Buffer:
         """Encode face frames via motion encoder + face encoder.
 
         Args:
@@ -955,8 +812,7 @@ class WanAnimatePipeline(WanI2VPipeline):
             device: Target device.
 
         Returns:
-            Tuple of (face_emb Buffer [B, T//4+1, 5, 5120],
-            motion_vectors Buffer [T, 512]).
+            face_emb Buffer [B, T//4+1, 5, 5120].
         """
         # Convert face frames to [T, 3, 512, 512] float32 in [-1, 1]
         import PIL.Image
@@ -1019,165 +875,7 @@ class WanAnimatePipeline(WanI2VPipeline):
             "  face encoder: %.1fs",
             _time_mod.perf_counter() - _t0,
         )
-        return face_emb, motion_buf
-
-    def _build_segment_condition(
-        self,
-        ref_condition: Buffer,
-        prev_segment_video: np.ndarray | None,
-        seg_idx: int,
-        mode: str,
-        bg_frames: list[Any] | None,
-        mask_frames: list[Any] | None,
-        seg_start: int,
-        num_seg_frames: int,
-        latent_shape: tuple[int, ...],
-        device: Device,
-    ) -> Buffer:
-        """Build the full conditioning tensor for a segment.
-
-        Returns:
-            Buffer [B, 20, 1+T_l, H_l, W_l]
-        """
-        z_dim = int(latent_shape[1])
-        t_l = int(latent_shape[2])
-        h_l = int(latent_shape[3])
-        w_l = int(latent_shape[4])
-        vae_t = self.vae_scale_factor_temporal
-
-        if seg_idx == 0 and mode == "animate":
-            # First segment, animate mode: zeros for prev conditioning
-            prev_latents = np.zeros(
-                (1, z_dim, t_l, h_l, w_l), dtype=np.float32
-            )
-            mask_prev = np.zeros(
-                (1, vae_t, t_l, h_l, w_l), dtype=np.float32
-            )
-        elif seg_idx == 0 and mode == "replace" and bg_frames is not None:
-            # First segment, replace mode: use background frames
-            prev_latents, mask_prev = self._encode_prev_condition(
-                bg_frames[seg_start : seg_start + num_seg_frames],
-                mask_frames[seg_start : seg_start + num_seg_frames]
-                if mask_frames
-                else None,
-                latent_shape,
-                device,
-            )
-        elif prev_segment_video is not None:
-            # Subsequent segments: use last decoded frames from prev segment
-            prev_latents, mask_prev = self._encode_prev_from_decoded(
-                prev_segment_video, latent_shape, device
-            )
-        else:
-            prev_latents = np.zeros(
-                (1, z_dim, t_l, h_l, w_l), dtype=np.float32
-            )
-            mask_prev = np.zeros(
-                (1, vae_t, t_l, h_l, w_l), dtype=np.float32
-            )
-
-        # Combine: [mask(vae_t ch), latents(z_dim ch)] = [B, 20, T_l, H_l, W_l]
-        y_prev = np.concatenate(
-            [mask_prev, prev_latents], axis=1
-        ).astype(np.float32)
-        y_prev_buf = _numpy_f32_to_buffer(
-            y_prev, self.vae.config.dtype, device
-        )
-
-        # Full conditioning: concat ref + prev along temporal dim
-        # ref_condition: [B, 20, 1, H_l, W_l]
-        # y_prev: [B, 20, T_l, H_l, W_l]
-        # Result: [B, 20, 1+T_l, H_l, W_l]
-        if self._i2v_concat_model is None:
-            # Use numpy concat for simplicity (this is done once per segment)
-            ref_np = _buffer_to_numpy_f32(ref_condition)
-            full_cond = np.concatenate([ref_np, y_prev], axis=2).astype(
-                np.float32
-            )
-            return _numpy_f32_to_buffer(
-                full_cond, self.vae.config.dtype, device
-            )
-        else:
-            ref_np = _buffer_to_numpy_f32(ref_condition)
-            full_cond = np.concatenate([ref_np, y_prev], axis=2).astype(
-                np.float32
-            )
-            return _numpy_f32_to_buffer(
-                full_cond, self.vae.config.dtype, device
-            )
-
-    def _encode_prev_condition(
-        self,
-        frames: list[Any],
-        mask_frames_slice: list[Any] | None,
-        latent_shape: tuple[int, ...],
-        device: Device,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Encode previous conditioning frames (for replace mode first segment)."""
-        # Simple implementation: encode frames via VAE, build mask
-        z_dim = int(latent_shape[1])
-        t_l = int(latent_shape[2])
-        h_l = int(latent_shape[3])
-        w_l = int(latent_shape[4])
-        vae_t = self.vae_scale_factor_temporal
-
-        # For now, return zeros (replace mode can be refined later)
-        prev_latents = np.zeros(
-            (1, z_dim, t_l, h_l, w_l), dtype=np.float32
-        )
-        mask_prev = np.zeros(
-            (1, vae_t, t_l, h_l, w_l), dtype=np.float32
-        )
-        return prev_latents, mask_prev
-
-    def _encode_prev_from_decoded(
-        self,
-        decoded_video: np.ndarray,
-        latent_shape: tuple[int, ...],
-        device: Device,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Encode previously decoded frames for segment conditioning."""
-        z_dim = int(latent_shape[1])
-        t_l = int(latent_shape[2])
-        h_l = int(latent_shape[3])
-        w_l = int(latent_shape[4])
-        vae_t = self.vae_scale_factor_temporal
-
-        # VAE encode the decoded video
-        enc_buf = _numpy_f32_to_buffer(
-            decoded_video.astype(np.float32), self.vae.config.dtype, device
-        )
-        enc_latent = self.vae.encode(enc_buf)
-        prev_latents = _buffer_to_numpy_f32(enc_latent)
-
-        # Standardize
-        mean = np.array(
-            self.vae.config.latents_mean, dtype=np.float32
-        ).reshape(1, z_dim, 1, 1, 1)
-        inv_std = 1.0 / np.array(
-            self.vae.config.latents_std, dtype=np.float32
-        ).reshape(1, z_dim, 1, 1, 1)
-        prev_latents = (prev_latents - mean) * inv_std
-
-        # Pad/truncate to match expected temporal dimension
-        if prev_latents.shape[2] < t_l:
-            pad = np.zeros(
-                (1, z_dim, t_l - prev_latents.shape[2], h_l, w_l),
-                dtype=np.float32,
-            )
-            prev_latents = np.concatenate([prev_latents, pad], axis=2)
-        elif prev_latents.shape[2] > t_l:
-            prev_latents = prev_latents[:, :, :t_l, :, :]
-
-        # Build i2v mask: first prev_cond_frames are conditioned
-        mask_prev = np.zeros(
-            (1, vae_t, t_l, h_l, w_l), dtype=np.float32
-        )
-        # Mark conditioned frames
-        cond_t = min(prev_latents.shape[2], t_l)
-        mask_prev[:, :, :cond_t, :, :] = 1.0
-
-        return prev_latents, mask_prev
+        return face_emb
 
     def _run_animate_denoising(
         self,
@@ -1363,10 +1061,6 @@ class WanAnimatePipeline(WanI2VPipeline):
         if hasattr(context, "prev_segment_conditioning_frames"):
             animate_inputs.prev_segment_conditioning_frames = (
                 context.prev_segment_conditioning_frames
-            )
-        if hasattr(context, "motion_encode_batch_size"):
-            animate_inputs.motion_encode_batch_size = (
-                context.motion_encode_batch_size
             )
         if hasattr(context, "shared_inputs_dir"):
             animate_inputs.shared_inputs_dir = context.shared_inputs_dir

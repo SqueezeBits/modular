@@ -19,15 +19,12 @@ New modules for Wan-Animate that extend the base Wan transformer:
 - WanAnimateFaceEncoder: CausalConv1d face encoder (MAX Graph API)
 - WanAnimateFaceBlock: Face adapter cross-attention (MAX Graph API)
 - WanAnimatePreProcess: Extended pre-processing with pose + CLIP
-- CLIPImageEncoderBridge: PyTorch bridge for CLIP ViT-H/14
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from typing import Any
-
 import numpy as np
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, Weight, ops
@@ -768,40 +765,3 @@ class WanAnimateMotionEncoder(Module):
         q_t = ops.permute(self.q_matrix, [1, 0])  # [motion_dim, out_dim]
         motion_vec = ops.matmul(x, q_t)  # [B, out_dim=512]
         return ops.cast(motion_vec, DType.bfloat16)
-
-
-class CLIPImageEncoderBridge:
-    """PyTorch bridge for CLIP ViT-H/14 image encoder.
-
-    Loads from the diffusers checkpoint's image_encoder subfolder.
-    Runs once per generation — not performance critical.
-    """
-
-    def __init__(self, model_path: str, device: str = "cuda") -> None:
-        from transformers import CLIPImageProcessor, CLIPVisionModel  
-        logger.info("Loading CLIP image encoder from %s", model_path)
-        self.model = CLIPVisionModel.from_pretrained(
-            model_path, subfolder="image_encoder",
-        ).to(device).eval()
-        self.processor = CLIPImageProcessor.from_pretrained(
-            model_path, subfolder="image_processor",
-        )
-        self.device = device
-
-    def encode(self, image: Any) -> np.ndarray:
-        """Encode image to CLIP features.
-
-        Args:
-            image: PIL Image or numpy array.
-
-        Returns:
-            [1, 257, 1280] float32 (last_hidden_state).
-        """
-        import torch  
-        inputs = self.processor(images=image, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(
-            device=self.device, dtype=self.model.dtype,
-        )
-        with torch.no_grad():
-            outputs = self.model(pixel_values)
-        return outputs.last_hidden_state.float().cpu().numpy()

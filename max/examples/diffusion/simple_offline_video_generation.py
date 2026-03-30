@@ -213,12 +213,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional warmup low-noise CFG scale override.",
     )
     parser.add_argument(
-        "--manual-warmup",
-        action="store_true",
-        default=False,
-        help="Run one full pipeline iteration as warmup before the timed run.",
-    )
-    parser.add_argument(
         "--lora-repo-id",
         type=str,
         default=None,
@@ -331,12 +325,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of overlap frames between segments for Wan-Animate.",
-    )
-    parser.add_argument(
-        "--motion-encode-batch-size",
-        type=int,
-        default=8,
-        help="Batch size for motion encoder in Wan-Animate.",
     )
     args = parser.parse_args(argv)
     assert args.prompt, "Prompt must be a non-empty string."
@@ -745,7 +733,6 @@ async def generate_video(args: argparse.Namespace) -> None:
         context.mode = args.mode
         context.segment_frame_length = args.segment_frame_length
         context.prev_segment_conditioning_frames = args.prev_segment_conditioning_frames
-        context.motion_encode_batch_size = args.motion_encode_batch_size
         if args.background_video:
             context.background_video = _load_video_frames_ffmpeg(args.background_video)
         if args.mask_video:
@@ -859,16 +846,14 @@ async def generate_video(args: argparse.Namespace) -> None:
             batch={context_warmup.request_id: context_warmup}
         )
 
-        if getattr(args, "manual_warmup", False):
-            # Use full-resolution warmup (avoids CLIP preprocessing
-            # crashes with small dummy inputs for animate pipelines).
-            print("Running manual warmup (full pipeline)...")
-            wu_inputs = pipeline._pipeline_model.prepare_inputs(context)
-            pipeline._pipeline_model.execute(wu_inputs)
-            print("Manual warmup complete.")
-        else:
-            for i in range(args.num_warmups):
-                print(f"Running warmup {i + 1} of {args.num_warmups}")
+        for i in range(args.num_warmups):
+            print(f"Running warmup {i + 1} of {args.num_warmups}")
+            if arch.name == "WanAnimatePipeline":
+                # Animate pipeline requires pose/face/image inputs that a generic
+                # warmup context cannot carry — use the full context directly.
+                wu_inputs = pipeline._pipeline_model.prepare_inputs(context)
+                pipeline._pipeline_model.execute(wu_inputs)
+            else:
                 print(
                     "Warmup parameters: "
                     f"{warmup_height}x{warmup_width}, {warmup_num_frames} frames, "
@@ -898,13 +883,6 @@ async def generate_video(args: argparse.Namespace) -> None:
         frames = _video_frames_from_raw_output(model_outputs.images)
     else:
         import time as _time
-
-        # Optional manual warmup: run once to compile all graphs, then measure.
-        if getattr(args, "manual_warmup", False):
-            print("Running manual warmup iteration...")
-            wu_inputs = pipeline._pipeline_model.prepare_inputs(context)
-            pipeline._pipeline_model.execute(wu_inputs)
-            print("Warmup complete. Starting timed run...")
 
         t0 = _time.perf_counter()
         model_inputs = pipeline._pipeline_model.prepare_inputs(context)

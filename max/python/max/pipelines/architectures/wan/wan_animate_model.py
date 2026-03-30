@@ -59,12 +59,6 @@ from .wan_transformer import (
 
 logger = logging.getLogger(__name__)
 
-# Additional key remappings for animate-specific weights
-_ANIMATE_KEY_REMAP: list[tuple[str, str]] = [
-    # No remaps needed currently — weight keys match module paths.
-]
-
-
 class _AnimateBlockLevelModel:
     """Executes animate transformer: pre -> N blocks (with face adapter) -> post.
 
@@ -180,14 +174,6 @@ class WanAnimateTransformerModel(ComponentModel):
             self._state_dict = _remap_state_dict(
                 self.weights, target_dtype=DType.bfloat16
             )
-            # Apply animate-specific key remaps
-            remapped: dict[str, Any] = {}
-            for key, value in self._state_dict.items():
-                new_key = key
-                for old, new in _ANIMATE_KEY_REMAP:
-                    new_key = new_key.replace(old, new)
-                remapped[new_key] = value
-            self._state_dict = remapped
 
             # Post-remap transformations on Buffer objects (already bfloat16).
             from max.driver import CPU
