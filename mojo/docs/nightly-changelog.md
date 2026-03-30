@@ -40,7 +40,7 @@ This version is still a work in progress.
 
 - Standard library types now use conditional conformances, replacing previous
   `_constrained_conforms_to` checks:
-  - `Span`: `Writable`
+  - `Span`: `Writable`, `Hashable`
   - `Tuple`, `Optional`, `Variant`, and `UnsafeMaybeUninit`: `RegisterPassable`
 
 - GPU primitive id accessors (e.g. `thread_idx`) are migrating from `UInt` to
@@ -125,8 +125,16 @@ This version is still a work in progress.
 
 - `NDBuffer` has been fully removed. Please migrate to `TileTensor`.
 
+- Added a generic `__contains__` method to `Span` for any element type
+  conforming to `Equatable`, not just `Scalar` types.
+
 - Fixed `blocked_product` in `tile_layout` to zip block and tiler dimensions
   per mode, matching the legacy `blocked_product` behavior.
+
+- Added `Span`-based overloads for `enqueue_copy`, `enqueue_copy_from`, and
+  `enqueue_copy_to` on `DeviceContext`, `DeviceBuffer`, and `HostBuffer`,
+  providing a safer alternative to raw `UnsafePointer` for host-device memory
+  transfers.
 
 ## Tooling changes
 
@@ -136,6 +144,10 @@ This version is still a work in progress.
 
 - `mojo format` no longer supports the deprecated `fn` keyword, nor the
   removed `owned` argument convention.
+
+- Comptime function calls now print more nicely in error messages and generated
+  documentation, not including `VariadicList`/`VariadicPack` and including
+  keyword argument labels when required.
 
 ## GPU programming
 

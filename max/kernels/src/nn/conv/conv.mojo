@@ -109,7 +109,7 @@ from linalg.utils import partition_work
 from std.runtime.asyncrt import parallelism_level
 from std.runtime.tracing import Trace, TraceLevel, trace_arg
 
-from std.sys import has_amd_gpu_accelerator
+from std.sys import has_amd_gpu_accelerator, has_amd_rdna_gpu_accelerator
 from std.gpu.host.info import _is_sm10x_gpu
 from std.gpu.host._amdgpu_hip import HIP
 from std.utils.index import Index, IndexList
@@ -338,9 +338,8 @@ def _m_to_n_ho_wo_nhwc(m: Int, HO: Int, WO: Int) -> IndexList[3]:
     TODO(Fixel): This utility should be generalized into a im2col util
     class with some additional layout agnostic logic.
     """
-    var n = m // (HO * WO)
-    var ho = (m % (HO * WO)) // WO
-    var wo = m % WO
+    var n, rem = divmod(m, HO * WO)
+    var ho, wo = divmod(rem, WO)
     return Index(n, ho, wo)
 
 
@@ -618,8 +617,7 @@ struct ConvDirectNHWC[
                 self.partition.ng_offset,
                 self.partition.ng_offset + self.partition.ng_size,
             ):
-                var n = ng // self.conv_shape.num_groups
-                var g = ng % self.conv_shape.num_groups
+                var n, g = divmod(ng, self.conv_shape.num_groups)
                 self._c_tile_loop[padded](n, g, self.cf_tile_size[0])
 
         unswitch[body](self.conv_shape.padded())
@@ -926,11 +924,12 @@ struct ConvDirectNHWC[
             ):
                 # The micro tile may cover points in different rows/images.
                 # Convert the 1D index back to (n, ho, wo).
+                var ho, wo = divmod(m, self.conv_shape.wo())
                 epilogue(
                     Index(
                         n,
-                        m // self.conv_shape.wo(),
-                        m % self.conv_shape.wo(),
+                        ho,
+                        wo,
                         f_tile_offset,
                     ),
                     f_tile_size_bounded,
@@ -4432,6 +4431,31 @@ def conv_gpu[
                     _sm100_dispatch[]()
                 return
 
+        # AMD RDNA 3+ dispatch: im2col + WMMA matmul for supported shapes.
+        comptime if has_amd_rdna_gpu_accelerator() and input_type in (
+            DType.bfloat16,
+            DType.float16,
+        ):
+            from nn.conv.gpu.amd.rdna.dispatch import dispatch_rdna_conv2d
+
+            if dispatch_rdna_conv2d[
+                input_type,
+                filter_type,
+                output_type,
+                filter_is_fcrs,
+                maybe_epilogue_func=maybe_epilogue_func,
+            ](
+                input,
+                filter,
+                output,
+                rebind[IndexList[2]](stride),
+                rebind[IndexList[2]](dilation),
+                rebind[IndexList[2]](symmetric_padding),
+                num_groups,
+                ctx,
+            ):
+                return
+
         # AMD GPU path: use MIOpen for conv2d.
         # Note: MIOpen's miopenConvolution mode (0) is cross-correlation
         # (standard DNN conv). The old CROSS_CORRELATION (1) was actually
@@ -4691,8 +4715,7 @@ def conv3d_gpu_naive_ndhwc_qrscf[
     var x_thread_id = block_idx.x * block_dim.x + thread_idx.x
 
     # map back to separate height and width
-    var h_out_idx = x_thread_id // UInt(W_out)  # integer division to get height
-    var w_out_idx = x_thread_id % UInt(W_out)  # modulo to get width
+    var h_out_idx, w_out_idx = divmod(x_thread_id, UInt(W_out))
 
     # calculate depth from y-dimension
     var d_out_idx = block_idx.y * block_dim.y + thread_idx.y

@@ -29,10 +29,9 @@ from std.gpu import (
     block_idx_uint as block_idx,
     thread_idx_uint as thread_idx,
 )
-from layout import IntTuple, Layout, LayoutTensor
+from layout import Idx, IntTuple, Layout, LayoutTensor, TileTensor, row_major
 from layout.int_tuple import product
 from layout._fillers import random
-from layout import lt_to_tt
 from nn.conv.conv import conv_gpu
 from std.testing import assert_almost_equal, assert_true
 
@@ -457,10 +456,31 @@ def test_winograd_conv_gpu[
         input_dim, filter_dim, stride, dilation, pad
     ]()
 
-    # Define layouts
-    comptime input_layout = Layout.row_major(input_dim)
-    comptime filter_layout = Layout.row_major(filter_dim)
-    comptime output_layout = Layout.row_major(output_dim)
+    # Define TileTensor layouts
+    comptime input_tt_layout = row_major(
+        (
+            Idx[Int(input_dim[0])](),
+            Idx[Int(input_dim[1])](),
+            Idx[Int(input_dim[2])](),
+            Idx[Int(input_dim[3])](),
+        )
+    )
+    comptime filter_tt_layout = row_major(
+        (
+            Idx[Int(filter_dim[0])](),
+            Idx[Int(filter_dim[1])](),
+            Idx[Int(filter_dim[2])](),
+            Idx[Int(filter_dim[3])](),
+        )
+    )
+    comptime output_tt_layout = row_major(
+        (
+            Idx[Int(output_dim[0])](),
+            Idx[Int(output_dim[1])](),
+            Idx[Int(output_dim[2])](),
+            Idx[Int(output_dim[3])](),
+        )
+    )
 
     # Create device buffers
     var input_device = ctx.enqueue_create_buffer[dtype](product(input_dim))
@@ -474,26 +494,24 @@ def test_winograd_conv_gpu[
 
     # Initialize input and filter with random values on host
     with input_device.map_to_host() as input_host:
-        var input_host_tensor = LayoutTensor[dtype, input_layout](input_host)
-        random(input_host_tensor)
+        var input_host_tt = TileTensor(input_host, input_tt_layout)
+        random(input_host_tt)
 
     with filter_device.map_to_host() as filter_host:
-        var filter_host_tensor = LayoutTensor[dtype, filter_layout](filter_host)
-        random(filter_host_tensor)
+        var filter_host_tt = TileTensor(filter_host, filter_tt_layout)
+        random(filter_host_tt)
 
-    # Create device tensors
-    var input_tensor = LayoutTensor[dtype, input_layout](input_device)
-    var filter_tensor = LayoutTensor[dtype, filter_layout](filter_device)
-    var output_tensor = LayoutTensor[dtype, output_layout](output_device)
-    var output_ref_tensor = LayoutTensor[dtype, output_layout](
-        output_ref_device
-    )
+    # Create device TileTensors
+    var input_tt = TileTensor(input_device, input_tt_layout)
+    var filter_tt = TileTensor(filter_device, filter_tt_layout)
+    var output_tt = TileTensor(output_device, output_tt_layout)
+    var output_ref_tt = TileTensor(output_ref_device, output_tt_layout)
 
     # Run reference convolution
     conv_gpu[dtype, dtype, dtype](
-        lt_to_tt(input_tensor.as_any_origin()),
-        lt_to_tt(filter_tensor.as_any_origin()),
-        lt_to_tt(output_ref_tensor.as_any_origin()),
+        input_tt,
+        filter_tt,
+        output_ref_tt,
         stride,
         dilation,
         pad,
@@ -503,9 +521,9 @@ def test_winograd_conv_gpu[
 
     # Run winograd convolution
     winograd_conv2d_gpu_launcher[dtype, dtype, dtype](
-        input_tensor,
-        filter_tensor,
-        output_tensor,
+        input_tt.to_layout_tensor(),
+        filter_tt.to_layout_tensor(),
+        output_tt.to_layout_tensor(),
         stride,
         dilation,
         pad,

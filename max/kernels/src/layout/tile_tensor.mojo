@@ -13,7 +13,7 @@
 """TileTensor type for structured memory access with compile-time layout information."""
 
 from std.math import ceildiv
-from std.sys import align_of, simd_width_of
+from std.sys import align_of, simd_width_of, is_gpu
 from std.os import abort
 
 from buffer import Dim, DimList
@@ -294,7 +294,7 @@ struct TileTensor[
         # Create TileTensor to use on device
         var tensor = TileTensor(
              dev_buf,
-             row_major((Idx[4](), Idx[4]())),
+             row_major(Idx[4](), Idx[4]()),
         )
         ...
         ```
@@ -333,7 +333,7 @@ struct TileTensor[
 
         var tensor = TileTensor(
             host_buf,
-            row_major((Idx[4](), Idx[4]())),
+            row_major(Idx[4](), Idx[4]()),
         )
         ```
 
@@ -422,7 +422,9 @@ struct TileTensor[
         # Inline load logic to avoid constraint propagation issues
         return self.ptr.load[
             width=Self.element_size,
-            alignment=align_of[SIMD[Self.dtype, Self.element_size]](),
+            alignment=align_of[
+                SIMD[Self.dtype, Self.element_size]
+            ]() if is_gpu() else 1,
         ](self.layout[linear_idx_type=Self.linear_idx_type](linear_tuple))
 
     @always_inline
@@ -573,7 +575,9 @@ struct TileTensor[
 
         # Inline store logic to avoid constraint propagation issues
         self.ptr.mut_cast[True]().store[
-            alignment=align_of[SIMD[Self.dtype, Self.element_size]](),
+            alignment=align_of[
+                SIMD[Self.dtype, Self.element_size]
+            ]() if is_gpu() else 1,
         ](
             self.layout[linear_idx_type=Self.linear_idx_type](linear_tuple),
             value,
@@ -582,7 +586,9 @@ struct TileTensor[
     @always_inline("nodebug")
     def load[
         width: Int = Self.element_size,
-        alignment: Int = align_of[SIMD[Self.dtype, width]](),
+        alignment: Int = align_of[
+            SIMD[Self.dtype, Self.element_size]
+        ]() if is_gpu() else 1,
         invariant: Bool = False,
         non_temporal: Bool = False,
     ](self, coord: Coord) -> SIMD[Self.dtype, width]:
@@ -615,7 +621,9 @@ struct TileTensor[
     @always_inline("nodebug")
     def store[
         width: Int = Self.element_size,
-        alignment: Int = align_of[SIMD[Self.dtype, width]](),
+        alignment: Int = align_of[
+            SIMD[Self.dtype, Self.element_size]
+        ]() if is_gpu() else 1,
         non_temporal: Bool = False,
     ](self, coord: Coord, value: SIMD[Self.dtype, width]) where Self.mut:
         """Store elements to the tensor at the specified coordinates.

@@ -75,9 +75,9 @@ def run_cublas[
     b: UnsafePointer[mut=False, Scalar[dtype], _],
     c: UnsafePointer[mut=True, Scalar[dtype], _],
 ) raises:
-    var a_device = TileTensor(a, row_major((Idx(M), Idx(K))))
-    var b_device = TileTensor(b, row_major((Idx(K), Idx(N))))
-    var c_device_ref = TileTensor(c, row_major((Idx(M), Idx(N))))
+    var a_device = TileTensor(a, row_major(Idx(M), Idx(K)))
+    var b_device = TileTensor(b, row_major(Idx(K), Idx(N)))
+    var c_device_ref = TileTensor(c, row_major(Idx(M), Idx(N)))
 
     with vendor_blas.Handle() as _handle:
 
@@ -393,8 +393,7 @@ def gemm_kernel_3[
     number of rows in B.
     """
     # Calculate the column and row indices for each thread
-    var col = thread_idx.x % UInt(BN)
-    var row = thread_idx.x // UInt(BN)
+    var row, col = divmod(thread_idx.x, UInt(BN))
 
     # Get the tile of the output matrix C that this thread block is responsible for
     var dst = c.tile[BM, BN](Int(block_idx.y), Int(block_idx.x))
@@ -548,8 +547,7 @@ def gemm_kernel_4[
     of rows in B.
     """
     # Calculate the column and row indices for each thread.
-    var col = thread_idx.x % UInt(BN)
-    var row = thread_idx.x // UInt(BN)
+    var row, col = divmod(thread_idx.x, UInt(BN))
     var bidx = block_idx.x
     var bidy = block_idx.y
 
@@ -722,8 +720,7 @@ def gemm_kernel_5[
     matrix multiplication, i.e., the number of columns in A equals the number
     of rows in B.
     """
-    var partition_col = Int(thread_idx.x % UInt(BN // TN))
-    var partition_row = Int(thread_idx.x // UInt(BN // TN))
+    var partition_row, partition_col = divmod(Int(thread_idx.x), BN // TN)
     var bidx = block_idx.x
     var bidy = block_idx.y
 
@@ -893,8 +890,7 @@ def gemm_kernel_6[
     """
 
     comptime simd_width = simd_width_of[dtype]()
-    var partition_col = Int(thread_idx.x % UInt(BN // TN))
-    var partition_row = Int(thread_idx.x // UInt(BN // TN))
+    var partition_row, partition_col = divmod(Int(thread_idx.x), BN // TN)
     var bidx = block_idx.x
     var bidy = block_idx.y
 

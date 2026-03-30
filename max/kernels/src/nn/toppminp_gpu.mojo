@@ -805,8 +805,7 @@ def _topp_minp_sampling_gpu[
     def apply_temperature[
         _simd_width: Int, _rank: Int
     ](coords: IndexList[_rank]) -> SIMD[dtype, _simd_width]:
-        var idx = input_logits.layout(Coord(coords))
-        var val = input_logits.ptr.load[width=_simd_width](idx)
+        var val = input_logits.load[width=_simd_width](Coord(coords))
         return val / temperature
 
     var input_size = input_logits.num_elements()
@@ -814,7 +813,7 @@ def _topp_minp_sampling_gpu[
     var probs_buf = ctx.enqueue_create_buffer[dtype](input_size * 2)
     var input_probs = TileTensor(
         probs_buf.unsafe_ptr(),
-        row_major((Idx(batch_size), Idx(vocab_size))),
+        row_major(Idx(batch_size), Idx(vocab_size)),
     )
 
     _softmax_gpu[
