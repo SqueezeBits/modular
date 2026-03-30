@@ -32,9 +32,9 @@ rope_ragged_with_position_ids = F.functional(_rope_ragged_with_position_ids)
 def _apply_zimage_qk_rope(
     query: Tensor,
     key: Tensor,
-    cos: Tensor,
-    sin: Tensor,
+    freqs_cis: Tensor,
 ) -> tuple[Tensor, Tensor]:
+    """Apply RoPE using pre-computed interleaved freqs_cis [S, head_dim]."""
     batch_size = query.shape[0]
     seq_len = query.shape[1]
     num_heads = query.shape[2]
@@ -43,14 +43,6 @@ def _apply_zimage_qk_rope(
     query_ragged = F.reshape(query, [batch_size * seq_len, num_heads, head_dim])
     key_ragged = F.reshape(key, [batch_size * seq_len, num_heads, head_dim])
 
-    # Convert repeat-interleaved ([cos, cos], [sin, sin]) to [cos, sin] pairs.
-    cos_pairs = F.reshape(cos, [cos.shape[0], cos.shape[1] // 2, 2])[..., 0]
-    sin_pairs = F.reshape(sin, [sin.shape[0], sin.shape[1] // 2, 2])[..., 0]
-    freqs_cis = F.reshape(
-        F.stack([cos_pairs, sin_pairs], axis=-1),
-        [cos.shape[0], cos.shape[1]],
-    )
-
     position_ids = F.arange(
         0, seq_len, dtype=DType.uint32, device=query.device
     )
@@ -58,16 +50,10 @@ def _apply_zimage_qk_rope(
     position_ids = F.reshape(position_ids, [batch_size * seq_len])
 
     query_out = rope_ragged_with_position_ids(
-        query_ragged,
-        freqs_cis,
-        position_ids,
-        interleaved=True,
+        query_ragged, freqs_cis, position_ids, interleaved=True,
     )
     key_out = rope_ragged_with_position_ids(
-        key_ragged,
-        freqs_cis,
-        position_ids,
-        interleaved=True,
+        key_ragged, freqs_cis, position_ids, interleaved=True,
     )
     return (
         F.reshape(query_out, [batch_size, seq_len, num_heads, head_dim]),
@@ -100,7 +86,7 @@ class ZImageAttention(Module[..., Tensor]):
     def forward(
         self,
         hidden_states: Tensor,
-        freqs_cis: tuple[Tensor, Tensor],
+        freqs_cis: Tensor,
     ) -> Tensor:
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
@@ -122,12 +108,7 @@ class ZImageAttention(Module[..., Tensor]):
         if self.norm_k is not None:
             key = self.norm_k(key)
 
-        query, key = _apply_zimage_qk_rope(
-            query,
-            key,
-            freqs_cis[0],
-            freqs_cis[1],
-        )
+        query, key = _apply_zimage_qk_rope(query, key, freqs_cis)
 
         out = flash_attention_gpu(
             query,
