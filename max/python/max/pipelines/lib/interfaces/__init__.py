@@ -26,8 +26,10 @@ from .cache_mixin import (
 )
 from .component_model import ComponentModel
 from .diffusion_pipeline import (
+    CompileWrapper,
     DiffusionPipeline,
-    DiffusionPipelineOutput,
+    PixelModelInputs,
+    max_compile,
 )
 from .generate import GenerateMixin
 from .pipeline_model import (
@@ -48,12 +50,12 @@ __all__ = [
     "DenoisingCacheConfig",
     "DenoisingCacheState",
     "DiffusionPipeline",
-    "DiffusionPipelineOutput",
     "GenerateMixin",
     "ModelInputs",
     "ModelOutputs",
     "PipelineModel",
     "PipelineModelWithKVCache",
+    "PixelModelInputs",
     "fbcache_conditional_execution",
     "get_paged_manager",
     "teacache_conditional_execution",
