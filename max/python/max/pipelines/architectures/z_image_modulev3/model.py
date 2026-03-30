@@ -29,7 +29,11 @@ if TYPE_CHECKING:
 
 from .model_config import ZImageConfig
 from .weight_adapters import convert_z_image_transformer_state_dict
-from .z_image import ZImageTransformer2DModel
+from .z_image import (
+    ZImageCFGMain,
+    ZImageSharedPreamble,
+    ZImageTransformer2DModel,
+)
 
 
 class ZImageTransformerModel(ComponentModel):
@@ -77,11 +81,46 @@ class ZImageTransformerModel(ComponentModel):
                 self.config,
                 cache_config=self.cache_config,
             )
+            preamble = ZImageSharedPreamble(transformer)
+            cfg_main = ZImageCFGMain(transformer)
             transformer.to(self.devices[0])
+            preamble.to(self.devices[0])
+            cfg_main.to(self.devices[0])
 
         self.model = transformer.compile(
             *transformer.input_types(),
             weights=state_dict,
+        )
+
+        # Compile split graphs for batched-CFG: preamble (batch=1) + main (batch=2).
+        self.preamble_model = preamble.compile(
+            *preamble.input_types(), weights=state_dict,
+        )
+        self.cfg_main_model = cfg_main.compile(
+            *cfg_main.input_types(), weights=state_dict,
+        )
+
+    @traced(message="ZImageTransformerModel.run_preamble")
+    def run_preamble(
+        self,
+        hidden_states: Tensor,
+        timestep: Tensor,
+        img_ids: Tensor,
+        txt_ids: Tensor,
+    ) -> Any:
+        return self.preamble_model(hidden_states, timestep, img_ids, txt_ids)
+
+    @traced(message="ZImageTransformerModel.run_cfg_main")
+    def run_cfg_main(
+        self,
+        x: Tensor,
+        encoder_hidden_states: Tensor,
+        t_emb: Tensor,
+        unified_freqs: Tensor,
+        txt_freqs: Tensor,
+    ) -> Any:
+        return self.cfg_main_model(
+            x, encoder_hidden_states, t_emb, unified_freqs, txt_freqs
         )
 
     @traced(message="ZImageTransformerModel.__call__")

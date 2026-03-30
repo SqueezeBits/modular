@@ -190,6 +190,7 @@ class ZImagePipeline(DiffusionPipeline):
         self.build_decode_latents()
         self.build_cfg_combine()
         self.build_duplicate_batch()
+        self.build_duplicate_2d()
         self.build_cfg_finalize_batched()
 
         self._init_cache_state(
@@ -375,6 +376,40 @@ class ZImagePipeline(DiffusionPipeline):
             prev_output=cache_state.prev_output,
         )
 
+    @staticmethod
+    def duplicate_2d(x: Tensor) -> Tensor:
+        """Duplicate [1, D] → [2, D] via broadcast."""
+        d = x.shape[1]
+        x = F.broadcast_to(x, [2, d])
+        return F.rebind(x, [2, d])
+
+    def run_transformer_cfg_split(
+        self,
+        latents: Tensor,
+        prompt_embeds: Tensor,
+        timestep: Tensor,
+        img_ids: Tensor,
+        txt_ids: Tensor,
+    ) -> Tensor:
+        """Run transformer with split preamble (batch=1) + main (batch=2).
+
+        Avoids redundant noise_refiner / embedder computation on the
+        duplicated CFG batch.
+        """
+        # Phase 1: shared preamble at batch=1.
+        x, t_emb, unified_freqs, txt_freqs = self.transformer.run_preamble(
+            latents, timestep, img_ids, txt_ids,
+        )
+
+        # Duplicate shared results to batch=2.
+        x_dup = self.duplicate_batch(x)
+        t_emb_dup = self.duplicate_2d(t_emb)
+
+        # Phase 2: main at batch=2.
+        return self.transformer.run_cfg_main(
+            x_dup, prompt_embeds, t_emb_dup, unified_freqs, txt_freqs,
+        )[0]
+
     def build_preprocess_latents(self) -> None:
         device = self.transformer.devices[0]
         self.__dict__["_patchify_and_pack"] = max_compile(
@@ -444,6 +479,16 @@ class ZImagePipeline(DiffusionPipeline):
                     shape=["batch", "seq", "channels"],
                     device=device,
                 ),
+            ],
+        )
+
+    def build_duplicate_2d(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        self.__dict__["duplicate_2d"] = max_compile(
+            self.duplicate_2d,
+            input_types=[
+                TensorType(dtype, shape=[1, "dim"], device=device),
             ],
         )
 
@@ -1178,21 +1223,17 @@ class ZImagePipeline(DiffusionPipeline):
                     with Tracer("transformer"):
                         if apply_cfg and use_batched_cfg_mode:
                             assert negative_prompt_embeds is not None
-                            cfg_batch = int(latents.shape[0])
-                            latents_cfg = self.duplicate_batch(latents)
                             assert cfg_prompt_embeds is not None
                             assert cfg_timestep_vectors is not None
-                            timestep_cfg = cfg_timestep_vectors[i]
 
                             if use_fast_denoise:
-                                noise_pred_cfg = self.run_transformer(
-                                    cache_pos,
-                                    latents=latents_cfg,
+                                noise_pred_cfg = self.run_transformer_cfg_split(
+                                    latents=latents,
                                     prompt_embeds=cfg_prompt_embeds,
-                                    timestep=timestep_cfg,
+                                    timestep=timestep,
                                     img_ids=img_ids,
                                     txt_ids=txt_ids,
-                                )[0]
+                                )
                             else:
                                 noise_pred_cfg = self.run_denoising_step(
                                     step=i,

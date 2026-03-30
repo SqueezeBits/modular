@@ -459,3 +459,134 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
 
     def forward(self, *args: Tensor) -> tuple[Tensor, ...]:
         return self._forward_impl(*args)
+
+
+# ---------------------------------------------------------------------------
+# Split modules for batched-CFG: run shared preamble at batch=1, then
+# duplicate and run the rest at batch=2.  Saves ~3% compute by avoiding
+# redundant noise_refiner + embedder work on the duplicated batch.
+# ---------------------------------------------------------------------------
+
+
+class ZImageSharedPreamble(Module[..., Sequence[Tensor]]):
+    """batch=1 shared computation: x_embed → t_embed → RoPE → noise_refiner."""
+
+    def __init__(self, transformer: ZImageTransformer2DModel):
+        self.x_embedder = transformer.x_embedder
+        self.t_embedder = transformer.t_embedder
+        self.noise_refiner = transformer.noise_refiner
+        self.rope_embedder = transformer.rope_embedder
+        self.t_scale = transformer.t_scale
+        self.axes_dims = transformer.axes_dims
+        self.max_dtype = transformer.max_dtype
+        self.max_device = transformer.max_device
+        self.packed_channels = transformer.packed_channels
+
+    def input_types(self) -> tuple[TensorType, ...]:
+        return (
+            TensorType(
+                self.max_dtype,
+                shape=[1, "image_seq_len", self.packed_channels],
+                device=self.max_device,
+            ),
+            TensorType(DType.float32, shape=[1], device=self.max_device),
+            TensorType(
+                DType.int64,
+                shape=["image_seq_len", len(self.axes_dims)],
+                device=self.max_device,
+            ),
+            TensorType(
+                DType.int64,
+                shape=["text_seq_len", len(self.axes_dims)],
+                device=self.max_device,
+            ),
+        )
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        timestep: Tensor,
+        img_ids: Tensor,
+        txt_ids: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        x = self.x_embedder(hidden_states)
+        t_emb = self.t_embedder(timestep * self.t_scale).cast(x.dtype)
+
+        img_seq_len = img_ids.shape[0]
+        unified_ids = F.concat([img_ids, txt_ids], axis=0)
+        unified_freqs = self.rope_embedder(unified_ids).cast(x.dtype)
+        img_freqs = unified_freqs[:img_seq_len]
+
+        for layer in self.noise_refiner:
+            x = layer(x, freqs_cis=img_freqs, adaln_input=t_emb)
+
+        return (x, t_emb, unified_freqs, unified_freqs[img_seq_len:])
+
+
+class ZImageCFGMain(Module[..., Sequence[Tensor]]):
+    """batch=2 computation: cap_proj → context_refiner → main_layers → final."""
+
+    def __init__(self, transformer: ZImageTransformer2DModel):
+        self.cap_norm = transformer.cap_norm
+        self.cap_proj = transformer.cap_proj
+        self.context_refiner = transformer.context_refiner
+        self.layers = transformer.layers
+        self.final_layer = transformer.final_layer
+        self.dim = transformer.dim
+        self.cap_feat_dim = transformer.cap_feat_dim
+        self.head_dim = sum(transformer.axes_dims)
+        self.max_dtype = transformer.max_dtype
+        self.max_device = transformer.max_device
+
+    def input_types(self) -> tuple[TensorType, ...]:
+        return (
+            TensorType(
+                self.max_dtype,
+                shape=["batch_size", "image_seq_len", self.dim],
+                device=self.max_device,
+            ),
+            TensorType(
+                self.max_dtype,
+                shape=["batch_size", "text_seq_len", self.cap_feat_dim],
+                device=self.max_device,
+            ),
+            TensorType(
+                self.max_dtype,
+                shape=["batch_size", ADALN_EMBED_DIM],
+                device=self.max_device,
+            ),
+            TensorType(
+                self.max_dtype,
+                shape=["total_seq_len", self.head_dim],
+                device=self.max_device,
+            ),
+            TensorType(
+                self.max_dtype,
+                shape=["text_seq_len", self.head_dim],
+                device=self.max_device,
+            ),
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        encoder_hidden_states: Tensor,
+        t_emb: Tensor,
+        unified_freqs: Tensor,
+        txt_freqs: Tensor,
+    ) -> tuple[Tensor]:
+        cap = self.cap_proj(self.cap_norm(encoder_hidden_states))
+
+        for layer in self.context_refiner:
+            cap = layer(cap, freqs_cis=txt_freqs)
+
+        img_len = x.shape[1]
+        unified = F.concat([x, cap], axis=1)
+
+        for layer in self.layers:
+            unified = layer(
+                unified, freqs_cis=unified_freqs, adaln_input=t_emb
+            )
+
+        hidden = unified[:, :img_len, :]
+        return (self.final_layer(hidden, c=t_emb),)
