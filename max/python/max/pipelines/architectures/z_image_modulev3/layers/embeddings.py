@@ -77,14 +77,6 @@ class RopeEmbedder(Module[[Tensor], tuple[Tensor, Tensor]]):
         self.axes_dims = axes_dims
 
     def forward(self, ids: Tensor) -> tuple[Tensor, Tensor]:
-        if ids.rank != 2:
-            raise ValueError(f"Expected 2D ids tensor, got rank={ids.rank}")
-
-        if int(ids.shape[-1]) != len(self.axes_dims):
-            raise ValueError(
-                "ids last dimension must match axes_dims length "
-                f"({len(self.axes_dims)}), got {ids.shape[-1]}"
-            )
 
         pos = ids.cast(DType.float32)
         cos_out = []

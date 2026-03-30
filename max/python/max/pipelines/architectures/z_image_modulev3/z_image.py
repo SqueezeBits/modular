@@ -345,17 +345,14 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
 
         cap = self.cap_proj(self.cap_norm(encoder_hidden_states))
 
-        if txt_ids.rank == 3:
-            txt_ids = txt_ids[0]
-        if img_ids.rank == 3:
-            img_ids = img_ids[0]
+        # Compute RoPE once on concatenated ids, then slice for refiners.
+        img_seq_len = img_ids.shape[0]
+        unified_ids = F.concat([img_ids, txt_ids], axis=0)
+        unified_cos, unified_sin = self.rope_embedder(unified_ids)
+        unified_freqs = (unified_cos, unified_sin)
 
-        txt_freqs = self.rope_embedder(txt_ids)
-        img_freqs = self.rope_embedder(img_ids)
-        unified_freqs = (
-            F.concat([img_freqs[0], txt_freqs[0]], axis=0),
-            F.concat([img_freqs[1], txt_freqs[1]], axis=0),
-        )
+        img_freqs = (unified_cos[:img_seq_len], unified_sin[:img_seq_len])
+        txt_freqs = (unified_cos[img_seq_len:], unified_sin[img_seq_len:])
 
         for layer in self.noise_refiner:
             x = layer(
