@@ -112,7 +112,8 @@ class ZImageTransformerBlock(Module[..., Tensor]):
             x = x + gate_mlp * self.ffn_norm2(ffn_out)
         else:
             attn_out = self.attention(
-                self.attention_norm1(x), freqs_cis=freqs_cis
+                self.attention_norm1(x),
+                freqs_cis=freqs_cis,
             )
             x = x + self.attention_norm2(attn_out)
             x = x + self.ffn_norm2(self.feed_forward(self.ffn_norm1(x)))
@@ -332,7 +333,12 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         timestep: Tensor,
         img_ids: Tensor,
         txt_ids: Tensor,
-    ) -> tuple[Tensor, Any, Tensor, tuple[Tensor, Tensor]]:
+    ) -> tuple[
+        Tensor,
+        Any,
+        Tensor,
+        tuple[Tensor, Tensor],
+    ]:
         """Embed inputs, run refiners, return unified seq before main ``layers[0]``."""
         x = self.x_embedder(hidden_states)
         t_emb = self.t_embedder(timestep * self.t_scale).cast(x.dtype)
@@ -352,14 +358,18 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         )
 
         for layer in self.noise_refiner:
-            x = layer(x, freqs_cis=img_freqs, adaln_input=t_emb)
+            x = layer(
+                x,
+                freqs_cis=img_freqs,
+                adaln_input=t_emb,
+            )
 
         for layer in self.context_refiner:
             cap = layer(cap, freqs_cis=txt_freqs)
 
         img_len = x.shape[1]
         unified0 = F.concat([x, cap], axis=1)
-        return unified0, img_len, t_emb, unified_freqs
+        return (unified0, img_len, t_emb, unified_freqs)
 
     def _run_first_main_layer(
         self,
