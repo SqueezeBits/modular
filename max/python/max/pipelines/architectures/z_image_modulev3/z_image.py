@@ -346,10 +346,12 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         cap = self.cap_proj(self.cap_norm(encoder_hidden_states))
 
         # Compute RoPE once on concatenated ids, then slice for refiners.
+        # Cast freqs to model dtype so the RoPE kernel operates in bfloat16
+        # directly, avoiding per-block float32→bfloat16 casts after RoPE.
         img_seq_len = img_ids.shape[0]
         unified_ids = F.concat([img_ids, txt_ids], axis=0)
         unified_cos, unified_sin = self.rope_embedder(unified_ids)
-        unified_freqs = (unified_cos, unified_sin)
+        unified_freqs = (unified_cos.cast(x.dtype), unified_sin.cast(x.dtype))
 
         img_freqs = (unified_cos[:img_seq_len], unified_sin[:img_seq_len])
         txt_freqs = (unified_cos[img_seq_len:], unified_sin[img_seq_len:])

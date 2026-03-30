@@ -128,8 +128,6 @@ class ZImageAttention(Module[..., Tensor]):
             freqs_cis[0],
             freqs_cis[1],
         )
-        query = query.cast(value.dtype)
-        key = key.cast(value.dtype)
 
         out = flash_attention_gpu(
             query,
