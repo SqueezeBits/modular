@@ -17,7 +17,6 @@ from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.nn import Linear, Module
 from max.experimental.nn.norm import RMSNorm
-from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
 from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
@@ -80,8 +79,7 @@ class ZImageAttention(Module[..., Tensor]):
         self.norm_q = RMSNorm(self.head_dim, eps=eps) if qk_norm else None
         self.norm_k = RMSNorm(self.head_dim, eps=eps) if qk_norm else None
 
-        # Keep ModuleList naming for diffusers-compatible key loading.
-        self.to_out = ModuleList([Linear(dim, dim, bias=False)])
+        self.to_out = Linear(dim, dim, bias=False)
 
     def forward(
         self,
@@ -119,4 +117,4 @@ class ZImageAttention(Module[..., Tensor]):
         )
 
         out = F.reshape(out, [batch_size, seq_len, self.inner_dim])
-        return self.to_out[0](out)
+        return self.to_out(out)
