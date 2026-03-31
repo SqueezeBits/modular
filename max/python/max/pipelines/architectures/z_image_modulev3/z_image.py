@@ -36,6 +36,8 @@ ADALN_EMBED_DIM = 256
 
 
 class FeedForward(Module[[Tensor], Tensor]):
+    """SwiGLU feed-forward network: w2(silu(w1(x)) * w3(x))."""
+
     def __init__(self, dim: int, hidden_dim: int):
         self.w1 = Linear(dim, hidden_dim, bias=False)
         self.w2 = Linear(hidden_dim, dim, bias=False)
@@ -46,6 +48,14 @@ class FeedForward(Module[[Tensor], Tensor]):
 
 
 class ZImageTransformerBlock(Module[..., Tensor]):
+    """Single Z-Image transformer block with optional AdaLN modulation.
+
+    When ``modulation=True`` (main layers, noise refiner), the block uses
+    adaptive layer-norm parameters (scale, gate) derived from the timestep
+    embedding.  When ``modulation=False`` (context refiner), the block is a
+    plain pre-norm residual block.
+    """
+
     def __init__(
         self,
         layer_id: int,
@@ -121,6 +131,8 @@ class ZImageTransformerBlock(Module[..., Tensor]):
 
 
 class FinalLayer(Module[..., Tensor]):
+    """Output projection with AdaLN modulation for timestep conditioning."""
+
     def __init__(self, hidden_size: int, out_channels: int):
         self.norm_final = LayerNorm(
             hidden_size,
@@ -142,6 +154,15 @@ class FinalLayer(Module[..., Tensor]):
 
 
 class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
+    """Z-Image diffusion transformer backbone.
+
+    Architecture: x_embedder → noise_refiner → context_refiner →
+    concat(image, text) → main_layers → final_layer.
+
+    Supports standard inference and first-block caching (FBCache) for
+    accelerated denoising.
+    """
+
     def __init__(
         self,
         config: ZImageConfig,

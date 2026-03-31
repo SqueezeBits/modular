@@ -37,6 +37,7 @@ from max.pipelines.lib.interfaces import (
     PixelModelInputs,
 )
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
+from max.pipelines.lib.utils import BoundedCache
 from max.profiler import Tracer, traced
 
 from ..autoencoders import AutoencoderKLModel
@@ -187,27 +188,41 @@ class ZImagePipeline(DiffusionPipeline):
 
         self.build_preprocess_latents()
         self.build_scheduler_step()
+        self.build_blend_img2img_latents()
         self.build_decode_latents()
         self.build_cfg_combine()
         self.build_duplicate_batch()
         self.build_duplicate_2d()
         self.build_cfg_finalize_batched()
+        self.build_cfg_renormalization()
+        self.build_postprocess_image()
 
         self._init_cache_state(
             dtype=self.transformer.config.dtype,
             device=self.transformer.devices[0],
         )
 
-        self._cached_text_ids: dict[str, Tensor] = {}
-        self._cached_sigmas: dict[str, Tensor] = {}
-        self._cached_img_ids: dict[str, Tensor] = {}
-        self._cached_img_ids_base_np: dict[str, np.ndarray] = {}
-        self._cached_shape_carriers: dict[int, Tensor] = {}
-        self._cached_prompt_token_tensors: dict[str, Tensor] = {}
-        self._cached_prompt_padding: dict[str, Tensor] = {}
-        self._cached_guidance_scale_tensors: dict[str, Tensor] = {}
-        self._cached_cfg_timestep_vectors: dict[str, list[Tensor]] = {}
-        self._cached_step_scalar_tensors: dict[str, list[Tensor]] = {}
+        self._cached_text_ids: BoundedCache[str, Tensor] = BoundedCache(32)
+        self._cached_sigmas: BoundedCache[str, Tensor] = BoundedCache(32)
+        self._cached_img_ids: BoundedCache[str, Tensor] = BoundedCache(32)
+        self._cached_img_ids_base_np: BoundedCache[
+            str, np.ndarray
+        ] = BoundedCache(32)
+        self._cached_shape_carriers: BoundedCache[
+            int, Tensor
+        ] = BoundedCache(32)
+        self._cached_prompt_token_tensors: BoundedCache[
+            str, Tensor
+        ] = BoundedCache(32)
+        self._cached_prompt_padding: BoundedCache[
+            str, Tensor
+        ] = BoundedCache(32)
+        self._cached_guidance_scale_tensors: BoundedCache[
+            str, Tensor
+        ] = BoundedCache(32)
+        self._cached_step_tensors: BoundedCache[
+            str, tuple[list[Tensor], list[Tensor]]
+        ] = BoundedCache(32)
 
     @traced(message="ZImagePipeline.prepare_inputs")
     def prepare_inputs(
@@ -414,8 +429,15 @@ class ZImagePipeline(DiffusionPipeline):
 
     def build_preprocess_latents(self) -> None:
         device = self.transformer.devices[0]
+        target_dtype = self.transformer.config.dtype
+
+        def _patchify_pack_and_cast(latents: Tensor) -> Tensor:
+            return ZImagePipeline._patchify_and_pack(latents).cast(
+                target_dtype
+            )
+
         self.__dict__["_patchify_and_pack"] = max_compile(
-            self._patchify_and_pack,
+            _patchify_pack_and_cast,
             input_types=[
                 TensorType(
                     DType.float32,
@@ -470,6 +492,40 @@ class ZImagePipeline(DiffusionPipeline):
                 ],
             )
 
+    def build_postprocess_image(self) -> None:
+        device = self.transformer.devices[0]
+        dtype = self.transformer.config.dtype
+        self.__dict__["_postprocess_image"] = max_compile(
+            self._postprocess_image,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["batch", "channels", "height", "width"],
+                    device=device,
+                ),
+            ],
+        )
+
+    def build_blend_img2img_latents(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        self.__dict__["_blend_img2img_latents"] = max_compile(
+            self._blend_img2img_latents,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["batch", "channels", "height", "width"],
+                    device=device,
+                ),
+                TensorType(
+                    dtype,
+                    shape=["batch", "channels", "height", "width"],
+                    device=device,
+                ),
+                TensorType(DType.float32, shape=[1], device=device),
+            ],
+        )
+
     def build_duplicate_batch(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -512,6 +568,25 @@ class ZImagePipeline(DiffusionPipeline):
         self.__dict__["cfg_finalize_batched_with_norm"] = max_compile(
             self.cfg_finalize_batched_with_norm,
             input_types=input_types,
+        )
+
+    def build_cfg_renormalization(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        self.__dict__["_cfg_renormalization_compiled"] = max_compile(
+            self._apply_cfg_renormalization_enabled,
+            input_types=[
+                TensorType(
+                    dtype,
+                    shape=["batch", "seq", "channels"],
+                    device=device,
+                ),
+                TensorType(
+                    dtype,
+                    shape=["batch", "seq", "channels"],
+                    device=device,
+                ),
+            ],
         )
 
     @traced(message="ZImagePipeline.build_cfg_combine")
@@ -847,7 +922,9 @@ class ZImagePipeline(DiffusionPipeline):
         )
 
         latents = self._postprocess_latents(latents)
-        return self._to_numpy(self.vae.decode(latents))
+        decoded = self.vae.decode(latents)
+        image = self._postprocess_image(decoded)
+        return np.from_dlpack(image.to(CPU()))
 
     def _postprocess_latents(self, latents: Tensor) -> Tensor:
         batch_size = latents.shape[0]
@@ -865,18 +942,15 @@ class ZImagePipeline(DiffusionPipeline):
         return latents
 
     @staticmethod
-    def _to_numpy(image: Tensor) -> np.ndarray:
-        # Match Flux/standard VAE contract: decoder outputs roughly [-1, 1] in NCHW.
-        # Convert on device before D2H to shrink transfer and satisfy pixel APIs
-        # (NHWC uint8 in [0, 255]).
+    def _postprocess_image(image: Tensor) -> Tensor:
+        """Normalize VAE output from [-1, 1] NCHW to [0, 255] uint8 NHWC."""
         image = image.cast(DType.float32)
         image = image * 0.5 + 0.5
-        image = image.clip(min=0.0, max=1.0)
+        image = F.where(image < 0.0, 0.0, image)
+        image = F.where(image > 1.0, 1.0, image)
         image = F.permute(image, (0, 2, 3, 1))
         image = image * 255.0
-        image = image.cast(DType.uint8)
-        cpu_image: Tensor = image.to(CPU())
-        return np.from_dlpack(cpu_image)
+        return image.cast(DType.uint8)
 
     @staticmethod
     def _vector_norm_per_sample(x: Tensor) -> Tensor:
@@ -885,34 +959,6 @@ class ZImagePipeline(DiffusionPipeline):
         squared = F.sum(squared, axis=2)
         squared = F.sum(squared, axis=1)
         return F.sqrt(squared + 1e-12)
-
-    @classmethod
-    def _apply_cfg_renormalization(
-        cls,
-        pos: Tensor,
-        pred: Tensor,
-        cfg_normalization: bool,
-    ) -> Tensor:
-        if not cfg_normalization:
-            return pred
-
-        ori_pos_norm = cls._vector_norm_per_sample(pos)
-        new_pos_norm = cls._vector_norm_per_sample(pred)
-        while ori_pos_norm.rank > 1:
-            ori_pos_norm = F.squeeze(ori_pos_norm, axis=-1)
-        while new_pos_norm.rank > 1:
-            new_pos_norm = F.squeeze(new_pos_norm, axis=-1)
-        max_new_norm = ori_pos_norm
-        # Avoid divide-by-zero and clip only when required.
-        safe_new_norm = F.where(
-            new_pos_norm > 1e-12,
-            new_pos_norm,
-            1e-12,
-        )
-        ratio = max_new_norm / safe_new_norm
-        ratio = F.where(new_pos_norm > max_new_norm, ratio, 1.0)
-        ratio = F.unsqueeze(F.unsqueeze(ratio, 1), 2)
-        return pred * ratio
 
     @staticmethod
     def scheduler_step(
@@ -926,15 +972,6 @@ class ZImagePipeline(DiffusionPipeline):
         latents = latents.cast(latents_dtype)
         return latents
 
-    @staticmethod
-    def prepare_scheduler(sigmas: Tensor) -> tuple[Tensor, Tensor]:
-        """Precompute denoising timesteps and step deltas."""
-        sigmas_curr = F.slice_tensor(sigmas, [slice(0, -1)])
-        sigmas_next = F.slice_tensor(sigmas, [slice(1, None)])
-        all_dt = sigmas_next - sigmas_curr
-        all_timesteps = sigmas_curr.cast(DType.float32)
-        return all_timesteps, all_dt
-
     @traced(message="ZImagePipeline.preprocess_latents")
     def preprocess_latents(self, latents: Tensor, dtype: DType) -> Tensor:
         """Patchify and pack latents before denoising."""
@@ -946,7 +983,7 @@ class ZImagePipeline(DiffusionPipeline):
         with Tracer("patchify_and_pack"):
             latents = self._patchify_and_pack(latents)
 
-        return latents.cast(dtype)
+        return latents
 
     def _image_to_tensor(
         self,
@@ -982,6 +1019,19 @@ class ZImagePipeline(DiffusionPipeline):
             )
         return image_tensor
 
+    def _blend_img2img_latents(
+        self,
+        image_latents: Tensor,
+        noise_latents: Tensor,
+        sigma: Tensor,
+    ) -> Tensor:
+        """Blend image latents with noise using sigma (compiled graph)."""
+        scaling = float(self.vae.config.scaling_factor)
+        shift = float(self.vae.config.shift_factor or 0.0)
+        image_latents = (image_latents - shift) * scaling
+        result = sigma * noise_latents + (1.0 - sigma) * image_latents
+        return result.cast(noise_latents.dtype)
+
     @traced(message="ZImagePipeline.prepare_img2img_latents")
     def prepare_img2img_latents(
         self,
@@ -1001,16 +1051,14 @@ class ZImagePipeline(DiffusionPipeline):
             raise ValueError("VAE encoder output must expose mode().")
 
         image_latents = posterior.mode()
-        image_latents = (
-            image_latents - float(self.vae.config.shift_factor or 0.0)
-        ) * float(self.vae.config.scaling_factor)
         image_latents = image_latents.to(self.transformer.devices[0]).cast(
             noise_latents.dtype
         )
 
-        sigma = sigmas[0]
-        latents = sigma * noise_latents + (1.0 - sigma) * image_latents
-        return latents.cast(noise_latents.dtype)
+        sigma_0 = sigmas[:1]
+        return self._blend_img2img_latents(
+            image_latents, noise_latents, sigma_0
+        )
 
     def _get_cached_guidance_scale_tensor(
         self,
@@ -1027,54 +1075,6 @@ class ZImagePipeline(DiffusionPipeline):
         )
         self._cached_guidance_scale_tensors[key] = tensor
         return tensor
-
-    def _get_cached_cfg_timestep_vectors(
-        self,
-        transformed_timesteps: np.ndarray,
-        cfg_width: int,
-        device: Device,
-    ) -> list[Tensor]:
-        digest = hashlib.sha1(transformed_timesteps.tobytes()).hexdigest()
-        key = (
-            f"cfg_timestep_vec::{cfg_width}::{transformed_timesteps.shape[0]}::"
-            f"{digest}::{device}"
-        )
-        if key in self._cached_cfg_timestep_vectors:
-            return self._cached_cfg_timestep_vectors[key]
-        vectors = [
-            Tensor(
-                storage=Buffer.from_dlpack(
-                    np.full((cfg_width,), float(t), dtype=np.float32)
-                ).to(device)
-            )
-            for t in transformed_timesteps
-        ]
-        self._cached_cfg_timestep_vectors[key] = vectors
-        return vectors
-
-    def _get_cached_step_scalar_tensors(
-        self,
-        values: np.ndarray,
-        key_prefix: str,
-        device: Device,
-    ) -> list[Tensor]:
-        values = np.ascontiguousarray(values.astype(np.float32, copy=False))
-        digest = hashlib.sha1(values.tobytes()).hexdigest()
-        key = (
-            f"{key_prefix}::{values.shape[0]}::{digest}::{device}"
-        )
-        if key in self._cached_step_scalar_tensors:
-            return self._cached_step_scalar_tensors[key]
-        tensors = [
-            Tensor(
-                storage=Buffer.from_dlpack(
-                    np.array([float(v)], dtype=np.float32)
-                ).to(device)
-            )
-            for v in values
-        ]
-        self._cached_step_scalar_tensors[key] = tensors
-        return tensors
 
     @traced(message="ZImagePipeline.execute")
     def execute(  # type: ignore[override]
@@ -1164,24 +1164,44 @@ class ZImagePipeline(DiffusionPipeline):
             transformed_timesteps = np.ascontiguousarray(
                 (1.0 - model_inputs.timesteps).astype(np.float32, copy=False)
             )
-            timestep_scalars = self._get_cached_step_scalar_tensors(
-                transformed_timesteps,
-                key_prefix=(
-                    f"step_t::{model_inputs.height}x{model_inputs.width}::"
-                    f"{model_inputs.num_inference_steps}"
-                ),
-                device=device,
-            )
             sigmas_host = np.asarray(model_inputs.sigmas, dtype=np.float32)
-            dt_values = np.ascontiguousarray(sigmas_host[1:] - sigmas_host[:-1])
-            dt_scalars = self._get_cached_step_scalar_tensors(
-                dt_values,
-                key_prefix=(
-                    f"step_dt::{model_inputs.height}x{model_inputs.width}::"
-                    f"{model_inputs.num_inference_steps}"
-                ),
-                device=device,
+            dt_values = np.ascontiguousarray(
+                (sigmas_host[1:] - sigmas_host[:-1]).astype(
+                    np.float32, copy=False
+                )
             )
+
+            # Cache per-step scalar tensors to avoid repeated uploads.
+            combined = np.concatenate([transformed_timesteps, dt_values])
+            step_key = (
+                f"steps::{num_timesteps}::"
+                f"{hashlib.sha1(combined.tobytes()).hexdigest()}"
+            )
+            if step_key in self._cached_step_tensors:
+                timestep_tensors, dt_tensors = self._cached_step_tensors[
+                    step_key
+                ]
+            else:
+                timestep_tensors = [
+                    Tensor(
+                        storage=Buffer.from_dlpack(
+                            np.array([float(t)], dtype=np.float32)
+                        ).to(device)
+                    )
+                    for t in transformed_timesteps
+                ]
+                dt_tensors = [
+                    Tensor(
+                        storage=Buffer.from_dlpack(
+                            np.array([float(d)], dtype=np.float32)
+                        ).to(device)
+                    )
+                    for d in dt_values
+                ]
+                self._cached_step_tensors[step_key] = (
+                    timestep_tensors,
+                    dt_tensors,
+                )
 
         cfg_cutoff_step = 0
         if model_inputs.do_cfg:
@@ -1206,21 +1226,12 @@ class ZImagePipeline(DiffusionPipeline):
                 [prompt_embeds, negative_prompt_embeds], axis=0
             )
 
-        # Batched CFG timestep vectors (only for non-fast fallback).
-        cfg_timestep_vectors: list[Tensor] | None = None
-        if use_batched_cfg_mode and not use_fast_denoise:
-            cfg_timestep_vectors = self._get_cached_cfg_timestep_vectors(
-                transformed_timesteps,
-                batch_size * 2,
-                device,
-            )
-
         # 4) Denoising loop.
         with Tracer("denoising_loop"):
             for i in range(num_timesteps):
                 apply_cfg = i < cfg_cutoff_step
-                timestep = timestep_scalars[i]
-                dt = dt_scalars[i]
+                timestep = timestep_tensors[i]
+                dt = dt_tensors[i]
                 preamble_out: tuple[Tensor, ...] | None = None
                 with Tracer(f"denoising_step_{i}"):
                     with Tracer("transformer"):
@@ -1235,15 +1246,21 @@ class ZImagePipeline(DiffusionPipeline):
                                     txt_ids=txt_ids,
                                 )
                             else:
-                                assert cfg_timestep_vectors is not None
                                 latents_cfg = self.duplicate_batch(latents)
+                                timestep_cfg = F.broadcast_to(
+                                    timestep_tensors[i],
+                                    [batch_size * 2],
+                                )
+                                timestep_cfg = F.rebind(
+                                    timestep_cfg, [batch_size * 2]
+                                )
                                 noise_pred_cfg = self.run_denoising_step(
                                     step=i,
                                     cache_state=cache_pos,
                                     device=device,
                                     latents=latents_cfg,
                                     prompt_embeds=cfg_prompt_embeds,
-                                    timestep=cfg_timestep_vectors[i],
+                                    timestep=timestep_cfg,
                                     img_ids=img_ids,
                                     txt_ids=txt_ids,
                                 )
@@ -1342,11 +1359,10 @@ class ZImagePipeline(DiffusionPipeline):
                             neg_noise_pred,
                             guidance_scale_tensor,
                         )
-                        noise_pred = self._apply_cfg_renormalization(
-                            noise_pred,
-                            noise_pred,
-                            model_inputs.cfg_normalization,
-                        )
+                        if model_inputs.cfg_normalization:
+                            noise_pred = self._cfg_renormalization_compiled(
+                                noise_pred, noise_pred,
+                            )
 
                     with Tracer("scheduler_step"):
                         latents = self.scheduler_step(latents, noise_pred, dt)

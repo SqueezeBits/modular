@@ -11,8 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-import math
-
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.nn import Linear, Module
@@ -61,6 +59,13 @@ def _apply_zimage_qk_rope(
 
 
 class ZImageAttention(Module[..., Tensor]):
+    """Multi-head self-attention with RoPE and optional QK normalization.
+
+    Projects hidden states to Q/K/V, applies per-head RMSNorm (when
+    ``qk_norm=True``), rotary position embeddings via a pre-computed
+    interleaved ``freqs_cis`` tensor, then flash attention.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -113,7 +118,7 @@ class ZImageAttention(Module[..., Tensor]):
             key,
             value,
             mask_variant=MHAMaskVariant.NULL_MASK,
-            scale=math.sqrt(1.0 / float(self.head_dim)),
+            scale=1.0 / (self.head_dim**0.5),
         )
 
         out = F.reshape(out, [batch_size, seq_len, self.inner_dim])
