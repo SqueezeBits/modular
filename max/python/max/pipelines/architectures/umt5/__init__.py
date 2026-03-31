@@ -11,8 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .scheduler_factory import SchedulerFactory
-from .scheduling_flow_match_euler_discrete import (
-    FlowMatchEulerDiscreteScheduler,
-)
-from .scheduling_unipc_multistep import UniPCMultistepScheduler
+from .model import UMT5Model
+
+__all__ = ["UMT5Model"]
