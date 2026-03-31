@@ -362,18 +362,6 @@ class ZImagePipeline(DiffusionPipeline):
             )
             state.prev_output = _device_zeros((batch_size, seq_len, output_dim))
 
-        if self.cache_config.taylorseer:
-            for attr in (
-                "taylor_factor_0",
-                "taylor_factor_1",
-                "taylor_factor_2",
-            ):
-                setattr(
-                    state,
-                    attr,
-                    _device_zeros((batch_size, seq_len, output_dim)),
-                )
-
         return state
 
     def run_transformer(
@@ -978,7 +966,7 @@ class ZImagePipeline(DiffusionPipeline):
         return latents
 
     @traced(message="ZImagePipeline.preprocess_latents")
-    def preprocess_latents(self, latents: Tensor, dtype: DType) -> Tensor:
+    def preprocess_latents(self, latents: Tensor) -> Tensor:
         """Patchify and pack latents before denoising."""
         with Tracer("host_to_device_latents"):
             latents = latents.to(self.transformer.devices[0]).cast(
@@ -1134,20 +1122,14 @@ class ZImagePipeline(DiffusionPipeline):
                 image_tensor=model_inputs.input_image_tensor,
                 sigmas=sigmas,
             )
-        latents = self.preprocess_latents(latents, dtype)
+        latents = self.preprocess_latents(latents)
 
         image_seq_len = int(latents.shape[1])
+        use_fast_denoise = not self.cache_config.first_block_caching
         use_batched_cfg_mode = bool(
             model_inputs.do_cfg
             and not model_inputs.explicit_negative_prompt
-            and not self.cache_config.first_block_caching
-            and not self.cache_config.taylorseer
-            and not self.cache_config.teacache
-        )
-        use_fast_denoise = bool(
-            not self.cache_config.first_block_caching
-            and not self.cache_config.taylorseer
-            and not self.cache_config.teacache
+            and use_fast_denoise
         )
 
         # Cache states are only needed for the non-split fallback path.
@@ -1242,33 +1224,13 @@ class ZImagePipeline(DiffusionPipeline):
                     with Tracer("transformer"):
                         if apply_cfg and use_batched_cfg_mode:
                             assert cfg_prompt_embeds is not None
-                            if use_fast_denoise:
-                                noise_pred_cfg = self.run_transformer_cfg_split(
-                                    latents=latents,
-                                    prompt_embeds=cfg_prompt_embeds,
-                                    timestep=timestep,
-                                    img_ids=img_ids,
-                                    txt_ids=txt_ids,
-                                )
-                            else:
-                                latents_cfg = self.duplicate_batch(latents)
-                                timestep_cfg = F.broadcast_to(
-                                    timestep_tensors[i],
-                                    [batch_size * 2],
-                                )
-                                timestep_cfg = F.rebind(
-                                    timestep_cfg, [batch_size * 2]
-                                )
-                                noise_pred_cfg = self.run_denoising_step(
-                                    step=i,
-                                    cache_state=cache_pos,
-                                    device=device,
-                                    latents=latents_cfg,
-                                    prompt_embeds=cfg_prompt_embeds,
-                                    timestep=timestep_cfg,
-                                    img_ids=img_ids,
-                                    txt_ids=txt_ids,
-                                )
+                            noise_pred_cfg = self.run_transformer_cfg_split(
+                                latents=latents,
+                                prompt_embeds=cfg_prompt_embeds,
+                                timestep=timestep,
+                                img_ids=img_ids,
+                                txt_ids=txt_ids,
+                            )
                             assert guidance_scale_tensor is not None
                             if model_inputs.cfg_normalization:
                                 _, noise_pred = self.cfg_finalize_batched_with_norm(
