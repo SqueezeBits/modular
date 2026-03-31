@@ -138,12 +138,16 @@ class Flux2Modulation(
         """
         self.mod_param_sets = mod_param_sets
         # Modulation layers are always BF16 in NVFP4 checkpoints.
-        self.linear = FP8Linear(
-            dim,
-            dim * 3 * mod_param_sets,
-            bias=bias,
-            float8_config=float8_config,
-            weight_dtype=weight_dtype,
+        self.linear = (
+            Linear(dim, dim * 3 * mod_param_sets, bias=bias)
+            if float8_config is None
+            else FP8Linear(
+                dim,
+                dim * 3 * mod_param_sets,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
         )
 
     def forward(
@@ -543,19 +547,9 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
         )
 
         # 4. Input embeddings (always BF16 — not quantized in FP8 checkpoints)
-        self.x_embedder = FP8Linear(
-            in_channels,
-            self.inner_dim,
-            bias=False,
-            float8_config=None,
-            weight_dtype=dtype,
-        )
-        self.context_embedder = FP8Linear(
-            joint_attention_dim,
-            self.inner_dim,
-            bias=False,
-            float8_config=None,
-            weight_dtype=dtype,
+        self.x_embedder = Linear(in_channels, self.inner_dim, bias=False)
+        self.context_embedder = Linear(
+            joint_attention_dim, self.inner_dim, bias=False
         )
 
         # 5. Dual-stream transformer blocks
@@ -606,16 +600,14 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
             float8_config=None,
             weight_dtype=dtype,
         )
-        self.proj_out = FP8Linear(
+        self.proj_out = Linear(
             self.inner_dim,
             patch_size * patch_size * self.out_channels,
             bias=False,
-            float8_config=None,
-            weight_dtype=dtype,
         )
 
         # Store config for input_types
-        self.max_device = device
+        self.max_device = self.device
         self.max_dtype = dtype
         self.max_input_dtype = DType.bfloat16 if dtype.is_float8() else dtype
         self.in_channels = in_channels

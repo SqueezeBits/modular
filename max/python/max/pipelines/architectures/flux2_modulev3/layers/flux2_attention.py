@@ -51,6 +51,26 @@ def _make_linear(
     return Linear(in_dim, out_dim, bias=bias)
 
 
+def _make_fp8_linear(
+    in_dim: int,
+    out_dim: int,
+    *,
+    bias: bool = False,
+    float8_config: Float8Config | None = None,
+    weight_dtype: DType | None = None,
+) -> Linear | FP8Linear:
+    """Create a plain Linear unless an FP8 config is explicitly provided."""
+    if float8_config is None:
+        return Linear(in_dim, out_dim, bias=bias)
+    return FP8Linear(
+        in_dim,
+        out_dim,
+        bias=bias,
+        float8_config=float8_config,
+        weight_dtype=weight_dtype,
+    )
+
+
 def _apply_flux2_qk_rope(
     query: Tensor,
     key: Tensor,
@@ -150,7 +170,7 @@ class Flux2FeedForward(Module[[Tensor], Tensor]):
                 inner_dim, dim_out, bias=bias, quant_config=quant_config
             )
         else:
-            self.linear_in = FP8Linear(
+            self.linear_in = _make_fp8_linear(
                 dim,
                 inner_dim * 2,
                 bias=bias,
@@ -158,7 +178,7 @@ class Flux2FeedForward(Module[[Tensor], Tensor]):
                 weight_dtype=weight_dtype,
             )
             self.act_fn = Flux2SwiGLU()
-            self.linear_out = FP8Linear(
+            self.linear_out = _make_fp8_linear(
                 inner_dim,
                 dim_out,
                 bias=bias,
@@ -283,21 +303,21 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
             )
         else:
             # FP8 or plain path
-            self.to_q = FP8Linear(
+            self.to_q = _make_fp8_linear(
                 query_dim,
                 self.inner_dim,
                 bias=bias,
                 float8_config=float8_config,
                 weight_dtype=weight_dtype,
             )
-            self.to_k = FP8Linear(
+            self.to_k = _make_fp8_linear(
                 query_dim,
                 self.inner_dim,
                 bias=bias,
                 float8_config=float8_config,
                 weight_dtype=weight_dtype,
             )
-            self.to_v = FP8Linear(
+            self.to_v = _make_fp8_linear(
                 query_dim,
                 self.inner_dim,
                 bias=bias,
@@ -322,7 +342,7 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
             )
         else:
             self.to_out.append(
-                FP8Linear(
+                _make_fp8_linear(
                     self.inner_dim,
                     out_dim,
                     bias=out_bias,
@@ -356,28 +376,28 @@ class Flux2Attention(Module[..., Tensor | tuple[Tensor, Tensor]]):
                     self.inner_dim, query_dim, bias=out_bias
                 )
             else:
-                self.add_q_proj = FP8Linear(
+                self.add_q_proj = _make_fp8_linear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=add_bias,
                     float8_config=float8_config,
                     weight_dtype=weight_dtype,
                 )
-                self.add_k_proj = FP8Linear(
+                self.add_k_proj = _make_fp8_linear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=add_bias,
                     float8_config=float8_config,
                     weight_dtype=weight_dtype,
                 )
-                self.add_v_proj = FP8Linear(
+                self.add_v_proj = _make_fp8_linear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=add_bias,
                     float8_config=float8_config,
                     weight_dtype=weight_dtype,
                 )
-                self.to_add_out = FP8Linear(
+                self.to_add_out = _make_fp8_linear(
                     self.inner_dim,
                     query_dim,
                     bias=out_bias,
@@ -571,7 +591,7 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
                 query_dim, fused_dim, bias=bias, quant_config=quant_config
             )
         else:
-            self.to_qkv_mlp_proj = FP8Linear(
+            self.to_qkv_mlp_proj = _make_fp8_linear(
                 query_dim,
                 fused_dim,
                 bias=bias,
@@ -595,7 +615,7 @@ class Flux2ParallelSelfAttention(Module[[Tensor], Tensor]):
                 quant_config=quant_config,
             )
         else:
-            self.to_out = FP8Linear(
+            self.to_out = _make_fp8_linear(
                 self.inner_dim + self.mlp_hidden_dim,
                 out_dim,
                 bias=out_bias,

@@ -44,12 +44,16 @@ class AdaLayerNormContinuous(Module[[Tensor, Tensor], Tensor]):
             norm_type: Type of normalization to use ("layer_norm" or "rms_norm").
         """
         self.silu = F.silu
-        self.linear = FP8Linear(
-            conditioning_embedding_dim,
-            embedding_dim * 2,
-            bias=bias,
-            float8_config=float8_config,
-            weight_dtype=weight_dtype,
+        self.linear = (
+            Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
+            if float8_config is None
+            else FP8Linear(
+                conditioning_embedding_dim,
+                embedding_dim * 2,
+                bias=bias,
+                float8_config=float8_config,
+                weight_dtype=weight_dtype,
+            )
         )
         self.norm: LayerNorm | RMSNorm
         if norm_type == "layer_norm":

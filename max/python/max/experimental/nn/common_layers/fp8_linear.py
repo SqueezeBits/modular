@@ -19,7 +19,8 @@ from max.experimental import random
 from max.dtype import DType
 from max.graph import DeviceRef, Dim, DimLike, TensorValue
 from max.experimental import functional as F
-from max.experimental.nn import Module
+from max.driver import CPU
+from max.experimental.nn import Module, PinnedDeviceTensor
 from max.nn.float8_config import Float8Config
 from max.nn.float8_ops import matmul_float8
 from max.nn.kernels import (
@@ -40,8 +41,8 @@ class FP8Linear(Module[[Tensor], Tensor]):
 
     weight: Tensor
     bias: Tensor | Literal[0]
-    input_scale: Tensor | None
-    weight_scale: Tensor | None
+    input_scale: PinnedDeviceTensor | None
+    weight_scale: PinnedDeviceTensor | None
     _weight_scale_cache: dict[str, Tensor]
 
     def __init__(
@@ -76,19 +77,19 @@ class FP8Linear(Module[[Tensor], Tensor]):
         # In FP8 mode, these tensors must be replaced by checkpoint values.
         if float8_config is not None:
             if float8_config.is_static:
-                self.input_scale = Tensor.ones([], dtype=DType.float32)
+                self.input_scale = Tensor.ones([], dtype=DType.float32, device=CPU())
             else:
                 self.input_scale = None
 
             if float8_config.weight_scale.is_tensor:
-                self.weight_scale = Tensor.ones([], dtype=DType.float32)
+                self.weight_scale = Tensor.ones([], dtype=DType.float32, device=CPU())
             else:
                 assert float8_config.weight_scale.block_size is not None
                 block_n, block_k = float8_config.weight_scale.block_size
                 out_blocks = (int(out_dim) + block_n - 1) // block_n
                 in_blocks = (int(in_dim) + block_k - 1) // block_k
                 self.weight_scale = Tensor.ones(
-                    [out_blocks, in_blocks], dtype=DType.float32
+                    [out_blocks, in_blocks], dtype=DType.float32, device=CPU()
                 )
         else:
             self.input_scale = None

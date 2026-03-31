@@ -159,7 +159,7 @@ class Linear(Module, Shardable):
                     name=f"{name}.input_scale" if name else "input_scale",
                     dtype=quant_config.input_scale.dtype,
                     shape=(),
-                    device=device,
+                    device=DeviceRef.CPU(),
                     quantization_encoding=quantization_encoding,
                 )
 
@@ -182,7 +182,7 @@ class Linear(Module, Shardable):
                 # TODO: Pass a per-layer quantization type.
                 # For now since we only support row-wise
                 shape=weight_scale_shape,
-                device=device,
+                device=DeviceRef.CPU(),
                 quantization_encoding=quantization_encoding,
             )
             if quant_config.is_nvfp4:
@@ -190,7 +190,7 @@ class Linear(Module, Shardable):
                     name=f"{name}.weight_scale_2" if name else "weight_scale_2",
                     dtype=quant_config.input_scale.dtype,
                     shape=(),
-                    device=device,
+                    device=DeviceRef.CPU(),
                     quantization_encoding=quantization_encoding,
                 )
 

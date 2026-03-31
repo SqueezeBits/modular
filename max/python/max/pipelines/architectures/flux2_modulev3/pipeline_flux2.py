@@ -18,6 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+import numpy.typing as npt
 from PIL import Image
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
