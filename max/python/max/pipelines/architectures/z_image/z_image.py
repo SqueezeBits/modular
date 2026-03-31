@@ -173,7 +173,6 @@ class ZImageTransformerBlock(Module):
 
     def __init__(
         self,
-        layer_id: int,
         dim: int,
         n_heads: int,
         norm_eps: float,
@@ -183,20 +182,7 @@ class ZImageTransformerBlock(Module):
         device: DeviceRef,
         modulation: bool = True,
     ) -> None:
-        """Initialize ZImageTransformerBlock.
-
-        Args:
-            layer_id: Index of this layer (informational).
-            dim: Model hidden dimension.
-            n_heads: Number of attention heads.
-            norm_eps: Epsilon for RMSNorm layers.
-            qk_norm: Whether to apply QK normalisation in attention.
-            dtype: Weight dtype.
-            device: Weight device.
-            modulation: If True, use adaLN modulation from timestep conditioning.
-        """
         super().__init__()
-        self.layer_id = layer_id
         self.modulation = modulation
 
         self.attention = ZImageAttention(
@@ -417,7 +403,6 @@ class ZImageTransformer2DModel(Module):
         self.noise_refiner = LayerList(
             [
                 ZImageTransformerBlock(
-                    layer_id=1000 + i,
                     dim=dim,
                     n_heads=n_heads,
                     norm_eps=norm_eps,
@@ -433,7 +418,6 @@ class ZImageTransformer2DModel(Module):
         self.context_refiner = LayerList(
             [
                 ZImageTransformerBlock(
-                    layer_id=i,
                     dim=dim,
                     n_heads=n_heads,
                     norm_eps=norm_eps,
@@ -468,7 +452,6 @@ class ZImageTransformer2DModel(Module):
         self.layers = LayerList(
             [
                 ZImageTransformerBlock(
-                    layer_id=i,
                     dim=dim,
                     n_heads=n_heads,
                     norm_eps=norm_eps,

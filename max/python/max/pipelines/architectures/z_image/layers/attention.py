@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-import math
-
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, ops
 from max.nn.attention.mask_config import MHAMaskVariant
@@ -152,7 +150,7 @@ class ZImageAttention(Module):
             key,
             value,
             mask_variant=MHAMaskVariant.NULL_MASK,
-            scale=math.sqrt(1.0 / float(self.head_dim)),
+            scale=1.0 / (self.head_dim**0.5),
         )
 
         out = ops.reshape(out, [batch_size, seq_len, self.inner_dim])

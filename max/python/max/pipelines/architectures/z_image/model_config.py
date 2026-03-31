@@ -30,7 +30,6 @@ class ZImageConfig(MAXModelConfigBase):
     n_layers: int = 30
     n_refiner_layers: int = 2
     n_heads: int = 30
-    n_kv_heads: int = 30
     norm_eps: float = 1e-5
     qk_norm: bool = True
     cap_feat_dim: int = 2560
@@ -73,7 +72,3 @@ class ZImageConfig(MAXModelConfigBase):
             * self.in_channels
         )
         return self.dim, out_dim
-
-
-# Back-compat alias for call sites that refer to the config as a "base" type.
-ZImageConfigBase = ZImageConfig
