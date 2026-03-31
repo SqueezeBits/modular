@@ -52,7 +52,6 @@ z_image_modulev3_arch = SupportedArchitecture(
     supported_encodings={"bfloat16"},
     example_repo_ids=[
         "Tongyi-MAI/Z-Image",
-        "Zyphra/Z-Image",
     ],
     pipeline_model=ZImagePipeline,  # type: ignore[arg-type]
     context_type=PixelContext,
