@@ -685,7 +685,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
             device=self.device,
         )
         timestep_type = TensorType(
-            self.max_input_dtype, shape=["batch_size"], device=self.max_device
+            self.max_input_dtype, shape=["batch_size"], device=self.device
         )
         img_ids_type = TensorType(
             DType.int64,
@@ -698,7 +698,7 @@ class Flux2Transformer2DModel(Module[..., Sequence[Tensor]]):
             device=self.device,
         )
         guidance_type = TensorType(
-            self.max_input_dtype, shape=["batch_size"], device=self.max_device
+            self.max_input_dtype, shape=["batch_size"], device=self.device
         )
         return (
             hidden_states_type,
