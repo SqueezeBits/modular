@@ -34,6 +34,7 @@ from max.interfaces import PixelGenerationContext
 from max.pipelines.lib.interfaces import (
     DenoisingCacheState,
     DiffusionPipeline,
+    DiffusionPipelineOutput,
     PixelModelInputs,
 )
 from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
@@ -147,19 +148,6 @@ class ZImageModelInputs(PixelModelInputs):
             )
 
 
-@dataclass
-class ZImagePipelineOutput:
-    """Container for Z-Image pipeline results.
-
-    Attributes:
-        images:
-            Decoded image data as a NumPy array or MAX :class:`~max.experimental.tensor.Tensor`,
-            depending on decode path and ``output_type``.
-    """
-
-    images: np.ndarray | Tensor
-
-
 class ZImagePipeline(DiffusionPipeline):
     """Diffusion pipeline for Z-Image generation (Qwen3 + transformer + VAE)."""
 
@@ -217,7 +205,7 @@ class ZImagePipeline(DiffusionPipeline):
         self._cached_prompt_padding: BoundedCache[
             str, Tensor
         ] = BoundedCache(32)
-        self._cached_guidance_scale_tensors: BoundedCache[
+        self._cached_guidance: BoundedCache[
             str, Tensor
         ] = BoundedCache(32)
         self._cached_step_tensors: BoundedCache[
@@ -289,7 +277,7 @@ class ZImagePipeline(DiffusionPipeline):
 
         input_image_tensor: Tensor | None = None
         if context.input_image is not None:
-            input_image_tensor = self._image_to_tensor(
+            input_image_tensor = self._numpy_image_to_tensor(
                 image=np.ascontiguousarray(
                     context.input_image.astype(np.uint8, copy=False)
                 ),
@@ -978,7 +966,7 @@ class ZImagePipeline(DiffusionPipeline):
 
         return latents
 
-    def _image_to_tensor(
+    def _numpy_image_to_tensor(
         self,
         image: np.ndarray,
         batch_size: int,
@@ -1025,8 +1013,8 @@ class ZImagePipeline(DiffusionPipeline):
         result = sigma * noise_latents + (1.0 - sigma) * image_latents
         return result.cast(noise_latents.dtype)
 
-    @traced(message="ZImagePipeline.prepare_img2img_latents")
-    def prepare_img2img_latents(
+    @traced(message="ZImagePipeline.prepare_image_latents")
+    def prepare_image_latents(
         self,
         noise_latents: Tensor,
         image_tensor: Tensor,
@@ -1053,20 +1041,20 @@ class ZImagePipeline(DiffusionPipeline):
             image_latents, noise_latents, sigma_0
         )
 
-    def _get_cached_guidance_scale_tensor(
+    def _get_cached_guidance(
         self,
         guidance_scale: float,
         device: Device,
     ) -> Tensor:
         key = f"{guidance_scale:.8f}::{device}"
-        if key in self._cached_guidance_scale_tensors:
-            return self._cached_guidance_scale_tensors[key]
+        if key in self._cached_guidance:
+            return self._cached_guidance[key]
         tensor = Tensor(
             storage=Buffer.from_dlpack(
                 np.array(guidance_scale, dtype=np.float32)
             ).to(device)
         )
-        self._cached_guidance_scale_tensors[key] = tensor
+        self._cached_guidance[key] = tensor
         return tensor
 
     @traced(message="ZImagePipeline.execute")
@@ -1074,7 +1062,7 @@ class ZImagePipeline(DiffusionPipeline):
         self,
         model_inputs: ZImageModelInputs,
         output_type: Literal["np", "latent", "pil"] = "np",
-    ) -> ZImagePipelineOutput:
+    ) -> DiffusionPipelineOutput:
         """Run the Z-Image denoising loop and decode outputs."""
 
         # 1) Encode prompt embeddings.
@@ -1117,7 +1105,7 @@ class ZImagePipeline(DiffusionPipeline):
         txt_ids = model_inputs.txt_ids_tensor
 
         if model_inputs.input_image_tensor is not None:
-            latents = self.prepare_img2img_latents(
+            latents = self.prepare_image_latents(
                 noise_latents=latents,
                 image_tensor=model_inputs.input_image_tensor,
                 sigmas=sigmas,
@@ -1200,7 +1188,7 @@ class ZImagePipeline(DiffusionPipeline):
 
         guidance_scale_tensor: Tensor | None = None
         if model_inputs.do_cfg:
-            guidance_scale_tensor = self._get_cached_guidance_scale_tensor(
+            guidance_scale_tensor = self._get_cached_guidance(
                 model_inputs.guidance_scale,
                 device,
             )
@@ -1342,4 +1330,4 @@ class ZImagePipeline(DiffusionPipeline):
                 output_type=output_type,
             )
 
-        return ZImagePipelineOutput(images=outputs)
+        return DiffusionPipelineOutput(images=outputs)
