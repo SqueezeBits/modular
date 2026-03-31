@@ -85,11 +85,15 @@ class WanI2VPipeline(WanPipeline):
                 np.array(pil_img).astype(np.float32) / 127.5 - 1.0
             ).transpose(2, 0, 1)[np.newaxis]
 
-        enc_latent = self.vae.encode_zero_padded_video_condition(
-            image_f32,
-            batch_size=batch_size,
-            num_frames=num_frames,
+        video_condition_np = np.zeros(
+            (batch_size, 3, num_frames, h, w), dtype=np.float32
         )
+        video_condition_np[:, :, 0:1, :, :] = image_f32[:, :, np.newaxis, :, :]
+
+        enc_buf = _numpy_f32_to_buffer(
+            video_condition_np, self.vae.config.dtype, device
+        )
+        enc_latent = self.vae.encode(enc_buf)
         latent_cond_np = _buffer_to_numpy_f32(enc_latent)
 
         logger.debug(
@@ -443,6 +447,4 @@ class WanI2VPipeline(WanPipeline):
                         coeff_buffers[i],
                         step_state,
                     )
-                del noise_pred_buf
-                del latent_model_input
         return latents, step_state

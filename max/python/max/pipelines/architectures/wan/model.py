@@ -235,17 +235,13 @@ class BlockLevelModel:
             pre_out[2],
             pre_out[3],
         )
-        del pre_out
         for block in self.blocks:
             block_out = block.execute(
                 hs, text_emb, timestep_proj, rope_cos, rope_sin
             )
             hs = block_out[0]
-            del block_out
         post_out = self.post.execute(hs, temb, spatial_shape)
-        result = post_out[0]
-        del post_out
-        return result
+        return post_out[0]
 
 
 class WanTransformerModel(ComponentModel):

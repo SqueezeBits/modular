@@ -14,10 +14,14 @@
 """Simple offline video generation example using diffusion models.
 
 Usage:
+    MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT=100 \
     ./bazelw run //max/examples/diffusion:simple_offline_video_generation -- \
         --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
         --prompt "A cat playing piano" \
         --output output.mp4
+
+Note: MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT=100 is required
+for 720p+ resolutions with symbolic seq_len block graphs.
 """
 
 from __future__ import annotations
