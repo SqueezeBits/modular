@@ -991,7 +991,7 @@ class ZImagePipeline(DiffusionPipeline):
                 )
 
         # Pre-create batch=2 timestep tensors for batched CFG.
-        cfg_timestep_bufs: list[Buffer] = []
+        cfg_timestep_bufs: list[Buffer] | None = None
         if use_batched_cfg:
             transformed = (1.0 - timesteps_np).astype(np.float32)
             cfg_timestep_bufs = [
@@ -1010,8 +1010,9 @@ class ZImagePipeline(DiffusionPipeline):
 
                 with Tracer(f"denoising_step_{i}"):
                     if apply_cfg and use_batched_cfg:
-                        # Batched CFG: run transformer once with batch=2.
+                        # Batched CFG: full transformer at batch=2.
                         assert cfg_prompt_embeds is not None
+                        assert cfg_timestep_bufs is not None
                         with Tracer("transformer"):
                             latents_cfg = self._duplicate_batch(latents)
                             noise_pred_cfg = self.transformer(

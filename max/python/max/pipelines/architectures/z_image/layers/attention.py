@@ -128,6 +128,15 @@ class ZImageAttention(Module):
         if self.norm_k is not None:
             key = self.norm_k(key)
 
+        # Rebind freqs_cis sequence dim to match query's seq dim,
+        # since Graph API tracks concat(img_seq, txt_seq) and
+        # total_seq_len as separate symbolic dims.
+        if isinstance(freqs_cis, tuple):
+            cos, sin = freqs_cis
+            cos = ops.rebind(cos, [seq_len, cos.shape[1]])
+            sin = ops.rebind(sin, [seq_len, sin.shape[1]])
+            freqs_cis = (cos, sin)
+
         query = apply_rotary_emb(
             query,
             freqs_cis,

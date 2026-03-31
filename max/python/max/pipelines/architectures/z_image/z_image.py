@@ -546,14 +546,21 @@ class ZImageTransformer2DModel(Module):
         if txt_ids.rank == 3:
             txt_ids = txt_ids[0]
 
-        # Compute RoPE embeddings for text and image separately.
-        txt_freqs = self.rope_embedder(txt_ids)  # (cos, sin) [text_seq, D]
-        img_freqs = self.rope_embedder(img_ids)  # (cos, sin) [img_seq, D]
-
-        # Unified freqs for joint attention: [img + txt, D]
+        # Compute RoPE from concatenated IDs (V3 pattern: compute once).
+        img_seq_len = img_ids.shape[0]
+        unified_ids = ops.concat([img_ids, txt_ids], axis=0)
+        unified_raw = self.rope_embedder(unified_ids)  # (cos, sin)
         unified_freqs = (
-            ops.concat([img_freqs[0], txt_freqs[0]], axis=0),
-            ops.concat([img_freqs[1], txt_freqs[1]], axis=0),
+            ops.cast(unified_raw[0], x.dtype),
+            ops.cast(unified_raw[1], x.dtype),
+        )
+        img_freqs = (
+            unified_freqs[0][:img_seq_len],
+            unified_freqs[1][:img_seq_len],
+        )
+        txt_freqs = (
+            unified_freqs[0][img_seq_len:],
+            unified_freqs[1][img_seq_len:],
         )
 
         # Noise refiner: modulated blocks on image tokens.
