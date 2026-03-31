@@ -427,6 +427,7 @@ class ZImagePipeline(DiffusionPipeline):
             x_dup, prompt_embeds, t_emb_dup, unified_freqs, txt_freqs,
         )[0]
 
+    @traced(message="ZImagePipeline.build_preprocess_latents")
     def build_preprocess_latents(self) -> None:
         device = self.transformer.devices[0]
         target_dtype = self.transformer.config.dtype
@@ -452,6 +453,7 @@ class ZImagePipeline(DiffusionPipeline):
             ],
         )
 
+    @traced(message="ZImagePipeline.build_scheduler_step")
     def build_scheduler_step(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -468,30 +470,35 @@ class ZImagePipeline(DiffusionPipeline):
             ],
         )
 
+    @traced(message="ZImagePipeline.build_decode_latents")
     def build_decode_latents(self) -> None:
         device = self.transformer.devices[0]
         if hasattr(self.vae, "build_fused_decode"):
             self._fused_decode = self.vae.build_fused_decode(device)
         else:
             dtype = self.transformer.config.dtype
-            self.__dict__["_postprocess_latents"] = max_compile(
-                self._postprocess_latents,
+            self.__dict__["_unpack_and_postprocess"] = max_compile(
+                self._unpack_and_postprocess,
                 input_types=[
                     TensorType(
                         dtype,
-                        shape=[
-                            "batch",
-                            "half_h",
-                            "half_w",
-                            2,
-                            2,
-                            "ch_4",
-                        ],
+                        shape=["batch", "seq", "channels"],
+                        device=device,
+                    ),
+                    TensorType(
+                        DType.float32,
+                        shape=["half_h"],
+                        device=device,
+                    ),
+                    TensorType(
+                        DType.float32,
+                        shape=["half_w"],
                         device=device,
                     ),
                 ],
             )
 
+    @traced(message="ZImagePipeline.build_postprocess_image")
     def build_postprocess_image(self) -> None:
         device = self.transformer.devices[0]
         dtype = self.transformer.config.dtype
@@ -506,6 +513,7 @@ class ZImagePipeline(DiffusionPipeline):
             ],
         )
 
+    @traced(message="ZImagePipeline.build_blend_img2img_latents")
     def build_blend_img2img_latents(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -526,6 +534,7 @@ class ZImagePipeline(DiffusionPipeline):
             ],
         )
 
+    @traced(message="ZImagePipeline.build_duplicate_batch")
     def build_duplicate_batch(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -540,6 +549,7 @@ class ZImagePipeline(DiffusionPipeline):
             ],
         )
 
+    @traced(message="ZImagePipeline.build_duplicate_2d")
     def build_duplicate_2d(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -550,6 +560,7 @@ class ZImagePipeline(DiffusionPipeline):
             ],
         )
 
+    @traced(message="ZImagePipeline.build_cfg_finalize_batched")
     def build_cfg_finalize_batched(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -570,6 +581,7 @@ class ZImagePipeline(DiffusionPipeline):
             input_types=input_types,
         )
 
+    @traced(message="ZImagePipeline.build_cfg_renormalization")
     def build_cfg_renormalization(self) -> None:
         dtype = self.transformer.config.dtype
         device = self.transformer.devices[0]
@@ -905,36 +917,29 @@ class ZImagePipeline(DiffusionPipeline):
             decoded = self._fused_decode(latents, h_carrier, w_carrier)
             return np.from_dlpack(decoded)
 
-        latent_h = int(h_carrier.shape[0]) * 2
-        latent_w = int(w_carrier.shape[0]) * 2
-        batch_size = int(latents.shape[0])
-        ch_size = int(latents.shape[2])
-        latents = F.reshape(
-            latents,
-            (
-                batch_size,
-                latent_h // 2,
-                latent_w // 2,
-                2,
-                2,
-                ch_size // 4,
-            ),
-        )
-
-        latents = self._postprocess_latents(latents)
+        latents = self._unpack_and_postprocess(latents, h_carrier, w_carrier)
         decoded = self.vae.decode(latents)
         image = self._postprocess_image(decoded)
         return np.from_dlpack(image.to(CPU()))
 
-    def _postprocess_latents(self, latents: Tensor) -> Tensor:
+    def _unpack_and_postprocess(
+        self,
+        latents: Tensor,
+        h_carrier: Tensor,
+        w_carrier: Tensor,
+    ) -> Tensor:
+        """Unpack [B, S, C] → [B, C/4, H, W] and apply VAE scaling."""
         batch_size = latents.shape[0]
-        half_h = latents.shape[1]
-        half_w = latents.shape[2]
-        c_quarter = latents.shape[5]
+        ch_size = latents.shape[2]
+        half_h = h_carrier.shape[0]
+        half_w = w_carrier.shape[0]
 
+        latents = F.reshape(
+            latents, (batch_size, half_h, half_w, 2, 2, ch_size // 4)
+        )
         latents = F.permute(latents, (0, 5, 1, 3, 2, 4))
         latents = F.reshape(
-            latents, (batch_size, c_quarter, half_h * 2, half_w * 2)
+            latents, (batch_size, ch_size // 4, half_h * 2, half_w * 2)
         )
         latents = (latents / float(self.vae.config.scaling_factor)) + float(
             self.vae.config.shift_factor or 0.0
