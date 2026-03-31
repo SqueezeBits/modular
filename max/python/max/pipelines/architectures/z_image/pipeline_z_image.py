@@ -173,8 +173,13 @@ class ZImagePipeline(DiffusionPipeline):
         self.build_scheduler_step()
         self.build_decode_latents()
         self.build_cfg_combine()
+        self.build_duplicate_batch()
+        self.build_cfg_finalize_batched()
         self.build_cfg_renormalization()
         self.build_postprocess_image()
+        self.build_pad_seq()
+        self.build_truncate_seq()
+        self.build_concat_batch()
 
         self._cached_text_ids: BoundedCache[str, Buffer] = BoundedCache(32)
         self._cached_sigmas: BoundedCache[str, Buffer] = BoundedCache(32)
@@ -427,6 +432,198 @@ class ZImagePipeline(DiffusionPipeline):
                 ],
             ),
         )
+
+    @traced(message="ZImagePipeline.build_duplicate_batch")
+    def build_duplicate_batch(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+
+        def _graph(x: TensorValue) -> TensorValue:
+            batch = x.shape[0]
+            seq = x.shape[1]
+            ch = x.shape[2]
+            x = ops.unsqueeze(x, 0)
+            x = ops.broadcast_to(x, [2, batch, seq, ch])
+            return ops.reshape(x, [batch * 2, seq, ch])
+
+        self._duplicate_batch = cast(
+            Callable[[Buffer], Buffer],
+            max_compile(
+                _graph,
+                input_types=[
+                    TensorType(
+                        dtype,
+                        shape=["batch", "seq", "channels"],
+                        device=device,
+                    ),
+                ],
+            ),
+        )
+
+    @traced(message="ZImagePipeline.build_cfg_finalize_batched")
+    def build_cfg_finalize_batched(self) -> None:
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+        input_types = [
+            TensorType(
+                dtype,
+                shape=["double_batch", "seq", "channels"],
+                device=device,
+            ),
+            TensorType(DType.float32, shape=[], device=device),
+        ]
+
+        def _no_norm(
+            pred_cfg: TensorValue, scale: TensorValue
+        ) -> tuple[TensorValue, TensorValue]:
+            batch2 = pred_cfg.shape[0]
+            batch = batch2 // 2
+            seq = pred_cfg.shape[1]
+            ch = pred_cfg.shape[2]
+            pos = ops.rebind(pred_cfg[:batch], [batch, seq, ch])
+            neg = ops.rebind(pred_cfg[batch:], [batch, seq, ch])
+            result = ops.cast(pos + scale * (pos - neg), pos.dtype)
+            return pos, result
+
+        def _with_norm(
+            pred_cfg: TensorValue, scale: TensorValue
+        ) -> tuple[TensorValue, TensorValue]:
+            pos, result = _no_norm(pred_cfg, scale)
+            ori = ops.sqrt(ops.sum(ops.sum(pos * pos, axis=2), axis=1) + 1e-12)
+            new = ops.sqrt(
+                ops.sum(ops.sum(result * result, axis=2), axis=1) + 1e-12
+            )
+            while ori.rank > 1:
+                ori = ops.squeeze(ori, -1)
+            while new.rank > 1:
+                new = ops.squeeze(new, -1)
+            safe = ops.where(new > 1e-12, new, 1e-12)
+            ratio = ori / safe
+            ratio = ops.where(new > ori, ratio, 1.0)
+            ratio = ops.unsqueeze(ops.unsqueeze(ratio, 1), 2)
+            return pos, result * ratio
+
+        self._cfg_finalize_no_norm = cast(
+            Callable[[Buffer, Buffer], tuple[Buffer, Buffer]],
+            max_compile(_no_norm, input_types=input_types),
+        )
+        self._cfg_finalize_with_norm = cast(
+            Callable[[Buffer, Buffer], tuple[Buffer, Buffer]],
+            max_compile(_with_norm, input_types=input_types),
+        )
+
+    @traced(message="ZImagePipeline.build_pad_seq")
+    def build_pad_seq(self) -> None:
+        """Compiled graph: concat embeds + zero padding along seq axis."""
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+
+        def _graph(embeds: TensorValue, pad: TensorValue) -> TensorValue:
+            return ops.concat([embeds, pad], axis=1)
+
+        self._pad_seq = cast(
+            Callable[[Buffer, Buffer], Buffer],
+            max_compile(
+                _graph,
+                input_types=[
+                    TensorType(
+                        dtype,
+                        shape=["batch", "seq_a", "hidden"],
+                        device=device,
+                    ),
+                    TensorType(
+                        dtype,
+                        shape=["batch", "seq_b", "hidden"],
+                        device=device,
+                    ),
+                ],
+            ),
+        )
+
+    @traced(message="ZImagePipeline.build_truncate_seq")
+    def build_truncate_seq(self) -> None:
+        """Compiled graph: truncate embeds to target_carrier length."""
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+
+        def _graph(
+            embeds: TensorValue, target_carrier: TensorValue
+        ) -> TensorValue:
+            target_len = target_carrier.shape[0]
+            return embeds[:, :target_len, :]
+
+        self._truncate_seq = cast(
+            Callable[[Buffer, Buffer], Buffer],
+            max_compile(
+                _graph,
+                input_types=[
+                    TensorType(
+                        dtype,
+                        shape=["batch", "seq", "hidden"],
+                        device=device,
+                    ),
+                    TensorType(
+                        dtype,
+                        shape=["target_len"],
+                        device=device,
+                    ),
+                ],
+            ),
+        )
+
+    @traced(message="ZImagePipeline.build_concat_batch")
+    def build_concat_batch(self) -> None:
+        """Compiled graph: concat two [B, S, H] tensors along batch axis."""
+        dtype = self.transformer.config.dtype
+        device = self.transformer.devices[0]
+
+        def _graph(a: TensorValue, b: TensorValue) -> TensorValue:
+            return ops.concat([a, b], axis=0)
+
+        self._concat_batch = cast(
+            Callable[[Buffer, Buffer], Buffer],
+            max_compile(
+                _graph,
+                input_types=[
+                    TensorType(
+                        dtype,
+                        shape=["batch_a", "seq", "hidden"],
+                        device=device,
+                    ),
+                    TensorType(
+                        dtype,
+                        shape=["batch_b", "seq", "hidden"],
+                        device=device,
+                    ),
+                ],
+            ),
+        )
+
+    def _align_prompt_embeds(
+        self,
+        neg_embeds: Buffer,
+        pos_embeds: Buffer,
+        device: Device,
+    ) -> Buffer:
+        """Align negative prompt embeddings to positive prompt length."""
+        pos_len = int(pos_embeds.shape[1])
+        neg_len = int(neg_embeds.shape[1])
+        hidden = int(pos_embeds.shape[2])
+
+        if neg_len == pos_len:
+            return neg_embeds
+        if neg_len > pos_len:
+            # Truncate using shape carrier.
+            carrier = Buffer.from_dlpack(
+                np.empty(pos_len, dtype=np.float32)
+            ).to(device)
+            return self._truncate_seq(neg_embeds, carrier)
+        # Pad with zeros.
+        pad_len = pos_len - neg_len
+        pad = Buffer.zeros(
+            (1, pad_len, hidden), pos_embeds.dtype, device=device
+        )
+        return self._pad_seq(neg_embeds, pad)
 
     # -- Prepare inputs ------------------------------------------------------
 
@@ -769,9 +966,14 @@ class ZImagePipeline(DiffusionPipeline):
                 model_inputs.guidance_scale, device
             )
 
-        # Prepare negative conditioning IDs if needed.
+        # Prepare batched CFG embeddings (matching V3 approach).
+        use_batched_cfg = bool(
+            model_inputs.do_cfg and not model_inputs.explicit_negative_prompt
+        )
+        cfg_prompt_embeds: Buffer | None = None
         neg_img_ids = img_ids
         neg_txt_ids = txt_ids
+
         if model_inputs.do_cfg and negative_prompt_embeds is not None:
             if model_inputs.explicit_negative_prompt:
                 assert model_inputs.negative_img_ids_tensor is not None
@@ -779,20 +981,25 @@ class ZImagePipeline(DiffusionPipeline):
                 neg_img_ids = model_inputs.negative_img_ids_tensor
                 neg_txt_ids = model_inputs.negative_txt_ids_tensor
             else:
-                # Create txt_ids matching negative prompt seq length.
-                neg_seq_len = int(negative_prompt_embeds.shape[1])
-                neg_txt_key = f"text_ids::{neg_seq_len}"
-                if neg_txt_key in self._cached_text_ids:
-                    neg_txt_ids = self._cached_text_ids[neg_txt_key]
-                else:
-                    neg_txt_np = np.zeros((neg_seq_len, 3), dtype=np.int64)
-                    neg_txt_np[:, 0] = np.arange(
-                        1, neg_seq_len + 1, dtype=np.int64
-                    )
-                    neg_txt_ids = Buffer.from_dlpack(
-                        np.ascontiguousarray(neg_txt_np)
-                    ).to(device)
-                    self._cached_text_ids[neg_txt_key] = neg_txt_ids
+                # Align negative embeds to positive length, then
+                # concat [pos, neg] along batch (same as V3).
+                neg_aligned = self._align_prompt_embeds(
+                    negative_prompt_embeds, prompt_embeds, device
+                )
+                cfg_prompt_embeds = self._concat_batch(
+                    prompt_embeds, neg_aligned
+                )
+
+        # Pre-create batch=2 timestep tensors for batched CFG.
+        cfg_timestep_bufs: list[Buffer] = []
+        if use_batched_cfg:
+            transformed = (1.0 - timesteps_np).astype(np.float32)
+            cfg_timestep_bufs = [
+                Buffer.from_dlpack(
+                    np.array([float(t), float(t)], dtype=np.float32)
+                ).to(device)
+                for t in transformed
+            ]
 
         # 4) Denoising loop.
         with Tracer("denoising_loop"):
@@ -802,17 +1009,37 @@ class ZImagePipeline(DiffusionPipeline):
                 dt = dts_seq[i : i + 1]
 
                 with Tracer(f"denoising_step_{i}"):
-                    with Tracer("transformer"):
-                        noise_pred = self.transformer(
-                            latents,
-                            prompt_embeds,
-                            timestep,
-                            img_ids,
-                            txt_ids,
-                        )[0]
-
-                    # Non-batched CFG: separate negative pass.
-                    if apply_cfg:
+                    if apply_cfg and use_batched_cfg:
+                        # Batched CFG: run transformer once with batch=2.
+                        assert cfg_prompt_embeds is not None
+                        with Tracer("transformer"):
+                            latents_cfg = self._duplicate_batch(latents)
+                            noise_pred_cfg = self.transformer(
+                                latents_cfg,
+                                cfg_prompt_embeds,
+                                cfg_timestep_bufs[i],
+                                img_ids,
+                                txt_ids,
+                            )[0]
+                        assert guidance_buf is not None
+                        if model_inputs.cfg_normalization:
+                            _, noise_pred = self._cfg_finalize_with_norm(
+                                noise_pred_cfg, guidance_buf
+                            )
+                        else:
+                            _, noise_pred = self._cfg_finalize_no_norm(
+                                noise_pred_cfg, guidance_buf
+                            )
+                    elif apply_cfg:
+                        # Non-batched CFG (explicit negative prompt).
+                        with Tracer("transformer"):
+                            noise_pred = self.transformer(
+                                latents,
+                                prompt_embeds,
+                                timestep,
+                                img_ids,
+                                txt_ids,
+                            )[0]
                         assert negative_prompt_embeds is not None
                         with Tracer("cfg_transformer"):
                             neg_noise_pred = self.transformer(
@@ -830,6 +1057,15 @@ class ZImagePipeline(DiffusionPipeline):
                             noise_pred = self._cfg_renormalization(
                                 noise_pred, noise_pred
                             )
+                    else:
+                        with Tracer("transformer"):
+                            noise_pred = self.transformer(
+                                latents,
+                                prompt_embeds,
+                                timestep,
+                                img_ids,
+                                txt_ids,
+                            )[0]
 
                     with Tracer("scheduler_step"):
                         latents = self._scheduler_step(latents, noise_pred, dt)
