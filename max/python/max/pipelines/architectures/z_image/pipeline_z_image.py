@@ -721,10 +721,14 @@ class ZImagePipeline(DiffusionPipeline):
 
     @traced(message="ZImagePipeline.preprocess_latents")
     def preprocess_latents(self, latents: Buffer) -> Buffer:
-        latents_f32 = Buffer.from_dlpack(
-            np.ascontiguousarray(np.from_dlpack(latents).astype(np.float32))
-        ).to(self.transformer.devices[0])
-        return self._patchify_and_pack(latents_f32)
+        """Patchify and pack latents.
+
+        Expects float32 GPU Buffer from prepare_inputs (latents are
+        uploaded as float32 via Buffer.from_dlpack().to(device)).
+        The compiled _patchify_and_pack graph handles the final dtype
+        cast to model precision internally.
+        """
+        return self._patchify_and_pack(latents)
 
     # -- Execute -------------------------------------------------------------
 
