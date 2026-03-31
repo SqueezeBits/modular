@@ -18,6 +18,7 @@ from max.experimental import functional as F
 from max.experimental.nn import Linear, Module
 from max.experimental.tensor import Tensor
 
+
 class TimestepEmbedder(Module[[Tensor], Tensor]):
     def __init__(
         self,
@@ -65,7 +66,9 @@ class TimestepEmbedder(Module[[Tensor], Tensor]):
 
 
 def _get_1d_rope_interleaved(
-    dim: int, pos: Tensor, theta: float = 10000.0,
+    dim: int,
+    pos: Tensor,
+    theta: float = 10000.0,
 ) -> Tensor:
     """Compute 1-D RoPE in [cos, sin] interleaved pair format ([S, dim])."""
     half = dim // 2
@@ -98,7 +101,9 @@ class RopeEmbedder(Module[[Tensor], Tensor]):
         for i in range(len(self.axes_dims)):
             parts.append(
                 _get_1d_rope_interleaved(
-                    self.axes_dims[i], pos[:, i], theta=self.theta,
+                    self.axes_dims[i],
+                    pos[:, i],
+                    theta=self.theta,
                 )
             )
         return F.concat(parts, axis=-1)

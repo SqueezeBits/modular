@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, overload
 
 import numpy as np
-from PIL import Image
 import numpy.typing as npt
 from max._core.driver import Device
 from max.driver import CPU, Accelerator, Buffer
@@ -38,6 +37,7 @@ from max.graph.weights import load_weights
 from max.interfaces import PixelGenerationContext
 from max.interfaces.tokens import TokenBuffer
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+from PIL import Image
 from tqdm import tqdm
 from typing_extensions import Self
 

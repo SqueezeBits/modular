@@ -21,10 +21,12 @@ tracing, module docstrings, and flat weight path assignment.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import MISSING, dataclass, fields
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.experimental import functional as F
@@ -158,6 +160,7 @@ class ZImagePipeline(DiffusionPipeline):
     vae: AutoencoderKLModel
     text_encoder: Qwen3TextEncoderZImageModel
     transformer: ZImageTransformerModel
+    _cfg_renormalization_compiled: Callable[..., Any]
 
     components = {
         "vae": AutoencoderKLModel,
@@ -193,21 +196,19 @@ class ZImagePipeline(DiffusionPipeline):
         self._cached_text_ids: BoundedCache[str, Tensor] = BoundedCache(32)
         self._cached_sigmas: BoundedCache[str, Tensor] = BoundedCache(32)
         self._cached_img_ids: BoundedCache[str, Tensor] = BoundedCache(32)
-        self._cached_img_ids_base_np: BoundedCache[
-            str, np.ndarray
-        ] = BoundedCache(32)
-        self._cached_shape_carriers: BoundedCache[
-            int, Tensor
-        ] = BoundedCache(32)
-        self._cached_prompt_token_tensors: BoundedCache[
-            str, Tensor
-        ] = BoundedCache(32)
-        self._cached_prompt_padding: BoundedCache[
-            str, Tensor
-        ] = BoundedCache(32)
-        self._cached_guidance: BoundedCache[
-            str, Tensor
-        ] = BoundedCache(32)
+        self._cached_img_ids_base_np: BoundedCache[str, np.ndarray] = (
+            BoundedCache(32)
+        )
+        self._cached_shape_carriers: BoundedCache[int, Tensor] = BoundedCache(
+            32
+        )
+        self._cached_prompt_token_tensors: BoundedCache[str, Tensor] = (
+            BoundedCache(32)
+        )
+        self._cached_prompt_padding: BoundedCache[str, Tensor] = BoundedCache(
+            32
+        )
+        self._cached_guidance: BoundedCache[str, Tensor] = BoundedCache(32)
         self._cached_step_tensors: BoundedCache[
             str, tuple[list[Tensor], list[Tensor]]
         ] = BoundedCache(32)
@@ -331,6 +332,7 @@ class ZImagePipeline(DiffusionPipeline):
         batch_size: int,
         seq_len: int,
         transformer_config: Any,
+        text_seq_len: int = 0,
     ) -> DenoisingCacheState:
         """Allocate FBCache / Taylor tensors using Z-Image output layout."""
         cfg = transformer_config
@@ -388,10 +390,11 @@ class ZImagePipeline(DiffusionPipeline):
         duplicated CFG batch.
         """
         # Phase 1: shared preamble at batch=1.
-        x, t_emb, unified_freqs, txt_freqs = (
-            self.transformer.run_preamble(
-                latents, timestep, img_ids, txt_ids,
-            )
+        x, t_emb, unified_freqs, txt_freqs = self.transformer.run_preamble(
+            latents,
+            timestep,
+            img_ids,
+            txt_ids,
         )
 
         # Duplicate shared results to batch=2.
@@ -400,7 +403,11 @@ class ZImagePipeline(DiffusionPipeline):
 
         # Phase 2: main at batch=2.
         return self.transformer.run_cfg_main(
-            x_dup, prompt_embeds, t_emb_dup, unified_freqs, txt_freqs,
+            x_dup,
+            prompt_embeds,
+            t_emb_dup,
+            unified_freqs,
+            txt_freqs,
         )[0]
 
     @traced(message="ZImagePipeline.build_preprocess_latents")
@@ -409,9 +416,7 @@ class ZImagePipeline(DiffusionPipeline):
         target_dtype = self.transformer.config.dtype
 
         def _patchify_pack_and_cast(latents: Tensor) -> Tensor:
-            return ZImagePipeline._patchify_and_pack(latents).cast(
-                target_dtype
-            )
+            return ZImagePipeline._patchify_and_pack(latents).cast(target_dtype)
 
         self.__dict__["_patchify_and_pack"] = max_compile(
             _patchify_pack_and_cast,
@@ -883,20 +888,16 @@ class ZImagePipeline(DiffusionPipeline):
         latents: Tensor,
         h_carrier: Tensor,
         w_carrier: Tensor,
-        output_type: Literal["np", "latent", "pil"] = "np",
-    ) -> Tensor | np.ndarray:
-        """Decode packed latents into image output."""
-        if output_type == "latent":
-            return latents
-
+    ) -> npt.NDArray[np.uint8]:
+        """Decode packed latents into a (B, H, W, C) uint8 NumPy array."""
         if hasattr(self, "_fused_decode"):
             decoded = self._fused_decode(latents, h_carrier, w_carrier)
-            return np.from_dlpack(decoded)
+            return np.asarray(np.from_dlpack(decoded), dtype=np.uint8)
 
         latents = self._unpack_and_postprocess(latents, h_carrier, w_carrier)
         decoded = self.vae.decode(latents)
         image = self._postprocess_image(decoded)
-        return np.from_dlpack(image.to(CPU()))
+        return np.asarray(np.from_dlpack(image.to(CPU())), dtype=np.uint8)
 
     def _unpack_and_postprocess(
         self,
@@ -1061,7 +1062,6 @@ class ZImagePipeline(DiffusionPipeline):
     def execute(  # type: ignore[override]
         self,
         model_inputs: ZImageModelInputs,
-        output_type: Literal["np", "latent", "pil"] = "np",
     ) -> DiffusionPipelineOutput:
         """Run the Z-Image denoising loop and decode outputs."""
 
@@ -1127,7 +1127,11 @@ class ZImagePipeline(DiffusionPipeline):
             self.transformer.config,
         )
         cache_neg: DenoisingCacheState | None = None
-        if not use_fast_denoise and model_inputs.do_cfg and not use_batched_cfg_mode:
+        if (
+            not use_fast_denoise
+            and model_inputs.do_cfg
+            and not use_batched_cfg_mode
+        ):
             cache_neg = self.create_cache_state(
                 batch_size,
                 image_seq_len,
@@ -1221,25 +1225,36 @@ class ZImagePipeline(DiffusionPipeline):
                             )
                             assert guidance_scale_tensor is not None
                             if model_inputs.cfg_normalization:
-                                _, noise_pred = self.cfg_finalize_batched_with_norm(
-                                    noise_pred_cfg,
-                                    guidance_scale_tensor,
+                                _, noise_pred = (
+                                    self.cfg_finalize_batched_with_norm(
+                                        noise_pred_cfg,
+                                        guidance_scale_tensor,
+                                    )
                                 )
                             else:
-                                _, noise_pred = self.cfg_finalize_batched_no_norm(
-                                    noise_pred_cfg,
-                                    guidance_scale_tensor,
+                                _, noise_pred = (
+                                    self.cfg_finalize_batched_no_norm(
+                                        noise_pred_cfg,
+                                        guidance_scale_tensor,
+                                    )
                                 )
                         elif apply_cfg:
                             # Non-batched CFG: split preamble shared,
                             # run main separately for pos and neg.
                             if use_fast_denoise:
                                 preamble_out = self.transformer.run_preamble(
-                                    latents, timestep, img_ids, txt_ids,
+                                    latents,
+                                    timestep,
+                                    img_ids,
+                                    txt_ids,
                                 )
                                 x_sh, t_emb_sh, uf_sh, tf_sh = preamble_out
                                 noise_pred = self.transformer.run_cfg_main(
-                                    x_sh, prompt_embeds, t_emb_sh, uf_sh, tf_sh,
+                                    x_sh,
+                                    prompt_embeds,
+                                    t_emb_sh,
+                                    uf_sh,
+                                    tf_sh,
                                 )[0]
                             else:
                                 noise_pred = self.run_denoising_step(
@@ -1281,8 +1296,12 @@ class ZImagePipeline(DiffusionPipeline):
                         neg_img_ids = img_ids
                         neg_txt_ids = txt_ids
                         if model_inputs.explicit_negative_prompt:
-                            assert model_inputs.negative_img_ids_tensor is not None
-                            assert model_inputs.negative_txt_ids_tensor is not None
+                            assert (
+                                model_inputs.negative_img_ids_tensor is not None
+                            )
+                            assert (
+                                model_inputs.negative_txt_ids_tensor is not None
+                            )
                             neg_img_ids = model_inputs.negative_img_ids_tensor
                             neg_txt_ids = model_inputs.negative_txt_ids_tensor
                         with Tracer("cfg_transformer"):
@@ -1290,11 +1309,15 @@ class ZImagePipeline(DiffusionPipeline):
                                 assert preamble_out is not None
                                 x_sh, t_emb_sh, _, _ = preamble_out
                                 neg_uf, neg_tf = self.transformer.compute_rope(
-                                    neg_img_ids, neg_txt_ids,
+                                    neg_img_ids,
+                                    neg_txt_ids,
                                 )
                                 neg_noise_pred = self.transformer.run_cfg_main(
-                                    x_sh, negative_prompt_embeds, t_emb_sh,
-                                    neg_uf, neg_tf,
+                                    x_sh,
+                                    negative_prompt_embeds,
+                                    t_emb_sh,
+                                    neg_uf,
+                                    neg_tf,
                                 )[0]
                             else:
                                 assert cache_neg is not None
@@ -1316,18 +1339,14 @@ class ZImagePipeline(DiffusionPipeline):
                         )
                         if model_inputs.cfg_normalization:
                             noise_pred = self._cfg_renormalization_compiled(
-                                noise_pred, noise_pred,
+                                noise_pred,
+                                noise_pred,
                             )
 
                     with Tracer("scheduler_step"):
                         latents = self.scheduler_step(latents, noise_pred, dt)
 
         with Tracer("decode_outputs"):
-            outputs = self.decode_latents(
-                latents,
-                h_carrier,
-                w_carrier,
-                output_type=output_type,
-            )
+            images = self.decode_latents(latents, h_carrier, w_carrier)
 
-        return DiffusionPipelineOutput(images=outputs)
+        return DiffusionPipelineOutput(images=images)

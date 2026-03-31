@@ -40,17 +40,21 @@ def _apply_zimage_qk_rope(
     query_ragged = F.reshape(query, [batch_size * seq_len, num_heads, head_dim])
     key_ragged = F.reshape(key, [batch_size * seq_len, num_heads, head_dim])
 
-    position_ids = F.arange(
-        0, seq_len, dtype=DType.uint32, device=query.device
-    )
+    position_ids = F.arange(0, seq_len, dtype=DType.uint32, device=query.device)
     position_ids = F.broadcast_to(position_ids[None, :], [batch_size, seq_len])
     position_ids = F.reshape(position_ids, [batch_size * seq_len])
 
     query_out = rope_ragged_with_position_ids(
-        query_ragged, freqs_cis, position_ids, interleaved=True,
+        query_ragged,
+        freqs_cis,
+        position_ids,
+        interleaved=True,
     )
     key_out = rope_ragged_with_position_ids(
-        key_ragged, freqs_cis, position_ids, interleaved=True,
+        key_ragged,
+        freqs_cis,
+        position_ids,
+        interleaved=True,
     )
     return (
         F.reshape(query_out, [batch_size, seq_len, num_heads, head_dim]),

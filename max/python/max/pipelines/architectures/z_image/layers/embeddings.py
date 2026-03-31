@@ -128,9 +128,7 @@ class RopeEmbedder(Module):
         self.theta = theta
         self.axes_dims = axes_dims
 
-    def __call__(
-        self, ids: TensorValue
-    ) -> tuple[TensorValue, TensorValue]:
+    def __call__(self, ids: TensorValue) -> tuple[TensorValue, TensorValue]:
         """Compute rotary position embeddings.
 
         Args:

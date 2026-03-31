@@ -58,17 +58,12 @@ class ZImageTransformerBlock(Module[..., Tensor]):
 
     def __init__(
         self,
-        layer_id: int,
         dim: int,
         n_heads: int,
-        n_kv_heads: int,
         norm_eps: float,
         qk_norm: bool,
         modulation: bool = True,
     ):
-        del n_kv_heads
-
-        self.layer_id = layer_id
         self.modulation = modulation
         self.dim = dim
 
@@ -205,30 +200,26 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.noise_refiner: ModuleList[ZImageTransformerBlock] = ModuleList(
             [
                 ZImageTransformerBlock(
-                    1000 + layer_id,
                     self.dim,
                     config.n_heads,
-                    config.n_kv_heads,
                     config.norm_eps,
                     config.qk_norm,
                     modulation=True,
                 )
-                for layer_id in range(config.n_refiner_layers)
+                for _ in range(config.n_refiner_layers)
             ]
         )
 
         self.context_refiner: ModuleList[ZImageTransformerBlock] = ModuleList(
             [
                 ZImageTransformerBlock(
-                    layer_id,
                     self.dim,
                     config.n_heads,
-                    config.n_kv_heads,
                     config.norm_eps,
                     config.qk_norm,
                     modulation=False,
                 )
-                for layer_id in range(config.n_refiner_layers)
+                for _ in range(config.n_refiner_layers)
             ]
         )
 
@@ -242,15 +233,13 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.layers: ModuleList[ZImageTransformerBlock] = ModuleList(
             [
                 ZImageTransformerBlock(
-                    layer_id,
                     self.dim,
                     config.n_heads,
-                    config.n_kv_heads,
                     config.norm_eps,
                     config.qk_norm,
                     modulation=True,
                 )
-                for layer_id in range(config.n_layers)
+                for _ in range(config.n_layers)
             ]
         )
 
@@ -605,9 +594,7 @@ class ZImageCFGMain(Module[..., Sequence[Tensor]]):
         unified = F.concat([x, cap], axis=1)
 
         for layer in self.layers:
-            unified = layer(
-                unified, freqs_cis=unified_freqs, adaln_input=t_emb
-            )
+            unified = layer(unified, freqs_cis=unified_freqs, adaln_input=t_emb)
 
         hidden = unified[:, :img_len, :]
         return (self.final_layer(hidden, c=t_emb),)
@@ -643,7 +630,9 @@ class ZImageRoPEOnly(Module[..., Sequence[Tensor]]):
         )
 
     def forward(
-        self, img_ids: Tensor, txt_ids: Tensor,
+        self,
+        img_ids: Tensor,
+        txt_ids: Tensor,
     ) -> tuple[Tensor, Tensor]:
         img_seq_len = img_ids.shape[0]
         unified_ids = F.concat([img_ids, txt_ids], axis=0)

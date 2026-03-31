@@ -97,13 +97,16 @@ class ZImageTransformerModel(ComponentModel):
 
         # Compile split graphs for CFG: preamble (batch=1) + main (batch=N).
         self.preamble_model = preamble.compile(
-            *preamble.input_types(), weights=state_dict,
+            *preamble.input_types(),
+            weights=state_dict,
         )
         self.cfg_main_model = cfg_main.compile(
-            *cfg_main.input_types(), weights=state_dict,
+            *cfg_main.input_types(),
+            weights=state_dict,
         )
         self.rope_only_model = rope_only.compile(
-            *rope_only.input_types(), weights=state_dict,
+            *rope_only.input_types(),
+            weights=state_dict,
         )
 
     def run_preamble(
@@ -128,7 +131,9 @@ class ZImageTransformerModel(ComponentModel):
         )
 
     def compute_rope(
-        self, img_ids: Tensor, txt_ids: Tensor,
+        self,
+        img_ids: Tensor,
+        txt_ids: Tensor,
     ) -> Any:
         return self.rope_only_model(img_ids, txt_ids)
 

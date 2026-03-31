@@ -68,7 +68,9 @@ class LayerNorm(Module):
         if elementwise_affine:
             self.weight = Weight("weight", dtype, (dim,), device=device)
             self.bias = (
-                Weight("bias", dtype, (dim,), device=device) if use_bias else None
+                Weight("bias", dtype, (dim,), device=device)
+                if use_bias
+                else None
             )
         else:
             self.weight = None
@@ -246,9 +248,8 @@ class ZImageTransformerBlock(Module):
         """
         if self.modulation:
             if adaln_input is None:
-                raise ValueError(
-                    "adaln_input is required when modulation=True"
-                )
+                raise ValueError("adaln_input is required when modulation=True")
+            assert self.adaLN_modulation is not None
             mod = self.adaLN_modulation(adaln_input)  # [B, 4*dim]
             mod = ops.unsqueeze(mod, 1)  # [B, 1, 4*dim]
             chunks = ops.chunk(mod, chunks=4, axis=2)
@@ -548,9 +549,7 @@ class ZImageTransformer2DModel(Module):
         x = self.x_embedder(hidden_states)  # [B, image_seq_len, dim]
 
         # Embed timestep (scaled) to produce adaLN conditioning vector.
-        t_emb = self.t_embedder(
-            timestep * self.t_scale
-        )  # [B, ADALN_EMBED_DIM]
+        t_emb = self.t_embedder(timestep * self.t_scale)  # [B, ADALN_EMBED_DIM]
         t_emb = ops.cast(t_emb, x.dtype)
 
         # Normalise and project caption features.
