@@ -13,15 +13,12 @@
 
 from typing import Any
 
-import numpy as np
-
-from max.driver import Buffer, Device
+from max.driver import Device
 from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, TensorType
 from max.graph.weights import WeightData, Weights
 from max.pipelines.lib import SupportedEncoding
-from max.pipelines.lib.bfloat16_utils import float32_to_bfloat16_as_uint16
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
 from .model_config import UMT5Config, UMT5ConfigBase
@@ -39,28 +36,12 @@ def _prepare_state_dict(
     and drop the alias to avoid strict-mode validation failures.
 
     If ``target_dtype`` is provided, all weights are cast to that dtype
-    (e.g. float32 → bfloat16 for Wan 2.1 checkpoints).  Uses fast numpy
-    bit-manipulation for float32 → bfloat16 instead of cast_dlpack_to.
+    (e.g. float32 → bfloat16 for Wan 2.1 checkpoints).
     """
     state_dict: dict[str, WeightData] = {}
     for key, value in weights.items():
         wd = value.data()
-        if (
-            target_dtype == DType.bfloat16
-            and wd.dtype == DType.float32
-        ):
-            arr = np.from_dlpack(wd)
-            u16 = float32_to_bfloat16_as_uint16(arr)
-            buf = Buffer.from_numpy(u16).view(
-                DType.bfloat16, arr.shape
-            )
-            wd = WeightData(
-                data=buf,
-                name=wd.name,
-                dtype=DType.bfloat16,
-                shape=wd.shape,
-            )
-        elif target_dtype is not None and wd.dtype != target_dtype:
+        if target_dtype is not None and wd.dtype != target_dtype:
             wd = wd.astype(target_dtype)
         state_dict[key] = wd
 
