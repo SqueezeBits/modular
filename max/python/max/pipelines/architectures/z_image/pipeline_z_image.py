@@ -169,6 +169,7 @@ class ZImagePipeline(DiffusionPipeline):
         )
 
         self.build_preprocess_latents()
+        self.build_prepare_scheduler()
         self.build_scheduler_step()
         self.build_decode_latents()
         self.build_cfg_combine()
@@ -191,9 +192,6 @@ class ZImagePipeline(DiffusionPipeline):
             32
         )
         self._cached_guidance: BoundedCache[str, Buffer] = BoundedCache(32)
-        self._cached_step_tensors: BoundedCache[
-            str, tuple[list[Buffer], list[Buffer]]
-        ] = BoundedCache(32)
 
     # -- Build compiled graphs -----------------------------------------------
 
@@ -223,6 +221,38 @@ class ZImagePipeline(DiffusionPipeline):
                     TensorType(
                         DType.float32,
                         shape=["batch", "channels", "height", "width"],
+                        device=device,
+                    ),
+                ],
+            ),
+        )
+
+    @traced(message="ZImagePipeline.build_prepare_scheduler")
+    def build_prepare_scheduler(self) -> None:
+        device = self.transformer.devices[0]
+
+        def _graph(
+            timesteps: TensorValue, sigmas: TensorValue
+        ) -> tuple[TensorValue, TensorValue]:
+            all_timesteps = 1.0 - timesteps
+            sigmas_curr = ops.slice_tensor(sigmas, [slice(0, -1)])
+            sigmas_next = ops.slice_tensor(sigmas, [slice(1, None)])
+            all_dt = sigmas_next - sigmas_curr
+            return all_timesteps, all_dt
+
+        self._prepare_scheduler = cast(
+            Callable[[Buffer, Buffer], tuple[Buffer, Buffer]],
+            max_compile(
+                _graph,
+                input_types=[
+                    TensorType(
+                        DType.float32,
+                        shape=["num_timesteps"],
+                        device=device,
+                    ),
+                    TensorType(
+                        DType.float32,
+                        shape=["num_sigmas"],
                         device=device,
                     ),
                 ],
@@ -630,13 +660,27 @@ class ZImagePipeline(DiffusionPipeline):
             if isinstance(decoded, Tensor):
                 assert decoded.storage is not None
                 decoded = decoded.storage
-            return np.asarray(np.from_dlpack(decoded.to(CPU())), dtype=np.uint8)
+            return self._buffer_to_numpy_uint8(decoded)
 
         latents = self._unpack_and_postprocess(latents, h_carrier, w_carrier)
         decoded = self.vae.decode(Tensor(storage=latents))
         assert decoded.storage is not None
         image = self._postprocess_image(decoded.storage)
-        return np.asarray(np.from_dlpack(image.to(CPU())), dtype=np.uint8)
+        return self._buffer_to_numpy_uint8(image)
+
+    @staticmethod
+    def _buffer_to_numpy_uint8(buf: Buffer) -> npt.NDArray[np.uint8]:
+        """Convert Buffer to uint8 numpy array (flux2 V2 pattern)."""
+        result: np.ndarray
+        if hasattr(buf, "__dlpack__"):
+            result = np.from_dlpack(buf)
+        elif hasattr(buf, "to_numpy"):
+            result = buf.to_numpy()
+        else:
+            result = buf.to(CPU()).to_numpy()
+        if result.dtype != np.uint8:
+            result = result.astype(np.uint8, copy=False)
+        return cast(npt.NDArray[np.uint8], result)
 
     # -- Preprocess ----------------------------------------------------------
 
@@ -692,49 +736,31 @@ class ZImagePipeline(DiffusionPipeline):
         txt_ids = model_inputs.txt_ids_tensor
         latents = self.preprocess_latents(latents)
 
-        # 3) Prepare scheduler tensors.
+        # 3) Prepare scheduler tensors (compiled graph, flux2 pattern).
         with Tracer("prepare_scheduler"):
-            transformed_timesteps = np.ascontiguousarray(
-                (1.0 - model_inputs.timesteps).astype(np.float32, copy=False)
+            timesteps_np = np.ascontiguousarray(
+                model_inputs.timesteps.astype(np.float32, copy=False)
             )
-            sigmas_host = np.asarray(model_inputs.sigmas, dtype=np.float32)
-            dt_values = np.ascontiguousarray(
-                (sigmas_host[1:] - sigmas_host[:-1]).astype(
-                    np.float32, copy=False
-                )
+            timesteps_buf = Buffer.from_dlpack(timesteps_np).to(device)
+            all_timesteps, all_dt = self._prepare_scheduler(
+                timesteps_buf, sigmas
             )
 
-            combined = np.concatenate([transformed_timesteps, dt_values])
-            step_key = (
-                f"steps::{num_timesteps}::"
-                f"{hashlib.sha1(combined.tobytes()).hexdigest()}"
-            )
-            if step_key in self._cached_step_tensors:
-                timestep_bufs, dt_bufs = self._cached_step_tensors[step_key]
-            else:
-                timestep_bufs = [
-                    Buffer.from_dlpack(
-                        np.array([float(t)], dtype=np.float32)
-                    ).to(device)
-                    for t in transformed_timesteps
-                ]
-                dt_bufs = [
-                    Buffer.from_dlpack(
-                        np.array([float(d)], dtype=np.float32)
-                    ).to(device)
-                    for d in dt_values
-                ]
-                self._cached_step_tensors[step_key] = (
-                    timestep_bufs,
-                    dt_bufs,
-                )
+            # For faster tensor slicing inside the denoising loop.
+            timesteps_seq: Any = all_timesteps
+            dts_seq: Any = all_dt
+            if hasattr(timesteps_seq, "driver_tensor"):
+                timesteps_seq = timesteps_seq.driver_tensor
+            if hasattr(dts_seq, "driver_tensor"):
+                dts_seq = dts_seq.driver_tensor
 
         cfg_cutoff_step = 0
         if model_inputs.do_cfg:
+            transformed_host = (1.0 - timesteps_np).astype(np.float32)
             if model_inputs.cfg_truncation > 1.0:
                 cfg_cutoff_step = num_timesteps
             else:
-                mask = transformed_timesteps <= model_inputs.cfg_truncation
+                mask = transformed_host <= model_inputs.cfg_truncation
                 cfg_cutoff_step = int(np.count_nonzero(mask))
 
         guidance_buf: Buffer | None = None
@@ -772,8 +798,8 @@ class ZImagePipeline(DiffusionPipeline):
         with Tracer("denoising_loop"):
             for i in range(num_timesteps):
                 apply_cfg = i < cfg_cutoff_step
-                timestep = timestep_bufs[i]
-                dt = dt_bufs[i]
+                timestep = timesteps_seq[i : i + 1]
+                dt = dts_seq[i : i + 1]
 
                 with Tracer(f"denoising_step_{i}"):
                     with Tracer("transformer"):
