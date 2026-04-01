@@ -475,91 +475,135 @@ class WanTransformerModel(ComponentModel):
             pre_model = self.session.load(
                 pre_graph, weights_registry=pre_module.state_dict()
             )
-            block_seq_len_dim: str = "seq_len"
-            block_input_types = [
-                TensorType(
-                    dtype, [batch_size, block_seq_len_dim, dim], device=dev
-                ),
-                TensorType(dtype, [batch_size, seq_text_len, dim], device=dev),
-                TensorType(dtype, [batch_size, 6, dim], device=dev),
-                TensorType(
-                    DType.float32,
-                    [block_seq_len_dim, self.config.attention_head_dim],
-                    device=dev,
-                ),
-                TensorType(
-                    DType.float32,
-                    [block_seq_len_dim, self.config.attention_head_dim],
-                    device=dev,
-                ),
-            ]
-            block_template = WanTransformerBlock(
-                dim=dim,
-                ffn_dim=self.config.ffn_dim,
-                num_heads=self.config.num_attention_heads,
-                head_dim=self.config.attention_head_dim,
-                text_dim=dim,
-                cross_attn_norm=self.config.cross_attn_norm,
-                eps=self.config.eps,
-                added_kv_proj_dim=self.config.added_kv_proj_dim,
-                dtype=dtype,
-                device=dev_ref,
-            )
-            block_template.load_state_dict(
-                block_weights_list[0], weight_alignment=1, strict=True
-            )
-            with Graph(
-                "wan_block", input_types=block_input_types
-            ) as block_graph:
-                block_out = block_template(
-                    *(v.tensor for v in block_graph.inputs)
-                )
-                block_graph.output(block_out)
-
-            block_models: list[Model] = [
-                self.session.load(
-                    block_graph,
-                    weights_registry=block_template.state_dict(),
-                )
-            ]
-            for i in range(1, self.config.num_layers):
-                block_template.load_state_dict(
-                    block_weights_list[i],
-                    weight_alignment=1,
-                    strict=True,
-                )
-                block_models.append(
-                    self.session.load(
-                        block_graph,
-                        weights_registry=block_template.state_dict(),
-                    )
-                )
+            # --- Single graph: pre + all blocks + post ---
             logger.info(
-                "Compiled block graph (batch=%d, seq_len=symbolic "
-                "default=%d, seq_text=%d, %d layers)",
-                batch_size,
-                seq_len,
-                seq_text_len,
-                len(block_models),
+                "Compiling single graph (batch=%d, seq_len=%d, "
+                "seq_text=%d, %d layers)...",
+                batch_size, seq_len, seq_text_len, self.config.num_layers,
             )
-            post_input_types = [
-                TensorType(dtype, ["batch", "seq_len", dim], device=dev),
-                TensorType(dtype, ["batch", dim], device=dev),
-                TensorType(DType.int8, ["ppf", "pph", "ppw"], device=dev),
-            ]
+
+            # Build all block modules with weights
+            blocks = []
+            for i in range(self.config.num_layers):
+                block = WanTransformerBlock(
+                    dim=dim,
+                    ffn_dim=self.config.ffn_dim,
+                    num_heads=self.config.num_attention_heads,
+                    head_dim=self.config.attention_head_dim,
+                    text_dim=dim,
+                    cross_attn_norm=self.config.cross_attn_norm,
+                    eps=self.config.eps,
+                    added_kv_proj_dim=self.config.added_kv_proj_dim,
+                    dtype=dtype,
+                    device=dev_ref,
+                )
+                block.load_state_dict(
+                    block_weights_list[i], weight_alignment=1, strict=True
+                )
+                blocks.append(block)
+
             post_module = WanTransformerPostProcess(
                 self.config, dtype=dtype, device=dev_ref
             )
             post_module.load_state_dict(
                 post_weights, weight_alignment=1, strict=True
             )
-            with Graph("wan_post", input_types=post_input_types) as post_graph:
-                post_out = post_module(*(v.tensor for v in post_graph.inputs))
-                post_graph.output(post_out)
-            post_model = self.session.load(
-                post_graph, weights_registry=post_module.state_dict()
+
+            # Single graph input types = pre inputs + rope + spatial
+            # Compute concrete latent dims for single-graph compilation
+            p_t, p_h, p_w = self.config.patch_size
+            ls = self.compute_video_latent_shape(
+                720, 1280, 81,
+                self.config.vae_temporal_compress_ratio,
+                self.config.vae_spatial_compress_ratio,
             )
-            self.model = BlockLevelModel(pre_model, block_models, post_model)
+            ppf = ls[0] // p_t
+            pph = ls[1] // p_h
+            ppw = ls[2] // p_w
+
+            single_input_types = [
+                # pre inputs (concrete spatial dims)
+                TensorType(
+                    dtype,
+                    [batch_size, self.config.in_channels, ls[0], ls[1], ls[2]],
+                    device=dev,
+                ),
+                TensorType(DType.float32, [batch_size], device=dev),
+                TensorType(
+                    dtype,
+                    [batch_size, seq_text_len, self.config.text_dim],
+                    device=dev,
+                ),
+                # rope (concrete seq_len)
+                TensorType(
+                    DType.float32,
+                    [seq_len, self.config.attention_head_dim],
+                    device=dev,
+                ),
+                TensorType(
+                    DType.float32,
+                    [seq_len, self.config.attention_head_dim],
+                    device=dev,
+                ),
+                # spatial shape (concrete)
+                TensorType(DType.int8, [ppf, pph, ppw], device=dev),
+            ]
+
+            with Graph(
+                "wan_single", input_types=single_input_types
+            ) as g:
+                (hidden_states, timestep, encoder_hidden_states,
+                 rope_cos, rope_sin, spatial_shape) = (
+                    v.tensor for v in g.inputs
+                )
+
+                # Pre-process
+                pre_outs = pre_module(
+                    hidden_states, timestep, encoder_hidden_states
+                )
+                hs, temb, timestep_proj, text_emb = pre_outs
+
+                # All blocks
+                for block in blocks:
+                    (hs,) = block(hs, text_emb, timestep_proj, rope_cos, rope_sin)
+
+                # Post-process
+                out = post_module(hs, temb, spatial_shape)
+                g.output(out)
+
+            # Merge all weights
+            all_weights: dict[str, object] = {}
+            all_weights.update(pre_module.state_dict())
+            for i, block in enumerate(blocks):
+                for k, v in block.state_dict().items():
+                    all_weights[f"blocks.{i}.{k}"] = v
+            all_weights.update(post_module.state_dict())
+
+            single_model = self.session.load(
+                g, weights_registry=all_weights
+            )
+            logger.info("Single graph compiled successfully.")
+
+            # Wrap in a callable that matches BlockLevelModel interface
+            class SingleGraphModel:
+                def __init__(self, model: Model) -> None:
+                    self._model = model
+
+                def __call__(
+                    self,
+                    hidden_states: Buffer,
+                    timestep: Buffer,
+                    encoder_hidden_states: Buffer,
+                    rope_cos: Buffer,
+                    rope_sin: Buffer,
+                    spatial_shape: Buffer,
+                ) -> Buffer:
+                    return self._model.execute(
+                        hidden_states, timestep, encoder_hidden_states,
+                        rope_cos, rope_sin, spatial_shape,
+                    )[0]
+
+            self.model = SingleGraphModel(single_model)
             return self.__call__
 
     def compute_rope(
