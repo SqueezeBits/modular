@@ -92,8 +92,36 @@ def _remap_state_dict(
         else:
             raw_dict[new_key] = tensor
 
-    # Second pass: fuse attn2.to_k + attn2.to_v into attn2.to_kv
+    # Second pass: fuse attn1 Q+K+V into attn1.to_qkv
     fused_keys: set[str] = set()
+    for key in list(raw_dict.keys()):
+        if ".attn1.to_q." in key:
+            q_key = key
+            k_key = key.replace(".attn1.to_q.", ".attn1.to_k.")
+            v_key = key.replace(".attn1.to_q.", ".attn1.to_v.")
+            qkv_key = key.replace(".attn1.to_q.", ".attn1.to_qkv.")
+            if k_key in raw_dict and v_key in raw_dict:
+                parts = []
+                for src_key in (q_key, k_key, v_key):
+                    data = raw_dict[src_key]
+                    buf = (
+                        data.to_buffer()
+                        if hasattr(data, "to_buffer")
+                        else data
+                    )
+                    f32 = cast_dlpack_to(
+                        buf, data.dtype, DType.float32, CPU()
+                    )
+                    parts.append(np.from_dlpack(f32))
+                qkv_np = np.ascontiguousarray(
+                    np.concatenate(parts, axis=0)
+                )
+                state_dict[qkv_key] = qkv_np
+                fused_keys.add(q_key)
+                fused_keys.add(k_key)
+                fused_keys.add(v_key)
+
+    # Third pass: fuse attn2.to_k + attn2.to_v into attn2.to_kv
     for key in list(raw_dict.keys()):
         if ".attn2.to_k." in key:
             k_key = key

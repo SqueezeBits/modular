@@ -309,14 +309,8 @@ class WanSelfAttention(Module):
         self.head_dim = head_dim
         self.inner_dim = dim
 
-        self.to_q = Linear(
-            in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
-        )
-        self.to_k = Linear(
-            in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
-        )
-        self.to_v = Linear(
-            in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
+        self.to_qkv = Linear(
+            in_dim=dim, out_dim=dim * 3, dtype=dtype, device=device, has_bias=True
         )
         self.norm_q = WanRMSNorm(dim, eps=eps, dtype=dtype, device=device)
         self.norm_k = WanRMSNorm(dim, eps=eps, dtype=dtype, device=device)
@@ -329,9 +323,11 @@ class WanSelfAttention(Module):
         hidden_states: TensorValue,
         rotary_emb: tuple[TensorValue, TensorValue],
     ) -> TensorValue:
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
+        qkv = self.to_qkv(hidden_states)
+        dim = self.inner_dim
+        query = qkv[..., :dim]
+        key = qkv[..., dim : dim * 2]
+        value = qkv[..., dim * 2 :]
 
         # QK-norm applied across all heads (before reshape)
         query = self.norm_q(query)
