@@ -71,7 +71,8 @@ class WanAnimateTransformerModel(ComponentModel):
         self.motion_encoder_model: Model | None = None
         self.load_model()
 
-    def load_model(self) -> None:
+    def load_model(self, **kwargs: object) -> None:
+        del kwargs
         """Compile the animate transformer as a single graph."""
         if self.weights is None:
             raise RuntimeError(
@@ -83,6 +84,7 @@ class WanAnimateTransformerModel(ComponentModel):
             target_dtype=DType.bfloat16,
             is_animate=True,
         )
+        self.weights = None  # type: ignore[assignment]
         dim = self.config.num_attention_heads * self.config.attention_head_dim
         dtype = self.config.dtype
         dev = self.config.device

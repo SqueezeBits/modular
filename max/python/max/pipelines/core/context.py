@@ -790,6 +790,17 @@ class PixelContext:
     effective_seg_len: int | None = field(default=None)
     """Frames advanced per segment after overlap is removed."""
     animate_mode: str = field(default="animate")
+    shared_inputs_dir: str | None = field(default=None)
+    """Directory with dumped diffusers intermediate tensors for parity testing."""
+    pose_video: list[Any] | None = field(default=None)
+    """Pose skeleton frames for Wan-Animate (list of PIL Images or numpy arrays)."""
+    face_video: list[Any] | None = field(default=None)
+    """Face crop frames for Wan-Animate (list of PIL Images or numpy arrays)."""
+    background_video: list[Any] | None = field(default=None)
+    """Background frames for Wan-Animate replace mode."""
+    mask_video: list[Any] | None = field(default=None)
+    """Mask frames for Wan-Animate replace mode."""
+    mode: str = field(default="animate")
     """Wan-Animate mode: 'animate' (motion transfer) or 'replace' (character replacement)."""
     segment_frame_length: int = field(default=77)
     """Number of frames per segment for Wan-Animate."""
