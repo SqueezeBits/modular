@@ -818,12 +818,22 @@ class WanPipeline(DiffusionPipeline):
             if not self._moe_dual_loaded:
                 self._activate_transformer_weights(use_secondary=False)
 
+            # Pre-compute batched prompt embeds for CFG
+            batched_prompt_embeds: Buffer | None = None
+            if do_cfg and negative_prompt_embeds is not None:
+                batched_prompt_embeds = self.concat_cfg_prompt_embeddings(
+                    prompt_embeds, negative_prompt_embeds
+                )
+                batched_prompt_embeds = getattr(
+                    batched_prompt_embeds, "driver_tensor", batched_prompt_embeds
+                )
+
             # High-noise phase (or full denoising if no MoE).
             latents, step_state = self._run_denoising_phase(
                 latents=latents,
                 transformer_model=self.transformer,
                 prompt_embeds=prompt_embeds,
-                batched_prompt_embeds=None,
+                batched_prompt_embeds=batched_prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
@@ -848,7 +858,7 @@ class WanPipeline(DiffusionPipeline):
                     latents=latents,
                     transformer_model=low_noise_model,
                     prompt_embeds=prompt_embeds,
-                    batched_prompt_embeds=None,
+                    batched_prompt_embeds=batched_prompt_embeds,
                     negative_prompt_embeds=negative_prompt_embeds,
                     rope_cos=rope_cos,
                     rope_sin=rope_sin,

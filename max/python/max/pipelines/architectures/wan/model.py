@@ -504,12 +504,13 @@ class WanTransformerModel(ComponentModel):
                 pre_graph, weights_registry=pre_module.state_dict()
             )
             block_seq_len_dim: str = "seq_len"
+            block_batch_dim: str = "batch"
             block_input_types = [
                 TensorType(
-                    dtype, [batch_size, block_seq_len_dim, dim], device=dev
+                    dtype, [block_batch_dim, block_seq_len_dim, dim], device=dev
                 ),
-                TensorType(dtype, [batch_size, seq_text_len, dim], device=dev),
-                TensorType(dtype, [batch_size, 6, dim], device=dev),
+                TensorType(dtype, [block_batch_dim, seq_text_len, dim], device=dev),
+                TensorType(dtype, [block_batch_dim, 6, dim], device=dev),
                 TensorType(
                     DType.float32,
                     [block_seq_len_dim, self.config.attention_head_dim],
