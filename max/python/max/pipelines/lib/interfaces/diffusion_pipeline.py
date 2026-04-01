@@ -59,11 +59,12 @@ class DiffusionPipelineOutput:
     """Output of a diffusion pipeline.
 
     Attributes:
-        images: NHWC uint8 NumPy array of shape (B, H, W, C) with values
-            in [0, 255].
+        images: Pipeline output image/video payload. This is typically an
+            NHWC uint8 NumPy array, but some pipelines may return a MAX
+            ``Buffer`` during intermediate integration paths.
     """
 
-    images: npt.NDArray[np.uint8]
+    images: np.ndarray | Buffer
 
 
 class DiffusionPipeline(ABC):

@@ -157,9 +157,10 @@ class WanPipeline(DiffusionPipeline):
         transformer_cfg = components_cfg.get("transformer", {}).get(
             "config_dict", {}
         )
-        self.expand_timesteps = bool(
-            transformer_cfg.get("expand_timesteps", False)
-        )
+        expand_timesteps = diffusers_config.get("expand_timesteps")
+        if expand_timesteps is None:
+            expand_timesteps = transformer_cfg.get("expand_timesteps", False)
+        self.expand_timesteps = bool(expand_timesteps)
 
         device = self.transformer.devices[0]
         z_dim = int(self.vae.config.z_dim)
@@ -227,13 +228,18 @@ class WanPipeline(DiffusionPipeline):
         """Initialize VAE config, MoE, and compile runtime graphs."""
         self._setup_vae_config()
         self._setup_moe()
+        self.transformer.config.expand_timesteps = self.expand_timesteps
+        if self.transformer_2 is not None:
+            self.transformer_2.config.expand_timesteps = self.expand_timesteps
+        self.embed_seq_len = self._resolve_embed_seq_len()
 
         # Compile transformer for the default resolution.
         # TODO(compiler): use symbolic seq_len once engine OOM is fixed.
         h, w, nf = self.default_resolution
         seq_len = self._compute_seq_len(h, w, nf)
         self.transformer.load_model(
-            seq_text_len=self.embed_seq_len, seq_len=seq_len,
+            seq_text_len=self.embed_seq_len,
+            seq_len=seq_len,
         )
 
         self.build_guidance()
@@ -322,7 +328,13 @@ class WanPipeline(DiffusionPipeline):
         device = self.transformer.devices[0]
         self.__dict__["duplicate_cfg_timesteps"] = max_compile(
             self._duplicate_batch,
-            input_types=[TensorType(DType.float32, shape=[1], device=device)],
+            input_types=[
+                TensorType(
+                    DType.float32,
+                    shape=[1, "seq_len"] if self.expand_timesteps else [1],
+                    device=device,
+                )
+            ],
         )
 
     def build_concat_cfg_prompt_embeddings(self) -> None:
@@ -599,6 +611,37 @@ class WanPipeline(DiffusionPipeline):
     # TODO(compiler): remove once symbolic seq_len is supported.
     default_resolution: tuple[int, int, int] = (720, 1280, 81)
 
+    def _resolve_embed_seq_len(self) -> int:
+        def _normalize_seq_len(value: Any) -> int | None:
+            try:
+                seq_len = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return seq_len if 0 < seq_len <= 8192 else None
+
+        diffusers_config = self.pipeline_config.model.diffusers_config or {}
+        components_cfg = diffusers_config.get("components", {})
+        for key in ("tokenizer", "tokenizer_2", "text_encoder"):
+            config_dict = components_cfg.get(key, {}).get("config_dict", {})
+            for field_name in ("model_max_length", "max_length", "text_len"):
+                if seq_len := _normalize_seq_len(config_dict.get(field_name)):
+                    return seq_len
+        transformer_cfg = components_cfg.get("transformer", {}).get(
+            "config_dict", {}
+        )
+        for field_name in ("text_len", "max_text_length"):
+            if seq_len := _normalize_seq_len(transformer_cfg.get(field_name)):
+                return seq_len
+        return 512 if self.expand_timesteps else self.embed_seq_len
+
+    def _compute_token_seq_len_from_latents(self, latents: Buffer) -> int:
+        p_t, p_h, p_w = self.transformer.config.patch_size
+        return (
+            (int(latents.shape[2]) // p_t)
+            * (int(latents.shape[3]) // p_h)
+            * (int(latents.shape[4]) // p_w)
+        )
+
     def _compute_seq_len(self, height: int, width: int, num_frames: int) -> int:
         """Compute the latent sequence length for a given resolution."""
         p_t, p_h, p_w = self.transformer.config.patch_size
@@ -612,6 +655,16 @@ class WanPipeline(DiffusionPipeline):
             scale_factor_spatial=self.vae_scale_factor_spatial,
         )
         return (ls[2] // p_t) * (ls[3] // p_h) * (ls[4] // p_w)
+
+    def _ensure_transformer_compiled(
+        self, latents: Buffer, prompt_embeds: Buffer
+    ) -> None:
+        """Compile or refresh the Wan transformer for the active request shape."""
+        self.transformer.load_model(
+            seq_text_len=int(prompt_embeds.shape[1]),
+            seq_len=self._compute_token_seq_len_from_latents(latents),
+            batch_size=int(latents.shape[0]),
+        )
 
     # Standard resolutions to pre-compile block graphs for.
     def prepare_prompt_embeddings(
@@ -663,6 +716,7 @@ class WanPipeline(DiffusionPipeline):
             latents = Buffer.from_numpy(
                 np.ascontiguousarray(model_inputs.latents, dtype=np.float32)
             ).to(device)
+            self._ensure_transformer_compiled(latents, prompt_embeds)
 
         # 3. Prepare scheduler state.
         with Tracer("prepare_scheduler"):
@@ -684,9 +738,11 @@ class WanPipeline(DiffusionPipeline):
                 height=int(latents.shape[3]),
                 width=int(latents.shape[4]),
             )
+            token_seq_len = self._compute_token_seq_len_from_latents(latents)
             batched_timesteps = self._get_batched_timesteps(
                 scheduler_timesteps=timesteps,
                 batch_size=int(latents.shape[0]),
+                seq_len=token_seq_len,
                 device=device,
             )
             coeff_buffers = [
@@ -717,8 +773,7 @@ class WanPipeline(DiffusionPipeline):
 
             # MoE boundary.
             has_moe = (
-                self.transformer_2 is not None
-                and boundary_timestep is not None
+                self.transformer_2 is not None and boundary_timestep is not None
             )
             boundary_step_idx = len(timesteps)
             if boundary_timestep is not None:
@@ -779,9 +834,7 @@ class WanPipeline(DiffusionPipeline):
                     coeff_buffers=coeff_buffers,
                     do_cfg=do_cfg,
                     guidance_scale=guidance_scale_low,
-                    step_range=range(
-                        boundary_step_idx, len(batched_timesteps)
-                    ),
+                    step_range=range(boundary_step_idx, len(batched_timesteps)),
                     desc="Denoising (low-noise)",
                     spatial_shape=spatial_shape,
                     step_state=step_state,
@@ -824,9 +877,9 @@ class WanPipeline(DiffusionPipeline):
         for i in progress:  # type: ignore[attr-defined]
             with Tracer(f"{desc}:step_{i}"):
                 dit_timestep = batched_timesteps[i]
-                latent_model_input = (
-                    self._cast_f32_to_model_dtype.execute(latents)[0]
-                )
+                latent_model_input = self._cast_f32_to_model_dtype.execute(
+                    latents
+                )[0]
                 with Tracer("transformer"):
                     noise_pred_buf = self._run_transformer_forward(
                         transformer_model=transformer_model,
@@ -871,12 +924,8 @@ class WanPipeline(DiffusionPipeline):
             and batched_prompt_embeds is not None
             and negative_prompt_embeds is not None
         ):
-            duplicated_latents = self.duplicate_cfg_latents(
-                latent_model_input
-            )
-            duplicated_timesteps = self.duplicate_cfg_timesteps(
-                dit_timestep
-            )
+            duplicated_latents = self.duplicate_cfg_latents(latent_model_input)
+            duplicated_timesteps = self.duplicate_cfg_timesteps(dit_timestep)
             batched_predictions = transformer_model(
                 duplicated_latents,
                 duplicated_timesteps,
@@ -888,9 +937,7 @@ class WanPipeline(DiffusionPipeline):
             batched_predictions = getattr(
                 batched_predictions, "driver_tensor", batched_predictions
             )
-            positive, negative = self.split_cfg_predictions(
-                batched_predictions
-            )
+            positive, negative = self.split_cfg_predictions(batched_predictions)
             assert guidance_scale is not None
             guided = self.guidance(positive, negative, guidance_scale)
             return getattr(guided, "driver_tensor", guided)
@@ -949,23 +996,37 @@ class WanPipeline(DiffusionPipeline):
         self,
         scheduler_timesteps: np.ndarray,
         batch_size: int,
+        seq_len: int,
         device: Device,
+        prefix_zero_tokens: int = 0,
     ) -> list[Buffer]:
         key = (
             f"{batch_size}_{len(scheduler_timesteps)}_"
             f"{float(scheduler_timesteps[0]):.4f}_{float(scheduler_timesteps[-1]):.4f}_"
-            f"{device.id}"
+            f"{seq_len}_{prefix_zero_tokens}_{self.expand_timesteps}_{device.id}"
         )
         cached = self.cache.batched_timesteps.get(key)
         if cached is not None:
             return cached
 
-        batched_timesteps = [
-            Buffer.from_numpy(
-                np.full([batch_size], float(step_value), dtype=np.float32)
-            ).to(device)
-            for step_value in scheduler_timesteps
-        ]
+        if self.expand_timesteps:
+            batched_timesteps = []
+            for step_value in scheduler_timesteps:
+                timestep_np = np.full(
+                    [batch_size, seq_len], float(step_value), dtype=np.float32
+                )
+                if prefix_zero_tokens > 0:
+                    timestep_np[:, :prefix_zero_tokens] = 0.0
+                batched_timesteps.append(
+                    Buffer.from_numpy(timestep_np).to(device)
+                )
+        else:
+            batched_timesteps = [
+                Buffer.from_numpy(
+                    np.full([batch_size], float(step_value), dtype=np.float32)
+                ).to(device)
+                for step_value in scheduler_timesteps
+            ]
         self.cache.batched_timesteps[key] = batched_timesteps
         return batched_timesteps
 
@@ -1025,15 +1086,13 @@ class WanPipeline(DiffusionPipeline):
             else hidden_states.device
         )
         if hidden_states.dtype == DType.bfloat16:
-            u16 = float32_to_bfloat16_as_uint16(
-                np.ascontiguousarray(embeds_np)
+            u16 = float32_to_bfloat16_as_uint16(np.ascontiguousarray(embeds_np))
+            return (
+                Buffer.from_numpy(u16)
+                .to(out_device)
+                .view(dtype=DType.bfloat16, shape=embeds_np.shape)
             )
-            return Buffer.from_numpy(u16).to(out_device).view(
-                dtype=DType.bfloat16, shape=embeds_np.shape
-            )
-        return Buffer.from_numpy(np.ascontiguousarray(embeds_np)).to(
-            out_device
-        )
+        return Buffer.from_numpy(np.ascontiguousarray(embeds_np)).to(out_device)
 
     @staticmethod
     def _buffer_to_numpy_f32(

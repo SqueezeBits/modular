@@ -38,12 +38,26 @@ def get_timestep_embedding(
     )
     exponent = exponent / (half_dim - downscale_freq_shift)
     emb = ops.exp(exponent)
-    timesteps_expanded = ops.cast(ops.unsqueeze(timesteps, 1), DType.float32)
-    emb_expanded = ops.unsqueeze(emb, 0)
+
+    if len(timesteps.shape) == 1:
+        timesteps_expanded = ops.cast(
+            ops.unsqueeze(timesteps, 1), DType.float32
+        )
+        emb_expanded = ops.unsqueeze(emb, 0)
+    elif len(timesteps.shape) == 2:
+        timesteps_expanded = ops.cast(
+            ops.unsqueeze(timesteps, 2), DType.float32
+        )
+        emb_expanded = ops.reshape(emb, [1, 1, half_dim])
+    else:
+        raise ValueError(
+            f"Unsupported timestep rank {len(timesteps.shape)}; expected 1 or 2."
+        )
+
     emb = scale * timesteps_expanded * emb_expanded
     emb = ops.concat([ops.sin(emb), ops.cos(emb)], axis=-1)
     if flip_sin_to_cos:
-        emb = ops.concat([emb[:, half_dim:], emb[:, :half_dim]], axis=-1)
+        emb = ops.concat([emb[..., half_dim:], emb[..., :half_dim]], axis=-1)
     if embedding_dim % 2 == 1:
         emb = ops.pad(emb, (0, 0, 0, 1))
     return emb

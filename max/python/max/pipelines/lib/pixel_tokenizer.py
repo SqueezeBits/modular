@@ -237,11 +237,19 @@ class PixelGenerationTokenizer(
             "config_dict", {}
         )
 
-        # Compute static VAE scale factor
+        # Compute static VAE scale factors. Wan 2.2 TI2V-5B exposes explicit
+        # spatial/temporal values that differ from the block-count heuristic.
         block_out_channels = vae_config.get("block_out_channels", None)
-        self._vae_scale_factor = (
+        inferred_vae_scale_factor = (
             2 ** (len(block_out_channels) - 1) if block_out_channels else 8
         )
+        self._vae_scale_factor_spatial = int(
+            vae_config.get("scale_factor_spatial", inferred_vae_scale_factor)
+        )
+        self._vae_scale_factor_temporal = int(
+            vae_config.get("scale_factor_temporal", 4)
+        )
+        self._vae_scale_factor = self._vae_scale_factor_spatial
 
         # Store static model dimensions
         self._default_sample_size = 128
@@ -1064,7 +1072,7 @@ class PixelGenerationTokenizer(
         )
 
         if video_options and video_options.num_frames:
-            vae_scale_factor_temporal = 4
+            vae_scale_factor_temporal = self._vae_scale_factor_temporal
             latent_frames = (
                 video_options.num_frames - 1
             ) // vae_scale_factor_temporal + 1

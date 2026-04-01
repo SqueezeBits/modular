@@ -39,6 +39,7 @@ class WanConfigBase(MAXModelConfigBase):
     added_kv_proj_dim: int | None = None
     rope_max_seq_len: int = 1024
     pos_embed_seq_len: int | None = None
+    expand_timesteps: bool = False
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
 

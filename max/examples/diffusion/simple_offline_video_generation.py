@@ -56,6 +56,21 @@ logging.basicConfig(
     level=logging.INFO, format="%(name)s %(levelname)s %(message)s"
 )
 
+_WAN_MODEL_ALIASES = {
+    "Wan-AI/Wan2.1-I2V-14B-720P": "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+    "Wan-AI/Wan2.1-T2V-14B": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+    "Wan-AI/Wan2.2-I2V-A14B": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    "Wan-AI/Wan2.2-T2V-A14B": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "Wan-AI/Wan2.2-TI2V-5B": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+}
+_DEFAULT_NEGATIVE_PROMPT = (
+    "low quality, blurry, distorted, deformed, ugly, bad, poor, worst quality"
+)
+
+
+def _resolve_model_id(model_id: str) -> str:
+    return _WAN_MODEL_ALIASES.get(model_id, model_id)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -68,7 +83,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--negative-prompt",
         type=str,
-        default="low quality, blurry, distorted, deformed, ugly, bad, poor, worst quality",
+        default=_DEFAULT_NEGATIVE_PROMPT,
         help="Negative prompt to guide what NOT to generate.",
     )
     parser.add_argument(
@@ -168,15 +183,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Auto-compute height/width from input image if not specified.
     if args.height is None or args.width is None:
+        resolution_multiple = 32 if "TI2V-5B" in args.model else 16
         if args.input_image:
             import PIL.Image as _PIL
 
             _img = _PIL.open(args.input_image)
             aspect_ratio = _img.height / _img.width
             max_area = 720 * 1280
-            mod_value = 16  # vae_scale_factor_spatial(8) * patch_size(2)
-            h = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-            w = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            h = (
+                round(np.sqrt(max_area * aspect_ratio))
+                // resolution_multiple
+                * resolution_multiple
+            )
+            w = (
+                round(np.sqrt(max_area / aspect_ratio))
+                // resolution_multiple
+                * resolution_multiple
+            )
             if args.height is None:
                 args.height = h
             if args.width is None:
@@ -187,7 +210,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         else:
             if args.height is None:
-                args.height = 720
+                args.height = 704 if resolution_multiple == 32 else 720
             if args.width is None:
                 args.width = 1280
 
@@ -210,7 +233,9 @@ def save_video(frames: list[np.ndarray], output_path: str, fps: int) -> None:
 
     h, w = frames[0].shape[:2]
     container = av.open(output_path, mode="w")
-    stream: av.video.VideoStream = container.add_stream("libx264", rate=fps)  # type: ignore[assignment]
+    stream: av.video.VideoStream = container.add_stream(  # type: ignore[assignment]
+        "libx264", rate=fps
+    )
     stream.width = w
     stream.height = h
     stream.pix_fmt = "yuv420p"
@@ -269,6 +294,11 @@ def _load_pipeline(
     args: argparse.Namespace,
 ) -> tuple[PixelGenerationTokenizer, PixelGenerationPipeline[PixelContext]]:
     """Load tokenizer and pipeline from args."""
+    resolved_model_id = _resolve_model_id(args.model)
+    if resolved_model_id != args.model:
+        print(f"Resolved model: {args.model} -> {resolved_model_id}")
+        args.model = resolved_model_id
+
     print(f"Loading model: {args.model}")
 
     model_kwargs: dict[str, Any] = {

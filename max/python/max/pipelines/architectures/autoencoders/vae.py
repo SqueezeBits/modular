@@ -40,6 +40,156 @@ def _zero_cache_for(x: TensorValue) -> TensorValue:
     return ops.constant(0.0, dtype=x.dtype, device=x.device).broadcast_to(shape)
 
 
+class AvgDown3D(Module):
+    """Residual shortcut downsample matching diffusers AvgDown3D."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        factor_t: int,
+        factor_s: int = 1,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+        self.group_size = in_channels * self.factor // out_channels
+
+    def __call__(
+        self, x: TensorValue, *, first_chunk: bool = False
+    ) -> TensorValue:
+        if self.factor_t > 1 and first_chunk:
+            x = ops.pad(x, [0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+
+        b = x.shape[0]
+        c = x.shape[1]
+        t = x.shape[2]
+        h = x.shape[3]
+        w = x.shape[4]
+        rebind_t = self.factor_t if first_chunk and self.factor_t > 1 else t
+        if self.factor_t > 1 and not (first_chunk and self.factor_t > 1):
+            rebind_t = (t // self.factor_t) * self.factor_t
+        rebind_h = (h // self.factor_s) * self.factor_s
+        rebind_w = (w // self.factor_s) * self.factor_s
+        x = ops.rebind(x, shape=[b, c, rebind_t, rebind_h, rebind_w])
+        x = ops.reshape(
+            x,
+            [
+                b,
+                c,
+                t // self.factor_t,
+                self.factor_t,
+                h // self.factor_s,
+                self.factor_s,
+                w // self.factor_s,
+                self.factor_s,
+            ],
+        )
+        x = ops.permute(x, [0, 1, 3, 5, 7, 2, 4, 6])
+        x = ops.reshape(
+            x,
+            [
+                b,
+                c * self.factor,
+                t // self.factor_t,
+                h // self.factor_s,
+                w // self.factor_s,
+            ],
+        )
+        x = ops.reshape(
+            x,
+            [
+                b,
+                self.out_channels,
+                self.group_size,
+                t // self.factor_t,
+                h // self.factor_s,
+                w // self.factor_s,
+            ],
+        )
+        return ops.squeeze(ops.mean(x, axis=2), axis=2)
+
+
+class DupUp3D(Module):
+    """Residual shortcut upsample matching diffusers DupUp3D."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        factor_t: int,
+        factor_s: int = 1,
+    ) -> None:
+        super().__init__()
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        factor = factor_t * factor_s * factor_s
+        self.repeats = out_channels * factor // in_channels
+
+    def __call__(
+        self, x: TensorValue, *, first_chunk: bool = False
+    ) -> TensorValue:
+        if self.repeats > 1:
+            x = ops.unsqueeze(x, axis=2)
+            x = ops.broadcast_to(
+                x,
+                [
+                    x.shape[0],
+                    x.shape[1],
+                    self.repeats,
+                    x.shape[3],
+                    x.shape[4],
+                    x.shape[5],
+                ],
+            )
+            x = ops.reshape(
+                x,
+                [
+                    x.shape[0],
+                    x.shape[1] * x.shape[2],
+                    x.shape[3],
+                    x.shape[4],
+                    x.shape[5],
+                ],
+            )
+
+        b = x.shape[0]
+        t = x.shape[2]
+        h = x.shape[3]
+        w = x.shape[4]
+        x = ops.reshape(
+            x,
+            [
+                b,
+                self.out_channels,
+                self.factor_t,
+                self.factor_s,
+                self.factor_s,
+                t,
+                h,
+                w,
+            ],
+        )
+        x = ops.permute(x, [0, 1, 5, 2, 6, 3, 7, 4])
+        x = ops.reshape(
+            x,
+            [
+                b,
+                self.out_channels,
+                t * self.factor_t,
+                h * self.factor_s,
+                w * self.factor_s,
+            ],
+        )
+        if first_chunk and self.factor_t > 1:
+            x = x[:, :, self.factor_t - 1 :, :, :]
+        return x
+
+
 class RMSNorm(Module):
     """RMS norm used by Wan VAE blocks."""
 
@@ -637,20 +787,16 @@ class Resample(Module):
         self._out_c = upsample_out_dim
 
         self.time_conv: CausalConv3d | None = None
-        self.resample = LayerList(
-            [
-                Upsample2d(),
-                Conv2dPermuted(
-                    in_channels=dim,
-                    out_channels=upsample_out_dim,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    dtype=dtype,
-                    device=device,
-                    has_bias=True,
-                ),
-            ]
+        self.upsample2d = Upsample2d()
+        self.spatial_conv = Conv2dPermuted(
+            in_channels=dim,
+            out_channels=upsample_out_dim,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
         )
 
         if mode == "upsample3d":
@@ -686,9 +832,8 @@ class Resample(Module):
         # Per-frame 2D upsample + conv
         x = ops.permute(x, [0, 2, 1, 3, 4])  # [b, t, c, h, w]
         x = ops.reshape(x, [b * t, self.dim, h, w])
-        x = self.resample[0](x)  # Upsample2d: [b*t, dim, h*2, w*2]
-        # Conv2dPermuted handles NCHW->NHWC->conv->NCHW internally.
-        x = self.resample[1](x)  # [b*t, out_c, h*2, w*2]
+        x = self.upsample2d(x)  # [b*t, dim, h*2, w*2]
+        x = self.spatial_conv(x)  # [b*t, out_c, h*2, w*2]
 
         x = ops.reshape(x, [b, t, self._out_c, h * 2, w * 2])
         x = ops.permute(x, [0, 2, 1, 3, 4])  # [b, out_c, t, h*2, w*2]
@@ -704,10 +849,20 @@ class UpBlock(Module):
         out_dim: int,
         num_res_blocks: int,
         upsample_mode: str | None,
+        upsample_out_dim: int | None = None,
+        is_residual: bool = False,
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
         super().__init__()
+        self.shortcut: DupUp3D | None = None
+        if is_residual and upsample_mode is not None:
+            self.shortcut = DupUp3D(
+                in_dim,
+                out_dim,
+                factor_t=2 if upsample_mode == "upsample3d" else 1,
+                factor_s=2,
+            )
         resnets: list[ResidualBlock] = []
         current_dim = in_dim
         for _ in range(num_res_blocks + 1):
@@ -722,26 +877,28 @@ class UpBlock(Module):
             current_dim = out_dim
         self.resnets = LayerList(resnets)
 
-        self.upsamplers: LayerList | None = None
+        self.upsampler: Module | None = None
         if upsample_mode is not None:
-            self.upsamplers = LayerList(
-                [
-                    Resample(
-                        out_dim,
-                        mode=upsample_mode,
-                        upsample_out_dim=None,
-                        dtype=dtype,
-                        device=device,
-                    )
-                ]
+            self.upsampler = Resample(
+                out_dim,
+                mode=upsample_mode,
+                upsample_out_dim=upsample_out_dim,
+                dtype=dtype,
+                device=device,
             )
 
-    def __call__(self, x: TensorValue) -> TensorValue:
+    def __call__(
+        self, x: TensorValue, *, first_chunk: bool = False
+    ) -> TensorValue:
+        residual = x
         for resnet in self.resnets:
             x = resnet(x)
 
-        if self.upsamplers is not None:
-            x = self.upsamplers[0](x)
+        if self.upsampler is not None:
+            x = self.upsampler(x)
+
+        if self.shortcut is not None:
+            x = x + self.shortcut(residual, first_chunk=first_chunk)
 
         return x
 
@@ -762,7 +919,6 @@ class Decoder3d(Module):
         device: DeviceRef | None = None,
     ) -> None:
         super().__init__()
-        del is_residual
 
         dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
 
@@ -781,15 +937,18 @@ class Decoder3d(Module):
         up_blocks: list[UpBlock] = []
         final_out_dim = dims[-1]
         for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
-            if i > 0:
+            if i > 0 and not is_residual:
                 in_dim = in_dim // 2
 
             up_flag = i != len(dim_mult) - 1
             upsample_mode: str | None = None
+            upsample_out_dim: int | None = None
             if up_flag and temporal_upsample[i]:
                 upsample_mode = "upsample3d"
             elif up_flag:
                 upsample_mode = "upsample2d"
+            if up_flag and is_residual:
+                upsample_out_dim = out_dim
 
             up_blocks.append(
                 UpBlock(
@@ -797,6 +956,8 @@ class Decoder3d(Module):
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
                     upsample_mode=upsample_mode,
+                    upsample_out_dim=upsample_out_dim,
+                    is_residual=is_residual,
                     dtype=dtype,
                     device=device,
                 )
@@ -826,7 +987,7 @@ class Decoder3d(Module):
         x = self.mid_block(x)
 
         for up_block in self.up_blocks:
-            x = up_block(x)
+            x = up_block(x, first_chunk=False)
 
         x = self.norm_out(x)
         x = ops.silu(x)
@@ -982,20 +1143,16 @@ class ResampleCached(Module):
             device=device,
             has_bias=True,
         )
-        self.resample = LayerList(
-            [
-                Upsample2d(),
-                Conv2dPermuted(
-                    in_channels=dim,
-                    out_channels=upsample_out_dim,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    dtype=dtype,
-                    device=device,
-                    has_bias=True,
-                ),
-            ]
+        self.upsample2d = Upsample2d()
+        self.spatial_conv = Conv2dPermuted(
+            in_channels=dim,
+            out_channels=upsample_out_dim,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
         )
 
     def __call__(
@@ -1023,8 +1180,8 @@ class ResampleCached(Module):
 
         x = ops.permute(x, [0, 2, 1, 3, 4])
         x = ops.reshape(x, [b * t, self.dim, h, w])
-        x = self.resample[0](x)
-        x = self.resample[1](x)
+        x = self.upsample2d(x)
+        x = self.spatial_conv(x)
         x = ops.reshape(x, [b, t, self._out_c, h * 2, w * 2])
         x = ops.permute(x, [0, 2, 1, 3, 4])
         return x, cache_out
@@ -1041,10 +1198,20 @@ class UpBlockCached(Module):
         out_dim: int,
         num_res_blocks: int,
         upsample_mode: str | None,
+        upsample_out_dim: int | None = None,
+        is_residual: bool = False,
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
         super().__init__()
+        self.shortcut: DupUp3D | None = None
+        if is_residual and upsample_mode is not None:
+            self.shortcut = DupUp3D(
+                in_dim,
+                out_dim,
+                factor_t=2 if upsample_mode == "upsample3d" else 1,
+                factor_s=2,
+            )
         resnets: list[ResidualBlockCached] = []
         current_dim = in_dim
         for _ in range(num_res_blocks + 1):
@@ -1064,21 +1231,21 @@ class UpBlockCached(Module):
             1 if self._has_temporal_upsample else 0
         )
 
-        self.upsamplers: LayerList | None = None
+        self.upsampler: Module | None = None
         if upsample_mode is not None:
             if upsample_mode == "upsample3d":
-                upsampler: Module = ResampleCached(
+                self.upsampler = ResampleCached(
                     out_dim,
                     mode=upsample_mode,
-                    upsample_out_dim=None,
+                    upsample_out_dim=upsample_out_dim,
                     dtype=dtype,
                     device=device,
                 )
             elif upsample_mode == "upsample2d":
-                upsampler = Resample(
+                self.upsampler = Resample(
                     out_dim,
                     mode=upsample_mode,
-                    upsample_out_dim=None,
+                    upsample_out_dim=upsample_out_dim,
                     dtype=dtype,
                     device=device,
                 )
@@ -1086,8 +1253,6 @@ class UpBlockCached(Module):
                 raise ValueError(
                     f"Unsupported UpBlockCached upsample mode: {upsample_mode}"
                 )
-
-            self.upsamplers = LayerList([upsampler])
 
     def __call__(
         self,
@@ -1103,6 +1268,7 @@ class UpBlockCached(Module):
         use_cache_inputs = len(cache_inputs) == self.cache_slots
         cache_outputs: list[TensorValue] = []
         cache_idx = 0
+        residual = x
 
         for resnet in self.resnets:
             cache1_in = cache_inputs[cache_idx] if use_cache_inputs else None
@@ -1113,8 +1279,8 @@ class UpBlockCached(Module):
             cache_outputs.extend([cache1_out, cache2_out])
             cache_idx += 2
 
-        if self.upsamplers is not None:
-            upsampler = self.upsamplers[0]
+        if self.upsampler is not None:
+            upsampler = self.upsampler
             if self._has_temporal_upsample:
                 cache_in = cache_inputs[cache_idx] if use_cache_inputs else None
                 if not isinstance(upsampler, ResampleCached):
@@ -1129,6 +1295,9 @@ class UpBlockCached(Module):
                 cache_outputs.append(cache_out)
             else:
                 x = upsampler(x)
+
+        if self.shortcut is not None:
+            x = x + self.shortcut(residual, first_chunk=first_chunk)
 
         return (x, *cache_outputs)
 
@@ -1149,7 +1318,6 @@ class Decoder3dCached(Module):
         device: DeviceRef | None = None,
     ) -> None:
         super().__init__()
-        del is_residual
 
         dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
 
@@ -1168,15 +1336,18 @@ class Decoder3dCached(Module):
         up_blocks: list[UpBlockCached] = []
         final_out_dim = dims[-1]
         for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
-            if i > 0:
+            if i > 0 and not is_residual:
                 in_dim = in_dim // 2
 
             up_flag = i != len(dim_mult) - 1
             upsample_mode: str | None = None
+            upsample_out_dim: int | None = None
             if up_flag and temporal_upsample[i]:
                 upsample_mode = "upsample3d"
             elif up_flag:
                 upsample_mode = "upsample2d"
+            if up_flag and is_residual:
+                upsample_out_dim = out_dim
 
             up_blocks.append(
                 UpBlockCached(
@@ -1184,6 +1355,8 @@ class Decoder3dCached(Module):
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
                     upsample_mode=upsample_mode,
+                    upsample_out_dim=upsample_out_dim,
+                    is_residual=is_residual,
                     dtype=dtype,
                     device=device,
                 )
@@ -1297,9 +1470,9 @@ class Decoder3dCached(Module):
                     [batch_size, resnet.conv2.in_channels, CACHE_T, h, w]
                 )
 
-            if up_block.upsamplers is not None:
+            if up_block.upsampler is not None:
                 if up_block._has_temporal_upsample:
-                    upsampler = up_block.upsamplers[0]
+                    upsampler = up_block.upsampler
                     if not isinstance(upsampler, ResampleCached):
                         raise TypeError(
                             "Expected ResampleCached for temporal upsample"
@@ -1348,8 +1521,9 @@ class VAEDecoderFirstFrameCached(Module):
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
         super().__init__()
+        decoder_dim = config.decoder_base_dim or config.base_dim
         self.decoder = Decoder3dCached(
-            dim=config.base_dim,
+            dim=decoder_dim,
             z_dim=config.z_dim,
             dim_mult=tuple(config.dim_mult),
             num_res_blocks=config.num_res_blocks,
@@ -1373,8 +1547,9 @@ class VAEDecoderRestFrameCached(Module):
 
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
         super().__init__()
+        decoder_dim = config.decoder_base_dim or config.base_dim
         self.decoder = Decoder3dCached(
-            dim=config.base_dim,
+            dim=decoder_dim,
             z_dim=config.z_dim,
             dim_mult=tuple(config.dim_mult),
             num_res_blocks=config.num_res_blocks,
@@ -1401,6 +1576,7 @@ class VAEDecoder(Module):
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
         super().__init__()
         self._config = config
+        decoder_dim = config.decoder_base_dim or config.base_dim
         self.post_quant_conv = CausalConv3d(
             in_channels=config.z_dim,
             out_channels=config.z_dim,
@@ -1411,7 +1587,7 @@ class VAEDecoder(Module):
             has_bias=True,
         )
         self.decoder = Decoder3d(
-            dim=config.base_dim,
+            dim=decoder_dim,
             z_dim=config.z_dim,
             dim_mult=tuple(config.dim_mult),
             num_res_blocks=config.num_res_blocks,
@@ -1442,6 +1618,7 @@ class VAEDecoderFirstFrame(Module):
     def __init__(self, config: AutoencoderKLWanConfig) -> None:
         super().__init__()
         self._config = config
+        decoder_dim = config.decoder_base_dim or config.base_dim
         self.post_quant_conv = CausalConv3d(
             in_channels=config.z_dim,
             out_channels=config.z_dim,
@@ -1453,7 +1630,7 @@ class VAEDecoderFirstFrame(Module):
         )
         # Force all temporal upsamples to spatial-only.
         self.decoder = Decoder3d(
-            dim=config.base_dim,
+            dim=decoder_dim,
             z_dim=config.z_dim,
             dim_mult=tuple(config.dim_mult),
             num_res_blocks=config.num_res_blocks,
@@ -1492,23 +1669,16 @@ class DownResample(Module):
         self.dim = dim
         self.mode = mode
 
-        # Spatial: ZeroPad2d(0,1,0,1) + Conv2d(stride=2, padding=0)
-        # Asymmetric padding: right=1, bottom=1 only.
-        # Use index [1] to match state_dict key "resample.1".
-        self.resample = LayerList(
-            [
-                Upsample2d(),  # Dummy at index 0 (no weights, not called)
-                Conv2dPermuted(
-                    in_channels=dim,
-                    out_channels=dim,
-                    kernel_size=3,
-                    stride=2,
-                    padding=0,  # We do manual asymmetric pad in __call__
-                    dtype=dtype,
-                    device=device,
-                    has_bias=True,
-                ),
-            ]
+        # Spatial: ZeroPad2d(0,1,0,1) + Conv2d(stride=2, padding=0).
+        self.spatial_conv = Conv2dPermuted(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=3,
+            stride=2,
+            padding=0,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
         )
 
         self.time_conv: CausalConv3d | None = None
@@ -1548,7 +1718,7 @@ class DownResample(Module):
         # ZeroPad2d(left=0, right=1, top=0, bottom=1) on NCHW
         # paddings format: [N_before, N_after, C_before, C_after, H_before, H_after, W_before, W_after]
         x = ops.pad(x, [0, 0, 0, 0, 0, 1, 0, 1])
-        x = self.resample[1](x)  # Conv2d stride=2, padding=0
+        x = self.spatial_conv(x)  # Conv2d stride=2, padding=0
         new_h = (h + 1) // 2
         new_w = (w + 1) // 2
         # Rebind so the compiler sees conv output shape matches our computation.
@@ -1585,20 +1755,15 @@ class DownResampleCached(Module):
         self._has_temporal = mode == "downsample3d"
         self.cache_slots = 1 if self._has_temporal else 0
 
-        self.resample = LayerList(
-            [
-                Upsample2d(),  # Dummy at index 0 (match weight naming)
-                Conv2dPermuted(
-                    in_channels=dim,
-                    out_channels=dim,
-                    kernel_size=3,
-                    stride=2,
-                    padding=0,
-                    dtype=dtype,
-                    device=device,
-                    has_bias=True,
-                ),
-            ]
+        self.spatial_conv = Conv2dPermuted(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=3,
+            stride=2,
+            padding=0,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
         )
 
         self.time_conv: CausalConv3d | None = None
@@ -1633,7 +1798,7 @@ class DownResampleCached(Module):
         x = ops.permute(x, [0, 2, 1, 3, 4])  # [b, t, c, h, w]
         x = ops.reshape(x, [b * t, self.dim, h, w])
         x = ops.pad(x, [0, 0, 0, 0, 0, 1, 0, 1])  # ZeroPad2d(0,1,0,1)
-        x = self.resample[1](x)  # Conv2d stride=2
+        x = self.spatial_conv(x)  # Conv2d stride=2
         new_h = (h + 1) // 2
         new_w = (w + 1) // 2
         # Rebind so the compiler sees conv output shape matches our computation.
@@ -1677,13 +1842,22 @@ class DownBlock(Module):
         out_dim: int,
         num_res_blocks: int,
         downsample_mode: str | None,
+        is_residual: bool = False,
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
         super().__init__()
+        self.shortcut: AvgDown3D | None = None
+        if is_residual:
+            self.shortcut = AvgDown3D(
+                in_dim,
+                out_dim,
+                factor_t=2 if downsample_mode == "downsample3d" else 1,
+                factor_s=2 if downsample_mode is not None else 1,
+            )
         resnets: list[ResidualBlock] = []
         current_dim = in_dim
-        for _ in range(num_res_blocks + 1):
+        for _ in range(num_res_blocks):
             resnets.append(
                 ResidualBlock(
                     current_dim,
@@ -1695,34 +1869,153 @@ class DownBlock(Module):
             current_dim = out_dim
         self.resnets = LayerList(resnets)
 
-        self.downsamplers: LayerList | None = None
+        self.downsampler: Module | None = None
         if downsample_mode is not None:
-            self.downsamplers = LayerList(
-                [
-                    DownResample(
-                        out_dim,
-                        mode=downsample_mode,
-                        dtype=dtype,
-                        device=device,
-                    )
-                ]
+            self.downsampler = DownResample(
+                out_dim,
+                mode=downsample_mode,
+                dtype=dtype,
+                device=device,
             )
 
-    def __call__(self, x: TensorValue) -> TensorValue:
+    def __call__(
+        self, x: TensorValue, *, first_chunk: bool = False
+    ) -> TensorValue:
+        residual = x
         for resnet in self.resnets:
             x = resnet(x)
 
-        if self.downsamplers is not None:
-            x = self.downsamplers[0](x)
+        if self.downsampler is not None:
+            x = self.downsampler(x)
+
+        if self.shortcut is not None:
+            shortcut = self.shortcut(residual, first_chunk=first_chunk)
+            x = ops.rebind(x, shape=shortcut.shape)
+            x = x + shortcut
 
         return x
+
+
+class DownBlockCached(Module):
+    """Wan encoder down block with explicit cache threading."""
+
+    cache_slots: int
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_res_blocks: int,
+        downsample_mode: str | None,
+        is_residual: bool = False,
+        dtype: DType | None = None,
+        device: DeviceRef | None = None,
+    ) -> None:
+        super().__init__()
+        self.shortcut: AvgDown3D | None = None
+        if is_residual:
+            self.shortcut = AvgDown3D(
+                in_dim,
+                out_dim,
+                factor_t=2 if downsample_mode == "downsample3d" else 1,
+                factor_s=2 if downsample_mode is not None else 1,
+            )
+        resnets: list[ResidualBlockCached] = []
+        current_dim = in_dim
+        for _ in range(num_res_blocks):
+            resnets.append(
+                ResidualBlockCached(
+                    current_dim,
+                    out_dim,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+            current_dim = out_dim
+        self.resnets = LayerList(resnets)
+
+        self._has_temporal_downsample = downsample_mode == "downsample3d"
+        self.cache_slots = len(resnets) * 2 + (
+            1 if self._has_temporal_downsample else 0
+        )
+
+        self.downsampler: Module | None = None
+        if downsample_mode is not None:
+            if downsample_mode == "downsample3d":
+                self.downsampler = DownResampleCached(
+                    out_dim,
+                    mode=downsample_mode,
+                    dtype=dtype,
+                    device=device,
+                )
+            elif downsample_mode == "downsample2d":
+                self.downsampler = DownResample(
+                    out_dim,
+                    mode=downsample_mode,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported DownBlockCached downsample mode: {downsample_mode}"
+                )
+
+    def __call__(
+        self,
+        x: TensorValue,
+        *cache_inputs: TensorValue,
+        first_chunk: bool = False,
+    ) -> tuple[TensorValue, ...]:
+        if len(cache_inputs) not in (0, self.cache_slots):
+            raise ValueError(
+                "DownBlockCached expected 0 or "
+                f"{self.cache_slots} cache tensors, got {len(cache_inputs)}"
+            )
+
+        use_cache_inputs = len(cache_inputs) == self.cache_slots
+        cache_outputs: list[TensorValue] = []
+        cache_idx = 0
+        residual = x
+
+        for resnet in self.resnets:
+            cache1_in = cache_inputs[cache_idx] if use_cache_inputs else None
+            cache2_in = (
+                cache_inputs[cache_idx + 1] if use_cache_inputs else None
+            )
+            x, cache1_out, cache2_out = resnet(x, cache1_in, cache2_in)
+            cache_outputs.extend([cache1_out, cache2_out])
+            cache_idx += 2
+
+        if self.downsampler is not None:
+            if self._has_temporal_downsample:
+                downsampler = self.downsampler
+                if not isinstance(downsampler, DownResampleCached):
+                    raise TypeError(
+                        "Expected DownResampleCached for temporal downsample"
+                    )
+                cache_in = cache_inputs[cache_idx] if use_cache_inputs else None
+                x, cache_out = downsampler(
+                    x,
+                    cache_in=cache_in,
+                    first_chunk=first_chunk,
+                )
+                cache_outputs.append(cache_out)
+            else:
+                x = self.downsampler(x)
+
+        if self.shortcut is not None:
+            shortcut = self.shortcut(residual, first_chunk=first_chunk)
+            x = ops.rebind(x, shape=shortcut.shape)
+            x = x + shortcut
+
+        return (x, *cache_outputs)
 
 
 class Encoder3d(Module):
     """Wan 3D encoder module (mirror of Decoder3d).
 
-    Uses a flat ModuleList for down_blocks to match the diffusers
-    safetensors key naming (encoder.down_blocks.{i}.{conv1,norm1,...}).
+    Uses nested down blocks to match the diffusers checkpoint naming
+    (encoder.down_blocks.{i}.resnets.{j}..., encoder.down_blocks.{i}.downsampler...).
     """
 
     def __init__(
@@ -1733,6 +2026,7 @@ class Encoder3d(Module):
         dim_mult: tuple[int, ...] = (1, 2, 4, 4),
         num_res_blocks: int = 2,
         temporal_downsample: tuple[bool, ...] = (False, True, True),
+        is_residual: bool = False,
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
@@ -1751,37 +2045,25 @@ class Encoder3d(Module):
             prefer_nvidia_fcrs=False,
         )
 
-        # Flat ModuleList matching diffusers weight naming:
-        # down_blocks.{0,1} = ResidualBlock (first level, 2 blocks)
-        # down_blocks.2 = Resample (downsample)
-        # down_blocks.{3,4} = ResidualBlock (second level)
-        # down_blocks.5 = Resample ...etc
-        down_blocks: list[Module] = []
+        down_blocks: list[DownBlock] = []
         for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
-            for j in range(num_res_blocks):
-                down_blocks.append(
-                    ResidualBlock(
-                        in_dim if j == 0 else out_dim,
-                        out_dim,
-                        dtype=dtype,
-                        device=device,
-                        prefer_nvidia_fcrs=False,
-                    )
-                )
             down_flag = i != len(dim_mult) - 1
+            downsample_mode = None
             if down_flag:
-                mode = (
+                downsample_mode = (
                     "downsample3d" if temporal_downsample[i] else "downsample2d"
                 )
-                down_blocks.append(
-                    DownResample(
-                        out_dim,
-                        mode=mode,
-                        dtype=dtype,
-                        device=device,
-                        prefer_nvidia_fcrs=False,
-                    )
+            down_blocks.append(
+                DownBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    downsample_mode=downsample_mode,
+                    is_residual=is_residual,
+                    dtype=dtype,
+                    device=device,
                 )
+            )
 
         self.down_blocks = LayerList(down_blocks)
 
@@ -1815,7 +2097,7 @@ class Encoder3d(Module):
         x = self.conv_in(x)
 
         for down_block in self.down_blocks:
-            x = down_block(x)
+            x = down_block(x, first_chunk=False)
 
         x = self.mid_block(x)
         x = self.norm_out(x)
@@ -1827,8 +2109,8 @@ class Encoder3d(Module):
 class Encoder3dCached(Module):
     """Chunked encoder with explicit cache I/O for temporal context.
 
-    Uses a flat ModuleList for down_blocks (matching Encoder3d weight naming).
-    Each chunk processes either 1 frame (first) or CHUNK_SIZE frames (rest).
+    Uses nested down blocks matching Encoder3d weight naming. Each chunk
+    processes either 1 frame (first) or CHUNK_SIZE frames (rest).
     Temporal context is maintained via cache tensors passed between chunks.
     """
 
@@ -1840,6 +2122,7 @@ class Encoder3dCached(Module):
         dim_mult: tuple[int, ...] = (1, 2, 4, 4),
         num_res_blocks: int = 2,
         temporal_downsample: tuple[bool, ...] = (False, True, True),
+        is_residual: bool = False,
         dtype: DType | None = None,
         device: DeviceRef | None = None,
     ) -> None:
@@ -1862,33 +2145,25 @@ class Encoder3dCached(Module):
             has_bias=True,
         )
 
-        # Flat list matching diffusers weight naming
-        down_blocks: list[Module] = []
-        self._block_cache_slots: list[int] = []
+        down_blocks: list[DownBlockCached] = []
         for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
-            for j in range(num_res_blocks):
-                down_blocks.append(
-                    ResidualBlockCached(
-                        in_dim if j == 0 else out_dim,
-                        out_dim,
-                        dtype=dtype,
-                        device=device,
-                    )
-                )
-                self._block_cache_slots.append(2)
             down_flag = i != len(dim_mult) - 1
+            downsample_mode = None
             if down_flag:
-                mode = (
+                downsample_mode = (
                     "downsample3d" if temporal_downsample[i] else "downsample2d"
                 )
-                ds = DownResampleCached(
-                    out_dim,
-                    mode=mode,
+            down_blocks.append(
+                DownBlockCached(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    downsample_mode=downsample_mode,
+                    is_residual=is_residual,
                     dtype=dtype,
                     device=device,
                 )
-                down_blocks.append(ds)
-                self._block_cache_slots.append(ds.cache_slots)
+            )
 
         self.down_blocks = LayerList(down_blocks)
 
@@ -1913,7 +2188,7 @@ class Encoder3dCached(Module):
 
     @property
     def total_cache_slots(self) -> int:
-        return 1 + sum(self._block_cache_slots) + 4 + 1
+        return 1 + sum(block.cache_slots for block in self.down_blocks) + 4 + 1
 
     def cache_shapes(
         self,
@@ -1933,18 +2208,27 @@ class Encoder3dCached(Module):
         # conv_in cache
         shapes.append([batch_size, self._in_channels, CACHE_T, h, w])
 
-        for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
-            for j in range(self._num_res_blocks):
-                block_in = in_dim if j == 0 else out_dim
-                shapes.append([batch_size, block_in, CACHE_T, h, w])
-                shapes.append([batch_size, out_dim, CACHE_T, h, w])
+        for i, block in enumerate(self.down_blocks):
+            for resnet in block.resnets:
+                shapes.append(
+                    [batch_size, resnet.conv1.in_channels, CACHE_T, h, w]
+                )
+                shapes.append(
+                    [batch_size, resnet.conv2.in_channels, CACHE_T, h, w]
+                )
 
-            down_flag = i != len(self._dim_mult) - 1
-            if down_flag:
+            if block.downsampler is not None:
                 new_h = (h + 1) // 2 if h is not None else None
                 new_w = (w + 1) // 2 if w is not None else None
-                if self._temporal_downsample[i]:
-                    shapes.append([batch_size, out_dim, 1, new_h, new_w])
+                if block._has_temporal_downsample:
+                    downsampler = block.downsampler
+                    if not isinstance(downsampler, DownResampleCached):
+                        raise TypeError(
+                            "Expected DownResampleCached for temporal downsample"
+                        )
+                    shapes.append(
+                        [batch_size, downsampler.dim, 1, new_h, new_w]
+                    )
                 h, w = new_h, new_w
 
         final_dim = dims[-1]
@@ -1981,24 +2265,20 @@ class Encoder3dCached(Module):
         cache_outputs.append(c_out)
         idx += 1
 
-        # down_blocks (flat list of ResidualBlockCached and DownResampleCached)
-        block_idx = 0
         for block in self.down_blocks:
-            if isinstance(block, ResidualBlockCached):
-                c1 = cache_inputs[idx] if use_cache else None
-                c2 = cache_inputs[idx + 1] if use_cache else None
-                x, co1, co2 = block(x, c1, c2)
-                cache_outputs.extend([co1, co2])
-                idx += 2
-            elif isinstance(block, DownResampleCached):
-                if block._has_temporal:
-                    c = cache_inputs[idx] if use_cache else None
-                    x, co = block(x, cache_in=c, first_chunk=first_chunk)
-                    cache_outputs.append(co)
-                    idx += 1
-                else:
-                    (x,) = block(x)
-            block_idx += 1
+            block_cache_inputs: tuple[TensorValue, ...] = (
+                tuple(cache_inputs[idx : idx + block.cache_slots])
+                if use_cache
+                else ()
+            )
+            block_outputs = block(
+                x,
+                *block_cache_inputs,
+                first_chunk=first_chunk,
+            )
+            x = block_outputs[0]
+            cache_outputs.extend(block_outputs[1:])
+            idx += block.cache_slots
 
         # mid_block
         mid_caches: tuple[TensorValue, ...] = (
@@ -2033,10 +2313,11 @@ class VAEEncoder(Module):
         self.encoder = Encoder3d(
             dim=config.base_dim,
             z_dim=config.z_dim,
-            in_channels=3,
+            in_channels=config.in_channels,
             dim_mult=config.dim_mult,
             num_res_blocks=config.num_res_blocks,
             temporal_downsample=config.temporal_downsample,
+            is_residual=config.is_residual,
             dtype=config.dtype,
             device=config.device,
         )
@@ -2066,10 +2347,11 @@ class VAEEncoderFirstChunk(Module):
         self.encoder = Encoder3dCached(
             dim=config.base_dim,
             z_dim=config.z_dim,
-            in_channels=3,
+            in_channels=config.in_channels,
             dim_mult=config.dim_mult,
             num_res_blocks=config.num_res_blocks,
             temporal_downsample=config.temporal_downsample,
+            is_residual=config.is_residual,
             dtype=config.dtype,
             device=config.device,
         )
@@ -2101,10 +2383,11 @@ class VAEEncoderRestChunk(Module):
         self.encoder = Encoder3dCached(
             dim=config.base_dim,
             z_dim=config.z_dim,
-            in_channels=3,
+            in_channels=config.in_channels,
             dim_mult=config.dim_mult,
             num_res_blocks=config.num_res_blocks,
             temporal_downsample=config.temporal_downsample,
+            is_residual=config.is_residual,
             dtype=config.dtype,
             device=config.device,
         )

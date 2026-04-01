@@ -22,11 +22,7 @@ from max.nn.kernels import flash_attention_gpu
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 
-from .embeddings import (
-    TimestepEmbedding,
-    Timesteps,
-    apply_rotary_emb,
-)
+from .embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb
 from .model_config import WanConfigBase
 
 
@@ -58,12 +54,7 @@ class WanConv3d(Module):
 
 
 class WanLayerNorm(Module):
-    """LayerNorm using decomposed ops for float32 numerical stability.
-
-    The built-in ``layer_norm_gpu_block`` kernel hits
-    ``CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`` for dim=5120, so we decompose
-    into basic ops (mean, rsqrt, multiply) that each launch small kernels.
-    """
+    """LayerNorm using decomposed ops for float32 numerical stability."""
 
     def __init__(
         self,
@@ -100,11 +91,7 @@ class WanLayerNorm(Module):
 
 
 class WanRMSNorm(Module):
-    """RMSNorm using decomposed ops for float32 numerical stability.
-
-    Same reason as WanLayerNorm: the built-in ``rms_norm`` custom kernel
-    may also hit resource limits for dim=5120.
-    """
+    """RMSNorm using decomposed ops for float32 numerical stability."""
 
     def __init__(
         self,
@@ -160,17 +147,6 @@ class WanTextProjection(Module):
 
 
 class WanImageEmbedder(Module):
-    """Image embedding for Wan 2.1 I2V: LayerNorm → GEGLU FFN → LayerNorm.
-
-    Matches diffusers' FeedForward(image_dim, dim, mult=1, activation_fn="gelu")
-    with pre/post norms.  Weight keys::
-
-        image_embedder.norm1.{weight,bias}
-        image_embedder.ff.net.0.proj.{weight,bias}   (GEGLU gate+value)
-        image_embedder.ff.net.2.{weight,bias}         (output linear)
-        image_embedder.norm2.{weight,bias}
-    """
-
     def __init__(
         self,
         image_dim: int,
@@ -180,9 +156,6 @@ class WanImageEmbedder(Module):
         device: DeviceRef = DeviceRef.CPU(),
     ) -> None:
         super().__init__()
-        # Matches diffusers FeedForward(image_dim, out_dim, mult=1, activation_fn="gelu"):
-        #   norm1(image_dim) → Linear(image_dim→image_dim) → GELU →
-        #   Linear(image_dim→out_dim) → norm2(out_dim)
         self.norm1 = WanLayerNorm(
             image_dim,
             elementwise_affine=True,
@@ -232,6 +205,7 @@ class WanTimeTextImageEmbedding(Module):
         device: DeviceRef = DeviceRef.CPU(),
     ) -> None:
         super().__init__()
+        self.dim = dim
         self.timesteps_proj = Timesteps(
             num_channels=freq_dim,
             flip_sin_to_cos=True,
@@ -243,7 +217,6 @@ class WanTimeTextImageEmbedding(Module):
             dtype=dtype,
             device=device,
         )
-        # Projects SiLU(temb) to 6 modulation params per block
         self.time_proj = Linear(
             in_dim=dim,
             out_dim=dim * 6,
@@ -257,7 +230,6 @@ class WanTimeTextImageEmbedding(Module):
             dtype=dtype,
             device=device,
         )
-        # Optional image embedder (Wan 2.1 I2V)
         self.image_embedder: WanImageEmbedder | None = None
         if image_dim is not None:
             self.image_embedder = WanImageEmbedder(
@@ -270,26 +242,32 @@ class WanTimeTextImageEmbedding(Module):
     def __call__(
         self, timestep: TensorValue, encoder_hidden_states: TensorValue
     ) -> tuple[TensorValue, TensorValue, TensorValue]:
-        # Sinusoidal timestep embedding (computed in float32 for precision).
-        # Cast to the model's working dtype (bf16) for the MLP, matching
-        # diffusers' behavior: float32 embedding → cast to weight dtype → MLP.
-        timesteps_emb = self.timesteps_proj(timestep)  # [B, freq_dim] float32
-        timesteps_emb = ops.cast(
-            timesteps_emb, encoder_hidden_states.dtype
-        )  # → bf16
-        temb = self.time_embedder(timesteps_emb)  # [B, dim]
+        timesteps_emb = self.timesteps_proj(timestep)
+        timesteps_emb = ops.cast(timesteps_emb, encoder_hidden_states.dtype)
+        temb = self.time_embedder(timesteps_emb)
 
-        # Timestep projection for modulation: SiLU then linear
-        timestep_proj = self.time_proj(ops.silu(temb))  # [B, dim*6]
-        # Reshape to [B, 6, dim] for per-block modulation
-        timestep_proj = ops.reshape(
-            timestep_proj,
-            [timestep_proj.shape[0], 6, timestep_proj.shape[1] // 6],
-        )
+        timestep_proj = self.time_proj(ops.silu(temb))
+        if len(timestep_proj.shape) == 2:
+            timestep_proj = ops.reshape(
+                timestep_proj,
+                [timestep_proj.shape[0], 6, timestep_proj.shape[1] // 6],
+            )
+        elif len(timestep_proj.shape) == 3:
+            timestep_proj = ops.reshape(
+                timestep_proj,
+                [
+                    timestep_proj.shape[0],
+                    timestep_proj.shape[1],
+                    6,
+                    timestep_proj.shape[2] // 6,
+                ],
+            )
+        else:
+            raise ValueError(
+                f"Unsupported timestep projection rank {len(timestep_proj.shape)}."
+            )
 
-        # Text projection
-        text_emb = self.text_embedder(encoder_hidden_states)  # [B, S, dim]
-
+        text_emb = self.text_embedder(encoder_hidden_states)
         return temb, timestep_proj, text_emb
 
 
@@ -333,11 +311,9 @@ class WanSelfAttention(Module):
         key = self.to_k(hidden_states)
         value = self.to_v(hidden_states)
 
-        # QK-norm applied across all heads (before reshape)
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        # Reshape to multi-head: [B, S, D] -> [B, S, H, head_dim]
         batch_size = query.shape[0]
         seq_len = query.shape[1]
         query = ops.reshape(
@@ -350,7 +326,6 @@ class WanSelfAttention(Module):
             value, [batch_size, seq_len, self.num_heads, self.head_dim]
         )
 
-        # Apply RoPE
         original_dtype = query.dtype
         query = apply_rotary_emb(
             query,
@@ -369,7 +344,6 @@ class WanSelfAttention(Module):
         query = ops.cast(query, original_dtype)
         key = ops.cast(key, original_dtype)
 
-        # Flash attention
         scale = 1.0 / (self.head_dim**0.5)
         hidden_states = flash_attention_gpu(
             query,
@@ -379,13 +353,11 @@ class WanSelfAttention(Module):
             scale=scale,
         )
 
-        # Reshape back: [B, S, H, head_dim] -> [B, S, D]
         hidden_states = ops.reshape(
             hidden_states,
             [hidden_states.shape[0], hidden_states.shape[1], self.inner_dim],
         )
         hidden_states = ops.cast(hidden_states, original_dtype)
-
         return self.to_out(hidden_states)
 
 
@@ -411,7 +383,6 @@ class WanCrossAttention(Module):
         self.to_q = Linear(
             in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
         )
-        # Fused K+V projection from text embeddings
         self.to_kv = Linear(
             in_dim=text_dim,
             out_dim=dim * 2,
@@ -425,7 +396,6 @@ class WanCrossAttention(Module):
             in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
         )
 
-        # Optional added KV projections for image conditioning (Wan 2.1 I2V)
         if added_kv_proj_dim is not None:
             self.add_k_proj = Linear(
                 in_dim=added_kv_proj_dim,
@@ -455,25 +425,19 @@ class WanCrossAttention(Module):
         image_embeds: TensorValue | None = None,
     ) -> TensorValue:
         query = self.to_q(hidden_states)
-
-        # Fused KV from text - use explicit slicing instead of chunk
         kv = self.to_kv(encoder_hidden_states)
         key = kv[:, :, : self.inner_dim]
         value = kv[:, :, self.inner_dim :]
 
-        # QK-norm across all heads (before reshape)
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        # Added image KV (Wan 2.1 I2V)
         if self._has_added_kv and image_embeds is not None:
             added_key = self.norm_added_k(self.add_k_proj(image_embeds))
             added_value = self.add_v_proj(image_embeds)
-            # Concatenate image KV with text KV along sequence dim
             key = ops.concat([key, added_key], axis=1)
             value = ops.concat([value, added_value], axis=1)
 
-        # Reshape to multi-head
         batch_size = query.shape[0]
         q_seq_len = query.shape[1]
         kv_seq_len = key.shape[1]
@@ -487,7 +451,6 @@ class WanCrossAttention(Module):
             value, [batch_size, kv_seq_len, self.num_heads, self.head_dim]
         )
 
-        # Flash attention (no RoPE for cross-attention)
         original_dtype = query.dtype
         scale = 1.0 / (self.head_dim**0.5)
         hidden_states = flash_attention_gpu(
@@ -498,13 +461,11 @@ class WanCrossAttention(Module):
             scale=scale,
         )
 
-        # Reshape back
         hidden_states = ops.reshape(
             hidden_states,
             [hidden_states.shape[0], hidden_states.shape[1], self.inner_dim],
         )
         hidden_states = ops.cast(hidden_states, original_dtype)
-
         return self.to_out(hidden_states)
 
 
@@ -518,8 +479,6 @@ class WanFeedForward(Module):
         device: DeviceRef = DeviceRef.CPU(),
     ) -> None:
         super().__init__()
-        # WAN uses "gelu-approximate" (simple GELU), NOT GEGLU.
-        # ffn_dim is the direct projection output size (no 2x expansion).
         self.proj = Linear(
             in_dim=dim,
             out_dim=ffn_dim,
@@ -557,6 +516,7 @@ class WanTransformerBlock(Module):
         device: DeviceRef = DeviceRef.CPU(),
     ) -> None:
         super().__init__()
+        self.dim = dim
         self.scale_shift_table = Weight(
             "scale_shift_table", dtype, [1, 6, dim], device
         )
@@ -608,44 +568,65 @@ class WanTransformerBlock(Module):
     ) -> TensorValue:
         rotary_emb = (rope_cos, rope_sin)
 
-        # Modulation: scale_shift_table[1,6,D] + timestep_proj[B,6,D]
-        mod = self.scale_shift_table + timestep_proj  # [B, 6, D]
+        if len(timestep_proj.shape) == 3:
+            mod = self.scale_shift_table + timestep_proj
+            shift_sa = mod[:, 0, :]
+            scale_sa = mod[:, 1, :]
+            gate_sa = mod[:, 2, :]
+            shift_ff = mod[:, 3, :]
+            scale_ff = mod[:, 4, :]
+            gate_ff = mod[:, 5, :]
+            shift_sa = ops.reshape(
+                shift_sa, [shift_sa.shape[0], 1, shift_sa.shape[1]]
+            )
+            scale_sa = ops.reshape(
+                scale_sa, [scale_sa.shape[0], 1, scale_sa.shape[1]]
+            )
+            gate_sa = ops.reshape(
+                gate_sa, [gate_sa.shape[0], 1, gate_sa.shape[1]]
+            )
+            shift_ff = ops.reshape(
+                shift_ff, [shift_ff.shape[0], 1, shift_ff.shape[1]]
+            )
+            scale_ff = ops.reshape(
+                scale_ff, [scale_ff.shape[0], 1, scale_ff.shape[1]]
+            )
+            gate_ff = ops.reshape(
+                gate_ff, [gate_ff.shape[0], 1, gate_ff.shape[1]]
+            )
+        elif len(timestep_proj.shape) == 4:
+            mod = (
+                ops.reshape(self.scale_shift_table, [1, 1, 6, self.dim])
+                + timestep_proj
+            )
+            shift_sa = mod[:, :, 0, :]
+            scale_sa = mod[:, :, 1, :]
+            gate_sa = mod[:, :, 2, :]
+            shift_ff = mod[:, :, 3, :]
+            scale_ff = mod[:, :, 4, :]
+            gate_ff = mod[:, :, 5, :]
+        else:
+            raise ValueError(
+                f"Unsupported timestep projection rank {len(timestep_proj.shape)}."
+            )
 
-        # Split into 6 modulation parameters
-        shift_sa, scale_sa, gate_sa = (
-            mod[:, 0:1, :],
-            mod[:, 1:2, :],
-            mod[:, 2:3, :],
-        )
-        shift_ff, scale_ff, gate_ff = (
-            mod[:, 3:4, :],
-            mod[:, 4:5, :],
-            mod[:, 5:6, :],
-        )
-
-        # Self-attention
         x = self.norm1(hidden_states)
         x = x * (1 + scale_sa) + shift_sa
         x = self.attn1(x, rotary_emb)
         hidden_states = hidden_states + gate_sa * x
 
-        # Cross-attention (with optional image KV for 2.1 I2V)
         x = self.norm2(hidden_states)
         x = self.attn2(x, encoder_hidden_states, image_embeds=image_embeds)
         hidden_states = hidden_states + x
 
-        # Feed-forward
         x = self.norm3(hidden_states)
         x = x * (1 + scale_ff) + shift_ff
         x = self.ffn(x)
         hidden_states = hidden_states + gate_ff * x
-
         return hidden_states
 
 
 class WanTransformerPreProcess(Module):
-    """Patch embedding + condition embedding (compiled separately)."""
-
     def __init__(
         self,
         config: WanConfigBase,
@@ -696,8 +677,6 @@ class WanTransformerPreProcess(Module):
 
 
 class WanTransformerPostProcess(Module):
-    """Output modulation + unpatchify (compiled separately)."""
-
     def __init__(
         self,
         config: WanConfigBase,
@@ -741,12 +720,27 @@ class WanTransformerPostProcess(Module):
         pph = spatial_shape.shape[1]
         ppw = spatial_shape.shape[2]
 
-        mod = self.scale_shift_table + ops.reshape(
-            temb, [batch_size, 1, self.inner_dim]
-        )
-        shift = mod[:, :1, :]
-        scale = mod[:, 1:, :]
-        hs = self.norm_out(hidden_states) * (1.0 + scale) + shift
+        hs = self.norm_out(hidden_states)
+        if len(temb.shape) == 2:
+            mod = self.scale_shift_table + ops.reshape(
+                temb, [batch_size, 1, self.inner_dim]
+            )
+            shift = mod[:, 0, :]
+            scale = mod[:, 1, :]
+            shift = ops.reshape(shift, [batch_size, 1, self.inner_dim])
+            scale = ops.reshape(scale, [batch_size, 1, self.inner_dim])
+        elif len(temb.shape) == 3:
+            mod = ops.reshape(
+                self.scale_shift_table, [1, 1, 2, self.inner_dim]
+            ) + ops.reshape(
+                temb, [batch_size, temb.shape[1], 1, self.inner_dim]
+            )
+            shift = mod[:, :, 0, :]
+            scale = mod[:, :, 1, :]
+        else:
+            raise ValueError(f"Unsupported temb rank {len(temb.shape)}.")
+
+        hs = hs * (1.0 + scale) + shift
         hs = self.proj_out(hs)
         hs = ops.rebind(
             hs,
@@ -756,7 +750,6 @@ class WanTransformerPostProcess(Module):
                 self.out_channels * p_t * p_h * p_w,
             ],
         )
-
         hs = ops.reshape(
             hs,
             [batch_size, ppf, pph, ppw, p_t, p_h, p_w, self.out_channels],
@@ -770,8 +763,6 @@ class WanTransformerPostProcess(Module):
 
 
 class WanTransformer3DModel(Module):
-    """Full transformer (for reference / single-graph compilation)."""
-
     def __init__(
         self,
         config: WanConfigBase,
@@ -815,6 +806,7 @@ class WanTransformer3DModel(Module):
                     text_dim=dim,
                     cross_attn_norm=config.cross_attn_norm,
                     eps=config.eps,
+                    added_kv_proj_dim=config.added_kv_proj_dim,
                     dtype=dtype,
                     device=device,
                 )
@@ -848,13 +840,13 @@ class WanTransformer3DModel(Module):
         rope_sin: TensorValue,
     ) -> TensorValue:
         batch_size = hidden_states.shape[0]
-        orig_T = hidden_states.shape[2]
-        orig_H = hidden_states.shape[3]
-        orig_W = hidden_states.shape[4]
+        orig_t = hidden_states.shape[2]
+        orig_h = hidden_states.shape[3]
+        orig_w = hidden_states.shape[4]
         p_t, p_h, p_w = self.patch_size
-        ppf = orig_T // p_t
-        pph = orig_H // p_h
-        ppw = orig_W // p_w
+        ppf = orig_t // p_t
+        pph = orig_h // p_h
+        ppw = orig_w // p_w
 
         hs = ops.permute(hidden_states, [0, 2, 3, 4, 1])
         hs = self.patch_embedding(hs)
@@ -866,7 +858,6 @@ class WanTransformer3DModel(Module):
             timestep, encoder_hidden_states
         )
 
-        # Rebind RoPE to match the sequence length derived from spatial dims.
         seq_len = ppf * pph * ppw
         rope_cos = ops.rebind(rope_cos, shape=[seq_len, self.head_dim])
         rope_sin = ops.rebind(rope_sin, shape=[seq_len, self.head_dim])
@@ -874,14 +865,24 @@ class WanTransformer3DModel(Module):
         for block in self.blocks:
             hs = block(hs, text_emb, timestep_proj, rope_cos, rope_sin)
 
-        mod = self.scale_shift_table + ops.reshape(
-            temb, [batch_size, 1, self.inner_dim]
-        )
-        shift = mod[:, :1, :]
-        scale = mod[:, 1:, :]
-        hs = self.norm_out(hs) * (1.0 + scale) + shift
-        hs = self.proj_out(hs)
+        hs = self.norm_out(hs)
+        if len(temb.shape) == 2:
+            mod = self.scale_shift_table + ops.reshape(
+                temb, [batch_size, 1, self.inner_dim]
+            )
+            shift = ops.reshape(mod[:, 0, :], [batch_size, 1, self.inner_dim])
+            scale = ops.reshape(mod[:, 1, :], [batch_size, 1, self.inner_dim])
+        else:
+            mod = ops.reshape(
+                self.scale_shift_table, [1, 1, 2, self.inner_dim]
+            ) + ops.reshape(
+                temb, [batch_size, temb.shape[1], 1, self.inner_dim]
+            )
+            shift = mod[:, :, 0, :]
+            scale = mod[:, :, 1, :]
 
+        hs = hs * (1.0 + scale) + shift
+        hs = self.proj_out(hs)
         hs = ops.reshape(
             hs,
             [batch_size, ppf, pph, ppw, p_t, p_h, p_w, self.out_channels],

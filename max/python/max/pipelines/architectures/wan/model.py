@@ -12,6 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from __future__ import annotations
+
 import logging
 import threading
 from collections.abc import Callable
@@ -270,6 +271,7 @@ class WanTransformerModel(ComponentModel):
         self._lora_scale = lora_scale
         self._lora_merged = False
         self.model: BlockLevelModel | None = None
+        self._compiled_signature: tuple[int, int, int] | None = None
         self._weight_registry_cache: dict[
             int,
             tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
@@ -430,8 +432,21 @@ class WanTransformerModel(ComponentModel):
         for symbolic dims (~18.5 GB vs ~6.5 GB concrete for 720p).
         """
         with self._load_lock:
-            if self.model is not None:
+            requested_signature = (batch_size, seq_len, seq_text_len)
+            if (
+                self.model is not None
+                and self._compiled_signature == requested_signature
+            ):
                 return self.__call__
+            if self.model is not None:
+                logger.info(
+                    "Recompiling block graph for batch=%d, seq_len=%d, seq_text=%d "
+                    "(previous batch=%d, seq_len=%d, seq_text=%d)",
+                    batch_size,
+                    seq_len,
+                    seq_text_len,
+                    *self._compiled_signature,
+                )
 
             state_dict = self._ensure_state_dict()
 
@@ -457,7 +472,13 @@ class WanTransformerModel(ComponentModel):
                     ],
                     device=dev,
                 ),
-                TensorType(DType.float32, ["batch"], device=dev),
+                TensorType(
+                    DType.float32,
+                    ["batch", seq_len]
+                    if self.config.expand_timesteps
+                    else ["batch"],
+                    device=dev,
+                ),
                 TensorType(
                     dtype,
                     ["batch", seq_text_len, self.config.text_dim],
@@ -477,13 +498,15 @@ class WanTransformerModel(ComponentModel):
                 pre_graph, weights_registry=pre_module.state_dict()
             )
             block_input_types = [
+                TensorType(dtype, [batch_size, seq_len, dim], device=dev),
+                TensorType(dtype, [batch_size, seq_text_len, dim], device=dev),
                 TensorType(
-                    dtype, [batch_size, seq_len, dim], device=dev
+                    dtype,
+                    [batch_size, seq_len, 6, dim]
+                    if self.config.expand_timesteps
+                    else [batch_size, 6, dim],
+                    device=dev,
                 ),
-                TensorType(
-                    dtype, [batch_size, seq_text_len, dim], device=dev
-                ),
-                TensorType(dtype, [batch_size, 6, dim], device=dev),
                 TensorType(
                     DType.float32,
                     [seq_len, self.config.attention_head_dim],
@@ -539,11 +562,20 @@ class WanTransformerModel(ComponentModel):
             logger.info(
                 "Compiled block graph (batch=%d, seq_len=%d, "
                 "seq_text=%d, %d layers)",
-                batch_size, seq_len, seq_text_len, len(block_models),
+                batch_size,
+                seq_len,
+                seq_text_len,
+                len(block_models),
             )
             post_input_types = [
                 TensorType(dtype, ["batch", "seq_len", dim], device=dev),
-                TensorType(dtype, ["batch", dim], device=dev),
+                TensorType(
+                    dtype,
+                    ["batch", "seq_len", dim]
+                    if self.config.expand_timesteps
+                    else ["batch", dim],
+                    device=dev,
+                ),
                 TensorType(DType.int8, ["ppf", "pph", "ppw"], device=dev),
             ]
             post_module = WanTransformerPostProcess(
@@ -559,6 +591,7 @@ class WanTransformerModel(ComponentModel):
                 post_graph, weights_registry=post_module.state_dict()
             )
             self.model = BlockLevelModel(pre_model, block_models, post_model)
+            self._compiled_signature = requested_signature
             return self.__call__
 
     def compute_rope(
