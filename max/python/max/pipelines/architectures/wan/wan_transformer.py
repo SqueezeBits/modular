@@ -16,7 +16,7 @@ from __future__ import annotations
 from math import prod
 
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
 from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu
 from max.nn.layer import LayerList, Module
@@ -58,12 +58,7 @@ class WanConv3d(Module):
 
 
 class WanLayerNorm(Module):
-    """LayerNorm using decomposed ops for float32 numerical stability.
-
-    The built-in ``layer_norm_gpu_block`` kernel hits
-    ``CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`` for dim=5120, so we decompose
-    into basic ops (mean, rsqrt, multiply) that each launch small kernels.
-    """
+    """LayerNorm using built-in fused GPU kernel."""
 
     def __init__(
         self,
@@ -86,25 +81,26 @@ class WanLayerNorm(Module):
                 self.bias = Weight("bias", dtype, [dim], device)
 
     def __call__(self, x: TensorValue) -> TensorValue:
-        original_dtype = x.dtype
-        x = ops.cast(x, DType.float32)
-        mean = ops.mean(x, axis=-1)
-        x = x - mean
-        var = ops.mean(x * x, axis=-1)
-        x = x * ops.rsqrt(var + self.eps)
+        # Pass bf16 directly — the kernel handles precision internally.
+        if self.has_weight and self.has_bias:
+            return ops.layer_norm(
+                x, self.weight, self.bias, epsilon=self.eps
+            )
         if self.has_weight:
-            x = x * ops.cast(self.weight, DType.float32)
-            if self.has_bias:
-                x = x + ops.cast(self.bias, DType.float32)
-        return ops.cast(x, original_dtype)
+            return ops.layer_norm(x, self.weight, epsilon=self.eps)
+        ones = ops.broadcast_to(
+            ops.constant(1.0, dtype=x.dtype, device=x.device),
+            [self.dim],
+        )
+        zeros = ops.broadcast_to(
+            ops.constant(0.0, dtype=x.dtype, device=x.device),
+            [self.dim],
+        )
+        return ops.layer_norm(x, ones, zeros, epsilon=self.eps)
 
 
 class WanRMSNorm(Module):
-    """RMSNorm using decomposed ops for float32 numerical stability.
-
-    Same reason as WanLayerNorm: the built-in ``rms_norm`` custom kernel
-    may also hit resource limits for dim=5120.
-    """
+    """RMSNorm using built-in fused GPU kernel."""
 
     def __init__(
         self,
@@ -119,12 +115,21 @@ class WanRMSNorm(Module):
         self.eps = eps
 
     def __call__(self, x: TensorValue) -> TensorValue:
-        original_dtype = x.dtype
-        x = ops.cast(x, DType.float32)
-        rms = ops.mean(x * x, axis=-1)
-        x = x * ops.rsqrt(rms + self.eps)
-        x = x * ops.cast(self.weight, DType.float32)
-        return ops.cast(x, original_dtype)
+        weight = ops.cast(self.weight, x.dtype)
+        if x.device:
+            weight = weight.to(x.device)
+        return ops.custom(
+            "rms_norm",
+            x.device,
+            [
+                x,
+                weight,
+                ops.constant(self.eps, dtype=x.dtype, device=DeviceRef.CPU()),
+                ops.constant(0.0, dtype=x.dtype, device=DeviceRef.CPU()),
+            ],
+            [TensorType(dtype=x.dtype, shape=x.shape, device=x.device)],
+            parameters={"multiply_before_cast": True},
+        )[0].tensor
 
 
 class WanTextProjection(Module):
@@ -309,14 +314,12 @@ class WanSelfAttention(Module):
         self.head_dim = head_dim
         self.inner_dim = dim
 
-        self.to_q = Linear(
-            in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
-        )
-        self.to_k = Linear(
-            in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
-        )
-        self.to_v = Linear(
-            in_dim=dim, out_dim=dim, dtype=dtype, device=device, has_bias=True
+        self.to_qkv = Linear(
+            in_dim=dim,
+            out_dim=dim * 3,
+            dtype=dtype,
+            device=device,
+            has_bias=True,
         )
         self.norm_q = WanRMSNorm(dim, eps=eps, dtype=dtype, device=device)
         self.norm_k = WanRMSNorm(dim, eps=eps, dtype=dtype, device=device)
@@ -329,9 +332,10 @@ class WanSelfAttention(Module):
         hidden_states: TensorValue,
         rotary_emb: tuple[TensorValue, TensorValue],
     ) -> TensorValue:
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
+        qkv = self.to_qkv(hidden_states)  # [B, S, 3*D]
+        query = qkv[:, :, : self.inner_dim]
+        key = qkv[:, :, self.inner_dim : self.inner_dim * 2]
+        value = qkv[:, :, self.inner_dim * 2 :]
 
         # QK-norm applied across all heads (before reshape)
         query = self.norm_q(query)
@@ -351,7 +355,6 @@ class WanSelfAttention(Module):
         )
 
         # Apply RoPE
-        original_dtype = query.dtype
         query = apply_rotary_emb(
             query,
             rotary_emb,
@@ -366,8 +369,6 @@ class WanSelfAttention(Module):
             use_real_unbind_dim=-1,
             sequence_dim=1,
         )
-        query = ops.cast(query, original_dtype)
-        key = ops.cast(key, original_dtype)
 
         # Flash attention
         scale = 1.0 / (self.head_dim**0.5)
@@ -384,7 +385,6 @@ class WanSelfAttention(Module):
             hidden_states,
             [hidden_states.shape[0], hidden_states.shape[1], self.inner_dim],
         )
-        hidden_states = ops.cast(hidden_states, original_dtype)
 
         return self.to_out(hidden_states)
 
@@ -488,7 +488,6 @@ class WanCrossAttention(Module):
         )
 
         # Flash attention (no RoPE for cross-attention)
-        original_dtype = query.dtype
         scale = 1.0 / (self.head_dim**0.5)
         hidden_states = flash_attention_gpu(
             query,
@@ -503,7 +502,6 @@ class WanCrossAttention(Module):
             hidden_states,
             [hidden_states.shape[0], hidden_states.shape[1], self.inner_dim],
         )
-        hidden_states = ops.cast(hidden_states, original_dtype)
 
         return self.to_out(hidden_states)
 

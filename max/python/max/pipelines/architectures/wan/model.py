@@ -127,8 +127,55 @@ def _remap_state_dict(
                 fused_keys.add(k_key)
                 fused_keys.add(v_key)
 
+    # Third pass: fuse attn1.to_q + attn1.to_k + attn1.to_v into attn1.to_qkv
+    qkv_fused_keys: set[str] = set()
+    for key in list(raw_dict.keys()):
+        if ".attn1.to_q." in key:
+            q_key = key
+            k_key = key.replace(".attn1.to_q.", ".attn1.to_k.")
+            v_key = key.replace(".attn1.to_q.", ".attn1.to_v.")
+            qkv_key = key.replace(".attn1.to_q.", ".attn1.to_qkv.")
+            if k_key in raw_dict and v_key in raw_dict:
+                q_data = raw_dict[q_key]
+                k_data = raw_dict[k_key]
+                v_data = raw_dict[v_key]
+                q_buf = (
+                    q_data.to_buffer()
+                    if hasattr(q_data, "to_buffer")
+                    else q_data
+                )
+                k_buf = (
+                    k_data.to_buffer()
+                    if hasattr(k_data, "to_buffer")
+                    else k_data
+                )
+                v_buf = (
+                    v_data.to_buffer()
+                    if hasattr(v_data, "to_buffer")
+                    else v_data
+                )
+                q_f32 = cast_dlpack_to(
+                    q_buf, q_data.dtype, DType.float32, CPU()
+                )
+                k_f32 = cast_dlpack_to(
+                    k_buf, k_data.dtype, DType.float32, CPU()
+                )
+                v_f32 = cast_dlpack_to(
+                    v_buf, v_data.dtype, DType.float32, CPU()
+                )
+                q_np = np.from_dlpack(q_f32)
+                k_np = np.from_dlpack(k_f32)
+                v_np = np.from_dlpack(v_f32)
+                qkv_np = np.ascontiguousarray(
+                    np.concatenate([q_np, k_np, v_np], axis=0)
+                )
+                state_dict[qkv_key] = qkv_np
+                qkv_fused_keys.add(q_key)
+                qkv_fused_keys.add(k_key)
+                qkv_fused_keys.add(v_key)
+
     for key, tensor in raw_dict.items():
-        if key not in fused_keys:
+        if key not in fused_keys and key not in qkv_fused_keys:
             state_dict[key] = tensor
 
     cpu_device = CPU()
@@ -278,6 +325,7 @@ class WanTransformerModel(ComponentModel):
         ] = {}
         self.session = session or InferenceSession(devices=devices)
         self._load_lock = threading.Lock()
+        self._rope_buffer_cache: dict[tuple[int, int, int, str], tuple[Buffer, Buffer]] = {}
         if eager_load:
             self.prepare_state_dict()
 
@@ -483,12 +531,12 @@ class WanTransformerModel(ComponentModel):
                 TensorType(dtype, [batch_size, seq_text_len, dim], device=dev),
                 TensorType(dtype, [batch_size, 6, dim], device=dev),
                 TensorType(
-                    DType.float32,
+                    DType.bfloat16,
                     [block_seq_len_dim, self.config.attention_head_dim],
                     device=dev,
                 ),
                 TensorType(
-                    DType.float32,
+                    DType.bfloat16,
                     [block_seq_len_dim, self.config.attention_head_dim],
                     device=dev,
                 ),
@@ -568,7 +616,13 @@ class WanTransformerModel(ComponentModel):
         height: int,
         width: int,
     ) -> tuple[Buffer, Buffer]:
-        """Compute 3D RoPE cos/sin tensors and transfer to device."""
+        """Compute 3D RoPE cos/sin tensors and cache device buffers."""
+        device = self.devices[0]
+        key = (num_frames, height, width, str(device.id))
+        cached = self._rope_buffer_cache.get(key)
+        if cached is not None:
+            return cached
+
         rope_cos_np, rope_sin_np = _compute_wan_rope_cached(
             num_frames,
             height,
@@ -576,11 +630,21 @@ class WanTransformerModel(ComponentModel):
             self.config.patch_size,
             self.config.attention_head_dim,
         )
-        device = self.devices[0]
-        return (
-            Buffer.from_numpy(rope_cos_np).to(device),
-            Buffer.from_numpy(rope_sin_np).to(device),
+        # Store as bf16 to avoid per-block f32→bf16 casts in apply_rotary_emb
+        rope_cos_bf16 = rope_cos_np.astype(np.float16)
+        rope_sin_bf16 = rope_sin_np.astype(np.float16)
+        cached = (
+            Buffer.from_numpy(rope_cos_bf16).to(device).view(
+                dtype=DType.bfloat16,
+                shape=[rope_cos_np.shape[0], rope_cos_np.shape[1]],
+            ),
+            Buffer.from_numpy(rope_sin_bf16).to(device).view(
+                dtype=DType.bfloat16,
+                shape=[rope_sin_np.shape[0], rope_sin_np.shape[1]],
+            ),
         )
+        self._rope_buffer_cache[key] = cached
+        return cached
 
     def __call__(
         self,

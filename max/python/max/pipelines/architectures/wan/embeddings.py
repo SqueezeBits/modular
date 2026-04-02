@@ -73,12 +73,18 @@ def apply_rotary_emb(
 
     if use_real_unbind_dim == -1:
         x_shape: list[Any] = list(x.shape)
-        new_shape: list[Any] = x_shape[:-1] + [x_shape[-1] // 2, 2]
+        half_dim = x_shape[-1] // 2
+        new_shape: list[Any] = x_shape[:-1] + [half_dim, 2]
         x_reshaped = ops.reshape(x, new_shape)
         x_real = x_reshaped[..., 0]
         x_imag = x_reshaped[..., 1]
-        x_rotated_stacked = ops.stack([-x_imag, x_real], axis=-1)
-        x_rotated = ops.reshape(x_rotated_stacked, x_shape)
+        # Swap pairs via gather [1,0] on the pair dim, then negate
+        # to get [-imag, real] interleaving without a concat/stack.
+        swap_idx = ops.constant([1, 0], DType.int64, x.device)
+        x_swapped = ops.gather(x_reshaped, swap_idx, axis=-1)
+        # Build negate mask [-1, 1] to turn [imag, real] → [-imag, real]
+        negate = ops.constant([-1.0, 1.0], input_dtype, x.device)
+        x_rotated = ops.reshape(x_swapped * negate, x_shape)
     elif use_real_unbind_dim == -2:
         x_shape = list(x.shape)
         new_shape = x_shape[:-1] + [2, x_shape[-1] // 2]
@@ -91,10 +97,12 @@ def apply_rotary_emb(
             f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
         )
 
-    out = ops.cast(x, DType.float32) * ops.cast(cos, DType.float32) + ops.cast(
-        x_rotated, DType.float32
-    ) * ops.cast(sin, DType.float32)
-    return ops.cast(out, input_dtype)
+    # Cast cos/sin to input dtype only if needed (skip if already matching)
+    if cos.dtype != input_dtype:
+        cos = ops.cast(cos, input_dtype)
+    if sin.dtype != input_dtype:
+        sin = ops.cast(sin, input_dtype)
+    return x * cos + x_rotated * sin
 
 
 class Timesteps(Module):
