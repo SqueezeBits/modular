@@ -163,6 +163,8 @@ __all__ = [
     "supported_encoding_supported_devices",
     "supported_encoding_supported_on",
     "token_sampler",
+    "load_video_frames",
+    "save_video",
     "try_to_load_from_cache",
     "upper_bounded_default",
     "validate_hf_repo_access",
