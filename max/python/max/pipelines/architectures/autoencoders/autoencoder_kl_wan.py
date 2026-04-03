@@ -57,6 +57,49 @@ from .vae import (
 logger = logging.getLogger(__name__)
 
 
+def _remap_wan_encoder_state_dict_keys(
+    state_dict: dict[str, Any],
+    *,
+    num_res_blocks: int,
+    num_levels: int,
+) -> dict[str, Any]:
+    """Map hierarchical HF encoder down_block keys onto MAX's flat layout."""
+    remapped: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if not key.startswith("encoder.down_blocks."):
+            remapped[key] = value
+            continue
+
+        rest = key.removeprefix("encoder.down_blocks.")
+        parts = rest.split(".")
+        if len(parts) < 3:
+            remapped[key] = value
+            continue
+
+        level_idx = int(parts[0])
+        flat_idx = 0
+        for prior_level in range(level_idx):
+            flat_idx += num_res_blocks
+            if prior_level != num_levels - 1:
+                flat_idx += 1
+
+        if parts[1] == "resnets" and len(parts) >= 4:
+            res_idx = int(parts[2])
+            new_key = (
+                f"encoder.down_blocks.{flat_idx + res_idx}."
+                + ".".join(parts[3:])
+            )
+        elif parts[1] == "downsampler" and level_idx != num_levels - 1:
+            new_key = (
+                f"encoder.down_blocks.{flat_idx + num_res_blocks}."
+                + ".".join(parts[2:])
+            )
+        else:
+            new_key = key
+        remapped[new_key] = value
+    return remapped
+
+
 def _buffer_to_numpy_f32(buf: Buffer, cpu: CPU | None = None) -> np.ndarray:
     """Convert a Buffer (possibly bf16) to f32 numpy on CPU."""
     cpu_buf = buf.to(cpu or CPU())
@@ -83,6 +126,70 @@ def _numpy_f32_to_buffer(
     return Buffer.from_numpy(arr).to(device)
 
 
+def _patchify_spatial_numpy(video: np.ndarray, patch_size: int) -> np.ndarray:
+    """Fold spatial patches into channels for Wan2.2-style VAE inputs."""
+    if patch_size == 1:
+        return np.ascontiguousarray(video)
+    batch, channels, frames, height, width = video.shape
+    if height % patch_size != 0 or width % patch_size != 0:
+        raise ValueError(
+            "Video spatial dims must be divisible by patch_size, "
+            f"got {(height, width)} and patch_size={patch_size}."
+        )
+    video = video.reshape(
+        batch,
+        channels,
+        frames,
+        height // patch_size,
+        patch_size,
+        width // patch_size,
+        patch_size,
+    )
+    video = video.transpose(0, 1, 4, 6, 2, 3, 5)
+    return np.ascontiguousarray(
+        video.reshape(
+            batch,
+            channels * patch_size * patch_size,
+            frames,
+            height // patch_size,
+            width // patch_size,
+        )
+    )
+
+
+def _unpatchify_spatial_numpy(video: np.ndarray, patch_size: int) -> np.ndarray:
+    """Restore spatial patches from channels for Wan2.2-style VAE outputs."""
+    if patch_size == 1:
+        return np.ascontiguousarray(video)
+    batch, channels, frames, height, width = video.shape
+    patch_area = patch_size * patch_size
+    if channels % patch_area != 0:
+        raise ValueError(
+            "Patched channel count must be divisible by patch_size^2, "
+            f"got channels={channels}, patch_size={patch_size}."
+        )
+    base_channels = channels // patch_area
+    video = video.reshape(
+        batch,
+        base_channels,
+        patch_size,
+        patch_size,
+        frames,
+        height,
+        width,
+    )
+    video = video.transpose(0, 1, 4, 5, 2, 6, 3)
+    return np.ascontiguousarray(
+        video.reshape(
+            batch,
+            base_channels,
+            frames,
+            height * patch_size,
+            width * patch_size,
+        )
+    )
+
+
 class AutoencoderKLWanModel(ComponentModel):
     """Wan VAE model using MAX-native 3D modules (decoder + optional encoder).
 
@@ -101,6 +208,12 @@ class AutoencoderKLWanModel(ComponentModel):
         super().__init__(config, encoding, devices, weights)
         self.config = AutoencoderKLWanConfig.generate(config, encoding, devices)
         self.config.dtype = DType.bfloat16
+        # Keep the VAE on the proven non-residual MAX path for now.
+        # Wan2.2-specific support in this wrapper currently relies on
+        # patch_size / decoder_base_dim / channel-shape fixes; the residual
+        # encoder/decoder shortcut path is not yet stable under MAX graph
+        # symbolic compilation.
+        self.config.is_residual = False
 
         self.pqc_model: Model | None = None
         self.first_frame_model: Model | None = None
@@ -210,6 +323,12 @@ class AutoencoderKLWanModel(ComponentModel):
 
             # Compile encoder graphs (optional).
             if has_encoder:
+                if not self.config.is_residual:
+                    encoder_state_dict = _remap_wan_encoder_state_dict_keys(
+                        encoder_state_dict,
+                        num_res_blocks=self.config.num_res_blocks,
+                        num_levels=len(self.config.dim_mult),
+                    )
                 self._compile_encoder_graphs(encoder_state_dict)
 
             self.weights = None  # type: ignore[assignment]
@@ -263,7 +382,7 @@ class AutoencoderKLWanModel(ComponentModel):
         # Caches at the same decoder level share dim names so concat in
         # forward_cached sees matching dims on non-concat axes.
         decoder_for_shapes = Decoder3dCached(
-            dim=cfg.base_dim,
+            dim=int(cfg.decoder_base_dim or cfg.base_dim),
             z_dim=cfg.z_dim,
             dim_mult=tuple(cfg.dim_mult),
             num_res_blocks=cfg.num_res_blocks,
@@ -292,7 +411,7 @@ class AutoencoderKLWanModel(ComponentModel):
             for _ in up_block.resnets:
                 cache_dim_names.append((h_name, w_name))
                 cache_dim_names.append((h_name, w_name))
-            if up_block.upsamplers is not None:
+            if up_block.upsampler is not None:
                 if up_block._has_temporal_upsample:
                     cache_dim_names.append((h_name, w_name))
                 level += 1
@@ -339,7 +458,7 @@ class AutoencoderKLWanModel(ComponentModel):
             encoder_state_dict, weight_alignment=1, strict=False
         )
         first_input_type = TensorType(
-            dtype, [1, 3, 1, "height", "width"], device=dev
+            dtype, [1, cfg.in_channels, 1, "height", "width"], device=dev
         )
         with Graph(
             "wan_vae_enc_first", input_types=[first_input_type]
@@ -358,7 +477,7 @@ class AutoencoderKLWanModel(ComponentModel):
         encoder_for_shapes = Encoder3dCached(
             dim=cfg.base_dim,
             z_dim=cfg.z_dim,
-            in_channels=3,
+            in_channels=cfg.in_channels,
             dim_mult=cfg.dim_mult,
             num_res_blocks=cfg.num_res_blocks,
             temporal_downsample=cfg.temporal_downsample,
@@ -373,7 +492,13 @@ class AutoencoderKLWanModel(ComponentModel):
         rest_input_types = [
             TensorType(
                 dtype,
-                [1, 3, WAN_ENCODER_CHUNK_SIZE, "height", "width"],
+                [
+                    1,
+                    cfg.in_channels,
+                    WAN_ENCODER_CHUNK_SIZE,
+                    "height",
+                    "width",
+                ],
                 device=dev,
             )
         ]
@@ -460,6 +585,8 @@ class AutoencoderKLWanModel(ComponentModel):
                 decoded_frames.append(_buffer_to_numpy_f32(decoded_buf, cpu))
 
         stitched = np.ascontiguousarray(np.concatenate(decoded_frames, axis=2))
+        patch_size = int(self.config.patch_size or 1)
+        stitched = _unpatchify_spatial_numpy(stitched, patch_size)
         return Buffer.from_numpy(stitched)
 
     def decode_4d(self, latents_4d: Buffer) -> Buffer:
@@ -508,6 +635,8 @@ class AutoencoderKLWanModel(ComponentModel):
             )
 
         video_np = _buffer_to_numpy_f32(video, CPU())
+        patch_size = int(self.config.patch_size or 1)
+        video_np = _patchify_spatial_numpy(video_np, patch_size)
         target_dtype = self.config.dtype
         device = self.devices[0]
         cpu = CPU()
@@ -572,9 +701,13 @@ class AutoencoderKLWanModel(ComponentModel):
                 f"got {image_f32.shape[0]} and {batch_size}."
             )
 
-        chunks = [image_f32[:, :, np.newaxis, :, :]]
+        patch_size = int(self.config.patch_size or 1)
+        patched_first = _patchify_spatial_numpy(
+            image_f32[:, :, np.newaxis, :, :], patch_size
+        )
+        chunks = [patched_first]
         if num_frames > 1:
-            _, channels, height, width = image_f32.shape
+            _, channels, _, height, width = patched_first.shape
             zero_chunk = np.zeros(
                 (batch_size, channels, WAN_ENCODER_CHUNK_SIZE, height, width),
                 dtype=np.float32,

@@ -32,6 +32,11 @@ def get_timestep_embedding(
     scale: float = 1,
     max_period: int = 10000,
 ) -> TensorValue:
+    if timesteps.rank == 2:
+        timesteps = ops.reshape(
+            timesteps, [timesteps.shape[0] * timesteps.shape[1]]
+        )
+
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * ops.range(
         0, half_dim, dtype=DType.float32, device=timesteps.device

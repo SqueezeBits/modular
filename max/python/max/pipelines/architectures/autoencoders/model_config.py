@@ -141,9 +141,17 @@ class AutoencoderKLWanConfig(AutoencoderKLWanConfigBase):
         encoding: SupportedEncoding,
         devices: list[Device],
     ) -> "AutoencoderKLWanConfig":
+        normalized_config = dict(config_dict)
+        if (
+            "temperal_downsample" in normalized_config
+            and "temporal_downsample" not in normalized_config
+        ):
+            normalized_config["temporal_downsample"] = normalized_config.pop(
+                "temperal_downsample"
+            )
         init_dict = {
             key: value
-            for key, value in config_dict.items()
+            for key, value in normalized_config.items()
             if key in AutoencoderKLWanConfigBase.__annotations__
         }
         init_dict.update(

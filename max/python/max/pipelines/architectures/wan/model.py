@@ -255,6 +255,7 @@ class WanTransformerModel(ComponentModel):
         seq_text_len: int,
         seq_len: int,
         batch_size: int = 1,
+        expand_timesteps: bool = False,
     ) -> Callable[..., Any]:
         """Compile the transformer as separate pre/block/post graphs.
 
@@ -290,7 +291,11 @@ class WanTransformerModel(ComponentModel):
                     ],
                     device=dev,
                 ),
-                TensorType(DType.float32, ["batch"], device=dev),
+                TensorType(
+                    DType.float32,
+                    ["batch", "seq_len"] if expand_timesteps else ["batch"],
+                    device=dev,
+                ),
                 TensorType(
                     dtype,
                     ["batch", seq_text_len, self.config.text_dim],
@@ -315,7 +320,15 @@ class WanTransformerModel(ComponentModel):
                     dtype, [batch_size, block_seq_len_dim, dim], device=dev
                 ),
                 TensorType(dtype, [batch_size, seq_text_len, dim], device=dev),
-                TensorType(dtype, [batch_size, 6, dim], device=dev),
+                TensorType(
+                    dtype,
+                    (
+                        [batch_size, block_seq_len_dim, 6, dim]
+                        if expand_timesteps
+                        else [batch_size, 6, dim]
+                    ),
+                    device=dev,
+                ),
                 TensorType(
                     DType.float32,
                     [block_seq_len_dim, self.config.attention_head_dim],
@@ -378,7 +391,13 @@ class WanTransformerModel(ComponentModel):
             )
             post_input_types = [
                 TensorType(dtype, ["batch", "seq_len", dim], device=dev),
-                TensorType(dtype, ["batch", dim], device=dev),
+                TensorType(
+                    dtype,
+                    ["batch", "seq_len", dim]
+                    if expand_timesteps
+                    else ["batch", dim],
+                    device=dev,
+                ),
                 TensorType(DType.int8, ["ppf", "pph", "ppw"], device=dev),
             ]
             post_module = WanTransformerPostProcess(

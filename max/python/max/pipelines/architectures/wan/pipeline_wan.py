@@ -37,6 +37,10 @@ from max.profiler import Tracer, traced
 from tqdm.auto import tqdm
 
 from ..autoencoders import AutoencoderKLWanModel
+from ..autoencoders.autoencoder_kl_wan import (
+    _buffer_to_numpy_f32 as _vae_buffer_to_numpy_f32,
+    _numpy_f32_to_buffer as _numpy_f32_to_device_buffer,
+)
 from ..umt5 import UMT5Model
 from .model import WanTransformerModel
 
@@ -110,6 +114,7 @@ class WanPipeline(DiffusionPipeline):
     split_cfg_predictions: CompileWrapper
     _cast_f32_to_model_dtype: CompileWrapper
     _denorm: CompileWrapper
+    _restore_ti2v_condition: CompileWrapper
 
     components = {
         "vae": AutoencoderKLWanModel,
@@ -209,11 +214,8 @@ class WanPipeline(DiffusionPipeline):
         self.num_train_timesteps = int(
             scheduler_cfg.get("num_train_timesteps", 1000)
         )
-        transformer_cfg = components_cfg.get("transformer", {}).get(
-            "config_dict", {}
-        )
         self.expand_timesteps = bool(
-            transformer_cfg.get("expand_timesteps", False)
+            diffusers_config.get("expand_timesteps", False)
         )
 
         device = self.transformer.devices[0]
@@ -289,6 +291,7 @@ class WanPipeline(DiffusionPipeline):
         self.transformer.load_model(
             seq_text_len=self.embed_seq_len,
             seq_len=seq_len,
+            expand_timesteps=self.expand_timesteps,
         )
 
         self.build_guidance()
@@ -300,6 +303,8 @@ class WanPipeline(DiffusionPipeline):
         self.build_cast_f32_to_model_dtype()
         self.build_cast_model_dtype_to_f32()
         self.build_denorm()
+        if self.expand_timesteps:
+            self.build_restore_ti2v_condition()
 
         self.cache: WanRuntimeCache = WanRuntimeCache()
 
@@ -377,7 +382,13 @@ class WanPipeline(DiffusionPipeline):
         device = self.transformer.devices[0]
         self.__dict__["duplicate_cfg_timesteps"] = max_compile(
             self._duplicate_batch,
-            input_types=[TensorType(DType.float32, shape=[1], device=device)],
+            input_types=[
+                TensorType(
+                    DType.float32,
+                    shape=[1, "seq_len"] if self.expand_timesteps else [1],
+                    device=device,
+                )
+            ],
         )
 
     def build_concat_cfg_prompt_embeddings(self) -> None:
@@ -465,6 +476,37 @@ class WanPipeline(DiffusionPipeline):
                 result = result[:, :, 1:, :, :]
             g.output(result)
         self.__dict__["_denorm"] = self.session.load(g)
+
+    def build_restore_ti2v_condition(self) -> None:
+        """Compile a helper that restores the conditioned first latent frame."""
+        device = self.transformer.devices[0]
+        z_dim = int(self.vae.config.z_dim)
+        input_types = [
+            TensorType(
+                DType.float32,
+                ["batch", z_dim, "frames", "height", "width"],
+                device=device,
+            ),
+            TensorType(
+                DType.float32,
+                ["batch", z_dim, 1, "height", "width"],
+                device=device,
+            ),
+        ]
+        with Graph("wan_restore_ti2v_condition", input_types=input_types) as g:
+            latents, conditioned_frame = (v.tensor for v in g.inputs)
+            remaining_frames = ops.slice_tensor(
+                latents,
+                [
+                    slice(None),
+                    slice(None),
+                    slice(1, None),
+                    slice(None),
+                    slice(None),
+                ],
+            )
+            g.output(ops.concat([conditioned_frame, remaining_frames], axis=2))
+        self.__dict__["_restore_ti2v_condition"] = self.session.load(g)
 
     @staticmethod
     def _duplicate_batch(value: Any) -> Any:
@@ -592,6 +634,7 @@ class WanPipeline(DiffusionPipeline):
             step_coefficients=getattr(context, "step_coefficients", None),
             boundary_timestep=getattr(context, "boundary_timestep", None),
             input_image=getattr(context, "input_image", None),
+            expand_timesteps=self.expand_timesteps,
         )
 
         if model_inputs.latents.ndim == 5:
@@ -751,6 +794,15 @@ class WanPipeline(DiffusionPipeline):
             latents = Buffer.from_numpy(
                 np.ascontiguousarray(model_inputs.latents, dtype=np.float32)
             ).to(device)
+        conditioned_first_frame: Buffer | None = None
+        if self.expand_timesteps and model_inputs.input_image is not None:
+            with Tracer("prepare_ti2v_condition"):
+                conditioned_first_frame = self._prepare_ti2v_condition_latents(
+                    model_inputs, device
+                )
+                latents = self._restore_conditioned_first_frame(
+                    latents, conditioned_first_frame
+                )
 
         # 3. Prepare scheduler state.
         with Tracer("prepare_scheduler"):
@@ -772,10 +824,20 @@ class WanPipeline(DiffusionPipeline):
                 height=int(latents.shape[3]),
                 width=int(latents.shape[4]),
             )
+            timestep_seq_len = (
+                self._compute_latent_seq_len(
+                    int(latents.shape[2]),
+                    int(latents.shape[3]),
+                    int(latents.shape[4]),
+                )
+                if self.expand_timesteps
+                else None
+            )
             batched_timesteps = self._get_batched_timesteps(
                 scheduler_timesteps=timesteps,
                 batch_size=int(latents.shape[0]),
                 device=device,
+                seq_len=timestep_seq_len,
             )
             coeff_buffers = [
                 Buffer.from_numpy(
@@ -845,6 +907,7 @@ class WanPipeline(DiffusionPipeline):
                 desc="Denoising (high-noise)" if has_moe else "Denoising",
                 spatial_shape=spatial_shape,
                 step_state=step_state,
+                conditioned_first_frame=conditioned_first_frame,
             )
 
             # Low-noise phase (MoE only).
@@ -870,6 +933,7 @@ class WanPipeline(DiffusionPipeline):
                     desc="Denoising (low-noise)",
                     spatial_shape=spatial_shape,
                     step_state=step_state,
+                    conditioned_first_frame=conditioned_first_frame,
                 )
 
         # 5. Decode.
@@ -899,6 +963,7 @@ class WanPipeline(DiffusionPipeline):
         desc: str,
         spatial_shape: Buffer,
         step_state: WanUniPCState,
+        conditioned_first_frame: Buffer | None = None,
     ) -> tuple[Buffer, WanUniPCState]:
         progress = tqdm(  # type: ignore[call-arg]
             step_range,
@@ -933,6 +998,10 @@ class WanPipeline(DiffusionPipeline):
                         coeff_buffers[i],
                         step_state,
                     )
+                    if conditioned_first_frame is not None:
+                        latents = self._restore_conditioned_first_frame(
+                            latents, conditioned_first_frame
+                        )
         return latents, step_state
 
     def _run_transformer_forward(
@@ -1029,24 +1098,102 @@ class WanPipeline(DiffusionPipeline):
         scheduler_timesteps: np.ndarray,
         batch_size: int,
         device: Device,
+        seq_len: int | None = None,
     ) -> list[Buffer]:
         key = (
             f"{batch_size}_{len(scheduler_timesteps)}_"
             f"{float(scheduler_timesteps[0]):.4f}_{float(scheduler_timesteps[-1]):.4f}_"
-            f"{device.id}"
+            f"{seq_len or 0}_{device.id}"
         )
         cached = self.cache.batched_timesteps.get(key)
         if cached is not None:
             return cached
 
-        batched_timesteps = [
-            Buffer.from_numpy(
-                np.full([batch_size], float(step_value), dtype=np.float32)
-            ).to(device)
-            for step_value in scheduler_timesteps
-        ]
+        if self.expand_timesteps:
+            if seq_len is None:
+                raise ValueError(
+                    "seq_len is required for Wan expanded timestep preparation."
+                )
+            batched_timesteps = [
+                Buffer.from_numpy(
+                    np.full(
+                        [batch_size, seq_len],
+                        float(step_value),
+                        dtype=np.float32,
+                    )
+                ).to(device)
+                for step_value in scheduler_timesteps
+            ]
+        else:
+            batched_timesteps = [
+                Buffer.from_numpy(
+                    np.full([batch_size], float(step_value), dtype=np.float32)
+                ).to(device)
+                for step_value in scheduler_timesteps
+            ]
         self.cache.batched_timesteps[key] = batched_timesteps
         return batched_timesteps
+
+    def _compute_latent_seq_len(
+        self,
+        latent_frames: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> int:
+        p_t, p_h, p_w = self.transformer.config.patch_size
+        return (latent_frames // p_t) * (latent_height // p_h) * (
+            latent_width // p_w
+        )
+
+    def _prepare_ti2v_condition_latents(
+        self,
+        model_inputs: WanModelInputs,
+        device: Device,
+    ) -> Buffer:
+        """Encode the conditioning image and normalize it into Wan latents."""
+        image = model_inputs.input_image
+        if image is None:
+            raise ValueError("Wan TI2V conditioning requires input_image.")
+        if not isinstance(image, np.ndarray):
+            image = np.asarray(image)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                "Expected TI2V input_image as HWC uint8 RGB array, "
+                f"got shape {image.shape}."
+            )
+
+        image_f32 = image.astype(np.float32) / 127.5 - 1.0
+        video_f32 = np.ascontiguousarray(
+            image_f32.transpose(2, 0, 1)[np.newaxis, :, np.newaxis, :, :]
+        )
+        encoded = self.vae.encode(
+            _numpy_f32_to_device_buffer(
+                video_f32, self.vae.config.dtype, device
+            )
+        )
+        latent_np = _vae_buffer_to_numpy_f32(encoded)
+        latent_np = latent_np[:, :, :1, :, :]
+
+        z_dim = int(self.vae.config.z_dim)
+        mean = np.asarray(self.vae.config.latents_mean, dtype=np.float32).reshape(
+            1, z_dim, 1, 1, 1
+        )
+        inv_std = 1.0 / np.asarray(
+            self.vae.config.latents_std, dtype=np.float32
+        ).reshape(1, z_dim, 1, 1, 1)
+        latent_np = np.ascontiguousarray((latent_np - mean) * inv_std)
+        return Buffer.from_numpy(latent_np).to(device)
+
+    def _restore_conditioned_first_frame(
+        self,
+        latents: Buffer,
+        conditioned_first_frame: Buffer,
+    ) -> Buffer:
+        if not self.expand_timesteps:
+            return latents
+        return self._restore_ti2v_condition.execute(
+            latents, conditioned_first_frame
+        )[0]
 
     def _get_t5_prompt_embeds(
         self,

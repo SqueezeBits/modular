@@ -323,13 +323,20 @@ class WanTransformerBlock(Module):
     ) -> TensorValue:
         rotary_emb = (rope_cos, rope_sin)
         mod = self.scale_shift_table + timestep_proj
-
-        shift_sa = mod[:, 0:1, :]
-        scale_sa = mod[:, 1:2, :]
-        gate_sa = mod[:, 2:3, :]
-        shift_ff = mod[:, 3:4, :]
-        scale_ff = mod[:, 4:5, :]
-        gate_ff = mod[:, 5:6, :]
+        if timestep_proj.rank == 4:
+            shift_sa = mod[:, :, 0, :]
+            scale_sa = mod[:, :, 1, :]
+            gate_sa = mod[:, :, 2, :]
+            shift_ff = mod[:, :, 3, :]
+            scale_ff = mod[:, :, 4, :]
+            gate_ff = mod[:, :, 5, :]
+        else:
+            shift_sa = mod[:, 0:1, :]
+            scale_sa = mod[:, 1:2, :]
+            gate_sa = mod[:, 2:3, :]
+            shift_ff = mod[:, 3:4, :]
+            scale_ff = mod[:, 4:5, :]
+            gate_ff = mod[:, 5:6, :]
 
         x = self.norm1(hidden_states)
         x = x * (1 + scale_sa) + shift_sa

@@ -186,15 +186,34 @@ class WanTimeTextImageEmbedding(Module):
         timesteps_emb = ops.cast(
             timesteps_emb, encoder_hidden_states.dtype
         )  # → bf16
+        if timestep.rank == 2:
+            timesteps_emb = ops.reshape(
+                timesteps_emb,
+                [
+                    timestep.shape[0],
+                    timestep.shape[1],
+                    timesteps_emb.shape[1],
+                ],
+            )
         temb = self.time_embedder(timesteps_emb)  # [B, dim]
 
         # Timestep projection for modulation: SiLU then linear
-        timestep_proj = self.time_proj(ops.silu(temb))  # [B, dim*6]
-        # Reshape to [B, 6, dim] for per-block modulation
-        timestep_proj = ops.reshape(
-            timestep_proj,
-            [timestep_proj.shape[0], 6, timestep_proj.shape[1] // 6],
-        )
+        timestep_proj = self.time_proj(ops.silu(temb))
+        if timestep.rank == 2:
+            timestep_proj = ops.reshape(
+                timestep_proj,
+                [
+                    timestep_proj.shape[0],
+                    timestep_proj.shape[1],
+                    6,
+                    timestep_proj.shape[2] // 6,
+                ],
+            )
+        else:
+            timestep_proj = ops.reshape(
+                timestep_proj,
+                [timestep_proj.shape[0], 6, timestep_proj.shape[1] // 6],
+            )
 
         # Text projection
         text_emb = self.text_embedder(encoder_hidden_states)  # [B, S, dim]
@@ -361,11 +380,18 @@ class WanTransformerPostProcess(Module):
         pph = spatial_shape.shape[1]
         ppw = spatial_shape.shape[2]
 
-        mod = self.scale_shift_table + ops.reshape(
-            temb, [batch_size, 1, self.inner_dim]
-        )
-        shift = mod[:, :1, :]
-        scale = mod[:, 1:, :]
+        if temb.rank == 3:
+            mod = ops.unsqueeze(self.scale_shift_table, 1) + ops.reshape(
+                temb, [batch_size, temb.shape[1], 1, self.inner_dim]
+            )
+            shift = mod[:, :, 0, :]
+            scale = mod[:, :, 1, :]
+        else:
+            mod = self.scale_shift_table + ops.reshape(
+                temb, [batch_size, 1, self.inner_dim]
+            )
+            shift = mod[:, :1, :]
+            scale = mod[:, 1:, :]
         hs = self.norm_out(hidden_states) * (1.0 + scale) + shift
         hs = self.proj_out(hs)
         hs = ops.rebind(
@@ -497,11 +523,18 @@ class WanTransformer3DModel(Module):
         for block in self.blocks:
             hs = block(hs, text_emb, timestep_proj, rope_cos, rope_sin)
 
-        mod = self.scale_shift_table + ops.reshape(
-            temb, [batch_size, 1, self.inner_dim]
-        )
-        shift = mod[:, :1, :]
-        scale = mod[:, 1:, :]
+        if temb.rank == 3:
+            mod = ops.unsqueeze(self.scale_shift_table, 1) + ops.reshape(
+                temb, [batch_size, temb.shape[1], 1, self.inner_dim]
+            )
+            shift = mod[:, :, 0, :]
+            scale = mod[:, :, 1, :]
+        else:
+            mod = self.scale_shift_table + ops.reshape(
+                temb, [batch_size, 1, self.inner_dim]
+            )
+            shift = mod[:, :1, :]
+            scale = mod[:, 1:, :]
         hs = self.norm_out(hs) * (1.0 + scale) + shift
         hs = self.proj_out(hs)
 
