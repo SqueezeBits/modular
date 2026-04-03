@@ -721,3 +721,101 @@ def conv2d_impl(session: InferenceSession) -> None:
         rtol=ACCURACY_RTOL,
         atol=ACCURACY_ATOL,
     )
+
+
+def conv2d_nhwc_fcrs_impl(session: InferenceSession) -> None:
+    """Test Conv2d with NHWC activations while still loading FCRS weights."""
+    torch.manual_seed(1234)
+
+    batch_size = 2
+    in_channels = 64
+    out_channels = 128
+    kernel_size = (3, 3)
+    stride = (1, 1)
+    padding = 1
+    height = 32
+    width = 32
+
+    is_gpu = not session.devices[0].is_host
+    torch_dtype = torch.float32
+    torch_device = torch.device("cuda") if is_gpu else torch.device("cpu")
+    max_dtype = DType.float32
+    max_device = DeviceRef.GPU() if is_gpu else DeviceRef.CPU()
+
+    torch_input = torch.rand(
+        size=(batch_size, in_channels, height, width),
+        dtype=torch_dtype,
+        device=torch_device,
+    )
+    max_input = torch_input.permute(0, 2, 3, 1).contiguous()
+
+    torch_conv = nn.Conv2d(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        bias=True,
+        device=torch_device,
+    )
+
+    max_conv = Conv2d(
+        kernel_size=kernel_size,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        dtype=max_dtype,
+        stride=stride,
+        padding=padding,
+        has_bias=True,
+        permute=True,
+        io_layout="nhwc",
+        device=max_device,
+    )
+
+    torch_conv.weight.data = nn.Parameter(
+        torch.rand(
+            size=torch_conv.weight.data.shape,
+            dtype=torch_dtype,
+            device=torch_device,
+        )
+    )
+    assert torch_conv.bias is not None
+    torch_conv.bias.data = nn.Parameter(
+        torch.rand(
+            size=torch_conv.bias.data.shape,
+            dtype=torch_dtype,
+            device=torch_device,
+        )
+    )
+
+    max_conv.load_state_dict(
+        {
+            "weight": torch_conv.weight.data.detach().cpu(),
+            "bias": torch_conv.bias.data.detach().cpu(),
+        }
+    )
+
+    with torch.no_grad():
+        torch_conv_result = (
+            torch_conv(torch_input).permute(0, 2, 3, 1).contiguous()
+        )
+
+    graph = Graph(
+        "conv2d_nhwc_fcrs",
+        max_conv,
+        input_types=(
+            TensorType(max_dtype, max_input.shape, device=max_device),
+        ),
+    )
+
+    compiled = session.load(graph, weights_registry=max_conv.state_dict())
+    graph_api_conv_result = compiled.execute(max_input)[0]
+    assert isinstance(graph_api_conv_result, Buffer)
+
+    np.testing.assert_allclose(
+        graph_api_conv_result.to_numpy(),
+        torch_conv_result.detach().cpu().numpy(),
+        equal_nan=True,
+        rtol=ACCURACY_RTOL,
+        atol=ACCURACY_ATOL,
+    )

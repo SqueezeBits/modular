@@ -42,11 +42,13 @@ import argparse
 import asyncio
 import base64
 import os
+import statistics
 import time
 from io import BytesIO
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 from max.driver import DeviceSpec
 from max.examples.diffusion.profiler import profile_execute
 from max.interfaces import (
@@ -63,7 +65,6 @@ from max.interfaces.request.open_responses import (
     InputImageContent,
     InputTextContent,
     OpenResponsesRequestBody,
-    OutputImageContent,
     UserMessage,
 )
 from max.pipelines import PIPELINE_REGISTRY, MAXModelConfig, PipelineConfig
@@ -136,6 +137,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional negative prompt to guide what NOT to generate.",
+    )
+    parser.add_argument(
+        "--warmup-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Prompt used for warmup requests. Defaults to a different generic "
+            "prompt so warmup does not prefill request-specific caches for the "
+            "measured prompt."
+        ),
     )
     parser.add_argument(
         "--height",
@@ -229,6 +240,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of iterations to run for profiling.",
     )
     parser.add_argument(
+        "--num-benchmark-iterations",
+        type=int,
+        default=0,
+        help=(
+            "Number of measured post-warmup iterations to run. "
+            "Prints full pipeline.execute latency statistics."
+        ),
+    )
+    parser.add_argument(
         "--first-block-caching",
         action="store_true",
         help="Enable first-block step cache optimization.",
@@ -289,6 +309,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Prefer the ModuleV3 implementation when the selected model provides one.",
     )
+    parser.add_argument(
+        "--diffusion-attention-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "max", "cudnn"],
+        help=(
+            "Attention backend for the diffusion transformer (DiT) only. "
+            "Text-encoder attention is unchanged."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -320,26 +350,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def save_image(image_data: str, output_path: str) -> None:
-    """Save base64-encoded image data to a file.
-
-    Args:
-        image_data: Base64-encoded image data string
-        output_path: Path where the image should be saved
-
-    Raises:
-        ImportError: If PIL is not available
-    """
-    try:
-        from PIL import Image
-
-        image_bytes = base64.b64decode(image_data)
-        image = Image.open(BytesIO(image_bytes))
-        image.save(output_path)
-        print(f"Image saved to: {output_path}")
-    except ImportError:
-        print("WARNING: PIL not available, cannot save image")
-        print(f"Base64 data length: {len(image_data)} chars")
+def save_numpy_image(image_array: np.ndarray, output_path: str) -> None:
+    """Save a raw HWC uint8 numpy image to a file."""
+    Image.fromarray(image_array).save(output_path)
+    print(f"Image saved to: {output_path}")
 
 
 def load_image_as_data_uri(image_path: str | None) -> str | None:
@@ -393,6 +407,7 @@ async def generate_image(args: argparse.Namespace) -> None:
         ),
         runtime=PipelineRuntimeConfig(
             prefer_module_v3=args.prefer_module_v3,
+            diffusion_attention_backend=args.diffusion_attention_backend,
         ),
     )
     arch = PIPELINE_REGISTRY.retrieve_architecture(
@@ -473,6 +488,11 @@ async def generate_image(args: argparse.Namespace) -> None:
     )
 
     print(f"Generating image for prompt: '{args.prompt}'")
+    warmup_prompt = args.warmup_prompt
+    if warmup_prompt is None and args.num_warmups > 0:
+        warmup_prompt = "a warmup image of abstract geometric shapes"
+        if warmup_prompt == args.prompt:
+            warmup_prompt = f"{warmup_prompt} with a different composition"
 
     # Step 4: Create an OpenResponsesRequest
     # Load input image if provided and convert to data URI
@@ -537,7 +557,8 @@ async def generate_image(args: argparse.Namespace) -> None:
     print(
         "Parameters: "
         f"steps={args.num_inference_steps}, guidance={args.guidance_scale}, "
-        f"cfg_norm={args.cfg_normalization}, cfg_trunc={args.cfg_truncation}"
+        f"cfg_norm={args.cfg_normalization}, cfg_trunc={args.cfg_truncation}, "
+        f"dit_attention_backend={args.diffusion_attention_backend}"
     )
 
     # Step 5: Create a PixelContext object from the request
@@ -599,7 +620,7 @@ async def generate_image(args: argparse.Namespace) -> None:
     if args.num_warmups > 0:
         body_warmup = OpenResponsesRequestBody(
             model=args.model,
-            input=args.prompt,
+            input=warmup_prompt,
             seed=args.seed,
             provider_options=ProviderOptions(
                 image=ImageProviderOptions(
@@ -626,8 +647,26 @@ async def generate_image(args: argparse.Namespace) -> None:
         )
         for i in range(args.num_warmups):
             print(f"Running warmup {i + 1} of {args.num_warmups}")
-            pipeline.execute(inputs_warmup)
+            model_inputs_warmup, flat_batch_warmup = pipeline.prepare_batch(
+                inputs_warmup.batch
+            )
+            if not flat_batch_warmup or model_inputs_warmup is None:
+                raise ValueError("No warmup inputs available for execution.")
+            pipeline._pipeline_model.execute(model_inputs=model_inputs_warmup)
         print("Warmup complete")
+
+    def _run_full_pipeline_once() -> tuple[np.ndarray, float]:
+        start_time = time.perf_counter()
+        model_inputs_local, flat_batch_local = pipeline.prepare_batch(
+            inputs.batch
+        )
+        if not flat_batch_local or model_inputs_local is None:
+            raise ValueError("No inputs available for execution.")
+        outputs_local = pipeline._pipeline_model.execute(
+            model_inputs=model_inputs_local
+        ).images
+        elapsed_local = time.perf_counter() - start_time
+        return outputs_local, elapsed_local
 
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
@@ -637,55 +676,59 @@ async def generate_image(args: argparse.Namespace) -> None:
                 print(
                     f"Running inference {i + 1} of {args.num_profile_iterations}"
                 )
-                outputs = pipeline.execute(inputs)
+                model_inputs_profile, flat_batch_profile = pipeline.prepare_batch(
+                    inputs.batch
+                )
+                if not flat_batch_profile or model_inputs_profile is None:
+                    raise ValueError("No profiling inputs available.")
+                outputs = pipeline._pipeline_model.execute(
+                    model_inputs=model_inputs_profile
+                ).images
         prof.report(unit="ms")
+    elif args.num_benchmark_iterations > 0:
+        durations_s: list[float] = []
+        outputs = None
+        for i in range(args.num_benchmark_iterations):
+            print(
+                f"Running benchmark iteration {i + 1} of {args.num_benchmark_iterations}"
+            )
+            outputs, elapsed = _run_full_pipeline_once()
+            durations_s.append(elapsed)
+
+        assert outputs is not None
+        durations_ms = [duration * 1000.0 for duration in durations_s]
+        p95_index = max(
+            0,
+            min(
+                len(durations_ms) - 1,
+                int(round(0.95 * len(durations_ms) + 0.5)) - 1,
+            ),
+        )
+        p95_ms = sorted(durations_ms)[p95_index]
+        print(
+            "Benchmark summary: "
+            f"mean={statistics.fmean(durations_ms):.2f} ms, "
+            f"median={statistics.median(durations_ms):.2f} ms, "
+            f"p95={p95_ms:.2f} ms, "
+            f"best={min(durations_ms):.2f} ms"
+        )
     else:
-        start_time = time.perf_counter()
-        outputs = pipeline.execute(inputs)
-        elapsed = time.perf_counter() - start_time
+        outputs, elapsed = _run_full_pipeline_once()
         print(f"Generation took {elapsed:.3f}s")
 
-    # Step 8: Get the output for our request
-    output = outputs[context.request_id]
-    output = await tokenizer.postprocess(output)
-
-    # Check if generation completed successfully
-    if not output.is_done:
-        print(f"WARNING: Generation status: {output.final_status}")
+    if outputs.size == 0:
+        print("ERROR: No images generated")
         return
 
     print("Generation complete!")
 
-    # Step 9: Extract and save images from OutputImageContent
-    # The output now contains a list of OutputImageContent objects with base64-encoded images
-    if not output.output:
-        print("ERROR: No images generated")
-        return
-
-    # Save each generated image
-    for idx, image_content in enumerate(output.output):
-        # Narrow type for mypy - we expect OutputImageContent for pixel generation
-        if not isinstance(image_content, OutputImageContent):
-            print(
-                f"ERROR: Expected OutputImageContent, got {type(image_content)}"
-            )
-            continue
-
-        # Determine output filename
-        if len(output.output) > 1:
-            # Multiple images: add index to filename
+    for idx, image_array in enumerate(outputs):
+        if len(outputs) > 1:
             base_name, ext = os.path.splitext(args.output)
             output_path = f"{base_name}_{idx}{ext}"
         else:
             output_path = args.output
-
-        # Save the image
-        if image_content.image_data:
-            save_image(image_content.image_data, output_path)
-        elif image_content.image_url:
-            print(f"Image available at URL: {image_content.image_url}")
-        else:
-            print("ERROR: No image data or URL in output")
+        save_numpy_image(image_array, output_path)
 
 
 def main(argv: list[str] | None = None) -> int:

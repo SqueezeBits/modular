@@ -30,6 +30,7 @@ def max_group_norm(  # noqa: ANN201
     affine: bool = False,
     weight: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    io_layout: str = "nchw",
 ):
     device_ref = DeviceRef.GPU()
     with Graph(
@@ -38,7 +39,9 @@ def max_group_norm(  # noqa: ANN201
             TensorType(DType.float32, input_tensor.shape, device_ref),
         ),
     ) as graph:
-        layer = GroupNorm(num_groups, num_channels, eps, affine)
+        layer = GroupNorm(
+            num_groups, num_channels, eps, affine, io_layout=io_layout
+        )
         output = layer(graph.inputs[0].tensor)
         graph.output(output)
     if affine:
@@ -59,6 +62,7 @@ def torch_group_norm(
     affine: bool = False,
     weight: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    io_layout: str = "nchw",
 ) -> torch.Tensor:
     layer = torch.nn.GroupNorm(num_groups, num_channels, eps, affine)
     layer = layer.to(input_tensor.device)
@@ -68,7 +72,14 @@ def torch_group_norm(
         layer.weight.data.copy_(weight.to(input_tensor.device))
         layer.bias.data.copy_(bias.to(input_tensor.device))
 
-    return layer(input_tensor)
+    if io_layout == "nchw":
+        return layer(input_tensor)
+    if io_layout != "nhwc":
+        raise ValueError(f"Unsupported io_layout: {io_layout}")
+
+    nchw_input = input_tensor.permute(0, 3, 1, 2).contiguous()
+    nchw_output = layer(nchw_input)
+    return nchw_output.permute(0, 2, 3, 1).contiguous()
 
 
 @pytest.mark.parametrize(
@@ -126,6 +137,52 @@ def test_group_norm(
         affine=affine,
         weight=weight,
         bias=bias,
+    )
+
+    torch.testing.assert_close(
+        torch_out,
+        max_out,
+        rtol=1e-6,
+        atol=2 * torch.finfo(torch.float32).eps,
+    )
+
+
+def test_group_norm_nhwc(
+    gpu_session: InferenceSession,
+) -> None:
+    torch.manual_seed(42)
+
+    num_channels = 32
+    num_groups = 8
+    input_tensor = torch.randn(
+        (2, 8, 8, num_channels),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    weight = torch.randn(num_channels)
+    bias = torch.randn(num_channels)
+
+    torch_out = torch_group_norm(
+        input_tensor,
+        num_groups=num_groups,
+        num_channels=num_channels,
+        eps=1e-5,
+        affine=True,
+        weight=weight,
+        bias=bias,
+        io_layout="nhwc",
+    )
+
+    max_out = max_group_norm(
+        gpu_session,
+        input_tensor,
+        num_groups=num_groups,
+        num_channels=num_channels,
+        eps=1e-5,
+        affine=True,
+        weight=weight,
+        bias=bias,
+        io_layout="nhwc",
     )
 
     torch.testing.assert_close(
