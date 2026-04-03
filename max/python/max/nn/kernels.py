@@ -59,6 +59,7 @@ _MHA_MASK_VARIANT_TO_ATTENTION_MASK = {
 
 KEY_CACHE_INDEX = 0
 VALUE_CACHE_INDEX = 1
+_SUPPORTED_MHA_BACKENDS = frozenset({"auto", "max", "cudnn"})
 
 
 def _mask_str(mask_variant: MHAMaskVariant) -> str:
@@ -69,12 +70,15 @@ def _mha_parameters(
     mask_variant: MHAMaskVariant,
     *,
     local_window_size: int | None = None,
+    backend: str | None = None,
 ) -> dict[str, int | str | DType]:
     parameters: dict[str, int | str | DType] = {
         "mask_str": _mask_str(mask_variant)
     }
     if local_window_size is not None:
         parameters["local_window_size"] = local_window_size
+    if backend is not None:
+        parameters["backend"] = backend
     return parameters
 
 
@@ -1850,6 +1854,7 @@ def flash_attention_gpu(
     scale: float,
     local_window_size: int = -1,
     valid_length: TensorValue | None = None,
+    backend: str = "auto",
 ) -> TensorValue:
     """Computes flash attention using GPU-optimized kernel.
 
@@ -1867,6 +1872,12 @@ def flash_attention_gpu(
     Returns:
         Output tensor of shape [batch, seq_len, num_heads, head_dim]
     """
+    if backend not in _SUPPORTED_MHA_BACKENDS:
+        raise ValueError(
+            "backend must be one of "
+            f"{sorted(_SUPPORTED_MHA_BACKENDS)}, got {backend!r}"
+        )
+
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError(
             "q, k, v must have matching dtypes. Got "
@@ -1906,15 +1917,21 @@ def flash_attention_gpu(
                 f"q batch size ({q.shape[0]})"
             )
 
-    parameters = _mha_parameters(
-        mask_variant, local_window_size=local_window_size
-    )
-
     op_name = "mo.mha.no_cache"
     values = [q, k, v]
     if valid_length is not None:
+        if backend != "auto":
+            raise ValueError(
+                "backend overrides are only supported for dense "
+                "mo.mha.no_cache attention"
+            )
         op_name = "mo.mha.padded.no_cache"
         values.append(valid_length)
+    parameters = _mha_parameters(
+        mask_variant,
+        local_window_size=local_window_size,
+        backend=backend if valid_length is None else None,
+    )
     values.append(
         ops.constant(scale, dtype=DType.float32, device=DeviceRef.CPU())
     )

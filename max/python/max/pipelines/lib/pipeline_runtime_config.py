@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 from max.config import ConfigFileModel
 from max.serve.worker_interface.zmq_queue import generate_zmq_ipc_path
@@ -238,6 +239,16 @@ class PipelineRuntimeConfig(ConfigFileModel):
             "When ``False`` (default), the inference server uses the graph API architecture. "
             "When ``True``, the server uses the eager API architecture when available and "
             "falls back to the graph API architecture."
+        ),
+    )
+
+    diffusion_attention_backend: Literal["auto", "max", "cudnn"] = Field(
+        default=os.environ.get("MAX_DIFFUSION_ATTENTION_BACKEND", "auto"),
+        description=(
+            "Backend policy for diffusion transformer attention. "
+            "Supported values are 'auto', 'max', and 'cudnn'. "
+            "This setting is currently only consumed by selected diffusion "
+            "transformer architectures."
         ),
     )
 

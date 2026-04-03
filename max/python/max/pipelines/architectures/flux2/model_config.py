@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from typing import Any
+from typing import Any, Literal
 
 from max.driver import Device
 from max.dtype import DType
@@ -38,6 +38,7 @@ class Flux2Config(MAXModelConfigBase):
     eps: float = 1e-6
     guidance_embeds: bool = True
     """If False (Klein/distilled), no guidance embedder weights are expected."""
+    diffusion_attention_backend: Literal["auto", "max", "cudnn"] = "auto"
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
 

@@ -12,6 +12,8 @@
 # ===----------------------------------------------------------------------=== #
 
 
+from typing import Literal
+
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, ops
 from max.nn.attention.mask_config import MHAMaskVariant
@@ -20,14 +22,14 @@ from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm import RMSNorm
 
-from .embeddings import get_1d_rotary_pos_embed
+from .embeddings import get_1d_rotary_freqs_cis
 
 
 def _apply_flux2_qk_rope(
     query: TensorValue,
     key: TensorValue,
-    cos: TensorValue,
-    sin: TensorValue,
+    freqs_cis: TensorValue,
+    position_ids: TensorValue,
 ) -> tuple[TensorValue, TensorValue]:
     batch_size = query.shape[0]
     seq_len = query.shape[1]
@@ -38,28 +40,6 @@ def _apply_flux2_qk_rope(
         query, [batch_size * seq_len, num_heads, head_dim]
     )
     key_ragged = ops.reshape(key, [batch_size * seq_len, num_heads, head_dim])
-
-    # Convert repeat-interleaved ([cos, cos], [sin, sin]) to [cos, sin] pairs.
-    cos_pairs = ops.reshape(cos, [cos.shape[0], cos.shape[1] // 2, 2])[..., 0]
-    sin_pairs = ops.reshape(sin, [sin.shape[0], sin.shape[1] // 2, 2])[..., 0]
-    freqs_cis = ops.reshape(
-        ops.stack([cos_pairs, sin_pairs], axis=-1),
-        [cos.shape[0], cos.shape[1]],
-    )
-    position_ids = ops.range(
-        0,
-        seq_len,
-        1,
-        dtype=DType.uint32,
-        device=query.device,
-    )
-    # broadcast_to instead of tile: tile has no GPU kernel and forces a
-    # CPU round-trip. broadcast_to expands [1, seq_len] -> [batch_size, seq_len]
-    # entirely on GPU.
-    position_ids = ops.broadcast_to(
-        ops.unsqueeze(position_ids, 0), [batch_size, seq_len]
-    )
-    position_ids = ops.reshape(position_ids, [batch_size * seq_len])
 
     query_out = rope_ragged_with_position_ids(
         query_ragged,
@@ -163,18 +143,17 @@ class Flux2PosEmbed(Module):
         self.theta = theta
         self.axes_dim = tuple(axes_dim)
 
-    def __call__(self, ids: TensorValue) -> tuple[TensorValue, TensorValue]:
-        """Compute rotary position embeddings.
+    def __call__(self, ids: TensorValue) -> TensorValue:
+        """Compute interleaved rotary position embeddings.
 
         Args:
             ids: Position IDs of shape [S, len(axes_dim)].
 
         Returns:
-            Tuple of (cos, sin) tensors of shape [S, sum(axes_dim)] for RoPE.
+            Tensor of shape [S, sum(axes_dim)] laid out as
+            ``[cos0, sin0, cos1, sin1, ...]`` for RoPE.
         """
-        # Expected ids shape: [S, len(self.axes_dim)]
-        cos_out = []
-        sin_out = []
+        freqs_out = []
 
         # Convert to float for frequency computation
 
@@ -184,21 +163,14 @@ class Flux2PosEmbed(Module):
         # Loop over each axis dimension
 
         for i, axis_dim in enumerate(self.axes_dim):
-            cos, sin = get_1d_rotary_pos_embed(
+            freqs_cis = get_1d_rotary_freqs_cis(
                 axis_dim,
                 pos[..., i],
                 theta=self.theta,
-                use_real=True,
-                repeat_interleave_real=True,
             )
-            cos_out.append(cos)
-            sin_out.append(sin)
+            freqs_out.append(freqs_cis)
 
-        # Concatenate all axes
-        freqs_cos = ops.concat(cos_out, axis=-1)
-        freqs_sin = ops.concat(sin_out, axis=-1)
-
-        return freqs_cos, freqs_sin
+        return ops.concat(freqs_out, axis=-1)
 
 
 class Flux2Attention(Module):
@@ -214,6 +186,7 @@ class Flux2Attention(Module):
         out_bias: bool = True,
         eps: float = 1e-5,
         out_dim: int | None = None,
+        attention_backend: Literal["auto", "max", "cudnn"] = "auto",
         *,
         dtype: DType,
         device: DeviceRef,
@@ -240,6 +213,7 @@ class Flux2Attention(Module):
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.added_kv_proj_dim = added_kv_proj_dim
+        self.attention_backend = attention_backend
         out_dim = out_dim if out_dim is not None else query_dim
 
         # Main Q/K/V projections
@@ -312,14 +286,16 @@ class Flux2Attention(Module):
         self,
         hidden_states: TensorValue,
         encoder_hidden_states: TensorValue | None = None,
-        image_rotary_emb: tuple[TensorValue, TensorValue] | None = None,
+        image_rotary_freqs_cis: TensorValue | None = None,
+        image_rotary_position_ids: TensorValue | None = None,
     ) -> TensorValue | tuple[TensorValue, TensorValue]:
         """Apply dual-stream attention.
 
         Args:
             hidden_states: Image tokens of shape [B, S_img, D].
             encoder_hidden_states: Optional text tokens of shape [B, S_txt, D_enc]. If provided, enables dual-stream mode.
-            image_rotary_emb: Optional tuple of (cos, sin) RoPE embeddings.
+            image_rotary_freqs_cis: Optional interleaved RoPE coefficients.
+            image_rotary_position_ids: Optional batched position ids for RoPE.
 
         Returns:
             If encoder_hidden_states is None: Output tensor of shape [B, S_img, out_dim].
@@ -386,9 +362,18 @@ class Flux2Attention(Module):
             value = ops.concat([encoder_value, value], axis=1)
 
         # Apply rotary embeddings if provided
-        if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            query, key = _apply_flux2_qk_rope(query, key, cos, sin)
+        if image_rotary_freqs_cis is not None:
+            if image_rotary_position_ids is None:
+                raise ValueError(
+                    "image_rotary_position_ids must be provided when "
+                    "image_rotary_freqs_cis is set"
+                )
+            query, key = _apply_flux2_qk_rope(
+                query,
+                key,
+                image_rotary_freqs_cis,
+                image_rotary_position_ids,
+            )
 
         # Scaled dot-product attention
         scale = 1.0 / (self.head_dim**0.5)
@@ -398,6 +383,7 @@ class Flux2Attention(Module):
             value,
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=scale,
+            backend=self.attention_backend,
         )
 
         # hidden_states = F.flatten(hidden_states, 2, 3)
@@ -443,6 +429,7 @@ class Flux2ParallelSelfAttention(Module):
         out_dim: int | None = None,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        attention_backend: Literal["auto", "max", "cudnn"] = "auto",
         *,
         dtype: DType,
         device: DeviceRef,
@@ -468,6 +455,7 @@ class Flux2ParallelSelfAttention(Module):
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.heads = out_dim // dim_head if out_dim is not None else heads
+        self.attention_backend = attention_backend
         out_dim = out_dim if out_dim is not None else query_dim
 
         self.mlp_hidden_dim = int(query_dim * mlp_ratio)
@@ -503,14 +491,16 @@ class Flux2ParallelSelfAttention(Module):
         self,
         hidden_states: TensorValue,
         attention_mask: TensorValue | None = None,
-        image_rotary_emb: tuple[TensorValue, TensorValue] | None = None,
+        image_rotary_freqs_cis: TensorValue | None = None,
+        image_rotary_position_ids: TensorValue | None = None,
     ) -> TensorValue:
         """Apply parallel self-attention and MLP.
 
         Args:
             hidden_states: Input tensor of shape [B, S, D].
             attention_mask: Optional attention mask (not used).
-            image_rotary_emb: Optional tuple of (cos, sin) RoPE embeddings.
+            image_rotary_freqs_cis: Optional interleaved RoPE coefficients.
+            image_rotary_position_ids: Optional batched position ids for RoPE.
 
         Returns:
             Output tensor of shape [B, S, D].
@@ -545,15 +535,25 @@ class Flux2ParallelSelfAttention(Module):
         key = self.norm_k(key)
 
         # Apply rotary embeddings
-        if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            query, key = _apply_flux2_qk_rope(query, key, cos, sin)
+        if image_rotary_freqs_cis is not None:
+            if image_rotary_position_ids is None:
+                raise ValueError(
+                    "image_rotary_position_ids must be provided when "
+                    "image_rotary_freqs_cis is set"
+                )
+            query, key = _apply_flux2_qk_rope(
+                query,
+                key,
+                image_rotary_freqs_cis,
+                image_rotary_position_ids,
+            )
         hidden_states = flash_attention_gpu(
             query,
             key,
             value,
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=1.0 / (self.head_dim**0.5),
+            backend=self.attention_backend,
         )
         # hidden_states = F.flatten(hidden_states, 2, 3)
         # Reshape from [B, S, num_heads, head_dim] to [B, S, num_heads * head_dim]

@@ -227,9 +227,13 @@ class DiffusionPipeline(ABC):
             if not issubclass(component_cls, ComponentModel):
                 continue
 
-            config_dict = self._get_component_config_dict(
-                components_config, name
+            config_dict = dict(
+                self._get_component_config_dict(components_config, name)
             )
+            if name == "transformer":
+                config_dict["diffusion_attention_backend"] = (
+                    self.pipeline_config.runtime.diffusion_attention_backend
+                )
 
             if name in relative_paths:
                 abs_paths = self._resolve_absolute_paths(

@@ -213,10 +213,14 @@ from nn.attention.gpu.mha import (
     flash_attention,
     flash_attention_ragged,
 )
+from nn.attention.gpu.mha_cudnn import (
+    flash_attention_cudnn,
+    flash_attention_cudnn_supported,
+)
 from nn.attention.gpu.mha_decode_partition_heuristic import (
     mha_decoding_num_partitions,
 )
-from nn.attention.mha_mask import MHAMask
+from nn.attention.mha_mask import MHAMask, MaskName
 from nn.attention.mha_utils import as_dynamic_row_major_1d, dispatch_mask
 from nn.attention.gpu.mla_graph import (
     mla_prefill_branch_fp8,
@@ -5357,6 +5361,7 @@ struct FlashAttentionGPU:
         //,
         target: StaticString,
         mask_str: StaticString,
+        backend: StaticString = "auto",
         local_window_size: Int = -1,
     ](
         output: OutputTensor[rank=rank, ...],
@@ -5426,11 +5431,49 @@ struct FlashAttentionGPU:
                 ctx[],
             )
 
-        dispatch_mask[
-            mask_str,
-            _dispatch_flash_attention,
-            local_window_size,
-        ]()
+        comptime if backend == "max":
+            dispatch_mask[
+                mask_str,
+                _dispatch_flash_attention,
+                local_window_size,
+            ]()
+        elif backend == "auto":
+            comptime if mask_str == MaskName.NULL.name:
+                if flash_attention_cudnn_supported(
+                    q_buffer, k_buffer, v_buffer, output_buffer
+                ):
+                    try:
+                        flash_attention_cudnn(
+                            q_buffer,
+                            k_buffer,
+                            v_buffer,
+                            output_buffer,
+                            scale,
+                            ctx[],
+                        )
+                        return
+                    except:
+                        pass
+            dispatch_mask[
+                mask_str,
+                _dispatch_flash_attention,
+                local_window_size,
+            ]()
+        elif backend == "cudnn":
+            comptime if mask_str != MaskName.NULL.name:
+                raise Error(
+                    "CuDNN attention backend only supports NULL_MASK for mo.mha.no_cache"
+                )
+            flash_attention_cudnn(
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                scale,
+                ctx[],
+            )
+        else:
+            raise Error("Unsupported attention backend: " + backend)
 
 
 @compiler.register("mo.mha.padded.no_cache")
@@ -11514,7 +11557,6 @@ struct Struct_kv_cache_ragged_paged_2m_iadd:
         )
 
 
-# ===-----------------------------------------------------------------------===#
 # Slice IAdd Kernel
 # ===-----------------------------------------------------------------------===#
 

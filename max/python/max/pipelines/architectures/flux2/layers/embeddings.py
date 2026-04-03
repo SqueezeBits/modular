@@ -219,6 +219,41 @@ def get_1d_rotary_pos_embed(
     return freqs_cos, freqs_sin
 
 
+def get_1d_rotary_freqs_cis(
+    dim: int,
+    pos: TensorValue,
+    theta: float = 10000.0,
+) -> TensorValue:
+    """Precompute interleaved ``[cos, sin]`` RoPE coefficients for one axis.
+
+    Args:
+        dim: Dimension of the embedding (must be even).
+        pos: Position indices tensor of shape [S].
+        theta: Base frequency for the sinusoidal encoding.
+
+    Returns:
+        Tensor of shape [S, dim] laid out as ``[cos0, sin0, cos1, sin1, ...]``.
+    """
+    assert dim % 2 == 0, f"dim must be even, got {dim}"
+
+    freq_exponent = (
+        ops.range(
+            0,
+            dim,
+            2,
+            dtype=DType.float32,
+            device=pos.device,
+        )
+        / dim
+    )
+    freq = 1.0 / (theta**freq_exponent)
+    freqs = ops.outer(pos, freq)
+    cos_emb = ops.cos(freqs)
+    sin_emb = ops.sin(freqs)
+    freqs_cis = ops.stack([cos_emb, sin_emb], axis=-1)
+    return ops.reshape(freqs_cis, [cos_emb.shape[0], dim])
+
+
 class Timesteps(Module):
     def __init__(
         self,

@@ -1,12 +1,35 @@
 load("//bazel:api.bzl", "mojo_library")
+load("//bazel/internal:modular_shared_library.bzl", "modular_shared_library")
 
 package(default_visibility = ["//max:consumers"])
+
+modular_shared_library(
+    name = "cudnn_sdpa_frontend_shim",
+    srcs = ["attention/gpu/cudnn_sdpa_frontend.cpp"],
+    hdrs = glob([
+        "attention/gpu/vendor/nvidia_cuda_runtime/include/**/*",
+        "attention/gpu/vendor/nvidia_cudnn/include/**/*",
+        "attention/gpu/vendor/nvidia_cudnn_frontend/**/*",
+    ]),
+    copts = [
+        "-std=c++17",
+        "-fexceptions",
+    ],
+    includes = [
+        "attention/gpu/vendor/nvidia_cuda_runtime/include",
+        "attention/gpu/vendor/nvidia_cudnn/include",
+        "attention/gpu/vendor/nvidia_cudnn_frontend",
+    ],
+    shared_lib_name = "libcudnn_sdpa_frontend_shim.so",
+    tags = ["clang-tidy-is-c++-tu"],
+)
 
 mojo_library(
     name = "nn",
     srcs = glob(["**/*.mojo"]),
     docs_base_path = "kernels",
     validate_missing_docs = False,
+    data = [":cudnn_sdpa_frontend_shim"],
     deps = [
         "//max:_cudnn",
         "//max:_cufft",

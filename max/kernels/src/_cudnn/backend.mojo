@@ -401,7 +401,7 @@ struct cudnnPointwiseMode_t(Equatable, TrivialRegisterPassable, Writable):
 struct cudnnBackendDescriptorType_t(
     Equatable, TrivialRegisterPassable, Writable
 ):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_BACKEND_POINTWISE_DESCRIPTOR = Self(0)
     comptime CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR = Self(1)
     comptime CUDNN_BACKEND_ENGINE_DESCRIPTOR = Self(2)
@@ -442,9 +442,29 @@ struct cudnnBackendDescriptorType_t(
     comptime CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR = Self(31)
     comptime CUDNN_BACKEND_RNG_DESCRIPTOR = Self(32)
     comptime CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR = Self(33)
+    comptime CUDNN_BACKEND_KERNEL_CACHE_DESCRIPTOR = Self(34)
+    comptime CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR = Self(35)
+    comptime CUDNN_BACKEND_OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR = Self(
+        36
+    )
+    comptime CUDNN_BACKEND_OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR = Self(
+        37
+    )
+    comptime CUDNN_BACKEND_DEVICEPROP_DESCRIPTOR = Self(38)
+    comptime CUDNN_BACKEND_OPERATION_EXPAND_BAND_MATRIX_DESCRIPTOR = Self(
+        39
+    )
+    comptime CUDNN_BACKEND_OPERATION_CONTRACT_BAND_MATRIX_DESCRIPTOR = Self(
+        40
+    )
+    comptime CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR = Self(41)
+    comptime CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR = Self(
+        42
+    )
+    comptime CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR = Self(43)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -569,6 +589,45 @@ struct cudnnBackendDescriptorType_t(
             return writer.write_string("CUDNN_BACKEND_RNG_DESCRIPTOR")
         if self is Self.CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR:
             return writer.write_string("CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR")
+        if self is Self.CUDNN_BACKEND_KERNEL_CACHE_DESCRIPTOR:
+            return writer.write_string("CUDNN_BACKEND_KERNEL_CACHE_DESCRIPTOR")
+        if self is Self.CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
+            return writer.write(
+                "CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR"
+            )
+        if self is Self.CUDNN_BACKEND_OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR:
+            return writer.write(
+                "CUDNN_BACKEND_OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR"
+            )
+        if (
+            self
+            is Self.CUDNN_BACKEND_OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR
+        ):
+            return writer.write(
+                "CUDNN_BACKEND_OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR"
+            )
+        if self is Self.CUDNN_BACKEND_DEVICEPROP_DESCRIPTOR:
+            return writer.write_string("CUDNN_BACKEND_DEVICEPROP_DESCRIPTOR")
+        if self is Self.CUDNN_BACKEND_OPERATION_EXPAND_BAND_MATRIX_DESCRIPTOR:
+            return writer.write(
+                "CUDNN_BACKEND_OPERATION_EXPAND_BAND_MATRIX_DESCRIPTOR"
+            )
+        if self is Self.CUDNN_BACKEND_OPERATION_CONTRACT_BAND_MATRIX_DESCRIPTOR:
+            return writer.write(
+                "CUDNN_BACKEND_OPERATION_CONTRACT_BAND_MATRIX_DESCRIPTOR"
+            )
+        if self is Self.CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR:
+            return writer.write_string(
+                "CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR"
+            )
+        if self is Self.CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
+            return writer.write(
+                "CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR"
+            )
+        if self is Self.CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR:
+            return writer.write_string(
+                "CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR"
+            )
         abort("invalid cudnnBackendDescriptorType_t entry")
 
     @no_inline
@@ -728,7 +787,7 @@ struct cudnnBackendNormFwdPhase_t(
 struct cudnnBackendHeurMode_t(
     Equatable, Identifiable, TrivialRegisterPassable, Writable
 ):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_HEUR_MODE_INSTANT = Self(0)
     comptime CUDNN_HEUR_MODE_B = Self(1)
     comptime CUDNN_HEUR_MODE_FALLBACK = Self(2)
@@ -736,7 +795,7 @@ struct cudnnBackendHeurMode_t(
     comptime CUDNN_HEUR_MODES_COUNT = Self(4)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -848,7 +907,7 @@ def cudnnBackendCreateDescriptor(
 struct cudnnBackendAttributeType_t(
     Equatable, TrivialRegisterPassable, Writable
 ):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_TYPE_HANDLE = Self(0)
     comptime CUDNN_TYPE_DATA_TYPE = Self(1)
     comptime CUDNN_TYPE_BOOLEAN = Self(2)
@@ -881,7 +940,7 @@ struct cudnnBackendAttributeType_t(
     comptime CUDNN_TYPE_RNG_DISTRIBUTION = Self(29)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -1043,7 +1102,7 @@ struct cudnnBackendTensorReordering_t(
 struct cudnnBackendAttributeName_t(
     Equatable, TrivialRegisterPassable, Writable
 ):
-    var _value: Int8
+    var _value: Int32
     comptime CUDNN_ATTR_POINTWISE_MODE = Self(0)
     comptime CUDNN_ATTR_POINTWISE_MATH_PREC = Self(1)
     comptime CUDNN_ATTR_POINTWISE_NAN_PROPAGATION = Self(2)
@@ -1061,19 +1120,26 @@ struct cudnnBackendAttributeName_t(
     comptime CUDNN_ATTR_CONVOLUTION_POST_PADDINGS = Self(14)
     comptime CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS = Self(15)
     comptime CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS = Self(16)
-    comptime CUDNN_ATTR_ENGINEHEUR_MODE = Self(17)
-    comptime CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH = Self(18)
-    comptime CUDNN_ATTR_ENGINEHEUR_RESULTS = Self(19)
-    comptime CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET = Self(20)
-    comptime CUDNN_ATTR_ENGINECFG_ENGINE = Self(21)
-    comptime CUDNN_ATTR_ENGINECFG_INTERMEDIATE_INFO = Self(22)
-    comptime CUDNN_ATTR_ENGINECFG_KNOB_CHOICES = Self(23)
-    comptime CUDNN_ATTR_EXECUTION_PLAN_HANDLE = Self(24)
-    comptime CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG = Self(25)
-    comptime CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE = Self(26)
-    comptime CUDNN_ATTR_EXECUTION_PLAN_COMPUTED_INTERMEDIATE_UIDS = Self(27)
-    comptime CUDNN_ATTR_EXECUTION_PLAN_RUN_ONLY_INTERMEDIATE_UIDS = Self(28)
-    comptime CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION = Self(29)
+    comptime CUDNN_ATTR_ENGINEHEUR_MODE = Self(200)
+    comptime CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH = Self(201)
+    comptime CUDNN_ATTR_ENGINEHEUR_RESULTS = Self(202)
+    comptime CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET = Self(203)
+    comptime CUDNN_ATTR_ENGINEHEUR_DEVICEPROP = Self(204)
+    comptime CUDNN_ATTR_ENGINECFG_ENGINE = Self(300)
+    comptime CUDNN_ATTR_ENGINECFG_INTERMEDIATE_INFO = Self(301)
+    comptime CUDNN_ATTR_ENGINECFG_KNOB_CHOICES = Self(302)
+    comptime CUDNN_ATTR_ENGINECFG_WORKSPACE_SIZE = Self(303)
+    comptime CUDNN_ATTR_ENGINECFG_SHARED_MEMORY_USED = Self(304)
+    comptime CUDNN_ATTR_EXECUTION_PLAN_HANDLE = Self(400)
+    comptime CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG = Self(401)
+    comptime CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE = Self(402)
+    comptime CUDNN_ATTR_EXECUTION_PLAN_COMPUTED_INTERMEDIATE_UIDS = Self(
+        403
+    )
+    comptime CUDNN_ATTR_EXECUTION_PLAN_RUN_ONLY_INTERMEDIATE_UIDS = Self(404)
+    comptime CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION = Self(405)
+    comptime CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE = Self(406)
+    comptime CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP = Self(407)
     comptime CUDNN_ATTR_INTERMEDIATE_INFO_UNIQUE_ID = Self(30)
     comptime CUDNN_ATTR_INTERMEDIATE_INFO_SIZE = Self(31)
     comptime CUDNN_ATTR_INTERMEDIATE_INFO_DEPENDENT_DATA_UIDS = Self(32)
@@ -1133,24 +1199,29 @@ struct cudnnBackendAttributeName_t(
     comptime CUDNN_ATTR_OPERATION_BN_FINALIZE_ACCUM_COUNT_DESC = Self(82)
     comptime CUDNN_ATTR_OPERATION_BN_FINALIZE_EPSILON_DESC = Self(83)
     comptime CUDNN_ATTR_OPERATION_BN_FINALIZE_EXP_AVERATE_FACTOR_DESC = Self(84)
-    comptime CUDNN_ATTR_OPERATIONGRAPH_HANDLE = Self(85)
-    comptime CUDNN_ATTR_OPERATIONGRAPH_OPS = Self(86)
-    comptime CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT = Self(87)
-    comptime CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT = Self(88)
-    comptime CUDNN_ATTR_TENSOR_DATA_TYPE = Self(89)
-    comptime CUDNN_ATTR_TENSOR_DIMENSIONS = Self(90)
-    comptime CUDNN_ATTR_TENSOR_STRIDES = Self(91)
-    comptime CUDNN_ATTR_TENSOR_VECTOR_COUNT = Self(92)
-    comptime CUDNN_ATTR_TENSOR_VECTORIZED_DIMENSION = Self(93)
-    comptime CUDNN_ATTR_TENSOR_UNIQUE_ID = Self(94)
-    comptime CUDNN_ATTR_TENSOR_IS_VIRTUAL = Self(95)
-    comptime CUDNN_ATTR_TENSOR_IS_BY_VALUE = Self(96)
-    comptime CUDNN_ATTR_TENSOR_REORDERING_MODE = Self(97)
-    comptime CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC = Self(98)
-    comptime CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS = Self(99)
-    comptime CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS = Self(100)
-    comptime CUDNN_ATTR_VARIANT_PACK_INTERMEDIATES = Self(101)
-    comptime CUDNN_ATTR_VARIANT_PACK_WORKSPACE = Self(102)
+    comptime CUDNN_ATTR_OPERATIONGRAPH_HANDLE = Self(800)
+    comptime CUDNN_ATTR_OPERATIONGRAPH_OPS = Self(801)
+    comptime CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT = Self(802)
+    comptime CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED = Self(803)
+    comptime CUDNN_ATTR_OPERATIONGRAPH_IS_SAME_TOPOLOGY = Self(804)
+    comptime CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT = Self(900)
+    comptime CUDNN_ATTR_TENSOR_DATA_TYPE = Self(901)
+    comptime CUDNN_ATTR_TENSOR_DIMENSIONS = Self(902)
+    comptime CUDNN_ATTR_TENSOR_STRIDES = Self(903)
+    comptime CUDNN_ATTR_TENSOR_VECTOR_COUNT = Self(904)
+    comptime CUDNN_ATTR_TENSOR_VECTORIZED_DIMENSION = Self(905)
+    comptime CUDNN_ATTR_TENSOR_UNIQUE_ID = Self(906)
+    comptime CUDNN_ATTR_TENSOR_IS_VIRTUAL = Self(907)
+    comptime CUDNN_ATTR_TENSOR_IS_BY_VALUE = Self(908)
+    comptime CUDNN_ATTR_TENSOR_REORDERING_MODE = Self(909)
+    comptime CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC = Self(913)
+    comptime CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS = Self(1000)
+    comptime CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS = Self(1001)
+    comptime CUDNN_ATTR_VARIANT_PACK_INTERMEDIATES = Self(1002)
+    comptime CUDNN_ATTR_VARIANT_PACK_WORKSPACE = Self(1003)
+    comptime CUDNN_ATTR_VARIANT_PACK_OVERRIDE_UNIQUE_IDS = Self(1010)
+    comptime CUDNN_ATTR_VARIANT_PACK_OVERRIDE_SHAPES = Self(1011)
+    comptime CUDNN_ATTR_VARIANT_PACK_OVERRIDE_STRIDES = Self(1012)
     comptime CUDNN_ATTR_LAYOUT_INFO_TENSOR_UID = Self(103)
     comptime CUDNN_ATTR_LAYOUT_INFO_TYPES = Self(104)
     comptime CUDNN_ATTR_KNOB_INFO_TYPE = Self(105)
@@ -1262,9 +1333,20 @@ struct cudnnBackendAttributeName_t(
     comptime CUDNN_ATTR_OPERATION_RNG_SEED = Self(209)
     comptime CUDNN_ATTR_OPERATION_RNG_DESC = Self(210)
     comptime CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC = Self(211)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC = Self(2800)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_KDESC = Self(2801)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_VDESC = Self(2802)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC = Self(2803)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC = Self(2804)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_SCALEDESC = Self(2805)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC = Self(2806)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_KDESC = Self(2807)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_VDESC = Self(2808)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_QDESC = Self(2809)
+    comptime CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_KVDESC = Self(2810)
 
     def __init__(out self, value: Int):
-        self._value = Int8(value)
+        self._value = Int32(value)
 
     def __eq__(self, other: Self) -> Bool:
         return self._value == other._value
@@ -1318,12 +1400,20 @@ struct cudnnBackendAttributeName_t(
             return writer.write_string("CUDNN_ATTR_ENGINEHEUR_RESULTS")
         if self is Self.CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET:
             return writer.write_string("CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET")
+        if self is Self.CUDNN_ATTR_ENGINEHEUR_DEVICEPROP:
+            return writer.write_string("CUDNN_ATTR_ENGINEHEUR_DEVICEPROP")
         if self is Self.CUDNN_ATTR_ENGINECFG_ENGINE:
             return writer.write_string("CUDNN_ATTR_ENGINECFG_ENGINE")
         if self is Self.CUDNN_ATTR_ENGINECFG_INTERMEDIATE_INFO:
             return writer.write_string("CUDNN_ATTR_ENGINECFG_INTERMEDIATE_INFO")
         if self is Self.CUDNN_ATTR_ENGINECFG_KNOB_CHOICES:
             return writer.write_string("CUDNN_ATTR_ENGINECFG_KNOB_CHOICES")
+        if self is Self.CUDNN_ATTR_ENGINECFG_WORKSPACE_SIZE:
+            return writer.write_string("CUDNN_ATTR_ENGINECFG_WORKSPACE_SIZE")
+        if self is Self.CUDNN_ATTR_ENGINECFG_SHARED_MEMORY_USED:
+            return writer.write_string(
+                "CUDNN_ATTR_ENGINECFG_SHARED_MEMORY_USED"
+            )
         if self is Self.CUDNN_ATTR_EXECUTION_PLAN_HANDLE:
             return writer.write_string("CUDNN_ATTR_EXECUTION_PLAN_HANDLE")
         if self is Self.CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG:
@@ -1346,6 +1436,10 @@ struct cudnnBackendAttributeName_t(
             return writer.write_string(
                 "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION"
             )
+        if self is Self.CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE:
+            return writer.write_string("CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE")
+        if self is Self.CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP:
+            return writer.write_string("CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP")
         if self is Self.CUDNN_ATTR_INTERMEDIATE_INFO_UNIQUE_ID:
             return writer.write_string("CUDNN_ATTR_INTERMEDIATE_INFO_UNIQUE_ID")
         if self is Self.CUDNN_ATTR_INTERMEDIATE_INFO_SIZE:
@@ -1553,6 +1647,12 @@ struct cudnnBackendAttributeName_t(
             return writer.write_string(
                 "CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT"
             )
+        if self is Self.CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED:
+            return writer.write_string(
+                "CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED"
+            )
+        if self is Self.CUDNN_ATTR_OPERATIONGRAPH_IS_SAME_TOPOLOGY:
+            return writer.write_string("CUDNN_ATTR_OPERATIONGRAPH_IS_SAME_TOPOLOGY")
         if self is Self.CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT:
             return writer.write_string("CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT")
         if self is Self.CUDNN_ATTR_TENSOR_DATA_TYPE:
@@ -1583,6 +1683,14 @@ struct cudnnBackendAttributeName_t(
             return writer.write_string("CUDNN_ATTR_VARIANT_PACK_INTERMEDIATES")
         if self is Self.CUDNN_ATTR_VARIANT_PACK_WORKSPACE:
             return writer.write_string("CUDNN_ATTR_VARIANT_PACK_WORKSPACE")
+        if self is Self.CUDNN_ATTR_VARIANT_PACK_OVERRIDE_UNIQUE_IDS:
+            return writer.write_string(
+                "CUDNN_ATTR_VARIANT_PACK_OVERRIDE_UNIQUE_IDS"
+            )
+        if self is Self.CUDNN_ATTR_VARIANT_PACK_OVERRIDE_SHAPES:
+            return writer.write_string("CUDNN_ATTR_VARIANT_PACK_OVERRIDE_SHAPES")
+        if self is Self.CUDNN_ATTR_VARIANT_PACK_OVERRIDE_STRIDES:
+            return writer.write_string("CUDNN_ATTR_VARIANT_PACK_OVERRIDE_STRIDES")
         if self is Self.CUDNN_ATTR_LAYOUT_INFO_TENSOR_UID:
             return writer.write_string("CUDNN_ATTR_LAYOUT_INFO_TENSOR_UID")
         if self is Self.CUDNN_ATTR_LAYOUT_INFO_TYPES:
@@ -1900,6 +2008,38 @@ struct cudnnBackendAttributeName_t(
             return writer.write_string("CUDNN_ATTR_OPERATION_RNG_DESC")
         if self is Self.CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC:
             return writer.write_string("CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC")
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC:
+            return writer.write_string("CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC")
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_KDESC:
+            return writer.write_string("CUDNN_ATTR_OPERATION_SDPA_FWD_KDESC")
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_VDESC:
+            return writer.write_string("CUDNN_ATTR_OPERATION_SDPA_FWD_VDESC")
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC:
+            return writer.write_string("CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC")
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC:
+            return writer.write_string("CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC")
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_SCALEDESC:
+            return writer.write_string("CUDNN_ATTR_OPERATION_SDPA_FWD_SCALEDESC")
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC:
+            return writer.write_string(
+                "CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC"
+            )
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_KDESC:
+            return writer.write_string(
+                "CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_KDESC"
+            )
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_VDESC:
+            return writer.write_string(
+                "CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_VDESC"
+            )
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_QDESC:
+            return writer.write_string(
+                "CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_QDESC"
+            )
+        if self is Self.CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_KVDESC:
+            return writer.write_string(
+                "CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_KVDESC"
+            )
         abort("invalid cudnnBackendAttributeName_t entry")
 
     @no_inline

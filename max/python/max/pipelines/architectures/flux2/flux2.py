@@ -15,6 +15,7 @@ from max.dtype import DType
 from max.graph import DeviceRef, Dim, TensorType, TensorValue, ops
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
+from typing_extensions import Literal
 
 from .layers.embeddings import TimestepEmbedding, Timesteps
 from .layers.flux2_attention import (
@@ -165,6 +166,7 @@ class Flux2TransformerBlock(Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        attention_backend: Literal["auto", "max", "cudnn"] = "auto",
     ) -> None:
         """Initialize Flux2TransformerBlock.
 
@@ -205,6 +207,7 @@ class Flux2TransformerBlock(Module):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
+            attention_backend=attention_backend,
             dtype=dtype,
             device=device,
         )
@@ -253,7 +256,8 @@ class Flux2TransformerBlock(Module):
             tuple[TensorValue, TensorValue, TensorValue],
             tuple[TensorValue, TensorValue, TensorValue],
         ],
-        image_rotary_emb: tuple[TensorValue, TensorValue] | None = None,
+        image_rotary_freqs_cis: TensorValue | None = None,
+        image_rotary_position_ids: TensorValue | None = None,
     ) -> tuple[TensorValue, TensorValue]:
         """Forward pass for dual-stream transformer block.
 
@@ -262,7 +266,8 @@ class Flux2TransformerBlock(Module):
             encoder_hidden_states: Text tokens of shape [B, S_txt, D].
             temb_mod_params_img: Image-stream modulation parameters.
             temb_mod_params_txt: Text-stream modulation parameters.
-            image_rotary_emb: Optional (cos, sin) tuple for rotary embeddings.
+            image_rotary_freqs_cis: Optional interleaved RoPE coefficients.
+            image_rotary_position_ids: Optional batched position ids for RoPE.
 
         Returns:
             Tuple of (encoder_hidden_states, hidden_states).
@@ -285,7 +290,8 @@ class Flux2TransformerBlock(Module):
         attn_result = self.attn(
             norm_hidden_states,
             norm_encoder_hidden_states,
-            image_rotary_emb=image_rotary_emb,
+            image_rotary_freqs_cis=image_rotary_freqs_cis,
+            image_rotary_position_ids=image_rotary_position_ids,
         )
         if not isinstance(attn_result, tuple):
             raise ValueError("Expected tuple from dual-stream attention")
@@ -330,6 +336,7 @@ class Flux2SingleTransformerBlock(Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        attention_backend: Literal["auto", "max", "cudnn"] = "auto",
     ) -> None:
         """Initialize Flux2SingleTransformerBlock.
 
@@ -362,6 +369,7 @@ class Flux2SingleTransformerBlock(Module):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
+            attention_backend=attention_backend,
             dtype=dtype,
             device=device,
         )
@@ -376,7 +384,8 @@ class Flux2SingleTransformerBlock(Module):
             TensorValue,
         ]
         | None = None,
-        image_rotary_emb: tuple[TensorValue, TensorValue] | None = None,
+        image_rotary_freqs_cis: TensorValue | None = None,
+        image_rotary_position_ids: TensorValue | None = None,
         split_hidden_states: bool = False,
         text_seq_len: int | Dim | None = None,
     ) -> TensorValue | tuple[TensorValue, TensorValue]:
@@ -386,7 +395,8 @@ class Flux2SingleTransformerBlock(Module):
             hidden_states: Image tokens or concatenated text+image tokens.
             encoder_hidden_states: Optional text tokens to concatenate.
             temb_mod_params: (shift, scale, gate) tuple for modulation.
-            image_rotary_emb: Optional (cos, sin) tuple for rotary embeddings.
+            image_rotary_freqs_cis: Optional interleaved RoPE coefficients.
+            image_rotary_position_ids: Optional batched position ids for RoPE.
             split_hidden_states: If True, split output back into text and image.
             text_seq_len: Length of text sequence when splitting.
 
@@ -408,7 +418,8 @@ class Flux2SingleTransformerBlock(Module):
         norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
         attn_output = self.attn(
             norm_hidden_states,
-            image_rotary_emb=image_rotary_emb,
+            image_rotary_freqs_cis=image_rotary_freqs_cis,
+            image_rotary_position_ids=image_rotary_position_ids,
         )
         hidden_states = hidden_states + mod_gate * attn_output
 
@@ -448,6 +459,7 @@ class Flux2Transformer2DModel(Module):
         device = config.device
         dtype = config.dtype
         eps = config.eps
+        attention_backend = config.diffusion_attention_backend
 
         self.device = device
         self.patch_size = patch_size
@@ -514,6 +526,7 @@ class Flux2Transformer2DModel(Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    attention_backend=attention_backend,
                 )
                 for _ in range(num_layers)
             ]
@@ -529,6 +542,7 @@ class Flux2Transformer2DModel(Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    attention_backend=attention_backend,
                 )
                 for _ in range(num_single_layers)
             ]
@@ -635,7 +649,20 @@ class Flux2Transformer2DModel(Module):
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
         ids = ops.concat([txt_ids, img_ids], axis=0)
-        image_rotary_emb = self.pos_embed(ids)
+        image_rotary_freqs_cis = self.pos_embed(ids)
+        image_rotary_position_ids = ops.broadcast_to(
+            ops.unsqueeze(
+                ops.range(
+                    0,
+                    ids.shape[0],
+                    1,
+                    dtype=DType.uint32,
+                    device=hidden_states.device,
+                ),
+                0,
+            ),
+            [hidden_states.shape[0], ids.shape[0]],
+        )
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -643,7 +670,8 @@ class Flux2Transformer2DModel(Module):
                 encoder_hidden_states=encoder_hidden_states,
                 temb_mod_params_img=double_stream_mod_img,
                 temb_mod_params_txt=double_stream_mod_txt,
-                image_rotary_emb=image_rotary_emb,
+                image_rotary_freqs_cis=image_rotary_freqs_cis,
+                image_rotary_position_ids=image_rotary_position_ids,
             )
 
         hidden_states = ops.concat(
@@ -655,7 +683,8 @@ class Flux2Transformer2DModel(Module):
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
-                image_rotary_emb=image_rotary_emb,
+                image_rotary_freqs_cis=image_rotary_freqs_cis,
+                image_rotary_position_ids=image_rotary_position_ids,
                 split_hidden_states=False,
             )
             if isinstance(hidden_states, tuple):
