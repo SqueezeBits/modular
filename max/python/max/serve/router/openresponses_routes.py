@@ -38,6 +38,7 @@ from max.interfaces.request.open_responses import (
 from max.serve.dependencies import create_request_parser
 from max.serve.media import (
     GeneratedMediaStore,
+    GeneratedMediaStorageError,
     StoredMediaAsset,
     encode_video_bytes_b64,
 )
@@ -112,11 +113,17 @@ async def create_response(
             if chunk.is_done:
                 break
 
-    final_output = _persist_generated_media(
-        request=request,
-        open_responses_request=open_responses_request,
-        final_output=final_output,
-    )
+    try:
+        final_output = _persist_generated_media(
+            request=request,
+            open_responses_request=open_responses_request,
+            final_output=final_output,
+        )
+    except GeneratedMediaStorageError as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.INSUFFICIENT_STORAGE,
+            detail=str(exc),
+        ) from exc
 
     # Convert GenerationOutput to ResponseResource format
     response = ResponseResource.from_generation_output(
@@ -240,13 +247,22 @@ def _persist_generated_media(
     if image_response_format == GeneratedMediaResponseFormat.b64_json:
         return final_output
 
+    image_assets = iter(
+        media_store.save_image_contents(
+            [
+                content
+                for content in final_output.output
+                if isinstance(content, OutputImageContent)
+            ]
+        )
+    )
     persisted_output: list[OutputContent] = []
     for content in final_output.output:
         if not isinstance(content, OutputImageContent):
             persisted_output.append(content)
             continue
 
-        image_asset = media_store.save_image_content(content)
+        image_asset = next(image_assets)
         image_url = str(
             request.url_for(
                 "get_generated_image_content",

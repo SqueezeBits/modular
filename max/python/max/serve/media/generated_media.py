@@ -27,6 +27,10 @@ from max.interfaces.request.open_responses import OutputImageContent
 from PIL import Image
 
 
+class GeneratedMediaStorageError(RuntimeError):
+    """Raised when generated media cannot be retained within local storage."""
+
+
 @dataclass(frozen=True)
 class StoredMediaAsset:
     """Metadata for a generated file persisted on disk."""
@@ -35,19 +39,28 @@ class StoredMediaAsset:
     path: Path
     media_type: str
     filename: str
+    kind: str
+    size_bytes: int
 
 
 class GeneratedMediaStore:
     """Stores generated media files for later download via HTTP."""
 
-    def __init__(self, root_dir: Path) -> None:
+    def __init__(
+        self,
+        root_dir: Path,
+        max_storage_bytes: int = 512 * 1024 * 1024,
+    ) -> None:
         self._root_dir = root_dir
         self._images_dir = root_dir / "images"
         self._videos_dir = root_dir / "videos"
         self._images_dir.mkdir(parents=True, exist_ok=True)
         self._videos_dir.mkdir(parents=True, exist_ok=True)
+        self._max_storage_bytes = max_storage_bytes
         self._images: dict[str, StoredMediaAsset] = {}
         self._videos: dict[str, StoredMediaAsset] = {}
+        self._assets: dict[str, StoredMediaAsset] = {}
+        self._total_storage_bytes = 0
 
     def get_image(self, image_id: str) -> StoredMediaAsset | None:
         return self._images.get(image_id)
@@ -58,16 +71,42 @@ class GeneratedMediaStore:
     def save_image_content(
         self, content: OutputImageContent
     ) -> StoredMediaAsset:
-        image_bytes = _decode_output_image_bytes(content)
-        image_format = (content.format or "png").lower()
-        asset = self._write_asset(
-            directory=self._images_dir,
-            extension=image_format,
-            default_media_type=f"image/{image_format}",
-            payload=image_bytes,
+        return self.save_image_contents([content])[0]
+
+    def save_image_contents(
+        self, contents: list[OutputImageContent]
+    ) -> list[StoredMediaAsset]:
+        if not contents:
+            return []
+
+        payloads = [
+            (
+                _decode_output_image_bytes(content),
+                (content.format or "png").lower(),
+            )
+            for content in contents
+        ]
+        self._ensure_capacity(
+            sum(len(image_bytes) for image_bytes, _ in payloads)
         )
-        self._images[asset.asset_id] = asset
-        return asset
+
+        saved_assets: list[StoredMediaAsset] = []
+        try:
+            for image_bytes, image_format in payloads:
+                asset = self._write_asset(
+                    directory=self._images_dir,
+                    extension=image_format,
+                    default_media_type=f"image/{image_format}",
+                    payload=image_bytes,
+                    kind="image",
+                )
+                self._register_asset(asset)
+                saved_assets.append(asset)
+        except Exception:
+            for asset in saved_assets:
+                self._delete_asset(asset)
+            raise
+        return saved_assets
 
     def save_video_frames(
         self,
@@ -77,21 +116,31 @@ class GeneratedMediaStore:
         if not frame_contents:
             raise ValueError("Cannot save a video without any frames.")
 
-        video_bytes = self.encode_video_frames(
-            frame_contents=frame_contents,
-            frames_per_second=frames_per_second,
-        )
         output_path = self._videos_dir / f"{uuid4().hex}.mp4"
-        output_path.write_bytes(video_bytes)
-
-        asset = StoredMediaAsset(
-            asset_id=output_path.stem,
-            path=output_path,
-            media_type="video/mp4",
-            filename=output_path.name,
-        )
-        self._videos[asset.asset_id] = asset
-        return asset
+        try:
+            _encode_mp4(
+                [
+                    _decode_output_image_frame(content)
+                    for content in frame_contents
+                ],
+                output_path,
+                frames_per_second,
+            )
+            size_bytes = output_path.stat().st_size
+            self._ensure_capacity(size_bytes)
+            asset = StoredMediaAsset(
+                asset_id=output_path.stem,
+                path=output_path,
+                media_type="video/mp4",
+                filename=output_path.name,
+                kind="video",
+                size_bytes=size_bytes,
+            )
+            self._register_asset(asset)
+            return asset
+        except Exception:
+            output_path.unlink(missing_ok=True)
+            raise
 
     def encode_video_frames(
         self,
@@ -123,6 +172,7 @@ class GeneratedMediaStore:
         extension: str,
         default_media_type: str,
         payload: bytes,
+        kind: str,
     ) -> StoredMediaAsset:
         asset_id = uuid4().hex
         output_path = directory / f"{asset_id}.{extension}"
@@ -135,7 +185,45 @@ class GeneratedMediaStore:
             path=output_path,
             media_type=media_type,
             filename=output_path.name,
+            kind=kind,
+            size_bytes=len(payload),
         )
+
+    def _register_asset(self, asset: StoredMediaAsset) -> None:
+        self._assets[asset.asset_id] = asset
+        self._total_storage_bytes += asset.size_bytes
+        if asset.kind == "image":
+            self._images[asset.asset_id] = asset
+        else:
+            self._videos[asset.asset_id] = asset
+
+    def _delete_asset(self, asset: StoredMediaAsset) -> None:
+        if asset.asset_id not in self._assets:
+            return
+
+        self._assets.pop(asset.asset_id, None)
+        if asset.kind == "image":
+            self._images.pop(asset.asset_id, None)
+        else:
+            self._videos.pop(asset.asset_id, None)
+        self._total_storage_bytes -= asset.size_bytes
+        asset.path.unlink(missing_ok=True)
+
+    def _ensure_capacity(self, additional_bytes: int) -> None:
+        if additional_bytes > self._max_storage_bytes:
+            raise GeneratedMediaStorageError(
+                "Generated media exceeds local storage limit: "
+                f"{additional_bytes} bytes requested, "
+                f"{self._max_storage_bytes} bytes available."
+            )
+
+        while (
+            self._total_storage_bytes + additional_bytes
+            > self._max_storage_bytes
+            and self._assets
+        ):
+            _, oldest_asset = next(iter(self._assets.items()))
+            self._delete_asset(oldest_asset)
 
 
 def _decode_output_image_bytes(content: OutputImageContent) -> bytes:

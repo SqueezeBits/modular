@@ -127,6 +127,11 @@ class Settings(BaseSettings):
         default=20 * 1024 * 1024,  # 20MiB
         alias="MAX_SERVE_MAX_LOCAL_IMAGE_BYTES",
     )
+    generated_media_storage_bytes: int = Field(
+        description="Maximum retained size in bytes for generated media files served from local disk.",
+        default=512 * 1024 * 1024,  # 512MiB
+        alias="MAX_SERVE_MAX_GENERATED_MEDIA_BYTES",
+    )
 
     # Telemetry and logging configuration
     logs_console_level: str | None = Field(
@@ -318,6 +323,10 @@ class Settings(BaseSettings):
         logger.info(f"    allowed_image_roots    : {allowed_roots_str}")
         logger.info(
             f"    max_local_image_bytes  : {to_human_readable_bytes(self.max_local_image_bytes)}"
+        )
+        logger.info(
+            "    generated_media_bytes : %s",
+            to_human_readable_bytes(self.generated_media_storage_bytes),
         )
         logger.info("")
 

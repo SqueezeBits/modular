@@ -12,6 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 """Tests for OpenResponses API routes."""
 
+import base64
 import logging
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -104,22 +105,27 @@ def patch_pipeline_registry_context_type(
 class MockGeneralPipelineHandler(GeneralPipelineHandler):
     """Mock implementation of GeneralPipelineHandler for testing."""
 
-    def __init__(self) -> None:
+    def __init__(self, pixel_data: np.ndarray | None = None) -> None:
         # Skip the parent constructor that requires real dependencies
         self.model_name = "test-model"
         self.logger = Mock()
         self.debug_logging = False
+        self.pixel_data = (
+            pixel_data
+            if pixel_data is not None
+            else np.array([[1, 2, 3]], dtype=np.uint8)
+        )
 
     async def next(
         self, request: OpenResponsesRequest
     ) -> AsyncGenerator[GenerationOutput, None]:
         """Mock implementation that yields a simple text response."""
-        # Create a simple mock response
-        pixel_data = np.array([[1, 2, 3]], dtype=np.uint8)
         yield GenerationOutput(
             request_id=request.request_id,
             final_status=GenerationStatus.END_OF_SEQUENCE,
-            output=[OutputImageContent.from_numpy(pixel_data, format="png")],
+            output=[
+                OutputImageContent.from_numpy(self.pixel_data, format="png")
+            ],
         )
 
 
@@ -181,6 +187,11 @@ def test_openresponses_simple_request(app) -> None:  # noqa: ANN001
         request_data = {
             "model": "test-model",
             "input": "Generate an image of a cat",
+            "provider_options": {
+                "image": {
+                    "response_format": "url",
+                }
+            },
         }
         response = client.post("/v1/responses", json=request_data)
 
@@ -326,3 +337,76 @@ def test_openresponses_video_request_returns_inline_base64_when_requested(
         assert content["num_frames"] == 2
         assert content["video_data"]
         assert "video_url" not in content
+
+
+def test_openresponses_media_urls_evict_oldest_asset(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    """New media should evict the oldest retained asset when storage is full."""
+    pixel_data = np.zeros((64, 64, 3), dtype=np.uint8)
+    image_content = OutputImageContent.from_numpy(pixel_data, format="png")
+    image_size = len(base64.b64decode(image_content.image_data or ""))
+    app.state.handler = MockGeneralPipelineHandler(pixel_data)
+    app.state.media_store = GeneratedMediaStore(
+        tmp_path / "bounded_media",
+        max_storage_bytes=image_size + 1,
+    )
+
+    with TestClient(app) as client:
+        request_data = {
+            "model": "test-model",
+            "input": "Generate an image of a cat",
+            "provider_options": {
+                "image": {
+                    "response_format": "url",
+                }
+            },
+        }
+        first_response = client.post("/v1/responses", json=request_data)
+        second_response = client.post("/v1/responses", json=request_data)
+
+        assert first_response.status_code == 200
+        assert second_response.status_code == 200
+
+        first_content = first_response.json()["output"][0]["content"][0]
+        second_content = second_response.json()["output"][0]["content"][0]
+
+        first_path = urlparse(first_content["image_url"]).path
+        second_path = urlparse(second_content["image_url"]).path
+
+        assert first_path != second_path
+        assert client.get(first_path).status_code == 404
+
+        second_asset = client.get(second_path)
+        assert second_asset.status_code == 200
+        assert second_asset.headers["content-type"] == "image/png"
+
+
+def test_openresponses_video_request_returns_507_when_storage_cap_is_too_small(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    """Video URL requests should fail when the retained storage cap is too small."""
+    app.state.handler = MockVideoPipelineHandler()
+    app.state.media_store = GeneratedMediaStore(
+        tmp_path / "tiny_media",
+        max_storage_bytes=1,
+    )
+
+    with TestClient(app) as client:
+        request_data = {
+            "model": "test-model",
+            "input": "Animate a red square becoming green.",
+            "provider_options": {
+                "video": {
+                    "width": 64,
+                    "height": 64,
+                    "num_frames": 2,
+                    "frames_per_second": 8,
+                    "steps": 2,
+                }
+            },
+        }
+        response = client.post("/v1/responses", json=request_data)
+
+        assert response.status_code == 507
+        assert "storage limit" in response.json()["detail"].lower()

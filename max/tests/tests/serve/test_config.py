@@ -78,3 +78,14 @@ def test_deprecated_dispatcher_config_fails_even_with_valid_di_bind_address() ->
             del os.environ["MAX_SERVE_DISPATCHER_CONFIG"]
         if "MAX_SERVE_DI_BIND_ADDRESS" in os.environ:
             del os.environ["MAX_SERVE_DI_BIND_ADDRESS"]
+
+
+def test_generated_media_storage_bytes_from_env() -> None:
+    """Test that generated media storage settings can be configured."""
+    os.environ["MAX_SERVE_MAX_GENERATED_MEDIA_BYTES"] = "12345"
+
+    try:
+        settings = Settings()
+        assert settings.generated_media_storage_bytes == 12345
+    finally:
+        del os.environ["MAX_SERVE_MAX_GENERATED_MEDIA_BYTES"]

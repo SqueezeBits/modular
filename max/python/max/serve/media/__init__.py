@@ -13,12 +13,14 @@
 
 from .generated_media import (
     GeneratedMediaStore,
+    GeneratedMediaStorageError,
     StoredMediaAsset,
     encode_video_bytes_b64,
 )
 
 __all__ = [
     "GeneratedMediaStore",
+    "GeneratedMediaStorageError",
     "StoredMediaAsset",
     "encode_video_bytes_b64",
 ]
