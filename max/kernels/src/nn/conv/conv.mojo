@@ -4652,7 +4652,6 @@ def conv_gpu[
             )
 
     elif input_lt.rank == 5:
-
         comptime if filter_is_fcrs:
             conv3d_cudnn[input_type, filter_type, output_type](
                 input_lt,

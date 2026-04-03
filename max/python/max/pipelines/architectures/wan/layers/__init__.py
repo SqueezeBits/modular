@@ -11,10 +11,28 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from .arch import wan_animate_arch, wan_arch, wan_i2v_arch
+from .embeddings import (
+    TimestepEmbedding,
+    Timesteps,
+    apply_rotary_emb,
+    compute_wan_rope_cached,
+)
+from .normalization import WanLayerNorm
+from .transformer import (
+    WanCrossAttention,
+    WanFeedForward,
+    WanSelfAttention,
+    WanTransformerBlock,
+)
 
 __all__ = [
-    "wan_animate_arch",
-    "wan_arch",
-    "wan_i2v_arch",
+    "TimestepEmbedding",
+    "Timesteps",
+    "WanCrossAttention",
+    "WanFeedForward",
+    "WanLayerNorm",
+    "WanSelfAttention",
+    "WanTransformerBlock",
+    "apply_rotary_emb",
+    "compute_wan_rope_cached",
 ]
