@@ -250,6 +250,11 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
                 ("scheduler_step", "scheduler_step"),
                 ("preprocess_latents", "preprocess_latents"),
                 ("prepare_image_latents", "prepare_image_latents"),
+                # Wan Animate-specific (silently skipped for other pipelines)
+                ("_encode_face_segment", "encode_face_segment"),
+                ("_encode_pose_segment", "encode_pose_segment"),
+                ("_build_segment_condition", "build_segment_condition"),
+                ("_run_animate_denoising", "run_animate_denoising"),
             ]
         else:
             specs = [
@@ -261,6 +266,8 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
                 ("_unpatchify_latents", "_unpatchify_latents"),
                 ("scheduler.step", "scheduler.step"),
                 ("image_processor.postprocess", "image_processor.postprocess"),
+                # Wan Animate diffusers (silently skipped for other pipelines)
+                ("encode_image", "encode_image"),
             ]
         for method_name, label in specs:
             self._wrap_method_if_exists(target, method_name, label)
@@ -352,6 +359,16 @@ class ExecuteProfiler(AbstractContextManager["ExecuteProfiler"]):
             if name == "vae":
                 timed_methods["encode"] = make_on_time("component/vae.encode")
                 timed_methods["decode"] = make_on_time("component/vae.decode")
+            elif name == "transformer":
+                # Wan Animate transformer sub-methods
+                if hasattr(comp, "encode_motion"):
+                    timed_methods["encode_motion"] = make_on_time(
+                        "component/transformer.encode_motion"
+                    )
+                if hasattr(comp, "encode_face"):
+                    timed_methods["encode_face"] = make_on_time(
+                        "component/transformer.encode_face"
+                    )
 
             proxy: _TimedCallableProxy = _TimedCallableProxy(
                 comp,
