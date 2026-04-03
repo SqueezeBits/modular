@@ -51,6 +51,163 @@ def _zero_cache_for(x: TensorValue) -> TensorValue:
     return ops.constant(0.0, dtype=x.dtype, device=x.device).broadcast_to(shape)
 
 
+class AvgDown3D(Module):
+    """Average-downsample shortcut for residual Wan2.2 VAE blocks."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        factor_t: int,
+        factor_s: int = 1,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+        self.group_size = in_channels * self.factor // out_channels
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        temporal_dim = int(x.shape[2])
+        pad_t = (self.factor_t - temporal_dim % self.factor_t) % self.factor_t
+        if pad_t:
+            x = ops.pad(x, [0, 0, 0, 0, pad_t, 0, 0, 0, 0, 0])
+        batch_size, channels, frames, height, width = x.shape
+        x = ops.rebind(
+            x,
+            shape=[
+                batch_size,
+                channels,
+                frames,
+                (height // self.factor_s) * self.factor_s,
+                (width // self.factor_s) * self.factor_s,
+            ],
+        )
+        batch_size, channels, frames, height, width = x.shape
+        x = ops.reshape(
+            x,
+            [
+                batch_size,
+                channels,
+                frames // self.factor_t,
+                self.factor_t,
+                height // self.factor_s,
+                self.factor_s,
+                width // self.factor_s,
+                self.factor_s,
+            ],
+        )
+        x = ops.permute(x, [0, 1, 3, 5, 7, 2, 4, 6])
+        x = ops.reshape(
+            x,
+            [
+                batch_size,
+                channels * self.factor,
+                frames // self.factor_t,
+                height // self.factor_s,
+                width // self.factor_s,
+            ],
+        )
+        x = ops.reshape(
+            x,
+            [
+                batch_size,
+                self.out_channels,
+                self.group_size,
+                frames // self.factor_t,
+                height // self.factor_s,
+                width // self.factor_s,
+            ],
+        )
+        x = ops.mean(x, axis=2)
+        return ops.reshape(
+            x,
+            [
+                batch_size,
+                self.out_channels,
+                frames // self.factor_t,
+                height // self.factor_s,
+                width // self.factor_s,
+            ],
+        )
+
+
+class DupUp3D(Module):
+    """Repeat-upsample shortcut for residual Wan2.2 VAE blocks."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        factor_t: int,
+        factor_s: int = 1,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+        self.repeats = out_channels * self.factor // in_channels
+
+    def __call__(
+        self, x: TensorValue, *, first_chunk: bool = False
+    ) -> TensorValue:
+        x = ops.reshape(
+            x,
+            [x.shape[0], x.shape[1], 1, x.shape[2], x.shape[3], x.shape[4]],
+        )
+        x = x.broadcast_to(
+            [
+                x.shape[0],
+                x.shape[1],
+                self.repeats,
+                x.shape[3],
+                x.shape[4],
+                x.shape[5],
+            ]
+        )
+        x = ops.reshape(
+            x,
+            [
+                x.shape[0],
+                x.shape[1] * self.repeats,
+                x.shape[3],
+                x.shape[4],
+                x.shape[5],
+            ],
+        )
+        x = ops.reshape(
+            x,
+            [
+                x.shape[0],
+                self.out_channels,
+                self.factor_t,
+                self.factor_s,
+                self.factor_s,
+                x.shape[2],
+                x.shape[3],
+                x.shape[4],
+            ],
+        )
+        x = ops.permute(x, [0, 1, 5, 2, 6, 3, 7, 4])
+        x = ops.reshape(
+            x,
+            [
+                x.shape[0],
+                self.out_channels,
+                x.shape[2] * self.factor_t,
+                x.shape[4] * self.factor_s,
+                x.shape[6] * self.factor_s,
+            ],
+        )
+        if first_chunk and self.factor_t > 1:
+            x = x[:, :, self.factor_t - 1 :, :, :]
+        return x
+
+
 class RMSNorm(Module):
     """RMS norm used by Wan VAE blocks."""
 
@@ -766,6 +923,9 @@ class UpBlock(Module):
         if self.upsampler is not None:
             x = self.upsampler(x)
 
+        if self.avg_shortcut is not None:
+            x = x + self.avg_shortcut(residual, first_chunk=first_chunk)
+
         return x
 
 
@@ -785,7 +945,6 @@ class Decoder3d(Module):
         device: DeviceRef | None = None,
     ) -> None:
         super().__init__()
-        del is_residual
 
         dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
 
@@ -804,6 +963,8 @@ class Decoder3d(Module):
         up_blocks: list[UpBlock] = []
         final_out_dim = dims[-1]
         for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
+            if i > 0 and not is_residual:
+                in_dim = in_dim // 2
             up_flag = i != len(dim_mult) - 1
             upsample_mode: str | None = None
             if up_flag and temporal_upsample[i]:
@@ -1187,7 +1348,6 @@ class Decoder3dCached(Module):
         device: DeviceRef | None = None,
     ) -> None:
         super().__init__()
-        del is_residual
 
         dims = [dim * u for u in [dim_mult[-1], *dim_mult[::-1]]]
 
@@ -1206,6 +1366,8 @@ class Decoder3dCached(Module):
         up_blocks: list[UpBlockCached] = []
         final_out_dim = dims[-1]
         for i, (in_dim, out_dim) in enumerate(pairwise(dims)):
+            if i > 0 and not is_residual:
+                in_dim = in_dim // 2
             up_flag = i != len(dim_mult) - 1
             upsample_mode: str | None = None
             if up_flag and temporal_upsample[i]:
@@ -1219,6 +1381,9 @@ class Decoder3dCached(Module):
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
                     upsample_mode=upsample_mode,
+                    temperal_upsample=temporal_upsample[i] if up_flag else False,
+                    up_flag=up_flag,
+                    is_residual=is_residual,
                     dtype=dtype,
                     device=device,
                 )
@@ -2228,21 +2393,37 @@ class Encoder3dCached(Module):
         cache_outputs.append(c_out)
         idx += 1
 
-        for block in self.down_blocks:
-            if isinstance(block, ResidualBlockCached):
-                c1 = cache_inputs[idx] if use_cache else None
-                c2 = cache_inputs[idx + 1] if use_cache else None
-                x, co1, co2 = block(x, c1, c2)
-                cache_outputs.extend([co1, co2])
-                idx += 2
-            elif isinstance(block, DownResampleCached):
-                if block._has_temporal:
-                    c = cache_inputs[idx] if use_cache else None
-                    x, co = block(x, cache_in=c, first_chunk=first_chunk)
-                    cache_outputs.append(co)
-                    idx += 1
-                else:
-                    (x,) = block(x)
+        if self._is_residual:
+            for block, cache_slots in zip(
+                self.down_blocks, self._block_cache_slots, strict=True
+            ):
+                block_cache_inputs: tuple[TensorValue, ...] = (
+                    tuple(cache_inputs[idx : idx + cache_slots])
+                    if use_cache
+                    else ()
+                )
+                block_outputs = block(
+                    x, *block_cache_inputs, first_chunk=first_chunk
+                )
+                x = block_outputs[0]
+                cache_outputs.extend(block_outputs[1:])
+                idx += cache_slots
+        else:
+            for block in self.down_blocks:
+                if isinstance(block, ResidualBlockCached):
+                    c1 = cache_inputs[idx] if use_cache else None
+                    c2 = cache_inputs[idx + 1] if use_cache else None
+                    x, co1, co2 = block(x, c1, c2)
+                    cache_outputs.extend([co1, co2])
+                    idx += 2
+                elif isinstance(block, DownResampleCached):
+                    if block._has_temporal:
+                        c = cache_inputs[idx] if use_cache else None
+                        x, co = block(x, cache_in=c, first_chunk=first_chunk)
+                        cache_outputs.append(co)
+                        idx += 1
+                    else:
+                        (x,) = block(x)
 
         # mid_block
         mid_caches: tuple[TensorValue, ...] = (

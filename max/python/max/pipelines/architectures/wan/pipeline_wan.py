@@ -85,6 +85,7 @@ class WanRuntimeCache:
 
     spatial_shapes: dict[str, Buffer] = field(default_factory=dict)
     batched_timesteps: dict[str, list[Buffer]] = field(default_factory=dict)
+    ti2v_timestep_masks: dict[str, np.ndarray] = field(default_factory=dict)
     guidance_scales: dict[tuple[float, DType, str], Buffer] = field(
         default_factory=dict
     )
@@ -833,11 +834,21 @@ class WanPipeline(DiffusionPipeline):
                 if self.expand_timesteps
                 else None
             )
+            timestep_mask = (
+                self._get_ti2v_timestep_mask(
+                    latent_frames=int(latents.shape[2]),
+                    latent_height=int(latents.shape[3]),
+                    latent_width=int(latents.shape[4]),
+                )
+                if conditioned_first_frame is not None and self.expand_timesteps
+                else None
+            )
             batched_timesteps = self._get_batched_timesteps(
                 scheduler_timesteps=timesteps,
                 batch_size=int(latents.shape[0]),
                 device=device,
                 seq_len=timestep_seq_len,
+                timestep_mask=timestep_mask,
             )
             coeff_buffers = [
                 Buffer.from_numpy(
@@ -1099,11 +1110,13 @@ class WanPipeline(DiffusionPipeline):
         batch_size: int,
         device: Device,
         seq_len: int | None = None,
+        timestep_mask: np.ndarray | None = None,
     ) -> list[Buffer]:
         key = (
             f"{batch_size}_{len(scheduler_timesteps)}_"
             f"{float(scheduler_timesteps[0]):.4f}_{float(scheduler_timesteps[-1]):.4f}_"
-            f"{seq_len or 0}_{device.id}"
+            f"{seq_len or 0}_{device.id}_"
+            f"{'ti2v' if timestep_mask is not None else 'base'}"
         )
         cached = self.cache.batched_timesteps.get(key)
         if cached is not None:
@@ -1114,13 +1127,26 @@ class WanPipeline(DiffusionPipeline):
                 raise ValueError(
                     "seq_len is required for Wan expanded timestep preparation."
                 )
+            if timestep_mask is not None:
+                if timestep_mask.shape != (seq_len,):
+                    raise ValueError(
+                        "TI2V timestep mask shape mismatch: "
+                        f"expected {(seq_len,)}, got {timestep_mask.shape}."
+                    )
             batched_timesteps = [
                 Buffer.from_numpy(
-                    np.full(
-                        [batch_size, seq_len],
-                        float(step_value),
-                        dtype=np.float32,
+                    np.broadcast_to(
+                        (
+                            (
+                                timestep_mask
+                                if timestep_mask is not None
+                                else np.ones((seq_len,), dtype=np.float32)
+                            )
+                            * float(step_value)
+                        )[np.newaxis, :],
+                        (batch_size, seq_len),
                     )
+                    .astype(np.float32, copy=False)
                 ).to(device)
                 for step_value in scheduler_timesteps
             ]
@@ -1133,6 +1159,29 @@ class WanPipeline(DiffusionPipeline):
             ]
         self.cache.batched_timesteps[key] = batched_timesteps
         return batched_timesteps
+
+    def _get_ti2v_timestep_mask(
+        self,
+        *,
+        latent_frames: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> np.ndarray:
+        p_t, p_h, p_w = self.transformer.config.patch_size
+        token_h = latent_height // p_h
+        token_w = latent_width // p_w
+        key = f"{latent_frames}_{token_h}_{token_w}"
+        cached = self.cache.ti2v_timestep_masks.get(key)
+        if cached is not None:
+            return cached
+
+        timestep_mask = np.ones(
+            (latent_frames // p_t, token_h, token_w), dtype=np.float32
+        )
+        timestep_mask[0, :, :] = 0.0
+        timestep_mask = np.ascontiguousarray(timestep_mask.reshape(-1))
+        self.cache.ti2v_timestep_masks[key] = timestep_mask
+        return timestep_mask
 
     def _compute_latent_seq_len(
         self,

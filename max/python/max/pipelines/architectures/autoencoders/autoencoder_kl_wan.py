@@ -208,12 +208,8 @@ class AutoencoderKLWanModel(ComponentModel):
         super().__init__(config, encoding, devices, weights)
         self.config = AutoencoderKLWanConfig.generate(config, encoding, devices)
         self.config.dtype = DType.bfloat16
-        # Keep the VAE on the proven non-residual MAX path for now.
-        # Wan2.2-specific support in this wrapper currently relies on
-        # patch_size / decoder_base_dim / channel-shape fixes; the residual
-        # encoder/decoder shortcut path is not yet stable under MAX graph
-        # symbolic compilation.
-        self.config.is_residual = False
+        self._compiled_encoder_shape: tuple[int, int] | None = None
+        self._compiled_decoder_shape: tuple[int, int] | None = None
 
         self.pqc_model: Model | None = None
         self.first_frame_model: Model | None = None
@@ -318,24 +314,28 @@ class AutoencoderKLWanModel(ComponentModel):
                         buf, src_dtype, target_dtype, cpu_device
                     )
 
-            # Compile decoder graphs with symbolic dims.
-            self._compile_decoder_graphs(decoder_state_dict)
+            if not self.config.is_residual:
+                self._compile_decoder_graphs(decoder_state_dict)
 
-            # Compile encoder graphs (optional).
-            if has_encoder:
-                if not self.config.is_residual:
+                if has_encoder:
                     encoder_state_dict = _remap_wan_encoder_state_dict_keys(
                         encoder_state_dict,
                         num_res_blocks=self.config.num_res_blocks,
                         num_levels=len(self.config.dim_mult),
                     )
-                self._compile_encoder_graphs(encoder_state_dict)
+                    self._compile_encoder_graphs(encoder_state_dict)
+            else:
+                self._decoder_state_dict = decoder_state_dict
+                self._encoder_state_dict = encoder_state_dict if has_encoder else None
 
             self.weights = None  # type: ignore[assignment]
             return self.decode_4d
-
     def _compile_decoder_graphs(
-        self, decoder_state_dict: dict[str, Any]
+        self,
+        decoder_state_dict: dict[str, Any],
+        *,
+        latent_height: int | None = None,
+        latent_width: int | None = None,
     ) -> None:
         """Compile PQC + first-frame + rest-frame decoder with symbolic dims."""
         cfg = self.config
@@ -347,9 +347,14 @@ class AutoencoderKLWanModel(ComponentModel):
         pqc_module.load_state_dict(
             decoder_state_dict, weight_alignment=1, strict=False
         )
-        pqc_input_types = [
-            TensorType(dtype, [1, cfg.z_dim, 1, "height", "width"], device=dev)
-        ]
+        h_dim: int | str = (
+            latent_height if latent_height is not None else "height"
+        )
+        w_dim: int | str = (
+            latent_width if latent_width is not None else "width"
+        )
+
+        pqc_input_types = [TensorType(dtype, [1, cfg.z_dim, 1, h_dim, w_dim], device=dev)]
         with Graph("wan_vae_pqc", input_types=pqc_input_types) as pqc_graph:
             out = pqc_module(pqc_graph.inputs[0].tensor)
             pqc_graph.output(out)
@@ -361,9 +366,7 @@ class AutoencoderKLWanModel(ComponentModel):
         first_module.load_state_dict(
             decoder_state_dict, weight_alignment=1, strict=False
         )
-        first_input_types = [
-            TensorType(dtype, [1, cfg.z_dim, 1, "height", "width"], device=dev)
-        ]
+        first_input_types = [TensorType(dtype, [1, cfg.z_dim, 1, h_dim, w_dim], device=dev)]
         with Graph(
             "wan_vae_first_frame", input_types=first_input_types
         ) as first_graph:
@@ -422,9 +425,7 @@ class AutoencoderKLWanModel(ComponentModel):
 
         assert len(cache_dim_names) == WAN_DECODER_CACHE_SLOTS
 
-        rest_input_types = [
-            TensorType(dtype, [1, cfg.z_dim, 1, "height", "width"], device=dev)
-        ]
+        rest_input_types = [TensorType(dtype, [1, cfg.z_dim, 1, h_dim, w_dim], device=dev)]
         for i, shape in enumerate(cache_shape_info):
             channels = shape[1]
             cache_t = shape[2]
@@ -445,7 +446,11 @@ class AutoencoderKLWanModel(ComponentModel):
         )
 
     def _compile_encoder_graphs(
-        self, encoder_state_dict: dict[str, Any]
+        self,
+        encoder_state_dict: dict[str, Any],
+        *,
+        height: int | None = None,
+        width: int | None = None,
     ) -> None:
         """Compile first-chunk + rest-chunk encoder with symbolic dims."""
         cfg = self.config
@@ -457,8 +462,10 @@ class AutoencoderKLWanModel(ComponentModel):
         first_module.load_state_dict(
             encoder_state_dict, weight_alignment=1, strict=False
         )
+        h_dim: int | str = height if height is not None else "height"
+        w_dim: int | str = width if width is not None else "width"
         first_input_type = TensorType(
-            dtype, [1, cfg.in_channels, 1, "height", "width"], device=dev
+            dtype, [1, cfg.in_channels, 1, h_dim, w_dim], device=dev
         )
         with Graph(
             "wan_vae_enc_first", input_types=[first_input_type]
@@ -481,12 +488,12 @@ class AutoencoderKLWanModel(ComponentModel):
             dim_mult=cfg.dim_mult,
             num_res_blocks=cfg.num_res_blocks,
             temporal_downsample=cfg.temporal_downsample,
+            is_residual=cfg.is_residual,
             dtype=dtype,
             device=dev_ref,
         )
-        # Encoder has no upsample so cache shapes use same dims throughout.
         cache_shape_info = encoder_for_shapes.cache_shapes(
-            batch_size=1, height=None, width=None
+            batch_size=1, height=height, width=width
         )
 
         rest_input_types = [
@@ -496,8 +503,8 @@ class AutoencoderKLWanModel(ComponentModel):
                     1,
                     cfg.in_channels,
                     WAN_ENCODER_CHUNK_SIZE,
-                    "height",
-                    "width",
+                    h_dim,
+                    w_dim,
                 ],
                 device=dev,
             )
@@ -506,10 +513,12 @@ class AutoencoderKLWanModel(ComponentModel):
             channels = shape[1]
             cache_t = shape[2]
             assert channels is not None and cache_t is not None
+            ch_dim: int | str = shape[3] if shape[3] is not None else f"eh{i}"
+            cw_dim: int | str = shape[4] if shape[4] is not None else f"ew{i}"
             rest_input_types.append(
                 TensorType(
                     dtype,
-                    [1, channels, cache_t, f"eh{i}", f"ew{i}"],
+                    [1, channels, cache_t, ch_dim, cw_dim],
                     device=dev,
                 )
             )
@@ -524,10 +533,57 @@ class AutoencoderKLWanModel(ComponentModel):
             rest_graph, weights_registry=rest_module.state_dict()
         )
 
+    def _ensure_decoder_compiled(
+        self,
+        *,
+        latent_height: int,
+        latent_width: int,
+    ) -> None:
+        if not self.config.is_residual:
+            if self.pqc_model is None:
+                self.load_model()
+            return
+        target_shape = (latent_height, latent_width)
+        if self._compiled_decoder_shape == target_shape and self.pqc_model is not None:
+            return
+        self._compile_decoder_graphs(
+            self._decoder_state_dict,
+            latent_height=latent_height,
+            latent_width=latent_width,
+        )
+        self._compiled_decoder_shape = target_shape
+
+    def _ensure_encoder_compiled(
+        self,
+        *,
+        height: int,
+        width: int,
+    ) -> None:
+        if self._encoder_state_dict is None:
+            return
+        if not self.config.is_residual:
+            if self.first_chunk_encoder is None:
+                self.load_model()
+            return
+        target_shape = (height, width)
+        if (
+            self._compiled_encoder_shape == target_shape
+            and self.first_chunk_encoder is not None
+        ):
+            return
+        self._compile_encoder_graphs(
+            self._encoder_state_dict,
+            height=height,
+            width=width,
+        )
+        self._compiled_encoder_shape = target_shape
+
     def decode_5d(self, latents_5d: Buffer) -> Buffer:
         """Decode 5D latents [B, C, T, H, W] frame-by-frame."""
-        if self.pqc_model is None:
-            self.load_model()
+        self._ensure_decoder_compiled(
+            latent_height=int(latents_5d.shape[3]),
+            latent_width=int(latents_5d.shape[4]),
+        )
         pqc_model = self.pqc_model
         first_frame_model = self.first_frame_model
         rest_frame_model = self.rest_frame_model
@@ -624,8 +680,16 @@ class AutoencoderKLWanModel(ComponentModel):
         Returns the mean of the diagonal Gaussian (argmax mode),
         shape [B, z_dim, T_latent, H_latent, W_latent].
         """
-        if self.first_chunk_encoder is None:
-            self.load_model()
+        first_chunk_encoder = self.first_chunk_encoder
+        rest_chunk_encoder = self.rest_chunk_encoder
+
+        video_np = _buffer_to_numpy_f32(video, CPU())
+        patch_size = int(self.config.patch_size or 1)
+        video_np = _patchify_spatial_numpy(video_np, patch_size)
+        self._ensure_encoder_compiled(
+            height=int(video_np.shape[3]),
+            width=int(video_np.shape[4]),
+        )
         first_chunk_encoder = self.first_chunk_encoder
         rest_chunk_encoder = self.rest_chunk_encoder
         if first_chunk_encoder is None or rest_chunk_encoder is None:
@@ -633,10 +697,6 @@ class AutoencoderKLWanModel(ComponentModel):
                 "VAE encoder weights not available. "
                 "Ensure the model checkpoint includes encoder weights."
             )
-
-        video_np = _buffer_to_numpy_f32(video, CPU())
-        patch_size = int(self.config.patch_size or 1)
-        video_np = _patchify_spatial_numpy(video_np, patch_size)
         target_dtype = self.config.dtype
         device = self.devices[0]
         cpu = CPU()
