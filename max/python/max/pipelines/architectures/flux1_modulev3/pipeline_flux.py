@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, field, fields
+from pathlib import Path
 from queue import Queue
 from typing import Any
 
@@ -29,6 +30,7 @@ from max.pipelines.lib.interfaces import (
     DenoisingCacheState,
     DiffusionPipeline,
 )
+from max.pipelines.lib.interfaces.component_model import ComponentModel
 from max.pipelines.lib.interfaces.diffusion_pipeline import (
     DiffusionPipelineOutput,
     max_compile,
@@ -36,7 +38,7 @@ from max.pipelines.lib.interfaces.diffusion_pipeline import (
 from PIL import Image
 from typing_extensions import Self
 
-from ..autoencoders_modulev3 import AutoencoderKLModel
+from ..autoencoders_modulev3 import AutoencoderKLModel, AutoencoderTinyModel
 from ..clip import ClipModel
 from ..t5 import T5Model
 from .model import Flux1TransformerModel
@@ -165,7 +167,7 @@ class Flux1ModelInputs:
 
 
 class FluxPipeline(DiffusionPipeline):
-    vae: AutoencoderKLModel
+    vae: AutoencoderKLModel | AutoencoderTinyModel
     text_encoder: ClipModel
     text_encoder_2: T5Model
     transformer: Flux1TransformerModel
@@ -177,12 +179,36 @@ class FluxPipeline(DiffusionPipeline):
         "transformer": Flux1TransformerModel,
     }
 
+    def _load_sub_models(
+        self, weight_paths: list[Path]
+    ) -> dict[str, ComponentModel]:
+        """Override to swap VAE class when a Tiny VAE is detected."""
+        vae_config = self.pipeline_config.models["vae"].huggingface_config
+        if getattr(vae_config, "_class_name", None) == "AutoencoderTiny":
+            self.components = {
+                **self.components,
+                "vae": AutoencoderTinyModel,
+            }
+        return super()._load_sub_models(weight_paths)
+
     def init_remaining_components(self) -> None:
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1)
-            if getattr(self, "vae", None)
-            else 8
-        )
+        if isinstance(self.vae, AutoencoderTinyModel):
+            block_out_channels = getattr(
+                self.vae.config, "block_out_channels", None
+            )
+            if not block_out_channels:
+                block_out_channels = getattr(
+                    self.vae.config,
+                    "encoder_block_out_channels",
+                    [64, 64, 64, 64],
+                )
+            self.vae_scale_factor = 2 ** (len(block_out_channels) - 1)
+        elif getattr(self, "vae", None):
+            self.vae_scale_factor = 2 ** (
+                len(self.vae.config.block_out_channels) - 1
+            )
+        else:
+            self.vae_scale_factor = 8
 
         self.build_prepare_prompt_embeddings()
         self.build_preprocess_latents()
