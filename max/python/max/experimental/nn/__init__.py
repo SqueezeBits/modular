@@ -13,6 +13,7 @@
 """Module implementation using eager tensors."""
 
 from .conv import Conv2d
+from .conv_transpose import ConvTranspose2d
 from .embedding import Embedding
 from .linear import Linear
 from .module import CompiledModel, Module, PinnedDeviceTensor, module_dataclass
@@ -23,6 +24,7 @@ from .sequential import ModuleList, Sequential
 __all__ = [
     "CompiledModel",
     "Conv2d",
+    "ConvTranspose2d",
     "Embedding",
     "GemmaRMSNorm",
     "GroupNorm",
