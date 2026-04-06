@@ -12,6 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,7 @@ from max.pipelines.lib.interfaces import (
     DenoisingCacheState,
     DiffusionPipeline,
 )
+from max.pipelines.lib.interfaces.component_model import ComponentModel
 from max.pipelines.lib.interfaces.diffusion_pipeline import (
     DiffusionPipelineOutput,
     max_compile,
@@ -34,7 +36,10 @@ from max.pipelines.lib.interfaces.diffusion_pipeline import (
 from max.pipelines.lib.utils import BoundedCache
 from max.profiler import Tracer, traced
 
-from ..autoencoders_modulev3 import AutoencoderKLFlux2Model
+from ..autoencoders_modulev3 import (
+    AutoencoderKLFlux2Model,
+    Flux2TinyAutoEncoderModel,
+)
 from ..mistral3_modulev3.text_encoder import Mistral3TextEncoderModel
 from .model import Flux2TransformerModel
 
@@ -126,7 +131,7 @@ class Flux2Pipeline(DiffusionPipeline):
     default_num_inference_steps = 28
     default_residual_threshold = 0.06
 
-    vae: AutoencoderKLFlux2Model
+    vae: AutoencoderKLFlux2Model | Flux2TinyAutoEncoderModel
     text_encoder: Mistral3TextEncoderModel
     transformer: Flux2TransformerModel
 
@@ -136,14 +141,35 @@ class Flux2Pipeline(DiffusionPipeline):
         "transformer": Flux2TransformerModel,
     }
 
+    def _load_sub_models(
+        self, weight_paths: list[Path]
+    ) -> dict[str, ComponentModel]:
+        """Override to swap VAE class when a Tiny VAE is detected."""
+        vae_config = self.pipeline_config.models["vae"].huggingface_config
+        if getattr(vae_config, "_class_name", None) == "Flux2TinyAutoEncoder":
+            self.components = {
+                **self.components,
+                "vae": Flux2TinyAutoEncoderModel,
+            }
+        return super()._load_sub_models(weight_paths)
+
     @traced(message="Flux2Pipeline.init_remaining_components")
     def init_remaining_components(self) -> None:
         """Initialize derived attributes that depend on loaded components."""
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1)
-            if getattr(self, "vae", None)
-            else 8
-        )
+        self._is_tiny_vae = isinstance(self.vae, Flux2TinyAutoEncoderModel)
+        if getattr(self, "vae", None):
+            block_out_channels = getattr(
+                self.vae.config, "block_out_channels", None
+            )
+            if not block_out_channels:
+                block_out_channels = getattr(
+                    self.vae.config,
+                    "encoder_block_out_channels",
+                    [64, 64, 64, 64],
+                )
+            self.vae_scale_factor = 2 ** (len(block_out_channels) - 1)
+        else:
+            self.vae_scale_factor = 8
 
         self.build_preprocess_latents()
         self.build_prepare_image_latents()
@@ -281,6 +307,9 @@ class Flux2Pipeline(DiffusionPipeline):
 
     @traced(message="Flux2Pipeline.build_prepare_image_latents")
     def build_prepare_image_latents(self) -> None:
+        if self._is_tiny_vae:
+            return
+        assert isinstance(self.vae, AutoencoderKLFlux2Model)
         dtype = self.vae.config.dtype
         device = self.vae.devices[0]
         num_channels = int(self.vae.bn.running_mean.shape[0])
@@ -356,6 +385,11 @@ class Flux2Pipeline(DiffusionPipeline):
     @traced(message="Flux2Pipeline.build_decode_latents")
     def build_decode_latents(self) -> None:
         device = self.transformer.devices[0]
+        if self._is_tiny_vae:
+            assert isinstance(self.vae, Flux2TinyAutoEncoderModel)
+            self._postprocess_and_decode = self.vae.build_fused_decode(device)
+            return
+        assert isinstance(self.vae, AutoencoderKLFlux2Model)
         self._bn_mean: Tensor = self.vae.bn.running_mean
         self._bn_var: Tensor = self.vae.bn.running_var
         num_channels = int(self._bn_mean.shape[0])
@@ -456,6 +490,11 @@ class Flux2Pipeline(DiffusionPipeline):
         device: Device,
         dtype: DType,
     ) -> tuple[Tensor, Tensor]:
+        if self._is_tiny_vae:
+            return self._prepare_image_latents_tiny(
+                images, batch_size, device, dtype
+            )
+
         bn_mean = self._bn_mean
         bn_var = self._bn_var
 
@@ -494,6 +533,46 @@ class Flux2Pipeline(DiffusionPipeline):
             image_latent_ids = F.tile(image_latent_ids, (batch_size, 1, 1))
         image_latent_ids = image_latent_ids.to(device)
 
+        return image_latents, image_latent_ids
+
+    def _prepare_image_latents_tiny(
+        self,
+        images: list[Tensor],
+        batch_size: int,
+        device: Device,
+        dtype: DType,
+    ) -> tuple[Tensor, Tensor]:
+        packed_latents = []
+        latent_shapes = []
+
+        for image in images:
+            image = image.to(device).cast(dtype)
+            encoder_output = self.vae.encode(image)
+            raw_latents = (
+                encoder_output["latents"]
+                if isinstance(encoder_output, dict)
+                else encoder_output
+            )
+            assert isinstance(raw_latents, Tensor)
+
+            b, c, raw_h, raw_w = map(int, raw_latents.shape)
+            latent_shapes.append((raw_h, raw_w))
+
+            packed = F.reshape(raw_latents, (b, c, raw_h * raw_w))
+            packed = F.permute(packed, (0, 2, 1))
+            packed_latents.append(packed)
+
+        image_latent_ids = self._prepare_image_ids(latent_shapes, device=device)
+        image_latents = (
+            packed_latents[0]
+            if len(packed_latents) == 1
+            else F.concat(packed_latents, axis=1)
+        )
+
+        if batch_size > 1:
+            image_latents = F.tile(image_latents, (batch_size, 1, 1))
+            image_latent_ids = F.tile(image_latent_ids, (batch_size, 1, 1))
+        image_latent_ids = image_latent_ids.to(device)
         return image_latents, image_latent_ids
 
     @traced(message="Flux2Pipeline.prepare_prompt_embeddings")
@@ -576,7 +655,9 @@ class Flux2Pipeline(DiffusionPipeline):
         """
         decoded = self._postprocess_and_decode(latents, h_carrier, w_carrier)
 
-        return np.from_dlpack(decoded)  # (B, H, W, C)
+        if isinstance(decoded, Tensor):
+            return np.from_dlpack(decoded)
+        return decoded
 
     @staticmethod
     def _prepare_text_ids(

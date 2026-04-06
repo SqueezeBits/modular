@@ -292,6 +292,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Prefer the ModuleV3 implementation when the selected model provides one.",
     )
     parser.add_argument(
+        "--tiny-vae",
+        action="store_true",
+        help=(
+            "Replace the VAE with a lightweight tiny autoencoder for "
+            "faster decoding. Automatically selects the correct model "
+            "based on the pipeline type. To specify a custom tiny VAE, "
+            "use --model-override vae.model_path=<repo_id> "
+            "--model-override vae.subfolder=null instead."
+        ),
+    )
+    parser.add_argument(
         "--model-override",
         type=str,
         action="append",
@@ -412,6 +423,24 @@ async def generate_image(args: argparse.Namespace) -> None:
             "transformer",
             quantization_encoding=args.quantization_encoding,
         )
+
+    # Apply --tiny-vae shorthand.
+    # Automatically selects the correct tiny VAE based on pipeline type.
+    if args.tiny_vae:
+        pipeline_class = manifest.metadata.get("_class_name", "")
+        if pipeline_class in _FLUX2_ARCH_NAMES:
+            manifest = manifest.with_override(
+                "vae",
+                model_path="fal/FLUX.2-Tiny-AutoEncoder",
+                subfolder=None,
+            )
+        else:
+            # FLUX.1 and other pipelines: use madebyollin/taef1
+            manifest = manifest.with_override(
+                "vae",
+                model_path="madebyollin/taef1",
+                subfolder=None,
+            )
 
     # Apply flexible per-component overrides from --model-override.
     if args.model_override:
