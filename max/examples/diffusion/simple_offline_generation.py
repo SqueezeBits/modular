@@ -481,15 +481,7 @@ async def generate_image(args: argparse.Namespace) -> None:
     has_tokenizer_2 = "tokenizer_2" in models
     max_length = args.max_length
     secondary_max_length = args.secondary_max_length
-    if (
-        max_length is None
-        and diffusers_config is not None
-        and (components_config := diffusers_config.get("components", None))
-        and (components_config.get("tokenizer", None) is not None)
-    ):
-        max_length = components_config["tokenizer"]["config_dict"].get(
-            "model_max_length", None
-        )
+    if max_length is None and "tokenizer" in models:
         if arch.name in _FLUX2_ARCH_NAMES or arch.name in _Z_IMAGE_ARCH_NAMES:
             max_length = 512
         else:

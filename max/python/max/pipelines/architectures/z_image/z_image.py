@@ -13,11 +13,21 @@
 
 """Z-Image DiT core model (Graph API / ModuleV2)."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
+
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
+from max.graph import DeviceRef, Dim, TensorType, TensorValue, Weight, ops
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm import RMSNorm
+
+from max.pipelines.lib.interfaces.cache_mixin import (
+    DenoisingCacheConfig,
+    can_use_fbcache,
+    teacache_rescaled_delta,
+)
 
 from .layers.attention import ZImageAttention
 from .layers.embeddings import RopeEmbedder, TimestepEmbedder
@@ -248,7 +258,12 @@ class FinalLayer(Module):
 class ZImageTransformer2DModel(Module):
     """Z-Image diffusion transformer (DiT) model."""
 
-    def __init__(self, config: ZImageConfig) -> None:
+    def __init__(
+        self,
+        config: ZImageConfig,
+        *,
+        cache_config: DenoisingCacheConfig | None = None,
+    ) -> None:
         super().__init__()
 
         dim = config.dim
@@ -270,7 +285,9 @@ class ZImageTransformer2DModel(Module):
         )
         out_channels = in_channels
 
+        self.dim = dim
         self.packed_channels = in_channels
+        self.out_channels_total = out_channels
         self.max_dtype = dtype
         self.max_device = device
         self.cap_feat_dim = cap_feat_dim
@@ -364,7 +381,60 @@ class ZImageTransformer2DModel(Module):
             axes_dims=axes_dims,
         )
 
-    def input_types(self) -> tuple[TensorType, ...]:
+        # Cache mode routing.
+        self._forward_impl: Callable[..., tuple[TensorValue, ...]] = (
+            self._forward_standard
+        )
+        self._input_types_impl: Callable[..., tuple[TensorType, ...]] = (
+            self._input_types_standard
+        )
+        self._teacache_rel_l1_thresh: float = 0.4
+        self._teacache_coefficients: tuple[float, ...] = ()
+        if cache_config is not None and cache_config.first_block_caching:
+            self._forward_impl = self._forward_fbcache
+            self._input_types_impl = self._input_types_fbcache
+        elif cache_config is not None and cache_config.teacache:
+            assert cache_config.teacache_rel_l1_thresh is not None
+            assert cache_config.teacache_coefficients is not None
+            self._teacache_rel_l1_thresh = cache_config.teacache_rel_l1_thresh
+            self._teacache_coefficients = tuple(
+                cache_config.teacache_coefficients
+            )
+            self._forward_impl = self._forward_teacache
+            self._input_types_impl = self._input_types_teacache
+
+    def _fbcache_output_types(self) -> list[TensorType]:
+        """[residual_type, output_type] for FBCache conditional execution."""
+        residual_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", self.dim],
+            device=self.max_device,
+        )
+        output_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", self.out_channels_total],
+            device=self.max_device,
+        )
+        return [residual_type, output_type]
+
+    def _teacache_output_types(self) -> list[TensorType]:
+        """[modulated_input, residual, accumulated, output] for TeaCache."""
+        hidden_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", self.dim],
+            device=self.max_device,
+        )
+        accum_type = TensorType(
+            DType.float32, shape=[1], device=self.max_device
+        )
+        output_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", self.out_channels_total],
+            device=self.max_device,
+        )
+        return [hidden_type, hidden_type, accum_type, output_type]
+
+    def _base_input_types(self) -> tuple[TensorType, ...]:
         return (
             TensorType(
                 self.max_dtype,
@@ -393,17 +463,52 @@ class ZImageTransformer2DModel(Module):
             ),
         )
 
-    def __call__(
+    def _input_types_standard(self) -> tuple[TensorType, ...]:
+        return self._base_input_types()
+
+    def _input_types_fbcache(self) -> tuple[TensorType, ...]:
+        rdt_type = TensorType(
+            DType.float32, shape=[], device=self.max_device
+        )
+        return (
+            self._base_input_types()
+            + tuple(self._fbcache_output_types())
+            + (rdt_type,)
+        )
+
+    def _input_types_teacache(self) -> tuple[TensorType, ...]:
+        hidden_type = TensorType(
+            self.max_dtype,
+            shape=["batch_size", "image_seq_len", self.dim],
+            device=self.max_device,
+        )
+        accum_type = TensorType(
+            DType.float32, shape=[1], device=self.max_device
+        )
+        force_type = TensorType(
+            DType.bool, shape=[1], device=self.max_device
+        )
+        return self._base_input_types() + (
+            hidden_type,  # prev_modulated_input
+            hidden_type,  # prev_residual
+            accum_type,  # accumulated_rel_l1
+            force_type,  # force_compute
+        )
+
+    def input_types(self) -> tuple[TensorType, ...]:
+        return self._input_types_impl()
+
+    def _forward_preamble(
         self,
         hidden_states: TensorValue,
         encoder_hidden_states: TensorValue,
         timestep: TensorValue,
         img_ids: TensorValue,
         txt_ids: TensorValue,
-    ) -> tuple[TensorValue]:
+    ) -> tuple[TensorValue, int | Dim, TensorValue, TensorValue]:
+        """Embed inputs, run refiners, return unified seq before layers[0]."""
         x = self.x_embedder(hidden_states)
-        t_emb = self.t_embedder(timestep * self.t_scale)
-        t_emb = ops.cast(t_emb, x.dtype)
+        t_emb = ops.cast(self.t_embedder(timestep * self.t_scale), x.dtype)
 
         cap = self.cap_proj(self.cap_norm(encoder_hidden_states))
 
@@ -425,11 +530,156 @@ class ZImageTransformer2DModel(Module):
             cap = block(cap, freqs_cis=txt_freqs)
 
         img_len = x.shape[1]
-        x = ops.concat([x, cap], axis=1)
+        unified0 = ops.concat([x, cap], axis=1)
+        return unified0, img_len, t_emb, unified_freqs
 
-        for block in self.layers:
-            x = block(x, freqs_cis=unified_freqs, adaln_input=t_emb)
+    def _run_first_main_layer(
+        self,
+        unified0: TensorValue,
+        t_emb: TensorValue,
+        unified_freqs: TensorValue,
+    ) -> TensorValue:
+        return self.layers[0](
+            unified0, freqs_cis=unified_freqs, adaln_input=t_emb
+        )
 
-        x = x[:, :img_len, :]
-        x = self.final_layer(x, t_emb)
-        return (x,)
+    def _run_remaining_after_first(
+        self,
+        unified: TensorValue,
+        *,
+        img_len: int | Dim,
+        t_emb: TensorValue,
+        freqs_cis: TensorValue,
+    ) -> TensorValue:
+        u = unified
+        for i in range(1, len(self.layers)):
+            u = self.layers[i](u, freqs_cis=freqs_cis, adaln_input=t_emb)
+        return u[:, :img_len, :]
+
+    def _forward_postamble(
+        self, hidden_states: TensorValue, t_emb: TensorValue
+    ) -> TensorValue:
+        return self.final_layer(hidden_states, t_emb)
+
+    def _forward_standard(
+        self,
+        hidden_states: TensorValue,
+        encoder_hidden_states: TensorValue,
+        timestep: TensorValue,
+        img_ids: TensorValue,
+        txt_ids: TensorValue,
+    ) -> tuple[TensorValue]:
+        unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
+            hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids
+        )
+        u1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
+        remaining = self._run_remaining_after_first(
+            u1, img_len=img_len, t_emb=t_emb, freqs_cis=unified_freqs
+        )
+        return (self._forward_postamble(remaining, t_emb),)
+
+    def _forward_fbcache(
+        self,
+        hidden_states: TensorValue,
+        encoder_hidden_states: TensorValue,
+        timestep: TensorValue,
+        img_ids: TensorValue,
+        txt_ids: TensorValue,
+        prev_residual: TensorValue,
+        prev_output: TensorValue,
+        residual_threshold: TensorValue,
+    ) -> tuple[TensorValue, TensorValue]:
+        unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
+            hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids
+        )
+        unified1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
+        first_block_residual = (
+            unified1[:, :img_len, :] - unified0[:, :img_len, :]
+        )
+
+        use_cache = can_use_fbcache(
+            first_block_residual, prev_residual, residual_threshold
+        )
+
+        def then_fn() -> tuple[TensorValue, TensorValue]:
+            return first_block_residual, prev_output
+
+        def else_fn() -> tuple[TensorValue, TensorValue]:
+            remaining = self._run_remaining_after_first(
+                unified1,
+                img_len=img_len,
+                t_emb=t_emb,
+                freqs_cis=unified_freqs,
+            )
+            out = self._forward_postamble(remaining, t_emb)
+            return first_block_residual, out
+
+        result = ops.cond(
+            use_cache, self._fbcache_output_types(), then_fn, else_fn
+        )
+        return (result[0], result[1])
+
+    def _forward_teacache(
+        self,
+        hidden_states: TensorValue,
+        encoder_hidden_states: TensorValue,
+        timestep: TensorValue,
+        img_ids: TensorValue,
+        txt_ids: TensorValue,
+        prev_modulated_input: TensorValue,
+        prev_residual: TensorValue,
+        accumulated_rel_l1: TensorValue,
+        force_compute: TensorValue,
+    ) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue]:
+        unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
+            hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids
+        )
+
+        # Compute modulated input from first block's adaLN.
+        projected = unified0[:, :img_len, :]
+        block0 = self.layers[0]
+        assert block0.adaLN_modulation is not None
+        mod = ops.unsqueeze(block0.adaLN_modulation(t_emb), 1)
+        d = self.dim
+        scale_msa = 1.0 + mod[:, :, :d]
+        modulated_input = block0.attention_norm1(projected) * scale_msa
+
+        delta = teacache_rescaled_delta(
+            modulated_input, prev_modulated_input, self._teacache_coefficients
+        )
+        next_accumulated = accumulated_rel_l1 + delta
+
+        thresh = ops.constant(
+            self._teacache_rel_l1_thresh,
+            DType.float32,
+            device=next_accumulated.device,
+        )
+        should_skip = ops.squeeze(
+            ~force_compute & (next_accumulated < thresh), 0
+        )
+
+        def then_fn() -> (
+            tuple[TensorValue, TensorValue, TensorValue, TensorValue]
+        ):
+            out = self._forward_postamble(projected + prev_residual, t_emb)
+            return modulated_input, prev_residual, next_accumulated, out
+
+        def else_fn() -> (
+            tuple[TensorValue, TensorValue, TensorValue, TensorValue]
+        ):
+            u1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
+            remaining = self._run_remaining_after_first(
+                u1, img_len=img_len, t_emb=t_emb, freqs_cis=unified_freqs
+            )
+            residual = remaining - projected
+            out = self._forward_postamble(remaining, t_emb)
+            zero_accum = accumulated_rel_l1 - accumulated_rel_l1
+            return modulated_input, residual, zero_accum, out
+
+        result = ops.cond(
+            should_skip, self._teacache_output_types(), then_fn, else_fn
+        )
+        return (result[0], result[1], result[2], result[3])
+
+    def __call__(self, *args: TensorValue) -> tuple[TensorValue, ...]:
+        return self._forward_impl(*args)

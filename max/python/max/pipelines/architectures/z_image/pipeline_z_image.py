@@ -215,6 +215,11 @@ class ZImagePipeline(DiffusionPipeline):
         self.build_truncate_seq()
         self.build_concat_batch()
 
+        self._init_cache_state(
+            dtype=self.transformer.config.dtype,
+            device=self.transformer.devices[0],
+        )
+
         self._cached_text_ids: BoundedCache[str, Buffer] = BoundedCache(32)
         self._cached_sigmas: BoundedCache[str, Buffer] = BoundedCache(32)
         self._cached_img_ids: BoundedCache[str, Buffer] = BoundedCache(32)
@@ -231,6 +236,57 @@ class ZImagePipeline(DiffusionPipeline):
             32
         )
         self._cached_guidance: BoundedCache[str, Buffer] = BoundedCache(32)
+
+    def _make_rdt_buffer(
+        self, request_value: float | None, device: Device
+    ) -> Buffer | None:
+        """Create a scalar float32 threshold buffer if FBCache is enabled."""
+        if not self.cache_config.first_block_caching:
+            return None
+        value = (
+            request_value
+            if request_value is not None
+            else self.default_residual_threshold
+        )
+        return Buffer.from_dlpack(np.array(value, dtype=np.float32)).to(device)
+
+    def _create_cache_buffers(
+        self, batch_size: int, seq_len: int
+    ) -> dict[str, Buffer | None]:
+        """Allocate per-request cache buffers for the denoising loop."""
+        device = self._cache_device
+        dtype = self._cache_dtype
+        cfg = self.transformer.config
+        residual_dim, output_dim = cfg.fbcache_dims()
+
+        state: dict[str, Buffer | None] = {
+            "prev_residual": None,
+            "prev_output": None,
+            "teacache_prev_modulated_input": None,
+            "teacache_cached_residual": None,
+            "teacache_accumulated_rel_l1": None,
+        }
+
+        if self.cache_config.first_block_caching:
+            state["prev_residual"] = Buffer.zeros(
+                (batch_size, seq_len, residual_dim), dtype, device=device
+            )
+            state["prev_output"] = Buffer.zeros(
+                (batch_size, seq_len, output_dim), dtype, device=device
+            )
+
+        if self.cache_config.teacache:
+            state["teacache_prev_modulated_input"] = Buffer.zeros(
+                (batch_size, seq_len, residual_dim), dtype, device=device
+            )
+            state["teacache_cached_residual"] = Buffer.zeros(
+                (batch_size, seq_len, residual_dim), dtype, device=device
+            )
+            state["teacache_accumulated_rel_l1"] = Buffer.from_dlpack(
+                np.array([0.0], dtype=np.float32)
+            ).to(device)
+
+        return state
 
     @traced(message="ZImagePipeline.build_preprocess_latents")
     def build_preprocess_latents(self) -> None:
@@ -886,6 +942,67 @@ class ZImagePipeline(DiffusionPipeline):
     def preprocess_latents(self, latents: Buffer) -> Buffer:
         return self._patchify_and_pack(latents)
 
+    def _run_transformer_with_cache(
+        self,
+        cache: dict[str, Buffer | None],
+        latents: Buffer,
+        prompt_embeds: Buffer,
+        timestep: Buffer,
+        img_ids: Buffer,
+        txt_ids: Buffer,
+        *,
+        residual_threshold: Buffer | None = None,
+        force_compute: Buffer | None = None,
+    ) -> Buffer:
+        """Run transformer with cache state management.
+
+        Returns the noise_pred buffer and mutates *cache* in-place.
+        """
+        cc = self.cache_config
+
+        if cc.teacache:
+            results = self.transformer(
+                latents,
+                prompt_embeds,
+                timestep,
+                img_ids,
+                txt_ids,
+                teacache_prev_modulated_input=cache[
+                    "teacache_prev_modulated_input"
+                ],
+                teacache_cached_residual=cache["teacache_cached_residual"],
+                teacache_accumulated_rel_l1=cache[
+                    "teacache_accumulated_rel_l1"
+                ],
+                force_compute=force_compute,
+            )
+            (
+                cache["teacache_prev_modulated_input"],
+                cache["teacache_cached_residual"],
+                cache["teacache_accumulated_rel_l1"],
+                noise_pred,
+            ) = results
+            return noise_pred
+
+        if cc.first_block_caching:
+            results = self.transformer(
+                latents,
+                prompt_embeds,
+                timestep,
+                img_ids,
+                txt_ids,
+                prev_residual=cache["prev_residual"],
+                prev_output=cache["prev_output"],
+                residual_threshold=residual_threshold,
+            )
+            cache["prev_residual"] = results[0]
+            cache["prev_output"] = results[1]
+            return results[1]
+
+        return self.transformer(
+            latents, prompt_embeds, timestep, img_ids, txt_ids
+        )[0]
+
     @traced(message="ZImagePipeline.execute")
     def execute(  # type: ignore[override]
         self,
@@ -921,6 +1038,12 @@ class ZImagePipeline(DiffusionPipeline):
         img_ids = model_inputs.img_ids_tensor
         txt_ids = model_inputs.txt_ids_tensor
         latents = self.preprocess_latents(latents)
+
+        # Cache state allocation.
+        batch_size = int(prompt_embeds.shape[0])
+        image_seq_len = int(latents.shape[1])
+        cache = self._create_cache_buffers(batch_size, image_seq_len)
+        rdt_buf = self._make_rdt_buffer(None, device)
 
         with Tracer("prepare_scheduler"):
             timesteps_np = np.ascontiguousarray(
@@ -985,6 +1108,18 @@ class ZImagePipeline(DiffusionPipeline):
                 for t in transformed
             ]
 
+        use_taylorseer = self.cache_config.taylorseer
+        taylor_state: dict[str, Buffer | int | None] = {}
+        if use_taylorseer:
+            output_dim = self.transformer.config.fbcache_dims()[1]
+            shape = (batch_size, image_seq_len, output_dim)
+            taylor_state = {
+                "factor_0": Buffer.zeros(shape, self._cache_dtype, device=device),
+                "factor_1": Buffer.zeros(shape, self._cache_dtype, device=device),
+                "factor_2": Buffer.zeros(shape, self._cache_dtype, device=device),
+                "last_compute_step": None,
+            }
+
         with Tracer("denoising_loop"):
             for i in range(num_timesteps):
                 apply_cfg = i < cfg_cutoff_step
@@ -992,7 +1127,34 @@ class ZImagePipeline(DiffusionPipeline):
                 dt = dts_seq[i : i + 1]
 
                 with Tracer(f"denoising_step_{i}"):
-                    if apply_cfg and use_batched_cfg:
+                    # TaylorSeer: skip decision.
+                    skip_transformer = False
+                    if use_taylorseer:
+                        assert self.cache_config.taylorseer_warmup_steps is not None
+                        assert self.cache_config.taylorseer_cache_interval is not None
+                        skip_transformer = self.taylorseer_skip_transformer(
+                            i,
+                            self.cache_config.taylorseer_warmup_steps,
+                            self.cache_config.taylorseer_cache_interval,
+                        )
+
+                    if use_taylorseer and skip_transformer:
+                        delta = (
+                            float(i - taylor_state["last_compute_step"])
+                            if taylor_state["last_compute_step"] is not None
+                            else 1.0
+                        )
+                        delta_buf = Buffer.from_dlpack(
+                            np.array([delta], dtype=np.float32)
+                        ).to(device)
+                        noise_pred = self.taylor_predict(
+                            taylor_state["factor_0"],
+                            taylor_state["factor_1"],
+                            taylor_state["factor_2"],
+                            delta_buf,
+                            self._cache_taylor_max_order_tensor,
+                        ).storage
+                    elif apply_cfg and use_batched_cfg:
                         assert cfg_prompt_embeds is not None
                         assert cfg_timestep_bufs is not None
                         with Tracer("transformer"):
@@ -1041,14 +1203,46 @@ class ZImagePipeline(DiffusionPipeline):
                                 noise_pred,
                             )
                     else:
+                        force_compute_buf: Buffer | None = None
+                        if self.cache_config.teacache:
+                            force_compute_buf = Buffer.from_dlpack(
+                                np.array(
+                                    [i == 0 or i == num_timesteps - 1],
+                                    dtype=bool,
+                                )
+                            ).to(device)
                         with Tracer("transformer"):
-                            noise_pred = self.transformer(
+                            noise_pred = self._run_transformer_with_cache(
+                                cache,
                                 latents,
                                 prompt_embeds,
                                 timestep,
                                 img_ids,
                                 txt_ids,
-                            )[0]
+                                residual_threshold=rdt_buf,
+                                force_compute=force_compute_buf,
+                            )
+
+                    if use_taylorseer and not skip_transformer:
+                        delta = (
+                            float(i - taylor_state["last_compute_step"])
+                            if taylor_state["last_compute_step"] is not None
+                            else 1.0
+                        )
+                        delta_buf = Buffer.from_dlpack(
+                            np.array([delta], dtype=np.float32)
+                        ).to(device)
+                        f0, f1, f2 = self.taylor_update(
+                            noise_pred,
+                            taylor_state["factor_0"],
+                            taylor_state["factor_1"],
+                            delta_buf,
+                            self._cache_taylor_max_order_tensor,
+                        )
+                        taylor_state["factor_0"] = f0.storage
+                        taylor_state["factor_1"] = f1.storage
+                        taylor_state["factor_2"] = f2.storage
+                        taylor_state["last_compute_step"] = i
 
                     with Tracer("scheduler_step"):
                         latents = self._scheduler_step(latents, noise_pred, dt)

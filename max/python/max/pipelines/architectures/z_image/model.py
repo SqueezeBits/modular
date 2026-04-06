@@ -11,8 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from __future__ import annotations
+
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from max.driver import Buffer, Device
 from max.engine import InferenceSession, Model
@@ -20,6 +22,9 @@ from max.graph import Graph
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+
+if TYPE_CHECKING:
+    from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 
 from .model_config import ZImageConfig
 from .weight_adapters import convert_z_image_transformer_state_dict
@@ -34,9 +39,12 @@ class ZImageTransformerModel(ComponentModel):
         devices: list[Device],
         weights: Weights,
         session: InferenceSession,
+        *,
+        cache_config: DenoisingCacheConfig | None = None,
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.session = session
+        self.cache_config = cache_config
         self.config = ZImageConfig.initialize_from_config(
             config,
             encoding,
@@ -56,7 +64,9 @@ class ZImageTransformerModel(ComponentModel):
             raw_state_dict[key] = weight
         state_dict = convert_z_image_transformer_state_dict(raw_state_dict)
 
-        nn_model = ZImageTransformer2DModel(self.config)
+        nn_model = ZImageTransformer2DModel(
+            self.config, cache_config=self.cache_config
+        )
         nn_model.load_state_dict(state_dict, weight_alignment=1, strict=True)
         self.state_dict = nn_model.state_dict()
 
@@ -83,11 +93,30 @@ class ZImageTransformerModel(ComponentModel):
         timestep: Buffer,
         img_ids: Buffer,
         txt_ids: Buffer,
+        prev_residual: Buffer | None = None,
+        prev_output: Buffer | None = None,
+        residual_threshold: Buffer | None = None,
+        teacache_prev_modulated_input: Buffer | None = None,
+        teacache_cached_residual: Buffer | None = None,
+        teacache_accumulated_rel_l1: Buffer | None = None,
+        force_compute: Buffer | None = None,
     ) -> list[Buffer]:
-        return self.model.execute(
+        args: tuple[Buffer, ...] = (
             hidden_states,
             encoder_hidden_states,
             timestep,
             img_ids,
             txt_ids,
         )
+        if teacache_prev_modulated_input is not None:
+            args = (
+                *args,
+                teacache_prev_modulated_input,
+                teacache_cached_residual,
+                teacache_accumulated_rel_l1,
+                force_compute,
+            )
+        elif prev_residual is not None:
+            assert residual_threshold is not None
+            args = (*args, prev_residual, prev_output, residual_threshold)
+        return self.model.execute(*args)
