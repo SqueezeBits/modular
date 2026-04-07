@@ -162,6 +162,8 @@ class WanPipeline(DiffusionPipeline):
             }
             if "session" in init_params:
                 init_kwargs["session"] = self.session
+            if "cache_config" in init_params:
+                init_kwargs["cache_config"] = self.cache_config
             if "lora_path" in init_params and lora_path is not None:
                 init_kwargs["lora_path"] = lora_path
                 init_kwargs["lora_scale"] = lora_scale

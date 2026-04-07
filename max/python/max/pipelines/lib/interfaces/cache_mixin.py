@@ -20,10 +20,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from max.config import ConfigFileModel
+from max.driver import CPU
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
-from max.graph import TensorType, TensorValue
+from max.graph import TensorType, TensorValue, ops
 from pydantic import ConfigDict, Field, model_validator
 
 
@@ -250,7 +251,7 @@ def can_use_fbcache(
     relative_diff = mean_diff / (mean_prev + eps)
     rdt = residual_threshold.cast(relative_diff.dtype)
     pred = relative_diff < rdt
-    return F.squeeze(pred, 0)
+    return ops.transfer_to(F.squeeze(pred, 0), CPU())
 
 
 def teacache_rescaled_delta(
@@ -340,7 +341,7 @@ def teacache_conditional_execution(
     thresh = F.constant(
         rel_l1_thresh, DType.float32, device=next_accumulated.device
     )
-    should_skip = F.squeeze(~force_compute & (next_accumulated < thresh), 0)
+    should_skip = ops.transfer_to(F.squeeze(~force_compute & (next_accumulated < thresh), 0), CPU())
 
     def then_fn() -> tuple[TensorValue, TensorValue, TensorValue, TensorValue]:
         output = run_postamble(projected_hidden_states + prev_residual, temb)

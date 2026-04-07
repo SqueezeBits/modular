@@ -32,6 +32,7 @@ from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, TensorType
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
+from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 from max.pipelines.lib.interfaces.component_model import ComponentModel
 
 from .layers.embeddings import compute_wan_rope_cached
@@ -60,11 +61,22 @@ class WanAnimateTransformerModel(ComponentModel):
         devices: list[Device],
         weights: Weights,
         session: InferenceSession | None = None,
+        cache_config: DenoisingCacheConfig | None = None,
     ) -> None:
         super().__init__(config, encoding, devices, weights)
         self.config = WanConfig.generate(config, encoding, devices)
         self.model: Model | None = None
         self.session = session or InferenceSession(devices=devices)
+        self.cache_config = cache_config
+
+        # Determine cache mode for __call__ routing
+        self._cache_mode: str | None = None
+        if cache_config is not None:
+            if cache_config.first_block_caching:
+                self._cache_mode = "fbcache"
+            elif cache_config.teacache:
+                self._cache_mode = "teacache"
+
         # Face encoder model (compiled MAX graph, run once per segment)
         self.face_encoder_model: Model | None = None
         # Motion encoder model (compiled MAX graph, run once per segment)
@@ -165,7 +177,10 @@ class WanAnimateTransformerModel(ComponentModel):
         dev_ref: DeviceRef,
     ) -> Model:
         transformer_module = WanAnimateTransformer3DModel(
-            self.config, dtype=dtype, device=dev_ref
+            self.config,
+            dtype=dtype,
+            device=dev_ref,
+            cache_config=self.cache_config,
         )
         transformer_module.load_state_dict(
             transformer_weights, weight_alignment=1, strict=True
@@ -223,11 +238,47 @@ class WanAnimateTransformerModel(ComponentModel):
             TensorType(DType.int32, [1], device=dev),
         ]
 
+        # Append cache-mode-specific input types
+        logger.debug("_load_transformer_model: _cache_mode=%s", self._cache_mode)
+        if self._cache_mode == "fbcache":
+            model_input_types += [
+                # prev_residual [B, seq_len, dim]
+                TensorType(dtype, ["batch", "seq_len", dim], device=dev),
+                # prev_output [B, out_channels, frames, height, width]
+                TensorType(
+                    dtype,
+                    [
+                        "batch",
+                        self.config.out_channels,
+                        "frames",
+                        "height",
+                        "width",
+                    ],
+                    device=dev,
+                ),
+                # residual_threshold scalar
+                TensorType(DType.float32, [], device=dev),
+            ]
+        elif self._cache_mode == "teacache":
+            model_input_types += [
+                # teacache_prev_modulated_input [B, 6, dim]
+                TensorType(dtype, ["batch", 6, dim], device=dev),
+                # teacache_cached_residual [B, seq_len, dim]
+                TensorType(dtype, ["batch", "seq_len", dim], device=dev),
+                # teacache_accumulated_rel_l1 [1]
+                TensorType(DType.float32, [1], device=dev),
+                # force_compute scalar bool
+                TensorType(DType.bool, [], device=dev),
+            ]
+
         with Graph(
             "wan_animate_transformer", input_types=model_input_types
         ) as graph:
             out = transformer_module(*(v.tensor for v in graph.inputs))
-            graph.output(out)
+            if isinstance(out, tuple):
+                graph.output(*out)
+            else:
+                graph.output(out)
         return self.session.load(graph, weights_registry=weights_registry)
 
     def _load_face_encoder_model(
@@ -353,10 +404,11 @@ class WanAnimateTransformerModel(ComponentModel):
         spatial_shape: Buffer,
         face_emb: Buffer,
         num_temporal_frames: Buffer,
-    ) -> Buffer:
+        *cache_inputs: Buffer,
+    ) -> Buffer | tuple[Buffer, Buffer] | tuple[Buffer, Buffer, Buffer, Buffer]:
         if self.model is None:
             raise RuntimeError("Wan animate transformer model failed to load.")
-        return self.model.execute(
+        outputs = self.model.execute(
             hidden_states,
             timestep,
             encoder_hidden_states,
@@ -367,4 +419,10 @@ class WanAnimateTransformerModel(ComponentModel):
             spatial_shape,
             face_emb,
             num_temporal_frames,
-        )[0]
+            *cache_inputs,
+        )
+        if self._cache_mode == "fbcache":
+            return outputs[0], outputs[1]
+        elif self._cache_mode == "teacache":
+            return outputs[0], outputs[1], outputs[2], outputs[3]
+        return outputs[0]

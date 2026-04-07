@@ -33,7 +33,10 @@ import numpy.typing as npt
 import PIL.Image
 from max.driver import Buffer, Device
 from max.dtype import DType
+from max.experimental.tensor import Tensor as ExperimentalTensor
 from max.graph import Graph, TensorType, ops
+from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheState
+from max.pipelines.lib.interfaces.diffusion_pipeline import max_compile
 from max.profiler import Tracer, traced
 from tqdm.auto import tqdm
 
@@ -123,6 +126,12 @@ class WanAnimatePipeline(WanI2VPipeline):
         self.build_i2v_concat()
         self.cache: WanRuntimeCache = WanRuntimeCache()
 
+        # Initialize cache state infrastructure (TaylorSeer graphs etc.)
+        self._init_cache_state(
+            self.transformer.config.dtype,
+            self.transformer.devices[0],
+        )
+
     def build_standardize_latents(self) -> None:
         """Compile VAE latent standardization in model dtype."""
         device = self.transformer.devices[0]
@@ -169,6 +178,167 @@ class WanAnimatePipeline(WanI2VPipeline):
             )
             g.output(uncond)
         self.__dict__["_uncond_face_embedding_model"] = self.session.load(g)
+
+    # ------------------------------------------------------------------ #
+    # Caching support                                                      #
+    # ------------------------------------------------------------------ #
+
+    def build_taylorseer(self, dtype: DType, device: Device) -> None:
+        """Override: compile TaylorSeer graphs for Wan's 5-D output shape."""
+        out_channels = self.transformer.config.out_channels
+        tensor_type = TensorType(
+            dtype,
+            shape=["batch", out_channels, "frames", "height", "width"],
+            device=device,
+        )
+        scalar_type = TensorType(DType.float32, shape=[1], device=device)
+        order_type = TensorType(DType.int32, shape=[1], device=device)
+
+        self.__dict__["taylor_predict"] = max_compile(
+            self.taylor_predict,
+            input_types=[
+                tensor_type,
+                tensor_type,
+                tensor_type,
+                scalar_type,
+                order_type,
+            ],
+        )
+        self.__dict__["taylor_update"] = max_compile(
+            self.taylor_update,
+            input_types=[
+                tensor_type,
+                tensor_type,
+                tensor_type,
+                scalar_type,
+                order_type,
+            ],
+        )
+
+    def _create_wan_cache_state(
+        self,
+        batch_size: int,
+        out_channels: int,
+        total_latent_t: int,
+        height_latent: int,
+        width_latent: int,
+        seq_len: int,
+        inner_dim: int,
+    ) -> DenoisingCacheState:
+        """Create Wan-specific cache state with correct 5-D output shapes."""
+        device = self._cache_device
+        dtype = self._cache_dtype
+
+        def _zeros_3d(d0: int, d1: int, d2: int) -> ExperimentalTensor:
+            return ExperimentalTensor(
+                storage=Buffer.zeros((d0, d1, d2), dtype, device=device)
+            )
+
+        def _zeros_5d() -> ExperimentalTensor:
+            return ExperimentalTensor(
+                storage=Buffer.zeros(
+                    (batch_size, out_channels, total_latent_t, height_latent, width_latent),
+                    dtype,
+                    device=device,
+                )
+            )
+
+        state = DenoisingCacheState()
+
+        if self.cache_config.first_block_caching:
+            state.prev_residual = _zeros_3d(batch_size, seq_len, inner_dim)
+            state.prev_output = _zeros_5d()
+
+        if self.cache_config.taylorseer:
+            state.taylor_factor_0 = _zeros_5d()
+            state.taylor_factor_1 = _zeros_5d()
+            state.taylor_factor_2 = _zeros_5d()
+
+        if self.cache_config.teacache:
+            # Proxy signal: timestep_proj [B, 6, dim]
+            state.teacache_prev_modulated_input = _zeros_3d(batch_size, 6, inner_dim)
+            state.teacache_cached_residual = _zeros_3d(batch_size, seq_len, inner_dim)
+            state.teacache_accumulated_rel_l1 = ExperimentalTensor(
+                storage=Buffer.from_dlpack(
+                    np.array([0.0], dtype=np.float32)
+                ).to(device)
+            )
+
+        return state
+
+    def run_transformer(
+        self,
+        cache_state: DenoisingCacheState,
+        **kwargs: Any,
+    ) -> tuple[ExperimentalTensor, ...]:
+        """Run the Wan-Animate transformer for one denoising step.
+
+        Passes cache state buffers when a cache mode is active and returns
+        ``(noise_pred,)`` (base/TaylorSeer), ``(new_residual, noise_pred)``
+        (FBCache), or ``(mod_input, residual, accumulated, noise_pred)``
+        (TeaCache).
+        """
+        latent_model_input: Buffer = kwargs["latent_model_input"]
+        dit_timestep: Buffer = kwargs["dit_timestep"]
+        prompt_embeds: Buffer = kwargs["prompt_embeds"]
+        clip_features: Buffer = kwargs["clip_features"]
+        pose_latents: Buffer = kwargs["pose_latents"]
+        rope_cos: Buffer = kwargs["rope_cos"]
+        rope_sin: Buffer = kwargs["rope_sin"]
+        spatial_shape: Buffer = kwargs["spatial_shape"]
+        face_emb: Buffer = kwargs["face_emb"]
+        num_temporal_frames: Buffer = kwargs["num_temporal_frames"]
+
+        base_args = (
+            latent_model_input,
+            dit_timestep,
+            prompt_embeds,
+            clip_features,
+            pose_latents,
+            rope_cos,
+            rope_sin,
+            spatial_shape,
+            face_emb,
+            num_temporal_frames,
+        )
+
+        if self.cache_config.first_block_caching:
+            assert cache_state.prev_residual is not None
+            assert cache_state.prev_output is not None
+            residual_threshold: Buffer = kwargs["residual_threshold"]
+            result = self.transformer(
+                *base_args,
+                cache_state.prev_residual.driver_tensor,
+                cache_state.prev_output.driver_tensor,
+                residual_threshold,
+            )
+            new_res_buf, noise_buf = result
+            return (
+                ExperimentalTensor(storage=new_res_buf),
+                ExperimentalTensor(storage=noise_buf),
+            )
+        elif self.cache_config.teacache:
+            assert cache_state.teacache_prev_modulated_input is not None
+            assert cache_state.teacache_cached_residual is not None
+            assert cache_state.teacache_accumulated_rel_l1 is not None
+            force_compute_buf: Buffer = kwargs["force_compute"]
+            result = self.transformer(
+                *base_args,
+                cache_state.teacache_prev_modulated_input.driver_tensor,
+                cache_state.teacache_cached_residual.driver_tensor,
+                cache_state.teacache_accumulated_rel_l1.driver_tensor,
+                force_compute_buf,
+            )
+            mod_buf, res_buf, accum_buf, noise_buf = result
+            return (
+                ExperimentalTensor(storage=mod_buf),
+                ExperimentalTensor(storage=res_buf),
+                ExperimentalTensor(storage=accum_buf),
+                ExperimentalTensor(storage=noise_buf),
+            )
+        else:
+            noise_buf = self.transformer(*base_args)
+            return (ExperimentalTensor(storage=noise_buf),)
 
     @traced(message="WanAnimatePipeline.execute")
     def execute(  # type: ignore[override]
@@ -746,9 +916,36 @@ class WanAnimatePipeline(WanI2VPipeline):
             np.array([ppf], dtype=np.int32)
         ).to(device)
 
+        inner_dim = (
+            self.transformer.config.num_attention_heads
+            * self.transformer.config.attention_head_dim
+        )
+        out_channels = self.transformer.config.out_channels
+        seq_len = ppf * pph * ppw
+
+        # Create per-segment cache state
+        cache_state = self._create_wan_cache_state(
+            batch_size=1,
+            out_channels=out_channels,
+            total_latent_t=total_latent_t,
+            height_latent=height_latent,
+            width_latent=width_latent,
+            seq_len=seq_len,
+            inner_dim=inner_dim,
+        )
+
+        # Pre-compute residual threshold buffer for FBCache
+        residual_threshold_buf: Buffer | None = None
+        if self.cache_config.first_block_caching:
+            # Scalar float32 matching TensorType(DType.float32, [], ...)
+            residual_threshold_buf = Buffer.from_dlpack(
+                np.array(self.default_residual_threshold, dtype=np.float32)
+            ).to(device)
+
+        num_steps = len(batched_timesteps)
         step_state: WanUniPCState = (None, None, None)
         progress = tqdm(  # type: ignore[call-arg]
-            range(len(batched_timesteps)),
+            range(num_steps),
             desc="Denoising",
             leave=True,
             disable=not sys.stderr.isatty(),
@@ -773,25 +970,43 @@ class WanAnimatePipeline(WanI2VPipeline):
                     latent_model_input, condition
                 )
 
-                # Run animate transformer
-                with Tracer("transformer"):
-                    noise_pred_buf = self.transformer(
-                        latent_model_input,
-                        dit_timestep,
-                        prompt_embeds,
-                        clip_features,
-                        pose_latents,
-                        rope_cos,
-                        rope_sin,
-                        spatial_shape,
-                        face_emb,
-                        num_temporal_frames,
+                # Build per-step transformer kwargs
+                transformer_kwargs: dict[str, Any] = dict(
+                    latent_model_input=latent_model_input,
+                    dit_timestep=dit_timestep,
+                    prompt_embeds=prompt_embeds,
+                    clip_features=clip_features,
+                    pose_latents=pose_latents,
+                    rope_cos=rope_cos,
+                    rope_sin=rope_sin,
+                    spatial_shape=spatial_shape,
+                    face_emb=face_emb,
+                    num_temporal_frames=num_temporal_frames,
+                )
+                if self.cache_config.first_block_caching:
+                    assert residual_threshold_buf is not None
+                    transformer_kwargs["residual_threshold"] = residual_threshold_buf
+                if self.cache_config.teacache:
+                    # force_compute=True on first and last steps (scalar bool)
+                    force_val = np.array(
+                        i == 0 or i == num_steps - 1, dtype=np.bool_
                     )
-                    noise_pred_buf = getattr(
-                        noise_pred_buf, "driver_tensor", noise_pred_buf
-                    )
+                    transformer_kwargs["force_compute"] = Buffer.from_dlpack(
+                        force_val
+                    ).to(device)
 
-                # CFG (2-pass: positive then negative)
+                # Run conditional pass via unified denoising-step dispatch
+                # (handles TaylorSeer skip + FBCache/TeaCache cond execution)
+                with Tracer("transformer"):
+                    noise_pred_tensor = self.run_denoising_step(
+                        step=i,
+                        cache_state=cache_state,
+                        device=device,
+                        **transformer_kwargs,
+                    )
+                noise_pred_buf = noise_pred_tensor.driver_tensor
+
+                # CFG (2-pass: unconditional always runs full transformer)
                 if do_cfg and negative_prompt_embeds is not None:
                     assert guidance_scale is not None
                     assert uncond_face_emb is not None

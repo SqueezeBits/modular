@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import math
 from math import prod
+from typing import Any
 
+from max.driver import CPU
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
 from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.conv import Conv3D
 from max.nn.kernels import flash_attention_gpu
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm import RMSNorm
+from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 
 from .layers.conv import CausalConv1d
 from .layers.embeddings import (
@@ -526,11 +529,31 @@ class WanAnimateTransformer3DModel(Module):
         *,
         dtype: DType = DType.bfloat16,
         device: DeviceRef = DeviceRef.CPU(),
+        cache_config: DenoisingCacheConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config
+        self._device = device
         dim = config.num_attention_heads * config.attention_head_dim
         self.inject_interval = config.inject_face_latents_blocks
+
+        # Determine cache mode from config
+        self._cache_mode: str | None = None
+        self._teacache_rel_l1_thresh: float = 0.4
+        self._teacache_coefficients: tuple[float, ...] = ()
+        if cache_config is not None:
+            if cache_config.first_block_caching:
+                self._cache_mode = "fbcache"
+            elif cache_config.teacache:
+                self._cache_mode = "teacache"
+                if cache_config.teacache_rel_l1_thresh is not None:
+                    self._teacache_rel_l1_thresh = (
+                        cache_config.teacache_rel_l1_thresh
+                    )
+                if cache_config.teacache_coefficients is not None:
+                    self._teacache_coefficients = tuple(
+                        cache_config.teacache_coefficients
+                    )
 
         self.pre = WanTransformerPreProcess(
             config, is_animate=True, dtype=dtype, device=device
@@ -570,6 +593,60 @@ class WanAnimateTransformer3DModel(Module):
             config, dtype=dtype, device=device
         )
 
+    def _fbcache_output_types(self) -> list[TensorType]:
+        """Return [residual_type, output_type] for FBCache conditional execution."""
+        inner_dim = (
+            self.config.num_attention_heads * self.config.attention_head_dim
+        )
+        return [
+            TensorType(
+                self.config.dtype,
+                ["batch", "seq_len", inner_dim],
+                device=self._device,
+            ),
+            TensorType(
+                self.config.dtype,
+                [
+                    "batch",
+                    self.config.out_channels,
+                    "frames",
+                    "height",
+                    "width",
+                ],
+                device=self._device,
+            ),
+        ]
+
+    def _teacache_output_types(self) -> list[TensorType]:
+        """Return [modulated, residual, accumulated, output] types for TeaCache."""
+        inner_dim = (
+            self.config.num_attention_heads * self.config.attention_head_dim
+        )
+        return [
+            TensorType(
+                self.config.dtype,
+                ["batch", 6, inner_dim],
+                device=self._device,
+            ),
+            TensorType(
+                self.config.dtype,
+                ["batch", "seq_len", inner_dim],
+                device=self._device,
+            ),
+            TensorType(DType.float32, [1], device=self._device),
+            TensorType(
+                self.config.dtype,
+                [
+                    "batch",
+                    self.config.out_channels,
+                    "frames",
+                    "height",
+                    "width",
+                ],
+                device=self._device,
+            ),
+        ]
+
     def __call__(
         self,
         hidden_states: TensorValue,
@@ -582,7 +659,20 @@ class WanAnimateTransformer3DModel(Module):
         spatial_shape: TensorValue,
         face_emb: TensorValue,
         num_temporal_frames: TensorValue,
-    ) -> TensorValue:
+        # FBCache parameters (only present when _cache_mode == "fbcache")
+        prev_residual: TensorValue | None = None,
+        prev_output: TensorValue | None = None,
+        residual_threshold: TensorValue | None = None,
+        # TeaCache parameters (only present when _cache_mode == "teacache")
+        teacache_prev_modulated_input: TensorValue | None = None,
+        teacache_cached_residual: TensorValue | None = None,
+        teacache_accumulated_rel_l1: TensorValue | None = None,
+        force_compute: TensorValue | None = None,
+    ) -> (
+        TensorValue
+        | tuple[TensorValue, TensorValue]
+        | tuple[TensorValue, TensorValue, TensorValue, TensorValue]
+    ):
         hs, temb, timestep_proj, text_emb, image_embeds = self.pre(
             hidden_states,
             timestep,
@@ -600,17 +690,81 @@ class WanAnimateTransformer3DModel(Module):
             rope_sin, shape=[seq_len, self.config.attention_head_dim]
         )
 
+        if self._cache_mode == "fbcache":
+            assert prev_residual is not None
+            assert prev_output is not None
+            assert residual_threshold is not None
+            return self._forward_fbcache(
+                hs,
+                temb,
+                timestep_proj,
+                text_emb,
+                image_embeds,
+                rope_cos,
+                rope_sin,
+                spatial_shape,
+                face_emb,
+                num_temporal_frames,
+                prev_residual,
+                prev_output,
+                residual_threshold,
+                hidden_states,
+            )
+        elif self._cache_mode == "teacache":
+            assert teacache_prev_modulated_input is not None
+            assert teacache_cached_residual is not None
+            assert teacache_accumulated_rel_l1 is not None
+            assert force_compute is not None
+            return self._forward_teacache(
+                hs,
+                temb,
+                timestep_proj,
+                text_emb,
+                image_embeds,
+                rope_cos,
+                rope_sin,
+                spatial_shape,
+                face_emb,
+                num_temporal_frames,
+                teacache_prev_modulated_input,
+                teacache_cached_residual,
+                teacache_accumulated_rel_l1,
+                force_compute,
+                hidden_states,
+            )
+        else:
+            return self._forward_base(
+                hs,
+                temb,
+                timestep_proj,
+                text_emb,
+                image_embeds,
+                rope_cos,
+                rope_sin,
+                spatial_shape,
+                face_emb,
+                num_temporal_frames,
+            )
+
+    def _forward_base(
+        self,
+        hs: TensorValue,
+        temb: TensorValue,
+        timestep_proj: TensorValue,
+        text_emb: TensorValue,
+        image_embeds: TensorValue,
+        rope_cos: TensorValue,
+        rope_sin: TensorValue,
+        spatial_shape: TensorValue,
+        face_emb: TensorValue,
+        num_temporal_frames: TensorValue,
+    ) -> TensorValue:
+        """Standard forward pass through all transformer blocks."""
         adapter_idx = 0
         for i in range(len(self.blocks)):
             hs = self.blocks[i](
-                hs,
-                text_emb,
-                timestep_proj,
-                rope_cos,
-                rope_sin,
-                image_embeds,
+                hs, text_emb, timestep_proj, rope_cos, rope_sin, image_embeds
             )
-
             if i % self.inject_interval == 0 and adapter_idx < len(
                 self.face_adapter
             ):
@@ -623,8 +777,246 @@ class WanAnimateTransformer3DModel(Module):
                 )
                 hs = hs + adapter_out
                 adapter_idx += 1
-
         return self.post(hs, temb, spatial_shape)
+
+    def _forward_fbcache(
+        self,
+        hs: TensorValue,
+        temb: TensorValue,
+        timestep_proj: TensorValue,
+        text_emb: TensorValue,
+        image_embeds: TensorValue,
+        rope_cos: TensorValue,
+        rope_sin: TensorValue,
+        spatial_shape: TensorValue,
+        face_emb: TensorValue,
+        num_temporal_frames: TensorValue,
+        prev_residual: TensorValue,
+        prev_output: TensorValue,
+        residual_threshold: TensorValue,
+    ) -> tuple[TensorValue, TensorValue]:
+        """FBCache: run block 0, compare residual, conditionally skip remaining.
+
+        Uses pure legacy TensorValue/ops.* API (no experimental bridge).
+        """
+        hs_input = hs
+
+        # Run block 0 + its face adapter
+        hs = self.blocks[0](
+            hs, text_emb, timestep_proj, rope_cos, rope_sin, image_embeds
+        )
+        if 0 % self.inject_interval == 0 and len(self.face_adapter) > 0:
+            ao = self.face_adapter[0](hs, face_emb, num_temporal_frames)
+            ao = ops.rebind(
+                ao, shape=[hs.shape[0], hs.shape[1], hs.shape[2]]
+            )
+            hs = hs + ao
+            ai_start = 1
+        else:
+            ai_start = 0
+
+        fbr = hs - hs_input  # first_block_residual [B, seq_len, dim]
+        # Rebind to align symbolic seq_len with prev_residual so subtraction works.
+        fbr = ops.rebind(
+            fbr, shape=[fbr.shape[0], prev_residual.shape[1], fbr.shape[2]]
+        )
+
+        # Compute use_fbcache predicate (equivalent to can_use_fbcache) using
+        # legacy ops: global relative L1 distance between current and prev residual.
+        diff_abs = ops.abs(ops.cast(fbr - prev_residual, DType.float32))
+        prev_abs = ops.abs(ops.cast(prev_residual, DType.float32))
+        # Sequential single-axis reductions to compute global mean [1,1,1]
+        mean_diff = ops.mean(ops.mean(ops.mean(diff_abs, axis=-1), axis=1), axis=0)
+        mean_prev = ops.mean(ops.mean(ops.mean(prev_abs, axis=-1), axis=1), axis=0)
+        eps = ops.constant(1e-9, DType.float32, self._device)
+        rel_diff = mean_diff / (mean_prev + eps)  # [1, 1, 1]
+        rdt = ops.cast(residual_threshold, DType.float32)
+        pred = ops.squeeze(rel_diff < rdt, 0)  # [1, 1] bool
+        use_cache = ops.transfer_to(pred, CPU())
+
+        def then_fn(
+            _fbr: TensorValue = fbr,
+            _po: TensorValue = prev_output,
+        ) -> tuple[TensorValue, TensorValue]:
+            return (_fbr, _po)
+
+        def else_fn(
+            _hs: TensorValue = hs,
+            _fbr: TensorValue = fbr,
+            _po: TensorValue = prev_output,
+            _te: TensorValue = text_emb,
+            _tp: TensorValue = timestep_proj,
+            _rc: TensorValue = rope_cos,
+            _rs: TensorValue = rope_sin,
+            _ie: TensorValue = image_embeds,
+            _fe: TensorValue = face_emb,
+            _ntf: TensorValue = num_temporal_frames,
+            _temb: TensorValue = temb,
+            _ss: TensorValue = spatial_shape,
+            _ai: int = ai_start,
+        ) -> tuple[TensorValue, TensorValue]:
+            hs_tv = _hs
+            ai = _ai
+            for i in range(1, len(self.blocks)):
+                hs_tv = self.blocks[i](hs_tv, _te, _tp, _rc, _rs, _ie)
+                if i % self.inject_interval == 0 and ai < len(
+                    self.face_adapter
+                ):
+                    ao = self.face_adapter[ai](hs_tv, _fe, _ntf)
+                    ao = ops.rebind(
+                        ao,
+                        shape=[
+                            hs_tv.shape[0],
+                            hs_tv.shape[1],
+                            hs_tv.shape[2],
+                        ],
+                    )
+                    hs_tv = hs_tv + ao
+                    ai += 1
+            out = self.post(hs_tv, _temb, _ss)
+            # Rebind to align symbolic output dims with prev_output.
+            out = ops.rebind(
+                out,
+                shape=[
+                    out.shape[0],
+                    out.shape[1],
+                    _po.shape[2],
+                    _po.shape[3],
+                    _po.shape[4],
+                ],
+            )
+            return (_fbr, out)
+
+        result = ops.cond(
+            use_cache, self._fbcache_output_types(), then_fn, else_fn
+        )
+        return result[0], result[1]
+
+    def _forward_teacache(
+        self,
+        hs: TensorValue,
+        temb: TensorValue,
+        timestep_proj: TensorValue,
+        text_emb: TensorValue,
+        image_embeds: TensorValue,
+        rope_cos: TensorValue,
+        rope_sin: TensorValue,
+        spatial_shape: TensorValue,
+        face_emb: TensorValue,
+        num_temporal_frames: TensorValue,
+        prev_modulated_input: TensorValue,
+        cached_residual: TensorValue,
+        accumulated_rel_l1: TensorValue,
+        force_compute: TensorValue,
+    ) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue]:
+        """TeaCache: use timestep_proj as proxy to detect redundant steps.
+
+        Uses pure legacy TensorValue/ops.* API (no experimental bridge).
+        """
+        # Proxy signal: timestep_proj [B, 6, dim]
+        modulated_input = timestep_proj
+
+        # Compute rescaled delta (equivalent to teacache_rescaled_delta)
+        diff_abs = ops.abs(
+            ops.cast(modulated_input - prev_modulated_input, DType.float32)
+        )
+        prev_abs = ops.abs(ops.cast(prev_modulated_input, DType.float32))
+        # Sequential single-axis reductions for global mean [1,1,1]
+        mean_diff = ops.mean(
+            ops.mean(ops.mean(diff_abs, axis=-1), axis=1), axis=0
+        )
+        mean_prev = ops.mean(
+            ops.mean(ops.mean(prev_abs, axis=-1), axis=1), axis=0
+        )
+        eps = ops.constant(1e-9, DType.float32, self._device)
+        rel_diff = ops.cast(
+            mean_diff / (mean_prev + eps), DType.float32
+        )  # [1,1,1]
+
+        # Horner's polynomial on rel_diff
+        x = ops.constant(
+            self._teacache_coefficients[0], DType.float32, self._device
+        )
+        for coeff in self._teacache_coefficients[1:]:
+            x = x * rel_diff + ops.constant(coeff, DType.float32, self._device)
+        delta = ops.reshape(x, [1])  # [1]
+
+        next_accumulated = accumulated_rel_l1 + delta  # [1]
+
+        # Compute should_skip predicate (equivalent to teacache_conditional logic)
+        thresh = ops.reshape(
+            ops.constant(
+                self._teacache_rel_l1_thresh, DType.float32, self._device
+            ),
+            [1],
+        )
+        cmp = next_accumulated < thresh  # [1] bool
+        not_force = ops.reshape(~force_compute, [1])  # [1] bool
+        should_skip = not_force & cmp  # [1] bool
+        use_cache = ops.transfer_to(ops.squeeze(should_skip, 0), CPU())  # [] bool on CPU
+
+        def then_fn(
+            _mi: TensorValue = modulated_input,
+            _cr: TensorValue = cached_residual,
+            _na: TensorValue = next_accumulated,
+            _hs: TensorValue = hs,
+            _temb: TensorValue = temb,
+            _ss: TensorValue = spatial_shape,
+        ) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue]:
+            # Rebind hs to align symbolic seq_len with cached_residual
+            hs_rebound = ops.rebind(
+                _hs, shape=[_hs.shape[0], _cr.shape[1], _hs.shape[2]]
+            )
+            output = self.post(hs_rebound + _cr, _temb, _ss)
+            return (_mi, _cr, _na, output)
+
+        def else_fn(
+            _hs: TensorValue = hs,
+            _mi: TensorValue = modulated_input,
+            _cr: TensorValue = cached_residual,
+            _te: TensorValue = text_emb,
+            _tp: TensorValue = timestep_proj,
+            _rc: TensorValue = rope_cos,
+            _rs: TensorValue = rope_sin,
+            _ie: TensorValue = image_embeds,
+            _fe: TensorValue = face_emb,
+            _ntf: TensorValue = num_temporal_frames,
+            _temb: TensorValue = temb,
+            _ss: TensorValue = spatial_shape,
+            _acc: TensorValue = accumulated_rel_l1,
+        ) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue]:
+            hs_tv = _hs
+            ai = 0
+            for i in range(len(self.blocks)):
+                hs_tv = self.blocks[i](hs_tv, _te, _tp, _rc, _rs, _ie)
+                if i % self.inject_interval == 0 and ai < len(
+                    self.face_adapter
+                ):
+                    ao = self.face_adapter[ai](hs_tv, _fe, _ntf)
+                    ao = ops.rebind(
+                        ao,
+                        shape=[
+                            hs_tv.shape[0],
+                            hs_tv.shape[1],
+                            hs_tv.shape[2],
+                        ],
+                    )
+                    hs_tv = hs_tv + ao
+                    ai += 1
+            residual = hs_tv - _hs  # [B, seq_len, dim]
+            # Rebind to align symbolic seq_len with cached_residual.
+            residual = ops.rebind(
+                residual,
+                shape=[residual.shape[0], _cr.shape[1], residual.shape[2]],
+            )
+            output = self.post(hs_tv, _temb, _ss)
+            zero_acc = _acc - _acc  # [1] zeros
+            return (_mi, residual, zero_acc, output)
+
+        result = ops.cond(
+            use_cache, self._teacache_output_types(), then_fn, else_fn
+        )
+        return result[0], result[1], result[2], result[3]
 
 
 class WanAnimateFaceEncoder(Module):

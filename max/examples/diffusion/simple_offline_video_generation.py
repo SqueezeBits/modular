@@ -70,6 +70,7 @@ from max.pipelines.lib import (
     save_video,
 )
 from max.pipelines.lib.interfaces import DiffusionPipeline
+from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 from max.pipelines.lib.pipeline_variants.pixel_generation import (
     PixelGenerationPipeline,
 )
@@ -277,6 +278,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--profile-timings",
         action="store_true",
         help="Profile timings of the pipeline.",
+    )
+
+    # Caching flags
+    parser.add_argument(
+        "--first-block-caching",
+        action="store_true",
+        default=False,
+        help="Enable First-Block Cache (FBCache) for step-cache denoising.",
+    )
+    parser.add_argument(
+        "--fbcache-residual-threshold",
+        type=float,
+        default=None,
+        help="FBCache relative-L1 threshold (default: model-specific, ~0.05).",
+    )
+    parser.add_argument(
+        "--taylorseer",
+        action="store_true",
+        default=False,
+        help="Enable TaylorSeer cache: skip transformer steps via Taylor prediction.",
+    )
+    parser.add_argument(
+        "--taylorseer-cache-interval",
+        type=int,
+        default=None,
+        help="TaylorSeer: steps between full computations (default: 5).",
+    )
+    parser.add_argument(
+        "--taylorseer-warmup-steps",
+        type=int,
+        default=None,
+        help="TaylorSeer: warmup steps before prediction begins (default: 9).",
+    )
+    parser.add_argument(
+        "--taylorseer-max-order",
+        type=int,
+        default=None,
+        choices=[1, 2],
+        help="TaylorSeer: Taylor expansion order (default: 1).",
+    )
+    parser.add_argument(
+        "--teacache",
+        action="store_true",
+        default=False,
+        help="Enable TeaCache: use timestep-modulated proxy to skip redundant steps.",
+    )
+    parser.add_argument(
+        "--teacache-rel-l1-thresh",
+        type=float,
+        default=None,
+        help="TeaCache relative-L1 threshold (default: model-specific, ~0.4).",
     )
 
     args = parser.parse_args(argv)
@@ -570,9 +622,35 @@ def _load_pipeline(
         f"{arch.pipeline_model}"
     )
     pipeline_model = cast(type[DiffusionPipeline], arch.pipeline_model)
+
+    # Build cache config from CLI flags (if any cache mode requested)
+    cache_config: DenoisingCacheConfig | None = None
+    if (
+        getattr(args, "first_block_caching", False)
+        or getattr(args, "taylorseer", False)
+        or getattr(args, "teacache", False)
+    ):
+        cache_config = DenoisingCacheConfig(
+            first_block_caching=getattr(args, "first_block_caching", False),
+            taylorseer=getattr(args, "taylorseer", False),
+            taylorseer_cache_interval=getattr(
+                args, "taylorseer_cache_interval", None
+            ),
+            taylorseer_warmup_steps=getattr(
+                args, "taylorseer_warmup_steps", None
+            ),
+            taylorseer_max_order=getattr(args, "taylorseer_max_order", None),
+            teacache=getattr(args, "teacache", False),
+            teacache_rel_l1_thresh=getattr(
+                args, "teacache_rel_l1_thresh", None
+            ),
+        )
+        print(f"Cache config: {cache_config}")
+
     pipeline = PixelGenerationPipeline[PixelContext](
         pipeline_config=config,
         pipeline_model=pipeline_model,
+        cache_config=cache_config,
     )
 
     print("Initialization complete.")
