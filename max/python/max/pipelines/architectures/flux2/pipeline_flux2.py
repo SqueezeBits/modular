@@ -35,6 +35,7 @@ from ..autoencoders import AutoencoderKLFlux2Model
 from ..mistral3.text_encoder import Mistral3TextEncoderModel
 from .distributed_model import DistributedFlux2TransformerModel
 from .model import Flux2TransformerModel
+from .ring_model import RingFlux2TransformerModel
 from .ulysses_model import UlyssesFlux2TransformerModel
 
 if TYPE_CHECKING:
@@ -130,7 +131,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
     vae: AutoencoderKLFlux2Model
     text_encoder: Mistral3TextEncoderModel
-    transformer: Flux2TransformerModel | DistributedFlux2TransformerModel | UlyssesFlux2TransformerModel
+    transformer: Flux2TransformerModel | DistributedFlux2TransformerModel | UlyssesFlux2TransformerModel | RingFlux2TransformerModel
 
     components = {
         "vae": AutoencoderKLFlux2Model,
@@ -146,15 +147,25 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
     @property
+    def _ring_degree(self) -> int:
+        """Read ring_degree from pipeline metadata (0 = disabled)."""
+        return int(
+            self.pipeline_config.models.metadata.get("ring_degree", 0)
+        )
+
+    @property
     def _transformer_cls(self) -> type:
         """Select transformer class based on parallelism mode.
 
         - ulysses_degree > 1: Context Parallelism (Ulysses)
+        - ring_degree > 1:    Context Parallelism (Ring)
         - len(devices) > 1:   Tensor Parallelism
         - otherwise:          Single-GPU
         """
         if self._ulysses_degree > 1:
             return UlyssesFlux2TransformerModel
+        if self._ring_degree > 1:
+            return RingFlux2TransformerModel
         if len(self.devices) > 1:
             return DistributedFlux2TransformerModel
         return Flux2TransformerModel

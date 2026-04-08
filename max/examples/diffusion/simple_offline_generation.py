@@ -343,6 +343,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "num-gpus evenly. 0 = disabled (default: 0)."
         ),
     )
+    parser.add_argument(
+        "--ring-degree",
+        type=int,
+        default=0,
+        help=(
+            "Ring context-parallel degree. When > 1, uses ring-style "
+            "sequence parallelism (allgather K/V, local Q). "
+            "0 = disabled (default: 0)."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -506,9 +516,11 @@ async def generate_image(args: argparse.Namespace) -> None:
             value = adapter.validate_python(parsed)
             manifest = manifest.with_override(component, **{field_name: value})
 
-    # Inject ulysses_degree into manifest metadata so pipelines can read it.
+    # Inject parallelism degrees into manifest metadata so pipelines can read them.
     if args.ulysses_degree > 0:
         manifest._metadata["ulysses_degree"] = args.ulysses_degree
+    if args.ring_degree > 0:
+        manifest._metadata["ring_degree"] = args.ring_degree
 
     config = PipelineConfig(
         models=manifest,
