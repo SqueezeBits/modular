@@ -13,6 +13,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -35,11 +36,11 @@ from ..autoencoders import AutoencoderKLFlux2Model
 from ..mistral3.text_encoder import Mistral3TextEncoderModel
 from .distributed_model import DistributedFlux2TransformerModel
 from .model import Flux2TransformerModel
-from .ring_model import RingFlux2TransformerModel
-from .ulysses_model import UlyssesFlux2TransformerModel
 from .usp_model import USPFlux2TransformerModel
 
 if TYPE_CHECKING:
+    from max.pipelines.lib.interfaces.component_model import ComponentModel
+
     from ..autoencoders_modulev3.vae import DiagonalGaussianDistribution
 
 
@@ -132,7 +133,11 @@ class Flux2Pipeline(DiffusionPipeline):
 
     vae: AutoencoderKLFlux2Model
     text_encoder: Mistral3TextEncoderModel
-    transformer: Flux2TransformerModel | DistributedFlux2TransformerModel | UlyssesFlux2TransformerModel | RingFlux2TransformerModel | USPFlux2TransformerModel
+    transformer: (
+        Flux2TransformerModel
+        | DistributedFlux2TransformerModel
+        | USPFlux2TransformerModel
+    )
 
     components = {
         "vae": AutoencoderKLFlux2Model,
@@ -150,32 +155,38 @@ class Flux2Pipeline(DiffusionPipeline):
     @property
     def _ring_degree(self) -> int:
         """Read ring_degree from pipeline metadata (0 = disabled)."""
-        return int(
-            self.pipeline_config.models.metadata.get("ring_degree", 0)
-        )
+        return int(self.pipeline_config.models.metadata.get("ring_degree", 0))
 
     @property
     def _transformer_cls(self) -> type:
         """Select transformer class based on parallelism mode.
 
-        - ulysses + ring > 1: USP (Ulysses + Ring combined)
-        - ulysses_degree > 1: Context Parallelism (Ulysses only)
-        - ring_degree > 1:    Context Parallelism (Ring only)
-        - len(devices) > 1:   Tensor Parallelism
-        - otherwise:          Single-GPU
+        - ulysses/ring degree > 1: Context Parallelism (USP handles all modes)
+        - len(devices) > 1:        Tensor Parallelism
+        - otherwise:               Single-GPU
         """
-        if self._ulysses_degree > 1 and self._ring_degree > 1:
+        if self._ulysses_degree > 1 or self._ring_degree > 1:
             return USPFlux2TransformerModel
-        if self._ulysses_degree > 1:
-            return UlyssesFlux2TransformerModel
-        if self._ring_degree > 1:
-            return RingFlux2TransformerModel
         if len(self.devices) > 1:
             return DistributedFlux2TransformerModel
         return Flux2TransformerModel
 
-    def _load_sub_models(self, weight_paths):
+    def _load_sub_models(
+        self, weight_paths: list[Path]
+    ) -> dict[str, "ComponentModel"]:
         """Override to swap transformer class for multi-GPU."""
+        # Validate context-parallel configuration
+        u = max(self._ulysses_degree, 1)
+        r = max(self._ring_degree, 1)
+        num_devices = len(self.devices)
+        if (self._ulysses_degree > 1 or self._ring_degree > 1) and (
+            u * r != num_devices
+        ):
+            raise ValueError(
+                f"ulysses_degree({u}) * ring_degree({r}) "
+                f"must equal num_gpus({num_devices})"
+            )
+
         original_transformer_cls = self.components["transformer"]
         self.components["transformer"] = self._transformer_cls
 

@@ -74,9 +74,7 @@ class DistributedFlux2TransformerModel(ComponentModel):
         # names (e.g., to_q_shards.0.weight) than the checkpoint
         # (to_q.weight). The full weight is loaded into the original
         # Linear and sliced lazily via ShardingStrategy at graph time.
-        nn_model.load_state_dict(
-            state_dict, weight_alignment=1, strict=False
-        )
+        nn_model.load_state_dict(state_dict, weight_alignment=1, strict=False)
         self.state_dict_values = nn_model.state_dict()
 
         # Build graph with signal buffers as additional inputs
@@ -88,10 +86,17 @@ class DistributedFlux2TransformerModel(ComponentModel):
         ) as graph:
             # First 6 are TensorValue model inputs, rest are BufferValue signal buffers
             model_inputs = [graph.inputs[i].tensor for i in range(6)]
-            signal_buffers = [graph.inputs[i].buffer for i in range(6, len(graph.inputs))]
+            signal_buffers = [
+                graph.inputs[i].buffer for i in range(6, len(graph.inputs))
+            ]
 
             outputs = nn_model(
-                *model_inputs,
+                model_inputs[0],
+                model_inputs[1],
+                model_inputs[2],
+                model_inputs[3],
+                model_inputs[4],
+                model_inputs[5],
                 signal_buffers=signal_buffers,
             )
             if isinstance(outputs, tuple):

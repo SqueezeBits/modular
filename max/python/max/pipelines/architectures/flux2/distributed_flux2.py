@@ -16,7 +16,15 @@
 from __future__ import annotations
 
 from max.dtype import DType
-from max.graph import BufferType, DeviceRef, Dim, TensorType, TensorValue, ops
+from max.graph import (
+    BufferType,
+    BufferValue,
+    DeviceRef,
+    Dim,
+    TensorType,
+    TensorValue,
+    ops,
+)
 from max.nn.comm import Signals
 from max.nn.layer import Module
 from max.nn.linear import Linear
@@ -27,7 +35,6 @@ from .layers.distributed_flux2_attention import (
     DistributedFlux2FeedForward,
     DistributedFlux2ParallelSelfAttention,
 )
-from .layers.embeddings import TimestepEmbedding, Timesteps
 from .layers.flux2_attention import Flux2PosEmbed
 from .layers.normalizations import AdaLayerNormContinuous, LayerNorm
 from .model_config import Flux2Config
@@ -54,15 +61,23 @@ class DistributedFlux2TransformerBlock(Module):
         # Norms are replicated (no learnable params, elementwise_affine=False)
         self.norm1_shards = [
             LayerNorm(
-                dim, dtype=dtype, device=dev, eps=eps,
-                elementwise_affine=False, use_bias=False,
+                dim,
+                dtype=dtype,
+                device=dev,
+                eps=eps,
+                elementwise_affine=False,
+                use_bias=False,
             )
             for dev in devices
         ]
         self.norm1_context_shards = [
             LayerNorm(
-                dim, dtype=dtype, device=dev, eps=eps,
-                elementwise_affine=False, use_bias=False,
+                dim,
+                dtype=dtype,
+                device=dev,
+                eps=eps,
+                elementwise_affine=False,
+                use_bias=False,
             )
             for dev in devices
         ]
@@ -83,26 +98,42 @@ class DistributedFlux2TransformerBlock(Module):
 
         self.norm2_shards = [
             LayerNorm(
-                dim, dtype=dtype, device=dev, eps=eps,
-                elementwise_affine=False, use_bias=False,
+                dim,
+                dtype=dtype,
+                device=dev,
+                eps=eps,
+                elementwise_affine=False,
+                use_bias=False,
             )
             for dev in devices
         ]
         self.ff = DistributedFlux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias,
-            dtype=dtype, devices=devices,
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            dtype=dtype,
+            devices=devices,
         )
 
         self.norm2_context_shards = [
             LayerNorm(
-                dim, dtype=dtype, device=dev, eps=eps,
-                elementwise_affine=False, use_bias=False,
+                dim,
+                dtype=dtype,
+                device=dev,
+                eps=eps,
+                elementwise_affine=False,
+                use_bias=False,
             )
             for dev in devices
         ]
         self.ff_context = DistributedFlux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias,
-            dtype=dtype, devices=devices,
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            dtype=dtype,
+            devices=devices,
         )
 
     def __call__(
@@ -117,23 +148,32 @@ class DistributedFlux2TransformerBlock(Module):
             tuple[TensorValue, TensorValue, TensorValue],
             tuple[TensorValue, TensorValue, TensorValue],
         ],
-        signal_buffers: list,
-        image_rotary_emb_list: list[
-            tuple[TensorValue, TensorValue]
-        ]
+        signal_buffers: list[BufferValue],
+        image_rotary_emb_list: list[tuple[TensorValue, TensorValue]]
         | None = None,
     ) -> tuple[list[TensorValue], list[TensorValue]]:
         # Modulation params are per-device lists after broadcast
-        (shift_msa_list, scale_msa_list, gate_msa_list), (
-            shift_mlp_list, scale_mlp_list, gate_mlp_list,
+        (
+            (shift_msa_list, scale_msa_list, gate_msa_list),
+            (
+                shift_mlp_list,
+                scale_mlp_list,
+                gate_mlp_list,
+            ),
         ) = temb_mod_params_img
-        (c_shift_msa_list, c_scale_msa_list, c_gate_msa_list), (
-            c_shift_mlp_list, c_scale_mlp_list, c_gate_mlp_list,
+        (
+            (c_shift_msa_list, c_scale_msa_list, c_gate_msa_list),
+            (
+                c_shift_mlp_list,
+                c_scale_mlp_list,
+                c_gate_mlp_list,
+            ),
         ) = temb_mod_params_txt
 
         # Apply norms + modulation on each device
         norm_hidden = [
-            (1 + scale_msa_list[i]) * self.norm1_shards[i](hidden_states_list[i])
+            (1 + scale_msa_list[i])
+            * self.norm1_shards[i](hidden_states_list[i])
             + shift_msa_list[i]
             for i in range(self.num_devices)
         ]
@@ -145,35 +185,44 @@ class DistributedFlux2TransformerBlock(Module):
         ]
 
         # Distributed dual-stream attention
-        attn_hidden, attn_encoder = self.attn(
+        attn_result = self.attn(
             norm_hidden,
             signal_buffers,
             encoder_hidden_states_list=norm_encoder,
             image_rotary_emb_list=image_rotary_emb_list,
         )
+        assert isinstance(attn_result, tuple)
+        attn_hidden, attn_encoder = attn_result
 
         # Residual + gate for image stream
         hidden_states_list = [
             h + gate_msa_list[i] * a
-            for i, (h, a) in enumerate(zip(hidden_states_list, attn_hidden))
+            for i, (h, a) in enumerate(
+                zip(hidden_states_list, attn_hidden, strict=False)
+            )
         ]
 
         # MLP for image stream
         norm_hidden = [
-            self.norm2_shards[i](hidden_states_list[i]) * (1 + scale_mlp_list[i])
+            self.norm2_shards[i](hidden_states_list[i])
+            * (1 + scale_mlp_list[i])
             + shift_mlp_list[i]
             for i in range(self.num_devices)
         ]
         ff_output = self.ff(norm_hidden, signal_buffers)
         hidden_states_list = [
             h + gate_mlp_list[i] * f
-            for i, (h, f) in enumerate(zip(hidden_states_list, ff_output))
+            for i, (h, f) in enumerate(
+                zip(hidden_states_list, ff_output, strict=False)
+            )
         ]
 
         # Residual + gate for text stream
         encoder_hidden_states_list = [
             e + c_gate_msa_list[i] * a
-            for i, (e, a) in enumerate(zip(encoder_hidden_states_list, attn_encoder))
+            for i, (e, a) in enumerate(
+                zip(encoder_hidden_states_list, attn_encoder, strict=False)
+            )
         ]
 
         # MLP for text stream
@@ -186,7 +235,9 @@ class DistributedFlux2TransformerBlock(Module):
         context_ff_output = self.ff_context(norm_encoder, signal_buffers)
         encoder_hidden_states_list = [
             e + c_gate_mlp_list[i] * f
-            for i, (e, f) in enumerate(zip(encoder_hidden_states_list, context_ff_output))
+            for i, (e, f) in enumerate(
+                zip(encoder_hidden_states_list, context_ff_output, strict=False)
+            )
         ]
 
         # float16 clamping
@@ -219,8 +270,12 @@ class DistributedFlux2SingleTransformerBlock(Module):
         self.num_devices = len(devices)
         self.norm_shards = [
             LayerNorm(
-                dim, dtype=dtype, device=dev, eps=eps,
-                elementwise_affine=False, use_bias=False,
+                dim,
+                dtype=dtype,
+                device=dev,
+                eps=eps,
+                elementwise_affine=False,
+                use_bias=False,
             )
             for dev in devices
         ]
@@ -241,13 +296,11 @@ class DistributedFlux2SingleTransformerBlock(Module):
     def __call__(
         self,
         hidden_states_list: list[TensorValue],
-        signal_buffers: list,
+        signal_buffers: list[BufferValue],
         encoder_hidden_states_list: list[TensorValue] | None = None,
         temb_mod_params: tuple[TensorValue, TensorValue, TensorValue]
         | None = None,
-        image_rotary_emb_list: list[
-            tuple[TensorValue, TensorValue]
-        ]
+        image_rotary_emb_list: list[tuple[TensorValue, TensorValue]]
         | None = None,
         split_hidden_states: bool = False,
         text_seq_len: int | Dim | None = None,
@@ -257,7 +310,7 @@ class DistributedFlux2SingleTransformerBlock(Module):
             hidden_states_list = [
                 ops.concat([e, h], axis=1)
                 for e, h in zip(
-                    encoder_hidden_states_list, hidden_states_list
+                    encoder_hidden_states_list, hidden_states_list, strict=False
                 )
             ]
 
@@ -280,7 +333,9 @@ class DistributedFlux2SingleTransformerBlock(Module):
 
         hidden_states_list = [
             h + mod_gate_list[i] * a
-            for i, (h, a) in enumerate(zip(hidden_states_list, attn_output))
+            for i, (h, a) in enumerate(
+                zip(hidden_states_list, attn_output, strict=False)
+            )
         ]
 
         # float16 clamping
@@ -293,9 +348,7 @@ class DistributedFlux2SingleTransformerBlock(Module):
 
         if split_hidden_states:
             if text_seq_len is None:
-                raise ValueError(
-                    "text_seq_len is required when splitting"
-                )
+                raise ValueError("text_seq_len is required when splitting")
             encoder_list = [h[:, :text_seq_len, :] for h in hidden_states_list]
             hidden_list = [h[:, text_seq_len:, :] for h in hidden_states_list]
             return encoder_list, hidden_list
@@ -351,25 +404,40 @@ class DistributedFlux2Transformer2DModel(Module):
         # Modulations are replicated on device 0, results broadcast
         self.double_stream_modulation_img = Flux2Modulation(
             self.inner_dim,
-            dtype=dtype, device=devices[0], mod_param_sets=2, bias=False,
+            dtype=dtype,
+            device=devices[0],
+            mod_param_sets=2,
+            bias=False,
         )
         self.double_stream_modulation_txt = Flux2Modulation(
             self.inner_dim,
-            dtype=dtype, device=devices[0], mod_param_sets=2, bias=False,
+            dtype=dtype,
+            device=devices[0],
+            mod_param_sets=2,
+            bias=False,
         )
         self.single_stream_modulation = Flux2Modulation(
             self.inner_dim,
-            dtype=dtype, device=devices[0], mod_param_sets=1, bias=False,
+            dtype=dtype,
+            device=devices[0],
+            mod_param_sets=1,
+            bias=False,
         )
 
         # Input/context embedders: replicated on device 0, results broadcast
         self.x_embedder = Linear(
-            in_dim=in_channels, out_dim=self.inner_dim,
-            dtype=dtype, device=devices[0], has_bias=False,
+            in_dim=in_channels,
+            out_dim=self.inner_dim,
+            dtype=dtype,
+            device=devices[0],
+            has_bias=False,
         )
         self.context_embedder = Linear(
-            in_dim=joint_attention_dim, out_dim=self.inner_dim,
-            dtype=dtype, device=devices[0], has_bias=False,
+            in_dim=joint_attention_dim,
+            out_dim=self.inner_dim,
+            dtype=dtype,
+            device=devices[0],
+            has_bias=False,
         )
 
         # Distributed transformer blocks — must use LayerList for load_state_dict
@@ -412,12 +480,17 @@ class DistributedFlux2Transformer2DModel(Module):
             embedding_dim=self.inner_dim,
             conditioning_embedding_dim=self.inner_dim,
             elementwise_affine=False,
-            dtype=dtype, device=devices[0], eps=eps, bias=False,
+            dtype=dtype,
+            device=devices[0],
+            eps=eps,
+            bias=False,
         )
         self.proj_out = Linear(
             in_dim=self.inner_dim,
             out_dim=patch_size * patch_size * self.out_channels,
-            dtype=dtype, device=devices[0], has_bias=False,
+            dtype=dtype,
+            device=devices[0],
+            has_bias=False,
         )
 
     def input_types(self) -> tuple[TensorType | BufferType, ...]:
@@ -439,9 +512,7 @@ class DistributedFlux2Transformer2DModel(Module):
                 ],
                 device=device,
             ),
-            TensorType(
-                self.max_dtype, shape=["batch_size"], device=device
-            ),
+            TensorType(self.max_dtype, shape=["batch_size"], device=device),
             TensorType(
                 DType.int64,
                 shape=["batch_size", "image_seq_len", 4],
@@ -452,9 +523,7 @@ class DistributedFlux2Transformer2DModel(Module):
                 shape=["batch_size", "text_seq_len", 4],
                 device=device,
             ),
-            TensorType(
-                self.max_dtype, shape=["batch_size"], device=device
-            ),
+            TensorType(self.max_dtype, shape=["batch_size"], device=device),
         ]
         input_types.extend(signals.input_types())
         return tuple(input_types)
@@ -465,7 +534,7 @@ class DistributedFlux2Transformer2DModel(Module):
             tuple[TensorValue, TensorValue, TensorValue],
             tuple[TensorValue, TensorValue, TensorValue],
         ],
-        signal_buffers: list,
+        signal_buffers: list[BufferValue],
     ) -> tuple[
         tuple[list[TensorValue], list[TensorValue], list[TensorValue]],
         tuple[list[TensorValue], list[TensorValue], list[TensorValue]],
@@ -488,7 +557,7 @@ class DistributedFlux2Transformer2DModel(Module):
     def _broadcast_mod_single(
         self,
         mod_params: tuple[TensorValue, TensorValue, TensorValue],
-        signal_buffers: list,
+        signal_buffers: list[BufferValue],
     ) -> tuple[list[TensorValue], list[TensorValue], list[TensorValue]]:
         """Broadcast single-stream modulation params to all devices."""
         s, sc, g = mod_params
@@ -506,7 +575,7 @@ class DistributedFlux2Transformer2DModel(Module):
         img_ids: TensorValue,
         txt_ids: TensorValue,
         guidance: TensorValue,
-        signal_buffers: list,
+        signal_buffers: list[BufferValue],
     ) -> tuple[TensorValue]:
         if img_ids.rank == 3:
             img_ids = img_ids[0]
@@ -551,16 +620,16 @@ class DistributedFlux2Transformer2DModel(Module):
         cos, sin = image_rotary_emb
         cos_list = ops.distributed_broadcast(cos, signal_buffers)
         sin_list = ops.distributed_broadcast(sin, signal_buffers)
-        image_rotary_emb_list = list(zip(cos_list, sin_list))
+        image_rotary_emb_list = list(zip(cos_list, sin_list, strict=False))
 
         # Broadcast modulation params to all devices
-        double_stream_mod_img = self._broadcast_mod_params(
+        double_stream_mod_img = self._broadcast_mod_params(  # type: ignore[assignment]
             double_stream_mod_img, signal_buffers
         )
-        double_stream_mod_txt = self._broadcast_mod_params(
+        double_stream_mod_txt = self._broadcast_mod_params(  # type: ignore[assignment]
             double_stream_mod_txt, signal_buffers
         )
-        single_stream_mod = self._broadcast_mod_single(
+        single_stream_mod = self._broadcast_mod_single(  # type: ignore[assignment]
             single_stream_mod, signal_buffers
         )
 
@@ -579,7 +648,7 @@ class DistributedFlux2Transformer2DModel(Module):
         hidden_states_list = [
             ops.concat([e, h], axis=1)
             for e, h in zip(
-                encoder_hidden_states_list, hidden_states_list
+                encoder_hidden_states_list, hidden_states_list, strict=False
             )
         ]
 
