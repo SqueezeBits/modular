@@ -333,6 +333,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Number of GPUs for tensor-parallel inference (default: 1).",
     )
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=0,
+        help=(
+            "Ulysses context-parallel degree. When > 1, uses sequence "
+            "parallelism instead of tensor parallelism. Must divide "
+            "num-gpus evenly. 0 = disabled (default: 0)."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -495,6 +505,10 @@ async def generate_image(args: argparse.Namespace) -> None:
                 parsed = raw_value
             value = adapter.validate_python(parsed)
             manifest = manifest.with_override(component, **{field_name: value})
+
+    # Inject ulysses_degree into manifest metadata so pipelines can read it.
+    if args.ulysses_degree > 0:
+        manifest._metadata["ulysses_degree"] = args.ulysses_degree
 
     config = PipelineConfig(
         models=manifest,
