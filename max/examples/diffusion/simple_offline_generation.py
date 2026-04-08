@@ -327,6 +327,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "'transformer.quantization_encoding=float4_e2m1fnx2'."
         ),
     )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for tensor-parallel inference (default: 1).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -430,9 +436,10 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 1: Initialize pipeline configuration
     # Use from_model_path to get full diffusers component expansion.
+    device_specs = [DeviceSpec.accelerator(id=i) for i in range(args.num_gpus)]
     manifest = ModelManifest.from_model_path(
         args.model,
-        device_specs=[DeviceSpec.accelerator()],
+        device_specs=device_specs,
     )
 
     # Apply legacy single-component overrides for backward compat.

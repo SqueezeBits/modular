@@ -33,6 +33,7 @@ from max.profiler import Tracer, traced
 
 from ..autoencoders import AutoencoderKLFlux2Model
 from ..mistral3.text_encoder import Mistral3TextEncoderModel
+from .distributed_model import DistributedFlux2TransformerModel
 from .model import Flux2TransformerModel
 
 if TYPE_CHECKING:
@@ -128,13 +129,29 @@ class Flux2Pipeline(DiffusionPipeline):
 
     vae: AutoencoderKLFlux2Model
     text_encoder: Mistral3TextEncoderModel
-    transformer: Flux2TransformerModel
+    transformer: Flux2TransformerModel | DistributedFlux2TransformerModel
 
     components = {
         "vae": AutoencoderKLFlux2Model,
         "text_encoder": Mistral3TextEncoderModel,
         "transformer": Flux2TransformerModel,
     }
+
+    @property
+    def _transformer_cls(self) -> type:
+        """Select single-GPU or distributed transformer based on device count."""
+        if len(self.devices) > 1:
+            return DistributedFlux2TransformerModel
+        return Flux2TransformerModel
+
+    def _load_sub_models(self, weight_paths):
+        """Override to swap transformer class for multi-GPU."""
+        original_transformer_cls = self.components["transformer"]
+        self.components["transformer"] = self._transformer_cls
+        try:
+            return super()._load_sub_models(weight_paths)
+        finally:
+            self.components["transformer"] = original_transformer_cls
 
     def init_remaining_components(self) -> None:
         """Initialize derived attributes that depend on loaded components."""
