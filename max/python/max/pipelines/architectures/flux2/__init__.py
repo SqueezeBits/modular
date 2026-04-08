@@ -16,11 +16,13 @@ from .distributed_model import DistributedFlux2TransformerModel
 from .model import Flux2TransformerModel
 from .ring_model import RingFlux2TransformerModel
 from .ulysses_model import UlyssesFlux2TransformerModel
+from .usp_model import USPFlux2TransformerModel
 
 __all__ = [
     "DistributedFlux2TransformerModel",
     "Flux2TransformerModel",
     "RingFlux2TransformerModel",
+    "USPFlux2TransformerModel",
     "UlyssesFlux2TransformerModel",
     "flux2_arch",
 ]

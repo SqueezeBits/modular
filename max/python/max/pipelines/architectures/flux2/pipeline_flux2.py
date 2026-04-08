@@ -37,6 +37,7 @@ from .distributed_model import DistributedFlux2TransformerModel
 from .model import Flux2TransformerModel
 from .ring_model import RingFlux2TransformerModel
 from .ulysses_model import UlyssesFlux2TransformerModel
+from .usp_model import USPFlux2TransformerModel
 
 if TYPE_CHECKING:
     from ..autoencoders_modulev3.vae import DiagonalGaussianDistribution
@@ -131,7 +132,7 @@ class Flux2Pipeline(DiffusionPipeline):
 
     vae: AutoencoderKLFlux2Model
     text_encoder: Mistral3TextEncoderModel
-    transformer: Flux2TransformerModel | DistributedFlux2TransformerModel | UlyssesFlux2TransformerModel | RingFlux2TransformerModel
+    transformer: Flux2TransformerModel | DistributedFlux2TransformerModel | UlyssesFlux2TransformerModel | RingFlux2TransformerModel | USPFlux2TransformerModel
 
     components = {
         "vae": AutoencoderKLFlux2Model,
@@ -157,11 +158,14 @@ class Flux2Pipeline(DiffusionPipeline):
     def _transformer_cls(self) -> type:
         """Select transformer class based on parallelism mode.
 
-        - ulysses_degree > 1: Context Parallelism (Ulysses)
-        - ring_degree > 1:    Context Parallelism (Ring)
+        - ulysses + ring > 1: USP (Ulysses + Ring combined)
+        - ulysses_degree > 1: Context Parallelism (Ulysses only)
+        - ring_degree > 1:    Context Parallelism (Ring only)
         - len(devices) > 1:   Tensor Parallelism
         - otherwise:          Single-GPU
         """
+        if self._ulysses_degree > 1 and self._ring_degree > 1:
+            return USPFlux2TransformerModel
         if self._ulysses_degree > 1:
             return UlyssesFlux2TransformerModel
         if self._ring_degree > 1:
@@ -174,6 +178,12 @@ class Flux2Pipeline(DiffusionPipeline):
         """Override to swap transformer class for multi-GPU."""
         original_transformer_cls = self.components["transformer"]
         self.components["transformer"] = self._transformer_cls
+
+        # For USP, set class-level degrees before construction
+        if self._transformer_cls is USPFlux2TransformerModel:
+            USPFlux2TransformerModel._init_ulysses_degree = self._ulysses_degree
+            USPFlux2TransformerModel._init_ring_degree = self._ring_degree
+
         try:
             return super()._load_sub_models(weight_paths)
         finally:
