@@ -11,8 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from __future__ import annotations
+
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from max.driver import Buffer, Device
 from max.engine import InferenceSession, Model
@@ -20,6 +22,9 @@ from max.graph import Graph
 from max.graph.weights import Weights
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.lib.interfaces.component_model import ComponentModel
+
+if TYPE_CHECKING:
+    from max.pipelines.lib.interfaces.cache_mixin import DenoisingCacheConfig
 
 from .flux2 import Flux2Transformer2DModel
 from .model_config import Flux2Config
@@ -33,8 +38,12 @@ class Flux2TransformerModel(ComponentModel):
         devices: list[Device],
         weights: Weights,
         session: InferenceSession,
+        *,
+        cache_config: DenoisingCacheConfig | None = None,
     ) -> None:
-        super().__init__(config, encoding, devices, weights)
+        super().__init__(
+            config, encoding, devices, weights, cache_config=cache_config
+        )
         self.session = session
         self.config = Flux2Config.initialize_from_config(
             config,
@@ -59,7 +68,9 @@ class Flux2TransformerModel(ComponentModel):
             else:
                 self.config.guidance_embeds = False
 
-        nn_model = Flux2Transformer2DModel(self.config)
+        nn_model = Flux2Transformer2DModel(
+            self.config, cache_config=self.cache_config
+        )
         nn_model.load_state_dict(state_dict, weight_alignment=1, strict=True)
         self.state_dict = nn_model.state_dict()
 
@@ -87,8 +98,15 @@ class Flux2TransformerModel(ComponentModel):
         img_ids: Buffer,
         txt_ids: Buffer,
         guidance: Buffer,
+        prev_residual: Buffer | None = None,
+        prev_output: Buffer | None = None,
+        residual_threshold: Buffer | None = None,
+        teacache_prev_modulated_input: Buffer | None = None,
+        teacache_cached_residual: Buffer | None = None,
+        teacache_accumulated_rel_l1: Buffer | None = None,
+        force_compute: Buffer | None = None,
     ) -> list[Buffer]:
-        return self.model.execute(
+        args: tuple[Buffer, ...] = (
             hidden_states,
             encoder_hidden_states,
             timestep,
@@ -96,3 +114,17 @@ class Flux2TransformerModel(ComponentModel):
             txt_ids,
             guidance,
         )
+        if teacache_prev_modulated_input is not None:
+            args = (
+                *args,
+                teacache_prev_modulated_input,
+                teacache_cached_residual,  # type: ignore[arg-type]
+                teacache_accumulated_rel_l1,  # type: ignore[arg-type]
+                force_compute,  # type: ignore[arg-type]
+            )
+        elif prev_residual is not None:
+            assert residual_threshold is not None, (
+                "residual_threshold is required when step-cache is enabled"
+            )
+            args = (*args, prev_residual, prev_output, residual_threshold)  # type: ignore[arg-type]
+        return self.model.execute(*args)

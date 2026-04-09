@@ -13,7 +13,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -23,7 +23,10 @@ from max.experimental.tensor import Tensor
 from max.graph import TensorType, TensorValue, ops
 from max.pipelines.core import PixelContext
 from max.pipelines.lib import float32_array_to_buffer
-from max.pipelines.lib.interfaces import DiffusionPipeline
+from max.pipelines.lib.interfaces import (
+    DenoisingCacheState,
+    DiffusionPipeline,
+)
 from max.pipelines.lib.interfaces.diffusion_pipeline import (
     DiffusionPipelineOutput,
     max_compile,
@@ -90,6 +93,10 @@ class Flux2ModelInputs:
     input_image: npt.NDArray[np.uint8] | None
     """Optional input image for image-to-image generation (HWC uint8)."""
 
+    residual_threshold: Buffer | None = None
+    """Scalar float32 buffer for FBCache residual threshold, on device.
+    None when FBCache is not enabled."""
+
     def __post_init__(self) -> None:
         if not isinstance(self.height, int) or self.height <= 0:
             raise ValueError(
@@ -125,6 +132,7 @@ class Flux2Pipeline(DiffusionPipeline):
     """
 
     default_num_inference_steps = 28
+    default_residual_threshold = 0.06
 
     vae: AutoencoderKLFlux2Model
     text_encoder: Mistral3TextEncoderModel
@@ -152,6 +160,11 @@ class Flux2Pipeline(DiffusionPipeline):
         self.build_decode_latents()
         self.build_concat_packed_latents()
 
+        self._init_cache_state(
+            dtype=self.transformer.config.dtype,
+            device=self.transformer.devices[0],
+        )
+
         self._cached_guidance: BoundedCache[str, Buffer] = BoundedCache(32)
         self._cached_text_ids: BoundedCache[str, Buffer] = BoundedCache(32)
         self._cached_sigmas: BoundedCache[str, Buffer] = BoundedCache(32)
@@ -164,6 +177,19 @@ class Flux2Pipeline(DiffusionPipeline):
         self._repeat_image_conditioning_cache: dict[
             int, Callable[[Buffer, Buffer], tuple[Buffer, Buffer]]
         ] = {}
+
+    def _make_rdt_buffer(
+        self, request_value: float | None, device: Device
+    ) -> Buffer | None:
+        """Create a scalar float32 threshold buffer if FBCache is enabled."""
+        if not self.cache_config.first_block_caching:
+            return None
+        value = (
+            request_value
+            if request_value is not None
+            else self.default_residual_threshold
+        )
+        return Buffer.from_dlpack(np.array(value, dtype=np.float32)).to(device)
 
     @traced
     def prepare_inputs(self, context: PixelContext) -> Flux2ModelInputs:  # type: ignore[override]
@@ -243,6 +269,9 @@ class Flux2Pipeline(DiffusionPipeline):
             num_inference_steps=context.num_inference_steps,
             num_images_per_prompt=context.num_images_per_prompt,
             input_image=context.input_image,
+            residual_threshold=self._make_rdt_buffer(
+                context.residual_threshold, device
+            ),
         )
 
     def build_preprocess_latents(self) -> None:
@@ -799,6 +828,40 @@ class Flux2Pipeline(DiffusionPipeline):
         all_timesteps = ops.cast(sigmas_curr, self.transformer.config.dtype)
         return all_timesteps, all_dt
 
+    def run_transformer(
+        self,
+        cache_state: DenoisingCacheState,
+        **kwargs: Any,
+    ) -> tuple[Tensor, ...]:
+        base_args = (
+            kwargs["latents"],
+            kwargs["prompt_embeds"],
+            kwargs["timestep"],
+            kwargs["latent_image_ids"],
+            kwargs["text_ids"],
+            kwargs["guidance"],
+        )
+        if self.cache_config.teacache:
+            result = self.transformer(
+                *base_args,
+                teacache_prev_modulated_input=cache_state.teacache_prev_modulated_input.driver_tensor,  # type: ignore[union-attr]
+                teacache_cached_residual=cache_state.teacache_cached_residual.driver_tensor,  # type: ignore[union-attr]
+                teacache_accumulated_rel_l1=cache_state.teacache_accumulated_rel_l1.driver_tensor,  # type: ignore[union-attr]
+                force_compute=kwargs["force_compute"].driver_tensor,
+            )
+        elif self.cache_config.first_block_caching:
+            result = self.transformer(
+                *base_args,
+                prev_residual=cache_state.prev_residual.driver_tensor,  # type: ignore[union-attr]
+                prev_output=cache_state.prev_output.driver_tensor,  # type: ignore[union-attr]
+                residual_threshold=kwargs.get("residual_threshold"),
+            )
+        else:
+            result = self.transformer(*base_args)
+        return tuple(
+            Tensor(storage=r) if isinstance(r, Buffer) else r for r in result
+        )
+
     @traced
     def execute(  # type: ignore[override]
         self,
@@ -849,6 +912,18 @@ class Flux2Pipeline(DiffusionPipeline):
 
         # 4) Denoising loop.
         is_img2img = image_latents is not None
+        device = self.transformer.devices[0]
+
+        seq_len_for_cache = model_inputs.image_seq_len
+        if image_latents is not None:
+            seq_len_for_cache += int(image_latents.shape[1])
+        cache = self.create_cache_state(
+            batch_size,
+            seq_len_for_cache,
+            self.transformer.config,
+            text_seq_len=int(prompt_embeds.shape[1]),
+        )
+
         with Tracer("denoising_loop"):
             for i in range(model_inputs.num_inference_steps):
                 with Tracer(f"denoising_step_{i}"):
@@ -870,18 +945,39 @@ class Flux2Pipeline(DiffusionPipeline):
                         latents_concat = latents
                         latent_image_ids_concat = latent_image_ids
 
-                    with Tracer("transformer"):
-                        noise_pred = self.transformer(
-                            latents_concat,
-                            prompt_embeds,
-                            timestep,
-                            latent_image_ids_concat,
-                            text_ids,
-                            guidance,
-                        )[0]
+                    step_kwargs: dict[str, Any] = dict(
+                        latents=latents_concat,
+                        prompt_embeds=prompt_embeds,
+                        timestep=timestep,
+                        latent_image_ids=latent_image_ids_concat,
+                        text_ids=text_ids,
+                        guidance=guidance,
+                        residual_threshold=model_inputs.residual_threshold,
+                    )
+                    if self.cache_config.teacache:
+                        step_kwargs["force_compute"] = Tensor(
+                            storage=Buffer.from_dlpack(
+                                np.array(
+                                    [
+                                        i == 0
+                                        or i
+                                        == model_inputs.num_inference_steps - 1
+                                    ],
+                                    dtype=bool,
+                                )
+                            ).to(device)
+                        )
+                    noise_pred = self.run_denoising_step(
+                        step=i,
+                        cache_state=cache,
+                        device=device,
+                        **step_kwargs,
+                    )
 
                     with Tracer("scheduler_step"):
-                        latents = self._scheduler_step(latents, noise_pred, dt)
+                        latents = self._scheduler_step(
+                            latents, noise_pred.driver_tensor, dt
+                        )
 
         # 5) Decode final outputs for all batch elements in a single pass.
         with Tracer("decode_outputs"):
