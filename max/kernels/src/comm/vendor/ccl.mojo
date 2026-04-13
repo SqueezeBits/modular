@@ -184,6 +184,32 @@ def _ccl_allgather(
     ]()(sendbuff, recvbuff, count, datatype, comm, stream_ptr)
 
 
+# === ReduceScatter binding (unified) ===
+@always_inline
+def _ccl_reducescatter(
+    sendbuff: OpaquePointer,
+    recvbuff: OpaquePointer,
+    recvcount: Int,
+    datatype: ncclDataType_t,
+    op: ncclRedOp_t,
+    comm: ncclComm_t,
+    ctx: DeviceContext,
+) raises -> ncclResult_t:
+    var stream_ptr = _ccl_stream_ptr(ctx)
+    return _get_ccl_function[
+        "ncclReduceScatter",
+        def(
+            type_of(sendbuff),
+            type_of(recvbuff),
+            Int,
+            ncclDataType_t,
+            ncclRedOp_t,
+            ncclComm_t,
+            type_of(stream_ptr),
+        ) thin -> ncclResult_t,
+    ]()(sendbuff, recvbuff, recvcount, datatype, op, comm, stream_ptr)
+
+
 # === Broadcast binding (unified) ===
 @always_inline
 def _ccl_broadcast(
@@ -406,6 +432,10 @@ def is_allgather_available() -> Bool:
 
 def is_broadcast_available() -> Bool:
     return _is_ccl_symbol_available["ncclBroadcast"]()
+
+
+def is_reducescatter_available() -> Bool:
+    return _is_ccl_symbol_available["ncclReduceScatter"]()
 
 
 @parameter
