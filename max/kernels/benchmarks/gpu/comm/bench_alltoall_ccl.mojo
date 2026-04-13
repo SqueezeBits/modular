@@ -29,7 +29,9 @@ from std.benchmark import (
     ThroughputMeasure,
 )
 from comm.sync import enable_p2p
+from comm.alltoall import alltoall
 from comm import MAX_GPUS, Signal
+from layout import Idx, TileTensor, row_major
 import comm.vendor.ccl as vendor_ccl
 from comm.vendor.ccl import (
     _ccl_alltoall,
@@ -55,13 +57,6 @@ def bench_alltoall_ccl[
 ) raises:
     """num_bytes is per-chunk size (ngpus chunks per rank on send/recv side)."""
     comptime assert ngpus in (2, 4, 8), "ngpus must be 2, 4, or 8"
-    # Mojo P2P kernel for AlltoAll is not yet implemented. The NCCL path
-    # below is the only functional backend today.
-    comptime if not use_vendor_ccl:
-        comptime assert False, (
-            "Mojo AlltoAll kernel not yet implemented. Build this target"
-            " with use_vendor_ccl=True, or wait for comm/alltoall.mojo."
-        )
 
     var chunk_length = num_bytes // size_of[dtype]()
     var per_rank_length = chunk_length * ngpus
@@ -117,6 +112,24 @@ def bench_alltoall_ccl[
         )
         list_of_ctx[gpu_idx].synchronize()
 
+    # TileTensors for the Mojo path: one immut view per rank's sendbuf and
+    # one mut view of this rank's recvbuf.
+    comptime InTileType = type_of(
+        TileTensor(
+            cb_sends[0].unsafe_ptr(), row_major(Idx(per_rank_length))
+        ).as_immut()
+    )
+    var tt_in = InlineArray[InTileType, ngpus](uninitialized=True)
+
+    comptime OutTileType = type_of(
+        TileTensor(recv_bufs[0].unsafe_ptr(), row_major(Idx(per_rank_length)))
+    )
+    var tt_out = InlineArray[OutTileType, ngpus](uninitialized=True)
+    for gpu_idx in range(ngpus):
+        tt_out[gpu_idx] = TileTensor(
+            recv_bufs[gpu_idx].unsafe_ptr(), row_major(Idx(per_rank_length))
+        )
+
     # NCCL comm pre-init.
     comptime if use_vendor_ccl:
         if not vendor_ccl.is_alltoall_available():
@@ -143,6 +156,18 @@ def bench_alltoall_ccl[
                     chunk_length,
                     dtype_ccl,
                     comms.comms[device_rank],
+                    ctx_inner,
+                )
+            else:
+                comptime for i in range(ngpus):
+                    tt_in[i] = TileTensor(
+                        cb_sends[i].offset_ptr(cache_iter),
+                        row_major(Idx(per_rank_length)),
+                    ).as_immut()
+                alltoall[ngpus=ngpus](
+                    tt_in,
+                    tt_out[ctx_idx],
+                    rank_sigs,
                     ctx_inner,
                 )
 
@@ -183,7 +208,7 @@ def main() raises:
 
     comptime dtype = get_defined_dtype["dtype", DType.bfloat16]()
     comptime num_gpus = get_defined_int["num_gpus", 2]()
-    comptime use_vendor_ccl = get_defined_bool["use_vendor_ccl", True]()
+    comptime use_vendor_ccl = get_defined_bool["use_vendor_ccl", False]()
     comptime cache_busting = True
 
     var m = Bench()

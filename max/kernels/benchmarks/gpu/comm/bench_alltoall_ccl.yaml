@@ -20,8 +20,8 @@ commons: &commons
   $num_bytes: "[2**i for i in range(14, 29)]"
 
 params:
-# Mojo path is not yet implemented; only the NCCL path is functional today.
-# Once comm/alltoall.mojo lands, add a second params entry with
-# use_vendor_ccl: [False] to enable the comparison sweep.
+- <<: *commons
+  use_vendor_ccl: [False]
+
 - <<: *commons
   use_vendor_ccl: [True]

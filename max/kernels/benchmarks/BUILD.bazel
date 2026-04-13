@@ -229,9 +229,10 @@ _SCATTER_CCL_VARIANTS = [
     ("bench_scatter_ccl_nccl_8gpu", 8, True),
 ]
 
-# AlltoAll has no Mojo kernel yet; only NCCL variants build at present.
-# Add *_mojo_{2,4,8}gpu entries here once comm/alltoall.mojo lands.
 _ALLTOALL_CCL_VARIANTS = [
+    ("bench_alltoall_ccl_mojo_2gpu", 2, False),
+    ("bench_alltoall_ccl_mojo_4gpu", 4, False),
+    ("bench_alltoall_ccl_mojo_8gpu", 8, False),
     ("bench_alltoall_ccl_nccl_2gpu", 2, True),
     ("bench_alltoall_ccl_nccl_4gpu", 4, True),
     ("bench_alltoall_ccl_nccl_8gpu", 8, True),
