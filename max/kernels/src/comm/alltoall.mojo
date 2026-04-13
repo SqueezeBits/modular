@@ -10,20 +10,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Multi-GPU AlltoAll collective — v1 pull-based P2P kernel.
+"""Multi-GPU AlltoAll collective — v2 block-parallel pull kernel.
 
 Each rank's sendbuf holds ``ngpus`` chunks of size ``chunk_num_elems``:
 chunk ``i`` is destined for rank ``i``. After alltoall, each rank's
 recvbuf holds the chunks it received from every peer, in peer order:
 ``recvbuf[peer * chunk + elem] = sendbuf_of(peer)[my_rank * chunk + elem]``.
 
-Uses a pull-based approach: each GPU reads the chunk addressed to it
-from every peer's sendbuf via P2P. Single kernel launch with a
-start/end multi-GPU barrier, matching the pattern used by
-``scatter``/``allgather``. ``self`` (``peer == my_rank``) is copied
-via the same P2P path for code simplicity; the self-copy cost shows
-up in ``algbw`` but is folded out by the standard alltoall bus
-bandwidth formula ``busbw = algbw * (n - 1) / n``.
+v2 (current): the grid is partitioned per peer. Let
+``total_blocks = blocks_per_peer * ngpus``; block ``b`` handles only
+peer ``b // blocks_per_peer`` and iterates over the ``chunk_num_elems``
+elements addressed to ``my_rank`` within that peer's sendbuf. This
+drives all ``ngpus`` remote NVLink reads concurrently at the grid
+level, which v1 (serial per-peer loop inside every block) did not.
+
+v1 (historic): single loop ``for peer in range(ngpus)`` inside each
+block. All blocks read from peer 0 first, then peer 1, etc. — only
+one remote link saturated at a time. See ``alltoall_v1_benchmark.md``.
 """
 
 from layout import TileTensor
@@ -32,8 +35,10 @@ from std.collections import InlineArray
 from std.gpu.host import DeviceContext, get_gpu_target
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
+    block_idx,
     global_idx,
     grid_dim,
+    thread_idx,
 )
 from std.gpu.primitives.grid_controls import (
     PDL,
@@ -53,7 +58,7 @@ from .sync import (
     is_p2p_enabled,
 )
 
-# --- Pull kernel: each GPU reads its chunk from every peer's sendbuf. ---
+# --- v2 kernel: block-level peer partitioning ---
 
 
 @__llvm_metadata(
@@ -70,21 +75,31 @@ def alltoall_pull_kernel[
         UnsafePointer[Scalar[dtype], ImmutAnyOrigin], ngpus
     ],
     chunk_num_elems: Int,
+    blocks_per_peer: Int,
     rank_sigs: InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS],
     my_rank: Int,
 ):
-    """Pull-based AlltoAll: each GPU reads its chunk from every peer.
+    """Block-parallel pull: each block copies one peer's chunk slice.
 
-    For each peer p in [0, ngpus):
-        dst = output_ptr + p * chunk_num_elems
-        src = input_ptrs[p] + my_rank * chunk_num_elems
-    Each (dst, src) pair is a chunk_num_elems-wide P2P copy executed by
-    the full grid, vectorized to simd_width where possible.
+    The launch uses ``total_blocks = blocks_per_peer * ngpus`` blocks on
+    a single 1D grid (so the existing ``_multi_gpu_barrier`` slot
+    indexing by ``blockIdx.x`` still fits inside
+    ``MAX_NUM_BLOCKS_UPPER_BOUND``). Block ``b`` is assigned
+    ``peer = b // blocks_per_peer`` and works on the portion
+    ``[block_in_peer * BLOCK_SIZE, chunk_num_elems)`` of peer ``peer``'s
+    chunk via grid-stride with stride ``blocks_per_peer * BLOCK_SIZE``.
     """
     var my_sig = rank_sigs[my_rank]
 
-    var global_tid = global_idx.x
-    var stride = grid_dim.x * BLOCK_SIZE
+    # Decompose flat blockIdx.x into (peer, block_in_peer).
+    var peer = block_idx.x // blocks_per_peer
+    var block_in_peer = block_idx.x % blocks_per_peer
+
+    var src_base = input_ptrs[peer] + my_rank * chunk_num_elems
+    var dst_base = output_ptr + peer * chunk_num_elems
+
+    var tid_in_peer = block_in_peer * BLOCK_SIZE + thread_idx.x
+    var stride = blocks_per_peer * BLOCK_SIZE
 
     var num_simd_vectors = chunk_num_elems // simd_width
     var tail_start = num_simd_vectors * simd_width
@@ -92,26 +107,21 @@ def alltoall_pull_kernel[
     with PDL():
         _multi_gpu_barrier[ngpus, is_start=True](rank_sigs, my_sig, my_rank)
 
-        # Pull chunk destined for my_rank from every peer (including self).
-        comptime for peer in range(ngpus):
-            var src_base = input_ptrs[peer] + my_rank * chunk_num_elems
-            var dst_base = output_ptr + peer * chunk_num_elems
+        # Grid-strided vectorized copy within this peer's chunk.
+        for idx in range(tid_in_peer, num_simd_vectors, stride):
+            var elem_idx = idx * simd_width
+            dst_base.store[width=simd_width](
+                elem_idx,
+                src_base.load[width=simd_width](elem_idx),
+            )
 
-            # Grid-strided vectorized copy.
-            for idx in range(global_tid, num_simd_vectors, stride):
-                var elem_idx = idx * simd_width
-                dst_base.store[width=simd_width](
-                    elem_idx,
-                    src_base.load[width=simd_width](elem_idx),
-                )
-
-            # Tail elements (only active when chunk_num_elems % simd_width != 0).
-            var tail_idx = tail_start + global_tid
-            if tail_idx < chunk_num_elems:
-                dst_base.store[width=1](
-                    tail_idx,
-                    src_base.load[width=1](tail_idx),
-                )
+        # Tail elements (only active when chunk_num_elems % simd_width != 0).
+        var tail_idx = tail_start + tid_in_peer
+        if tail_idx < chunk_num_elems:
+            dst_base.store[width=1](
+                tail_idx,
+                src_base.load[width=1](tail_idx),
+            )
 
         _multi_gpu_barrier[ngpus, is_start=False](rank_sigs, my_sig, my_rank)
 
@@ -133,8 +143,9 @@ def alltoall[
     output_buffer: TileTensor[mut=True, dtype, ...],
     rank_sigs: InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS],
     ctx: DeviceContext,
+    _max_num_blocks: Optional[Int] = None,
 ) raises:
-    """Pull-based AlltoAll across ngpus GPUs.
+    """Pull-based AlltoAll across ngpus GPUs (v2 block-parallel).
 
     Each rank's ``input_buffers[my_rank]`` holds ``ngpus`` contiguous
     chunks of equal size; chunk ``i`` is destined for rank ``i``.
@@ -158,6 +169,11 @@ def alltoall[
             ``ngpus * chunk`` matching the input size.
         rank_sigs: Per-GPU Signal pointers for synchronization.
         ctx: Device context for THIS GPU.
+        _max_num_blocks: Optional cap on the total number of thread
+            blocks launched. If provided, the launch will use up to
+            ``floor(_max_num_blocks / ngpus) * ngpus`` blocks (i.e. the
+            cap is applied to the product ``blocks_per_peer * ngpus``).
+            If None, defaults to ``MAX_NUM_BLOCKS_UPPER_BOUND``.
 
     Raises:
         Error: If P2P access is not available between GPUs.
@@ -188,10 +204,21 @@ def alltoall[
 
     comptime BLOCK_SIZE = 256
     comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
-    var grid_size = min(
-        ceildiv(ceildiv(chunk_num_elems, simd_width), BLOCK_SIZE),
-        MAX_NUM_BLOCKS_UPPER_BOUND,
+
+    # blocks_per_peer is sized to cover one chunk with one grid-stride pass,
+    # then capped so that blocks_per_peer * ngpus <= MAX_NUM_BLOCKS_UPPER_BOUND
+    # (or the caller-supplied cap).
+    var cap_total = MAX_NUM_BLOCKS_UPPER_BOUND
+    if _max_num_blocks:
+        cap_total = min(cap_total, _max_num_blocks.value())
+
+    var blocks_for_chunk = ceildiv(
+        ceildiv(chunk_num_elems, simd_width), BLOCK_SIZE
     )
+    var blocks_per_peer = min(blocks_for_chunk, cap_total // ngpus)
+    if blocks_per_peer < 1:
+        blocks_per_peer = 1
+    var total_blocks = blocks_per_peer * ngpus
 
     comptime kernel = alltoall_pull_kernel[dtype, BLOCK_SIZE, ngpus]
 
@@ -199,9 +226,10 @@ def alltoall[
         rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](output_buffer.ptr),
         input_ptrs,
         chunk_num_elems,
+        blocks_per_peer,
         rank_sigs,
         Int(ctx.id()),
-        grid_dim=grid_size,
+        grid_dim=total_blocks,
         block_dim=BLOCK_SIZE,
         attributes=pdl_launch_attributes(pdl_level),
     )
