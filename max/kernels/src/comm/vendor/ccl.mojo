@@ -236,6 +236,38 @@ def _ccl_scatter(
     ]()(sendbuff, recvbuff, count, datatype, root, comm, stream_ptr)
 
 
+# === AlltoAll binding (NCCL 2.28.3+) ===
+@always_inline
+def _ccl_alltoall(
+    sendbuff: OpaquePointer,
+    recvbuff: OpaquePointer,
+    count: Int,
+    datatype: ncclDataType_t,
+    comm: ncclComm_t,
+    ctx: DeviceContext,
+) raises -> ncclResult_t:
+    """Per-rank ncclAlltoAll.
+
+    Each rank sends ``count`` values to every other rank and receives
+    ``count`` values from every other rank. ``sendbuff`` and ``recvbuff``
+    must hold ``count * ngpus`` elements; chunk ``i`` of ``sendbuff`` is
+    sent to rank ``i`` and ends up at chunk ``my_rank`` of rank ``i``'s
+    ``recvbuff``.
+    """
+    var stream_ptr = _ccl_stream_ptr(ctx)
+    return _get_ccl_function[
+        "ncclAlltoAll",
+        def(
+            type_of(sendbuff),
+            type_of(recvbuff),
+            Int,
+            ncclDataType_t,
+            ncclComm_t,
+            type_of(stream_ptr),
+        ) thin -> ncclResult_t,
+    ]()(sendbuff, recvbuff, count, datatype, comm, stream_ptr)
+
+
 # === Broadcast binding (unified) ===
 @always_inline
 def _ccl_broadcast(
@@ -466,6 +498,10 @@ def is_reducescatter_available() -> Bool:
 
 def is_scatter_available() -> Bool:
     return _is_ccl_symbol_available["ncclScatter"]()
+
+
+def is_alltoall_available() -> Bool:
+    return _is_ccl_symbol_available["ncclAlltoAll"]()
 
 
 @parameter
