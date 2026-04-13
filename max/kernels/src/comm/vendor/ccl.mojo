@@ -236,6 +236,59 @@ def _ccl_scatter(
     ]()(sendbuff, recvbuff, count, datatype, root, comm, stream_ptr)
 
 
+# === Send / Recv bindings (NCCL 2.7+) ===
+@always_inline
+def _ccl_send(
+    sendbuff: OpaquePointer,
+    count: Int,
+    datatype: ncclDataType_t,
+    peer: Int,
+    comm: ncclComm_t,
+    ctx: DeviceContext,
+) raises -> ncclResult_t:
+    """Send ``count`` values of ``datatype`` from ``sendbuff`` to rank ``peer``.
+
+    Typically wrapped in ``vendor_ccl.group()`` together with the matching
+    ``_ccl_recv`` call on the same rank to avoid deadlock.
+    """
+    var stream_ptr = _ccl_stream_ptr(ctx)
+    return _get_ccl_function[
+        "ncclSend",
+        def(
+            type_of(sendbuff),
+            Int,
+            ncclDataType_t,
+            Int,
+            ncclComm_t,
+            type_of(stream_ptr),
+        ) thin -> ncclResult_t,
+    ]()(sendbuff, count, datatype, peer, comm, stream_ptr)
+
+
+@always_inline
+def _ccl_recv(
+    recvbuff: OpaquePointer,
+    count: Int,
+    datatype: ncclDataType_t,
+    peer: Int,
+    comm: ncclComm_t,
+    ctx: DeviceContext,
+) raises -> ncclResult_t:
+    """Receive ``count`` values of ``datatype`` into ``recvbuff`` from rank ``peer``."""
+    var stream_ptr = _ccl_stream_ptr(ctx)
+    return _get_ccl_function[
+        "ncclRecv",
+        def(
+            type_of(recvbuff),
+            Int,
+            ncclDataType_t,
+            Int,
+            ncclComm_t,
+            type_of(stream_ptr),
+        ) thin -> ncclResult_t,
+    ]()(recvbuff, count, datatype, peer, comm, stream_ptr)
+
+
 # === AlltoAll binding (NCCL 2.28.3+) ===
 @always_inline
 def _ccl_alltoall(
@@ -502,6 +555,14 @@ def is_scatter_available() -> Bool:
 
 def is_alltoall_available() -> Bool:
     return _is_ccl_symbol_available["ncclAlltoAll"]()
+
+
+def is_send_available() -> Bool:
+    return _is_ccl_symbol_available["ncclSend"]()
+
+
+def is_recv_available() -> Bool:
+    return _is_ccl_symbol_available["ncclRecv"]()
 
 
 @parameter

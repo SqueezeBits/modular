@@ -238,6 +238,14 @@ _ALLTOALL_CCL_VARIANTS = [
     ("bench_alltoall_ccl_nccl_8gpu", 8, True),
 ]
 
+# SendRecv has no Mojo kernel (Modular doesn't expose point-to-point
+# primitives); only NCCL variants build at present.
+_SENDRECV_CCL_VARIANTS = [
+    ("bench_sendrecv_ccl_nccl_2gpu", 2),
+    ("bench_sendrecv_ccl_nccl_4gpu", 4),
+    ("bench_sendrecv_ccl_nccl_8gpu", 8),
+]
+
 [
     mojo_binary(
         name = variant_name,
@@ -465,6 +473,37 @@ _ALLTOALL_CCL_VARIANTS = [
         ],
     )
     for (variant_name, ngpus, use_ccl) in _ALLTOALL_CCL_VARIANTS
+]
+
+[
+    mojo_binary(
+        name = variant_name,
+        srcs = ["gpu/comm/bench_sendrecv_ccl.mojo"],
+        copts = [
+            "-D",
+            "num_gpus=" + str(ngpus),
+        ],
+        data = select({
+            "//:nvidia_gpu": ["@nvshmem_prebuilt//:host"],
+            "//conditions:default": [],
+        }),
+        enable_assertions = False,
+        env = select({
+            "//:nvidia_gpu": {"MODULAR_SHMEM_LIB_DIR": "../+http_archive+nvshmem_prebuilt"},
+            "//conditions:default": {},
+        }),
+        target_compatible_with = ["//:has_gpu", "//:nvidia_gpu"],
+        deps = [
+            "//max:comm",
+            "//max:internal_utils",
+            "//max:layout",
+            "//max:nn",
+            "//max:shmem",
+            "//max:structured_kernels",
+            "@mojo//:std",
+        ],
+    )
+    for (variant_name, ngpus) in _SENDRECV_CCL_VARIANTS
 ]
 
 # ============================================================================
