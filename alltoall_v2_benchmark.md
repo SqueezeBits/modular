@@ -162,3 +162,44 @@ concurrent-link benefit — a small price for the massive many-GPU win.
 v2 is at parity or better than NCCL everywhere; the earlier v1 fallback
 note ("use NCCL for 8 GPU / large") is no longer needed. Callers can
 use the Mojo path unconditionally via `use_vendor_ccl=False`.
+
+## Appendix — Autotune attempt on `blocks_per_peer` (negative result)
+
+After v2 landed we swept the `_max_num_blocks` cap across
+{8, 16, 32, 64, 96, 128, 192, 256, 384, 512} for every (ngpus, size)
+point and picked the fastest per-cell. The sweep was then re-verified
+with multi-run measurements on the cells that initially looked like
+wins.
+
+**Outcome**: no cap reliably beat the current default
+(`MAX_NUM_BLOCKS_UPPER_BOUND = 512`). Every apparent win was within
+per-run measurement noise (~3-5% std at small sizes; larger at
+64 KB on 8 GPU where one run hit an outlier that the initial pass
+flagged as a +70% improvement — re-measurement showed no real gap).
+
+**Why the default is already optimal**: the v2 heuristic
+```
+blocks_per_peer = min(blocks_for_chunk, cap // ngpus)
+```
+already self-adjusts per size:
+
+- Small chunks: `blocks_for_chunk` dominates, so the cap doesn't bind
+  and lowering it only wastes parallelism.
+- Large chunks: `cap // ngpus` dominates, and 512 is enough to keep
+  every SM busy on B200 without overshooting the barrier's 512-slot
+  counter array.
+
+In other words, the two-term `min` is the autotune. Further gains
+need structural changes, not block-count fiddling:
+
+- Multimem / NVLS: not a natural fit for alltoall (permutation, not
+  reduction or broadcast) — skipped.
+- `cp.async.bulk` (B200 TMA) for SM-stall-free bulk copies — the most
+  promising next avenue for the very-large regime where v2 already
+  sits at 97-99% of NCCL's peak busbw.
+- `ngpus == 2` runtime dispatch to v1 to recover the 2-GPU /
+  ≥ 16 MB regression.
+
+No code change landed for this experiment; this appendix documents the
+negative result so the same autotune sweep isn't re-run speculatively
+later.
