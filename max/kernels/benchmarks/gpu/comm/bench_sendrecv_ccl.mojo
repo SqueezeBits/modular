@@ -5,17 +5,16 @@
 # https://llvm.org/LICENSE.txt
 # ===----------------------------------------------------------------------=== #
 #
-# Minimal benchmark for NCCL point-to-point Send/Recv measured in a ring
-# pattern: each rank sends to (rank + 1) % ngpus and receives from
-# (rank - 1 + ngpus) % ngpus, wrapped in a single ncclGroupStart/End so
-# the send and recv are submitted together (required to avoid deadlock).
+# Ring Send/Recv benchmark comparing Modular's Mojo ring_sendrecv pull
+# kernel against NCCL's point-to-point ncclSend/ncclRecv batched in a
+# ncclGroupStart/End block. Each iteration performs one ring hop:
+# rank r sends num_bytes to (r + 1) % ngpus and receives num_bytes
+# from (r - 1 + ngpus) % ngpus.
 #
-# NCCL-only: Modular has no Mojo point-to-point send/recv primitive, so
-# there is nothing to compare against on the Mojo side. The data gathered
-# here feeds the "true Ring Attention could save X" analysis.
-#
-# num_bytes is the size of one ring hop. Per-rank traffic is num_bytes
-# sent + num_bytes received = 2 * num_bytes per iteration.
+# The Mojo path reads directly from the previous neighbor's sendbuf via
+# P2P; the NCCL path uses grouped send+recv to submit both directions
+# together (required to avoid deadlock). busbw = algbw for point-to-
+# point (nccl-tests SendRecv convention).
 
 from std.collections import InlineArray
 from std.sys.defines import (
@@ -33,7 +32,9 @@ from std.benchmark import (
     ThroughputMeasure,
 )
 from comm.sync import enable_p2p
+from comm.sendrecv import ring_sendrecv
 from comm import MAX_GPUS, Signal
+from layout import Idx, TileTensor, row_major
 import comm.vendor.ccl as vendor_ccl
 from comm.vendor.ccl import (
     _ccl_send,
@@ -52,6 +53,7 @@ def bench_sendrecv_ccl[
     ngpus: Int,
     *,
     cache_busting: Bool,
+    use_vendor_ccl: Bool,
 ](
     mut b: Bench,
     list_of_ctx: List[DeviceContext],
@@ -65,12 +67,15 @@ def bench_sendrecv_ccl[
     # for point-to-point send/recv (nccl-tests SendRecv convention).
     var total_bytes = num_bytes
 
+    var vendorccl_tag = "-vendorccl" if use_vendor_ccl else ""
     var name = String(
         "sendrecv-",
         dtype,
         "-",
         ngpus,
-        "gpus-vendorccl-",
+        "gpus",
+        vendorccl_tag,
+        "-",
         human_readable_size(total_bytes),
     )
     print("Running " + name)
@@ -108,9 +113,32 @@ def bench_sendrecv_ccl[
         )
         list_of_ctx[gpu_idx].synchronize()
 
-    if not vendor_ccl.is_send_available() or not vendor_ccl.is_recv_available():
-        raise "Vendor CCL send/recv not available (requires NCCL 2.7+)."
-    vendor_ccl.init_comms(ngpus)
+    # TileTensors for the Mojo path: one immut view per rank's sendbuf and
+    # one mut view of this rank's recvbuf.
+    comptime InTileType = type_of(
+        TileTensor(
+            cb_sends[0].unsafe_ptr(), row_major(Idx(chunk_length))
+        ).as_immut()
+    )
+    var tt_in = InlineArray[InTileType, ngpus](uninitialized=True)
+
+    comptime OutTileType = type_of(
+        TileTensor(recv_bufs[0].unsafe_ptr(), row_major(Idx(chunk_length)))
+    )
+    var tt_out = InlineArray[OutTileType, ngpus](uninitialized=True)
+    for gpu_idx in range(ngpus):
+        tt_out[gpu_idx] = TileTensor(
+            recv_bufs[gpu_idx].unsafe_ptr(), row_major(Idx(chunk_length))
+        )
+
+    # NCCL comm pre-init (only needed on vendor path).
+    comptime if use_vendor_ccl:
+        if (
+            not vendor_ccl.is_send_available()
+            or not vendor_ccl.is_recv_available()
+        ):
+            raise "Vendor CCL send/recv not available (requires NCCL 2.7+)."
+        vendor_ccl.init_comms(ngpus)
 
     @parameter
     @always_inline
@@ -120,30 +148,43 @@ def bench_sendrecv_ccl[
         @parameter
         @always_inline
         def call_fn(ctx_inner: DeviceContext, cache_iter: Int) raises:
-            var dtype_ccl = _dtype_to_ccl[dtype]()
-            var comms = _get_global_comms(ngpus)
-            var device_rank = Int(ctx_inner.id())
-            var next_peer = (device_rank + 1) % ngpus
-            var prev_peer = (device_rank - 1 + ngpus) % ngpus
-            var sendbuf = cb_sends[device_rank].offset_ptr(cache_iter)
-            var recvbuf = recv_bufs[device_rank].unsafe_ptr()
+            comptime if use_vendor_ccl:
+                var dtype_ccl = _dtype_to_ccl[dtype]()
+                var comms = _get_global_comms(ngpus)
+                var device_rank = Int(ctx_inner.id())
+                var next_peer = (device_rank + 1) % ngpus
+                var prev_peer = (device_rank - 1 + ngpus) % ngpus
+                var sendbuf = cb_sends[device_rank].offset_ptr(cache_iter)
+                var recvbuf = recv_bufs[device_rank].unsafe_ptr()
 
-            # Batch send + recv in one ncclGroupStart/End to avoid deadlock.
-            with vendor_ccl.group():
-                _ = _ccl_send(
-                    sendbuf.bitcast[NoneType](),
-                    chunk_length,
-                    dtype_ccl,
-                    next_peer,
-                    comms.comms[device_rank],
-                    ctx_inner,
-                )
-                _ = _ccl_recv(
-                    recvbuf.bitcast[NoneType](),
-                    chunk_length,
-                    dtype_ccl,
-                    prev_peer,
-                    comms.comms[device_rank],
+                # Batch send + recv in one ncclGroupStart/End to avoid deadlock.
+                with vendor_ccl.group():
+                    _ = _ccl_send(
+                        sendbuf.bitcast[NoneType](),
+                        chunk_length,
+                        dtype_ccl,
+                        next_peer,
+                        comms.comms[device_rank],
+                        ctx_inner,
+                    )
+                    _ = _ccl_recv(
+                        recvbuf.bitcast[NoneType](),
+                        chunk_length,
+                        dtype_ccl,
+                        prev_peer,
+                        comms.comms[device_rank],
+                        ctx_inner,
+                    )
+            else:
+                comptime for i in range(ngpus):
+                    tt_in[i] = TileTensor(
+                        cb_sends[i].offset_ptr(cache_iter),
+                        row_major(Idx(chunk_length)),
+                    ).as_immut()
+                ring_sendrecv[ngpus=ngpus](
+                    tt_in,
+                    tt_out[ctx_idx],
+                    rank_sigs,
                     ctx_inner,
                 )
 
@@ -184,6 +225,7 @@ def main() raises:
 
     comptime dtype = get_defined_dtype["dtype", DType.bfloat16]()
     comptime num_gpus = get_defined_int["num_gpus", 2]()
+    comptime use_vendor_ccl = get_defined_bool["use_vendor_ccl", False]()
     comptime cache_busting = True
 
     var m = Bench()
@@ -207,4 +249,5 @@ def main() raises:
         dtype=dtype,
         ngpus=num_gpus,
         cache_busting=cache_busting,
+        use_vendor_ccl=use_vendor_ccl,
     ](m, ctx, num_bytes)

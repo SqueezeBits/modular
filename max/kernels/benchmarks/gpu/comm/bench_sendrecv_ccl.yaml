@@ -14,9 +14,18 @@
 name: bench_sendrecv_ccl
 file: $KERNEL_BENCHMARKS_ROOT/gpu/comm/bench_sendrecv_ccl.mojo
 
-# Point-to-point send/recv benchmark in a ring pattern.
-# NCCL-only (Modular has no equivalent Mojo primitive).
-params:
-- dtype: [DType.bfloat16]
+# Point-to-point send/recv benchmark in a ring pattern. Compares the
+# Modular ring_sendrecv pull kernel (use_vendor_ccl=False) against NCCL
+# grouped ncclSend/ncclRecv (use_vendor_ccl=True).
+
+commons: &commons
+  dtype: [DType.bfloat16]
   num_gpus: [2, 4, 8]
   $num_bytes: "[2**i for i in range(14, 29)]"
+
+params:
+- <<: *commons
+  use_vendor_ccl: [False]
+
+- <<: *commons
+  use_vendor_ccl: [True]
