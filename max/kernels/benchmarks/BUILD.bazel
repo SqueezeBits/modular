@@ -187,6 +187,15 @@ _ALLREDUCE_VARIANTS = [
     ("bench_allreduce_nccl_8gpu", 8, True),
 ]
 
+_ALLGATHER_VARIANTS = [
+    ("bench_allgather_mojo_2gpu", 2, False),
+    ("bench_allgather_mojo_4gpu", 4, False),
+    ("bench_allgather_mojo_8gpu", 8, False),
+    ("bench_allgather_nccl_2gpu", 2, True),
+    ("bench_allgather_nccl_4gpu", 4, True),
+    ("bench_allgather_nccl_8gpu", 8, True),
+]
+
 [
     mojo_binary(
         name = variant_name,
@@ -218,6 +227,39 @@ _ALLREDUCE_VARIANTS = [
         ],
     )
     for (variant_name, ngpus, use_ccl) in _ALLREDUCE_VARIANTS
+]
+
+[
+    mojo_binary(
+        name = variant_name,
+        srcs = ["gpu/comm/bench_allgather_ccl.mojo"],
+        copts = [
+            "-D",
+            "num_gpus=" + str(ngpus),
+            "-D",
+            "use_vendor_ccl=" + str(use_ccl),
+        ],
+        data = select({
+            "//:nvidia_gpu": ["@nvshmem_prebuilt//:host"],
+            "//conditions:default": [],
+        }),
+        enable_assertions = False,
+        env = select({
+            "//:nvidia_gpu": {"MODULAR_SHMEM_LIB_DIR": "../+http_archive+nvshmem_prebuilt"},
+            "//conditions:default": {},
+        }),
+        target_compatible_with = ["//:has_gpu", "//:nvidia_gpu"],
+        deps = [
+            "//max:comm",
+            "//max:internal_utils",
+            "//max:layout",
+            "//max:nn",
+            "//max:shmem",
+            "//max:structured_kernels",
+            "@mojo//:std",
+        ],
+    )
+    for (variant_name, ngpus, use_ccl) in _ALLGATHER_VARIANTS
 ]
 
 # ============================================================================
