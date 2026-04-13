@@ -210,6 +210,32 @@ def _ccl_reducescatter(
     ]()(sendbuff, recvbuff, recvcount, datatype, op, comm, stream_ptr)
 
 
+# === Scatter binding (NCCL 2.28.3+) ===
+@always_inline
+def _ccl_scatter(
+    sendbuff: OpaquePointer,
+    recvbuff: OpaquePointer,
+    count: Int,
+    datatype: ncclDataType_t,
+    root: Int,
+    comm: ncclComm_t,
+    ctx: DeviceContext,
+) raises -> ncclResult_t:
+    var stream_ptr = _ccl_stream_ptr(ctx)
+    return _get_ccl_function[
+        "ncclScatter",
+        def(
+            type_of(sendbuff),
+            type_of(recvbuff),
+            Int,
+            ncclDataType_t,
+            Int,
+            ncclComm_t,
+            type_of(stream_ptr),
+        ) thin -> ncclResult_t,
+    ]()(sendbuff, recvbuff, count, datatype, root, comm, stream_ptr)
+
+
 # === Broadcast binding (unified) ===
 @always_inline
 def _ccl_broadcast(
@@ -436,6 +462,10 @@ def is_broadcast_available() -> Bool:
 
 def is_reducescatter_available() -> Bool:
     return _is_ccl_symbol_available["ncclReduceScatter"]()
+
+
+def is_scatter_available() -> Bool:
+    return _is_ccl_symbol_available["ncclScatter"]()
 
 
 @parameter
