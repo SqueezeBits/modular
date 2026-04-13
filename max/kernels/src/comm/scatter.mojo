@@ -46,6 +46,7 @@ from std.utils import StaticTuple
 
 from .sync import (
     MAX_GPUS,
+    MAX_NUM_BLOCKS_UPPER_BOUND,
     Signal,
     _multi_gpu_barrier,
     is_p2p_enabled,
@@ -177,7 +178,10 @@ def scatter[
 
     comptime BLOCK_SIZE = 256
     comptime simd_width = simd_width_of[dtype, target=get_gpu_target()]()
-    var grid_size = ceildiv(ceildiv(max_elems, simd_width), BLOCK_SIZE)
+    var grid_size = min(
+        ceildiv(ceildiv(max_elems, simd_width), BLOCK_SIZE),
+        MAX_NUM_BLOCKS_UPPER_BOUND,
+    )
 
     comptime kernel = scatter_pull_kernel[
         dtype,
